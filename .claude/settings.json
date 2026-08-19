@@ -45,6 +45,18 @@
                     }
                 ]
             }
+        ],
+        "PostToolUse": [
+            {
+                "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "node \"${CLAUDE_PROJECT_DIR}/.claude/hooks/sync-docs.cjs\"",
+                        "timeout": 15
+                    }
+                ]
+            }
         ]
     }
 }
