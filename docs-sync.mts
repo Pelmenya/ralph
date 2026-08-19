@@ -54,14 +54,23 @@ export function trackedFiles(root: string = CANON_ROOT): string[] {
  * Папки, у которых обязана быть пара доков: корень и каждая папка первого уровня с кодом.
  * Глубже не спускаемся намеренно — правила формулируются на уровне зоны ответственности
  * (`core/`, `adapters/`, …), иначе собственных правил потребовал бы каждый `__fixtures__`.
+ *
+ * Набор СЧИТАЕТСЯ по дереву, а не перечисляется руками: перечисление сторожило бы только
+ * уже существующие папки и промолчало бы про новую — то есть про единственный случай, ради
+ * которого проверка и заведена. Отделённая от git часть (`docDirsFromFiles`) нужна, чтобы
+ * это можно было проверить от противного, не заводя репозиторий во временном каталоге.
  */
-export function docDirs(root: string = CANON_ROOT): string[] {
+export function docDirsFromFiles(files: string[]): string[] {
     const dirs = new Set<string>();
-    for (const rel of trackedFiles(root)) {
+    for (const rel of files) {
         if (!CODE_EXT.test(rel) || !rel.includes('/')) continue;
         dirs.add(rel.split('/')[0]);
     }
     return ['.', ...[...dirs].sort()];
+}
+
+export function docDirs(root: string = CANON_ROOT): string[] {
+    return docDirsFromFiles(trackedFiles(root));
 }
 
 /**

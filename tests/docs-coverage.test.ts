@@ -17,7 +17,14 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { docDirs, docPairs, expectedAgents, isStale, renderAgents } from '../docs-sync.mts';
+import {
+    docDirs,
+    docDirsFromFiles,
+    docPairs,
+    expectedAgents,
+    isStale,
+    renderAgents,
+} from '../docs-sync.mts';
 
 const CANON_ROOT = resolve(import.meta.dirname, '..');
 
@@ -56,6 +63,20 @@ describe('документация по папкам', () => {
 
     it('в корне есть CLAUDE.md — на него ссылается всё остальное', () => {
         expect(existsSync(join(CANON_ROOT, 'CLAUDE.md'))).toBe(true);
+    });
+
+    // От противного: правило «папка без доков красит гейт» проживёт до первого нового
+    // модуля, если набор папок перечислен руками. Здесь проверяется, что он СЧИТАЕТСЯ по
+    // дереву — новая папка с кодом попадает в него сама, ещё не имея ни одного дока.
+    it('новая папка с кодом попадает в набор сама — и потому потребует доков', () => {
+        const dirs = docDirsFromFiles(['core/gate.ts', 'brand-new/thing.ts', 'README.md']);
+        expect(dirs).toContain('brand-new');
+        // Корень в наборе всегда, файл верхнего уровня своей папки не образует.
+        expect(dirs).toEqual(['.', 'brand-new', 'core']);
+    });
+
+    it('не-код папку не образует: доки требуются от кода, а не от данных', () => {
+        expect(docDirsFromFiles(['fixtures/config.json', 'docs/note.md'])).toEqual(['.']);
     });
 });
 
