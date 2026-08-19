@@ -1,0 +1,50 @@
+{
+    "permissions": {
+        "allow": [
+            "Edit(*)",
+            "Write(*)",
+            "Bash(npm run *)",
+            "Bash(npx tsc*)",
+            "Bash(npx prettier*)",
+            "Bash(npx vitest*)",
+            "Bash(git status*)",
+            "Bash(git diff*)",
+            "Bash(git log*)",
+            "Bash(git branch*)",
+            "Bash(git switch*)",
+            "Bash(git checkout -b*)",
+            "Bash(git add*)",
+            "Bash(git commit*)",
+            "Bash(git push*)",
+            "Bash(git fetch*)",
+            "Bash(git pull*)",
+            "WebSearch",
+            "WebFetch"
+        ],
+        "ask": ["Bash(npm install*)", "Bash(docker*)"],
+        "deny": [
+            "Read(.env)",
+            "Read(.env.*)",
+            "Read(**/.env)",
+            "Read(**/.env.*)",
+            "Read(**/*.local.md)",
+            "Read(**/*.pem)",
+            "Read(**/*.key)",
+            "Bash(git push --force*)",
+            "Bash(git reset --hard*)"
+        ]
+    },
+    "hooks": {
+        "SessionStart": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "node \"${CLAUDE_PROJECT_DIR}/.claude/hooks/load-context.cjs\"",
+                        "timeout": 15
+                    }
+                ]
+            }
+        ]
+    }
+}

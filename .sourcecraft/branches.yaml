@@ -1,0 +1,18 @@
+## Защита основной ветки. Конфигурация действует ИЗ ОСНОВНОЙ ВЕТКИ, поэтому PR не может
+## ослабить барьер, пока сам не смержен, — а правки этого файла требуют ship человека
+## (см. review.yaml).
+
+branch_protection:
+    policies:
+        - target: default_branch
+          message: 'Прямой push в main запрещён — изменения только через pull request'
+          rules:
+              - prevent_force_push
+              - prevent_non_pr_changes
+              - prevent_deletion
+
+pull_request:
+    ## Ветка-источник удаляется после слияния сама: иначе список веток за месяц
+    ## автономной работы превращается в свалку, где живую от мёртвой не отличить.
+    branch_cleanup:
+        matches: ['**', '!main']
