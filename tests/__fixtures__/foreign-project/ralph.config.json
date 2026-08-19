@@ -1,0 +1,81 @@
+{
+    "defaultProfile": "playground",
+    "common": {
+        "active": true,
+        "maxIterations": 5,
+        "maxTurns": 50,
+        "claudeTimeoutMs": 1800000,
+        "authorAllowlist": ["orbital-bot"],
+        "model": "fixture-coder-model-default",
+        "fallbackModel": "fixture-coder-model-default",
+        "permissionMode": "fixture-permission-mode",
+        "installCmd": "pnpm install --frozen-lockfile",
+        "runnerWorktreeDirname": "sputnik-tracker-ralph",
+        "board": {
+            "owner": "OrbitalLabs",
+            "number": 42
+        },
+        "gate": {
+            "checks": [
+                ["format", "pnpm run format:check"],
+                ["build", "pnpm run build"],
+                ["test", "pnpm run test"]
+            ],
+            "prodChecks": [["audit", "pnpm run audit"]],
+            "prodDropChecks": []
+        },
+        "blockedHealAttempts": 1,
+        "gateHealAttempts": 1,
+        "apiLimitMaxWaits": 1,
+        "apiLimitGraceMin": 1,
+        "deployCheck": {
+            "workflow": "deploy.yml",
+            "timeoutMs": 60000,
+            "pollIntervalMs": 5000,
+            "healthUrl": "https://status.orbitallabs.example/health",
+            "healthTimeoutMs": 5000,
+            "healthRetries": 1,
+            "healthRetryDelayMs": 1000
+        },
+        "deadman": {
+            "iterationGraceMs": 60000,
+            "gateSilenceMs": 60000,
+            "defaultSilenceMs": 30000
+        },
+        "modelRouting": {
+            "default": "fixture-coder-model-default",
+            "labels": {
+                "complexity:low": "fixture-coder-model-low",
+                "complexity:medium": "fixture-coder-model-medium",
+                "complexity:high": "fixture-coder-model-high",
+                "complexity:expert": "fixture-coder-model-expert"
+            }
+        },
+        "review": {
+            "default": "claude-opus-4-8",
+            "escalated": "claude-fable-5",
+            "fallback": "claude-opus-4-8",
+            "escalateOn": [],
+            "escalateOnPaths": ["infra/**"],
+            "maxTurns": 20,
+            "diffLimit": 10000
+        },
+        "tunnelCheck": {
+            "enabled": false,
+            "proxyUrl": "http://127.0.0.1:8118",
+            "ipCheckUrl": "https://api.ipify.org",
+            "restartCmd": "true",
+            "restartWaitMs": 1000
+        },
+        "prompt": "Прочитай AGENTS.md фикстурного проекта и следуй ему. Возьми следующий открытый Issue из milestone '{milestone}' и реализуй его в ветке '{branch}'.",
+        "phases": [
+            {
+                "milestone": "Sputnik Tracker · Фаза 1: Каркас",
+                "branch": "feature/sputnik-phase-1-scaffold"
+            }
+        ]
+    },
+    "profiles": {
+        "playground": {}
+    }
+}
