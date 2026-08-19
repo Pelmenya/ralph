@@ -8,6 +8,8 @@
         "typecheck": "tsc --noEmit",
         "format:check": "prettier --check .",
         "format": "prettier --write .",
+        "docs:sync": "node docs-sync.mts",
+        "docs:check": "node docs-sync.mts --check",
         "gate": "node gate.mts"
     },
     "devDependencies": {
