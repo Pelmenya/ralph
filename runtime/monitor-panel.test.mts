@@ -251,7 +251,12 @@ describe('deadmanPushMessage — текст пуша', () => {
 describe('maybePushDeadman — доставка через pushEvent() + дедуп по эпизоду (#149)', () => {
     // activity как const: maybePushDeadman теперь ждёт Activity | null, а не широкий string
     // (#403-review) — у отдельного const'а без as const поле вывелось бы в string.
-    const deadman = { silent: true, silenceMs: 700000, thresholdMs: 600000, activity: 'gate' as const };
+    const deadman = {
+        silent: true,
+        silenceMs: 700000,
+        thresholdMs: 600000,
+        activity: 'gate' as const,
+    };
     const notSilent = {
         silent: false,
         silenceMs: 100,

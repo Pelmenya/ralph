@@ -60,9 +60,8 @@ const { createOrchestrator } = await import('./core/orchestrator.ts');
 // orchestrator.ts при импорте не тянет env/сеть, а тесты передают фейки
 // (см. orchestrator.test.ts). telegram-notifier.ts самостоятелен (не импортирует
 // ralph.js — цикл), предохранитель #138 у него общий через side-effect-guard.ts.
-const { sendTelegramMessage, telegramConfigFromEnv } = await import(
-    './runtime/telegram-notifier.ts'
-);
+const { sendTelegramMessage, telegramConfigFromEnv } =
+    await import('./runtime/telegram-notifier.ts');
 const { buildSanitizedGateEnv } = await import('./gate-env.mts');
 
 // Флаги режима — прежние module-level ONCE/DRY/RESET/RESUBMIT/DEPLOY_RESOLVED монолита.

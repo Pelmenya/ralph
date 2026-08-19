@@ -16,11 +16,12 @@ import { spawnSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { TRACE_CLASSES, denyNamePattern, traceFindings, explain } from './project-traces.ts';
 
-// `__dirname`, а не import.meta: у потребителя корневой package.json может объявлять
-// CommonJS, и тогда `import.meta` в .ts запрещён самим tsc (TS1470). Отсчёт от файла —
-// ещё и устойчив к месту запуска: ядро гоняется и из своего корня, и из каталога внутри
-// проекта-потребителя, а CWD в этих раскладках разный.
-const CORE_ROOT = resolve(__dirname, '..');
+// Отсчёт от каталога МОДУЛЯ, а не от cwd: ядро гоняется и из своего корня, и из каталога
+// внутри проекта-потребителя, а CWD в этих раскладках разный. `import.meta.dirname` здесь
+// законен потому, что у канона свой package.json с `type: module`: без него корневой
+// package.json потребителя мог бы объявлять CommonJS, и tsc запретил бы `import.meta`
+// (TS1470) — ровно ради этого package.json канона и заведён.
+const CORE_ROOT = resolve(import.meta.dirname, '..');
 
 const SELF = new Set(['tests/project-traces.ts', 'tests/project-traces.test.ts']);
 
@@ -125,6 +126,10 @@ describe('словарь имён — снаружи, а не в дереве (#
 
 describe('сплошной скан репозитория ядра', () => {
     const files = coreRepoFiles();
+
+    // Словарь имён приходит снаружи и в каноне обычно пуст. Что прогон шёл без него —
+    // сообщает гейт (`gate.mts`), а не тест: вывод теста в зелёном прогоне не показывают,
+    // и предупреждение, которого никто не видит, барьером не является.
     // Ядро лежит копией внутри потребителя (до миграции на подмодуль) — сканировать
     // нечего: соседние файлы принадлежат ему, а не канону. Скан гоняется там, где ядро
     // само себе репозиторий, — то есть в гейте канона, ради которого барьер и заведён.
@@ -143,5 +148,55 @@ describe('сплошной скан репозитория ядра', () => {
             deny: denyNamePattern(),
         });
         expect(findings.length === 0 || explain(rel, findings)).toBe(true);
+    });
+});
+
+// ── Сообщения коммитов ───────────────────────────────────────────────────────
+// Дерево чистое, а история — нет: имя приватного репозитория или ссылка на его трекер
+// уезжают в публичный репозиторий сообщением коммита ровно так же, как строкой кода, и
+// правкой файла оттуда уже не убираются. Скан по дереву этого не видит вовсе — сообщения
+// в `git ls-files` не попадают, поэтому им нужен свой проход.
+describe('сообщения коммитов', () => {
+    function commitMessages(): Array<{ sha: string; body: string }> | null {
+        // `-z` разделяет коммиты NUL-байтом — символом, которого в тексте сообщения быть
+        // не может. Через сам формат его не передать: NUL в argv запрещён ядром ОС.
+        const out = spawnSync('git', ['-C', CORE_ROOT, 'log', '-z', '--format=%H%n%B'], {
+            encoding: 'utf-8',
+            maxBuffer: 64 * 1024 * 1024,
+        });
+        if (out.status !== 0) return null;
+        return out.stdout
+            .split('\u0000')
+            .map((chunk) => chunk.trim())
+            .filter((chunk) => chunk !== '')
+            .map((chunk) => {
+                const nl = chunk.indexOf('\n');
+                return nl === -1
+                    ? { sha: chunk, body: '' }
+                    : { sha: chunk.slice(0, nl), body: chunk.slice(nl + 1) };
+            });
+    }
+
+    const commits = commitMessages();
+
+    it('история читается — иначе скан ниже проверял бы пустоту', () => {
+        // Тот же fail-closed, что у скана дерева: `git log` не ответил (не репозиторий,
+        // сломанный вызов) — красный, а не «сообщений нет, значит следов нет».
+        expect(commits, 'git log не отработал — скан сообщений нечего проверять').not.toBeNull();
+        expect(commits?.length ?? 0).toBeGreaterThan(0);
+    });
+
+    it('ни одно сообщение не несёт следов проектов-потребителей', () => {
+        const deny = denyNamePattern();
+        const bad = (commits ?? []).flatMap(({ sha, body }) => {
+            const findings = traceFindings(body, { deny });
+            return findings.length === 0
+                ? []
+                : [explain(`${sha.slice(0, 12)} (сообщение)`, findings)];
+        });
+        expect(
+            bad.join('\n'),
+            'След в сообщении коммита правкой файла не убирается — историю придётся переписывать',
+        ).toBe('');
     });
 });

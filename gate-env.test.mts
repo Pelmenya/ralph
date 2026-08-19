@@ -172,12 +172,11 @@ describe('buildSanitizedGateEnv — обёртка загрузка+санаци
 // launch-дерева, а не из детаченного worktree. Барьер, а не только ручная проверка:
 // «упрощение» до process.cwd()/пути от конфига сразу покраснит этот тест.
 describe('провенанс DEFAULT_ALLOWLIST_PATH — от каталога модуля, не от cwd (#403)', () => {
-    // Тест лежит РЯДОМ с gate-env.mts (оба в .claude/ralph/), поэтому каталог теста и есть
-    // каталог модуля. Ждём ТОЧНОГО равенства — только оно ловит регрессию вида
-    // path.join(process.cwd(), '.claude/ralph/gate-env-allowlist.json'): она прошла бы обе
-    // мягкие проверки (endsWith / «не cwd+имя файла»), т.к. под vitest cwd — корень репо и
-    // путь от cwd совпал бы с путём от каталога модуля. Но во время гейта cwd — worktree на
-    // PR-голове, и allowlist читался бы из кода проверяемого PR (провенанс #209 сломан).
+    // Тест лежит РЯДОМ с gate-env.mts, поэтому каталог теста и есть каталог модуля. Ждём
+    // ТОЧНОГО равенства: только оно ловит регрессию, где путь собран от cwd. Мягкие формы
+    // («абсолютный», «оканчивается на имя файла») её пропустили бы — под vitest cwd обычно
+    // совпадает с каталогом модуля. Во время же гейта cwd — worktree на голове PR, и
+    // allowlist читался бы из кода проверяемого PR (провенанс #209 сломан).
     const HERE = path.dirname(fileURLToPath(import.meta.url));
     const EXPECTED = path.join(HERE, 'gate-env-allowlist.json');
 
@@ -186,12 +185,18 @@ describe('провенанс DEFAULT_ALLOWLIST_PATH — от каталога м
         expect(DEFAULT_ALLOWLIST_PATH).toBe(EXPECTED);
     });
 
-    it('не зависит от cwd: не строится от process.cwd()', () => {
-        // Дополнительная явная проверка «не от cwd»: даже наивную форму cwd+имя файла
-        // (когда корень репо совпал бы с каталогом модуля лишь случайно) точное равенство
-        // выше уже отсекает, но оставляем как читаемую формулировку инварианта.
-        expect(DEFAULT_ALLOWLIST_PATH).not.toBe(path.join(process.cwd(), 'gate-env-allowlist.json'));
-        expect(path.dirname(DEFAULT_ALLOWLIST_PATH).endsWith(path.join('.claude', 'ralph'))).toBe(true);
+    // Второй барьер — по ИСХОДНИКУ, а не по значению, и это не дубль первого. Значение
+    // константы считается один раз на импорте: сменить cwd в тесте и пересверить его
+    // нельзя, а совпадение «путь от cwd == путь от каталога модуля» в раскладке, где эти
+    // каталоги совпадают, сделало бы сравнение значений зелёным при сломанном провенансе.
+    // Проверка «в модуле нет обращения к cwd» от раскладки не зависит вовсе.
+    it('в исходнике модуля нет обращения к cwd', () => {
+        const src = fs.readFileSync(path.join(HERE, 'gate-env.mts'), 'utf-8');
+        const code = src
+            .split('\n')
+            .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+            .join('\n');
+        expect(code).not.toMatch(/process\.cwd\(\)|process\.env\.PWD/);
     });
 });
 

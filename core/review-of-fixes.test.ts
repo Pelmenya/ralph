@@ -2,12 +2,8 @@
 // арифметика сходимости: дедуп, потолок, косметика, анти-пинг-понг, арбитр. Сквозные
 // сценарии через настоящий runLoop — в tests/review-of-fixes-scenarios.test.ts.
 import { describe, expect, it } from 'vitest';
-// @ts-expect-error — проектный .mjs-скрипт без деклараций типов (тот же приём, что импорт
-// ralph.js в orchestrator.test.ts). Импортируется ТОЛЬКО тестом: ядро раннера обязано
-// работать до `npm ci` и на scripts/ не опирается — здесь он нужен как эталон для барьера
-// «набор severity ядра и метрики не разъехался».
-import { SEVERITY_LEVELS } from '../../../scripts/review-findings.mjs';
 import {
+    SEVERITY_LEVELS,
     backlogIssueFor,
     classifyFixReview,
     countsOf,
@@ -43,16 +39,27 @@ describe('severityOf — разметка серьёзности из контр
         expect(severityOf('   ')).toBe(null);
     });
 
-    // Барьер против дрейфа: набор severity ядра обязан совпадать с набором метрики
-    // (scripts/review-findings.mjs). Импортировать её в ядро нельзя (раннер работает до
-    // npm ci), поэтому дубль сторожится тестом, а не типом.
-    it('набор severity совпадает с метрикой находок', () => {
-        const mine = ['blocker', 'major', 'minor', 'nit'];
-        expect(mine).toEqual([...SEVERITY_LEVELS]);
-        expect(mine.filter((s) => isBlockingSeverity(s as 'blocker'))).toEqual([
-            'blocker',
-            'major',
-        ]);
+    // Барьер против дрейфа внутри модуля: словарь `SEVERITY_LEVELS` — контракт наружу
+    // (его сверяет у себя потребитель, считающий находки), а таблица маркеров — то, чем
+    // разметка разбирается. Разъедься они — новый уровень остался бы без маркера, и все
+    // его находки молча читались бы как «без разметки». Сверяем через ПОВЕДЕНИЕ severityOf,
+    // а не через приватную таблицу: тест не должен знать её имени.
+    it('каждый уровень словаря имеет свой маркер, и маркеры не пересекаются', () => {
+        const markers = SEVERITY_LEVELS.map(
+            (level) => ({ blocker: '🔴', major: '🟠', minor: '🟡', nit: '⚪' })[level],
+        );
+        expect(new Set(markers).size).toBe(SEVERITY_LEVELS.length);
+        markers.forEach((marker, i) => {
+            expect(severityOf(`${marker} [${SEVERITY_LEVELS[i]}] текст находки`)).toBe(
+                SEVERITY_LEVELS[i],
+            );
+        });
+    });
+
+    // Граница «держит мердж / едет в бэклог» проведена по словарю целиком, а не по
+    // отдельным значениям: появится пятый уровень — этот тест назовёт, по какую он сторону.
+    it('мердж держат ровно blocker и major', () => {
+        expect(SEVERITY_LEVELS.filter((s) => isBlockingSeverity(s))).toEqual(['blocker', 'major']);
     });
 });
 

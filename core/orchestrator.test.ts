@@ -8574,8 +8574,11 @@ import { createOrchestrator } from './orchestrator.ts';
 // docs/ralph-runner/portability-log.md. Снять вместе с платформенным швом.
 const itPosix = it.skipIf(process.platform === 'win32');
 
-// process.cwd(): vitest гоняет тесты из корня репо — путь стабилен.
-const RALPH_JS = path.join(process.cwd(), '.claude', 'ralph', 'ralph.js');
+// Путь считается от каталога МОДУЛЯ (import.meta.dirname), как FIXTURE_CONFIG_PATH выше,
+// а не от CWD. Ядро запускается и подмодулем в каноне, и каталогом `.claude/ralph` у
+// потребителя: CWD в этих раскладках разный, положение entry относительно этого теста —
+// одно и то же. От CWD путь молча указывал бы в никуда там, где раскладка другая.
+const RALPH_JS = path.resolve(import.meta.dirname, '../ralph.js');
 
 // Боевые флаги по умолчанию — как у vitest-процесса без CLI-флагов раннера.
 const FLAGS_OFF = {

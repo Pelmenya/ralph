@@ -8,13 +8,17 @@
 // Барьер, а не абзац в промпт (инвариант №5): grep как часть сьюта ловит регресс
 // детерминированно, независимо от внимательности ревьюера.
 import { describe, expect, it } from 'vitest';
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { basename, join, resolve, sep } from 'node:path';
 import { denyNamePattern, traceFindings } from './project-traces.ts';
 
-// `__dirname` (не import.meta): tsconfig ралфа компилит в CommonJS-режиме nodenext, где
-// import.meta запрещён (TS1470). Отсчёт от файла, а не от cwd, — устойчив к месту запуска.
-const REPO_ROOT = resolve(__dirname, '../../..'); // .claude/ralph/tests → корень репозитория
+// Отсчёт от каталога МОДУЛЯ, а не от cwd: ядро гоняется и своим клоном канона, и
+// каталогом `.claude/ralph` внутри проекта-потребителя — CWD в этих раскладках разный,
+// положение этого файла относительно корня ядра одно и то же. `import.meta.dirname`, а не
+// `__dirname`: у канона свой package.json с `type: module` (#R0), и ESM-форма здесь
+// работает и под vitest, и под нативным type stripping.
+const CANON_ROOT = resolve(import.meta.dirname, '..');
 
 // Что считать проектной строкой — решают КЛАССЫ следов (машинный путь, адрес хоста) и
 // словарь имён, который приходит СНАРУЖИ, через RALPH_TRACE_DENY. Список имён внутри
@@ -29,45 +33,49 @@ const CODE_EXT = /\.(js|ts|mjs|mts)$/;
 // Из скана исключаем: тесты (сами держат паттерн в проверках), общую тест-инфру
 // предохранителя #138 и `test-helpers`. Сканируем только код ядра (CODE_EXT = js/ts/mjs/mts —
 // .mts у явно-ESM модулей ядра: gate-env.mts (#403) и runtime/monitor-panel.mts (#404)).
-// .json/.log/.md — данные/конфиг/доки. .sh (deploy-remote.sh/backup-db.sh) НЕ сканируем не
-// потому что «не код» — это исполняемые скрипты с проектной специфики (домен, VDS), — а
-// потому что это деплой-обвязка ВНЕ переносимого ядра раннера: при переносе она заменяется
-// под своё окружение, а не копируется как есть (#367-ревью).
-// test-setup/test-helpers переведены в .ts (#405), поэтому и в EXCLUDE — `.ts`. Отсечение
-// это «защита на будущее»: сейчас оба файла лежат в `tests/` (SKIP_DIRS) и до имени скан не
-// доходит, но появись такой файл вне tests/ — он всё равно выпадет из скана.
+// .json/.log/.md — данные/конфиг/доки. Скрипты `.sh` НЕ сканируем не потому что «не код»,
+// а потому что деплой-обвязка лежит ВНЕ переносимого ядра: при переносе она заменяется под
+// своё окружение, а не копируется как есть (#367-ревью).
 const EXCLUDE = /\.test\.(js|ts|mjs|mts)$|^test-setup\.ts$|^test-helpers\.ts$/;
 
-// После раскладки по папкам (#396) модули ядра лежат в подпапках `.claude/ralph/`
-// (core/adapters/shared/runtime) + два файла в корне (ralph.js, gate-env.mts). Обход стал
-// РЕКУРСИВНЫМ — иначе `coreFiles('.claude/ralph')` вернул бы только пару корневых файлов,
-// а весь ядровый код в подпапках выпал бы из скана: grep-guard остался бы зелёным, ничего
-// не проверяя (тот же класс, что `looksBlind` в security-audit.mjs). Пропускаем каталоги:
-// `provision/` (специфика VDS-в-РФ, при переносе заменяется), `tests/` (сам держит паттерн
-// в проверках, а `__fixtures__/` под ним ОБЯЗАНА нести чужую специфику), `node_modules/`.
-// `__fixtures__` в наборе — защита НА БУДУЩЕЕ: сейчас единственный такой каталог лежит внутри
-// `tests/` и отсекается раньше (до вложенной проверки рекурсия не доходит), но появись
-// `__fixtures__` в другом месте — он всё равно выпадет из скана. `ralph.config.json` — ИМЕННО
-// место, где проектные строки жить обязаны, поэтому в скан не попадает (JSON, не код).
+// Каталоги вне скана. `provision/` — контурная обвязка (при переносе заменяется), `tests/`
+// сам держит паттерн в проверках, а `__fixtures__/` под ним ОБЯЗАНА нести чужую специфику.
 const SKIP_DIRS = new Set(['provision', 'tests', '__fixtures__', 'node_modules']);
 
-function coreFiles(relDir: string): string[] {
-    const out: string[] = [];
-    for (const e of readdirSync(join(REPO_ROOT, relDir), { withFileTypes: true })) {
-        const rel = join(relDir, e.name);
-        if (e.isDirectory()) {
-            if (SKIP_DIRS.has(e.name)) continue;
-            out.push(...coreFiles(rel));
-        } else if (e.isFile() && CODE_EXT.test(e.name) && !EXCLUDE.test(e.name)) {
-            out.push(rel);
-        }
+/**
+ * Набор файлов ядра — из `git ls-files`, а не из обхода каталога.
+ *
+ * Раньше здесь был рекурсивный readdir плюс ручной список `EXPECTED` из 25 путей: обход
+ * мог тихо усохнуть (переименовали каталог, сломалась рекурсия), и список сторожил именно
+ * это — ценой того, что каждый новый модуль ядра надо было дописать в тест, а забытый
+ * дописать модуль в скан не попадал вовсе. Плоское перечисление трекнутых файлов снимает
+ * обе беды разом: выпасть из него модуль может только вместе с удалением из репозитория,
+ * а исключения остаются ЯВНЫМИ — их сверяет отдельный тест ниже.
+ *
+ * Fail-closed: git не ответил — бросаем, а не возвращаем пустой набор. Пустой набор сделал
+ * бы весь сьют зелёным, не проверив ни одного файла.
+ */
+function trackedFiles(): string[] {
+    const ls = spawnSync('git', ['-C', CANON_ROOT, 'ls-files'], { encoding: 'utf-8' });
+    if (ls.status !== 0) {
+        throw new Error(`git ls-files в ${CANON_ROOT} не отработал: ${ls.stderr || ls.error}`);
     }
-    return out.sort();
+    return ls.stdout
+        .split('\n')
+        .map((s) => s.trim())
+        .filter((s) => s !== '')
+        .sort();
 }
 
-const CORE_OWN = coreFiles('.claude/ralph');
-const CORE = [...CORE_OWN, ...coreFiles('scripts')];
-const OWNED = new Set(CORE_OWN);
+const TRACKED = trackedFiles();
+const inSkippedDir = (rel: string) =>
+    rel
+        .split(sep)
+        .slice(0, -1)
+        .some((d) => SKIP_DIRS.has(d));
+const isCodeFile = (rel: string) => CODE_EXT.test(rel) && !EXCLUDE.test(basename(rel));
+
+const CORE = TRACKED.filter((rel) => isCodeFile(rel) && !inSkippedDir(rel));
 
 // Вырезание блочных комментариев /* … */ ПОСИМВОЛЬНО, с учётом строковых литералов
 // (#367-ревью). Наивный regex `/\/\*[\s\S]*?\*\//` не знает про строки: глоб-строка в коде
@@ -146,17 +154,15 @@ function stripComments(src: string): string {
  * Находки в КОДЕ (комментарии сняты): поясняющий пример в комментарии — норма и часть
  * истории решения, значение в коде — нарушение переносимости.
  *
- * Набор классов зависит от того, ЧЕЙ это файл. Ядро отвечает за себя целиком: машинный
- * путь в нём — такой же дефект переносимости, как имя чужого репозитория. Файлы рядом
- * (`scripts/**` потребителя) ядру не принадлежат: их классификация — отдельная задача
- * (#99), и требовать от них своих правил значит краснеть на чужом коде, который никто
- * этим тестом не чинит. Для них остаётся словарь имён — то же, что было до #117.
+ * Классы следов применяются ко ВСЕМУ, что сканируется. Раньше их состав зависел от того,
+ * чей это файл: рядом с ядром лежали `scripts/**` потребителя, и требовать от чужого кода
+ * своих правил значило краснеть на том, что этот тест всё равно не чинит. В каноне чужих
+ * файлов нет вовсе — каждый сканируемый файл принадлежит ядру и отвечает за себя целиком.
  */
-function specificsInCode(src: string, owned: boolean): Array<[number, string]> {
-    return traceFindings(stripComments(src), {
-        deny: DENY,
-        classes: owned ? undefined : [],
-    }).map((f) => [f.line, f.excerpt] as [number, string]);
+function specificsInCode(src: string): Array<[number, string]> {
+    return traceFindings(stripComments(src), { deny: DENY }).map(
+        (f) => [f.line, f.excerpt] as [number, string],
+    );
 }
 
 describe('stripComments — граница «код vs комментарий-пример»', () => {
@@ -198,59 +204,45 @@ describe('stripComments — граница «код vs комментарий-п
 });
 
 describe('набор сканируемых модулей ядра', () => {
-    // Fail-closed страж набора (#396): после раскладки по папкам рекурсивный обход обязан
-    // видеть КАЖДЫЙ модуль ядра в своей подпапке. Пустой/усохший CORE = красный, а не
-    // «нечего проверять»: если рекурсия сломается или каталог переименуют, модуль выпадет
-    // из скана и этот список его недосчитается. Перечислены все 25 файлов ядра: 23 TS-модуля
-    // (15 core + 2 adapters + 2 shared + 3 runtime + ESM-gate-env.mts; runtime включает
-    // ESM-monitor-panel.mts, #404) + 2 JS (рантайм-entry monitor.js, entry-ralph.js).
-    const EXPECTED = [
-        // core/
-        'core/orchestrator.ts',
-        'core/gate.ts',
-        'core/review.ts',
-        'core/deploy-check.ts',
-        'core/api-limit.ts',
-        'core/state-lock.ts',
-        'core/worktree.ts',
-        'core/workspace-trust.ts',
-        'core/exec.ts',
-        'core/tunnel-check.ts',
-        'core/config-profile.ts',
-        'core/session-requests.ts',
-        'core/prompts.ts',
-        'core/runtime-availability.ts',
-        'core/spawn-failure.ts',
-        // adapters/
-        'adapters/adapters.ts',
-        'adapters/adapters-impl.ts',
-        // shared/
-        'shared/ralph-util.ts',
-        'shared/side-effect-guard.ts',
-        // runtime/
-        'runtime/monitor.js',
-        'runtime/monitor-panel.mts',
-        'runtime/deadman.ts',
-        'runtime/telegram-notifier.ts',
-        // корень раннера
-        'ralph.js',
-        'gate-env.mts',
-    ].map((rel) => join('.claude/ralph', rel));
-
-    it('непуст и включает КАЖДЫЙ ожидаемый модуль ядра', () => {
-        // Явный `EXPECTED` строго сильнее прежнего `CORE.length > 10`: если каждый из 25
-        // ожидаемых модулей в наборе — набор заведомо непуст. Один источник правды об
-        // инварианте (#398-ревью), без параллельной проверки длины.
-        for (const mod of EXPECTED) {
-            expect(CORE, `модуль ${mod} выпал из скана core-purity`).toContain(mod);
+    // Fail-closed страж набора. Пустой или усохший CORE — красный, а не «нечего
+    // проверять»: сломайся перечисление, весь сьют ниже стал бы зелёным, не прочитав ни
+    // одного файла (тот же класс, что слепой grep).
+    it('непуст и покрывает каждую папку ядра', () => {
+        expect(CORE.length).toBeGreaterThan(20);
+        // Оба entry в корне ядра — тонкий ralph.js и ESM-gate-env.mts.
+        expect(CORE).toContain('ralph.js');
+        expect(CORE).toContain('gate-env.mts');
+        // Ни одна папка ядра не выпала целиком: именно так набор усыхал раньше — при
+        // раскладке по папкам нерекурсивный обход оставил в скане только корень.
+        for (const dir of ['core', 'adapters', 'shared', 'runtime']) {
+            expect(
+                CORE.filter((rel) => rel.startsWith(`${dir}/`)).length,
+                `папка ${dir}/ выпала из скана core-purity`,
+            ).toBeGreaterThan(1);
         }
-        expect(CORE).toContain(join('scripts', 'project-sync.mjs'));
+    });
+
+    // Обратная сторона плоского перечисления: список исключений обязан оставаться ЯВНЫМ.
+    // Разъехавшийся EXCLUDE (лишняя маска, опечатка в имени папки) вынес бы модуль из
+    // скана молча — набор остался бы непустым, а барьер перестал бы сторожить именно то,
+    // что ушло. Поэтому сверяем не только то, что сканируется, но и то, что НЕ.
+    it('из скана выпадает ровно заявленное: тесты, их обвязка и контурный provision', () => {
+        const skipped = TRACKED.filter((rel) => CODE_EXT.test(rel) && !CORE.includes(rel));
+        const unexpected = skipped.filter(
+            (rel) =>
+                !/\.test\.(js|ts|mjs|mts)$/.test(rel) &&
+                !rel.startsWith('tests/') &&
+                !rel.startsWith('provision/'),
+        );
+        expect(unexpected, `файл ядра молча выпал из скана — проверь EXCLUDE/SKIP_DIRS`).toEqual(
+            [],
+        );
     });
 });
 
 describe('ядро ralph свободно от проектной специфики (#204/#367)', () => {
     it.each(CORE)('%s — без проектной специфики в коде', (rel) => {
-        const hits = specificsInCode(readFileSync(join(REPO_ROOT, rel), 'utf-8'), OWNED.has(rel));
+        const hits = specificsInCode(readFileSync(join(CANON_ROOT, rel), 'utf-8'));
         const detail = hits.map(([n, line]) => `\n  ${n}: ${line.trim()}`).join('');
         expect(
             hits,
@@ -268,17 +260,30 @@ describe('ядро ralph свободно от проектной специфи
 // Скан по КОДУ без комментариев: докблоки ядра законно объясняют, что делает адаптер,
 // и называют команды — это не исполнение.
 describe('ядро не исполняет команд форжа (#55)', () => {
-    // Список ОЧИЩЕННЫХ модулей, а не всё `core/**`, и это осознанно. На момент #55 команды
-    // форжа лежат ещё в двух местах: `orchestrator.ts` (десять вызовов — там вся
-    // GitHub-реализация швов) и `deploy-check.ts` (`gh pr view`, `gh run list`). Вынести
-    // их одним заходом — переписать половину ядра; заведено отдельной карточкой.
+    // Скан теперь СПЛОШНОЙ: раньше здесь был белый список из одного очищенного модуля, и
+    // барьер сторожил ровно то, что уже чисто, — новый модуль с командой форжа проезжал бы
+    // мимо него молча. Теперь наоборот: сканируется всё ядро, а известный долг перечислен
+    // ИМЕНАМИ и ЧИСЛАМИ (храповик ниже). Разница не косметическая: белый список ничего не
+    // говорит о непокрытом, а храповик называет каждый непокрытый файл и его цену.
     //
-    // Барьер со списком слабее сплошного скана, но честен: он фиксирует достигнутое и не
-    // даёт классу вернуться туда, где уже чисто. Сплошной скан пришлось бы либо отключить,
-    // либо обвешать исключениями — а отключённый барьер не сторожит ничего.
-    // Очистили модуль — допиши его сюда, и регресс станет невозможен.
-    const CLEANED = [join('.claude', 'ralph', 'core', 'gate.ts')];
-    const CORE_MODULES = CORE.filter((rel) => CLEANED.includes(rel));
+    // `adapters/**` из скана исключён по определению: адаптер форжа — ровно то место, где
+    // команды форжа обязаны жить. Всё остальное — ядро, рантайм и entry — сканируется.
+    const CORE_MODULES = CORE.filter((rel) => !rel.startsWith('adapters/'));
+
+    // Известный долг: модули, где команды форжа ещё лежат в ядре. Число — сколько строк с
+    // ними осталось; сверяется РАВЕНСТВОМ, а не «не больше». Храповик работает в обе
+    // стороны намеренно: «не больше» позволило бы долгу тихо просесть и снова вырасти до
+    // старой отметки, оставаясь зелёным. Вынес вызов в адаптер — опусти число здесь же.
+    //
+    // Почему долг вообще есть. В `orchestrator.ts` живёт вся GitHub-реализация швов, в
+    // `deploy-check.ts` — чтение мердж-коммита и прогонов CI, в `monitor-panel.mts` —
+    // счётчики доски для дашборда. Вынести их одним заходом значит переписать половину
+    // ядра; это отдельная работа, а не попутная.
+    const DEBT: Record<string, number> = {
+        'core/orchestrator.ts': 29,
+        'core/deploy-check.ts': 3,
+        'runtime/monitor-panel.mts': 5,
+    };
 
     // `gh` как КОМАНДА: первым словом в строке-литерале (`'gh auth status'`) либо первым
     // аргументом argv-вызова (`runArgvFn('gh', [...])`). Слово `gh` внутри слов (`weight`)
@@ -303,14 +308,20 @@ describe('ядро не исполняет команд форжа (#55)', () =>
     // и закрывает последнюю известную дыру (#55-ревью, второй круг).
     const FORGE_WORD = /(?<![\w-])(gh|glab)(?![\w-])/;
 
-    it('каждый очищенный модуль реально попал в скан', () => {
-        // Опечатка в пути превратила бы `it.each` в пустой набор — сьют остался бы
+    it('скан видит ядро целиком, а долг назван по существующим файлам', () => {
+        // Опечатка в фильтре превратила бы `it.each` в пустой набор — сьют остался бы
         // зелёным, не проверив ничего (тот же класс, что слепой grep).
-        expect(CORE_MODULES).toEqual(CLEANED);
+        expect(CORE_MODULES.length).toBeGreaterThan(15);
+        expect(CORE_MODULES).toContain(join('core', 'gate.ts'));
+        // Долг, названный по несуществующему файлу, — это молчаливое исключение: файл
+        // переехал, строка осталась, и его новое имя сканируется как «чистое».
+        for (const rel of Object.keys(DEBT)) {
+            expect(CORE_MODULES, `в долге назван файл ${rel}, которого нет в скане`).toContain(rel);
+        }
     });
 
-    it.each(CORE_MODULES)('%s — без команд gh/glab в исполняемом коде', (rel) => {
-        const code = stripComments(readFileSync(join(REPO_ROOT, rel), 'utf-8'));
+    it.each(CORE_MODULES)('%s — команды gh/glab только в пределах известного долга', (rel) => {
+        const code = stripComments(readFileSync(join(CANON_ROOT, rel), 'utf-8'));
         const hits = code
             .split('\n')
             .map((line, i) => [i + 1, line] as const)
@@ -328,7 +339,14 @@ describe('ядро не исполняет команд форжа (#55)', () =>
             .filter(([n, line], i, arr) => arr.findIndex(([m, l]) => m === n && l === line) === i)
             .sort((a, b) => a[0] - b[0]);
         const detail = all.map(([n, line]) => `\n  ${n}: ${line.trim()}`).join('');
-        expect(all, `Команда форжа в ядре ${rel} — её место в adapters/:${detail}`).toEqual([]);
+        const budget = DEBT[rel] ?? 0;
+        expect(
+            all.length,
+            budget === 0
+                ? `Команда форжа в ядре ${rel} — её место в adapters/:${detail}`
+                : `Долг ${rel} изменился: было ${budget}, стало ${all.length}. ` +
+                      `Вырос — верни вызов в adapters/; убавился — опусти число в DEBT:${detail}`,
+        ).toBe(budget);
     });
 });
 
@@ -355,8 +373,8 @@ describe('ядро не исполняет команд форжа (#55)', () =>
 // грепать, но только пока промпты собираются ИМЕННО там.
 
 describe('промпты сессий: без команд и механик форжа (#45)', () => {
-    const PROMPTS = join('.claude', 'ralph', 'core', 'prompts.ts');
-    const ORCHESTRATOR = join('.claude', 'ralph', 'core', 'orchestrator.ts');
+    const PROMPTS = join('core', 'prompts.ts');
+    const ORCHESTRATOR = join('core', 'orchestrator.ts');
 
     const FORGE: Array<[RegExp, string]> = [
         // Не `gh <подкоманда>`, а СЛОВО `gh` целиком: формулировка, с которой заведён #45,
@@ -372,7 +390,7 @@ describe('промпты сессий: без команд и механик ф�
     it.each(FORGE)('prompts.ts не содержит %s (%s)', (re, why) => {
         // Комментарии модуля объясняют, ЧЕМ дефект был, и сами содержат эти строки —
         // поэтому сканируем код без строк-комментариев, а не файл целиком.
-        const code = readFileSync(join(REPO_ROOT, PROMPTS), 'utf-8')
+        const code = readFileSync(join(CANON_ROOT, PROMPTS), 'utf-8')
             .split('\n')
             .filter((line) => !line.trim().startsWith('//'))
             .join('\n');
@@ -387,7 +405,7 @@ describe('промпты сессий: без команд и механик ф�
         // пропускала самый вероятный вид регресса: prettier при ширине 100 переносит
         // длинный литерал на следующую строку, и `runClaudeFn(` с открывающей кавычкой
         // оказываются на разных строках — барьер видел бы каждую по отдельности и молчал.
-        const source = readFileSync(join(REPO_ROOT, ORCHESTRATOR), 'utf-8');
+        const source = readFileSync(join(CANON_ROOT, ORCHESTRATOR), 'utf-8');
         const hits = [...source.matchAll(/runClaudeFn\(\s*['"`]/g)].map((m) => {
             const lineNo = source.slice(0, m.index).split('\n').length;
             return [lineNo, m[0].replace(/\s+/g, ' ')] as const;
@@ -401,15 +419,19 @@ describe('промпты сессий: без команд и механик ф�
 
     it('ralph.md описывает намерения по PR — иначе сессии нечем ими пользоваться', () => {
         // Обратная сторона запрета: убрать способ мало, сессия обязана знать канал.
-        const contract = readFileSync(join(REPO_ROOT, '.claude', 'ralph', 'ralph.md'), 'utf-8');
+        const contract = readFileSync(join(CANON_ROOT, 'ralph.md'), 'utf-8');
         expect(contract).toMatch(/pr-comment/);
         expect(contract).toMatch(/pr-block/);
     });
 });
 
 describe('промпт-контракт: ralph.md переносим, площадочное — в ralph.project.md (#36)', () => {
-    const PROMPT = join('.claude', 'ralph', 'ralph.md');
-    const PROJECT_PROMPT = join('.claude', 'ralph', 'ralph.project.md');
+    const PROMPT = 'ralph.md';
+    // Проектная половина контракта принадлежит ПОТРЕБИТЕЛЮ: её содержимое — имена его
+    // меток, состав его гейта, его площадка. Канон везёт шаблон с плейсхолдерами (тот же
+    // приём, что `provision/ralph.service.example`), а подключение копирует его рядом с
+    // ядром под именем без `.example` и заполняет.
+    const PROJECT_PROMPT_TEMPLATE = 'ralph.project.md.example';
 
     // Каждый паттерн — с объяснением, ЧТО именно им ловится: сообщение читает тот, у кого
     // тест покраснел, и «не проходит регулярку» ему ничего не говорит.
@@ -428,14 +450,16 @@ describe('промпт-контракт: ralph.md переносим, площа
         ],
     ];
 
-    it('ralph.project.md существует — на него ссылается ralph.md', () => {
+    it('шаблон ralph.project.md лежит в каноне — на него ссылается ralph.md', () => {
         // Ровно тот дефект, с которого началась #36: ссылка была, файла не было, и сессия
-        // получала инструкцию читать пустоту.
-        expect(existsSync(join(REPO_ROOT, PROJECT_PROMPT))).toBe(true);
+        // получала инструкцию читать пустоту. В каноне заполненного файла быть не может
+        // (он проектный), но шаблон обязан ехать вместе с ядром — иначе подключающий
+        // узнаёт о нём из ошибки сессии.
+        expect(existsSync(join(CANON_ROOT, PROJECT_PROMPT_TEMPLATE))).toBe(true);
     });
 
     it.each(FORBIDDEN)('ralph.md не содержит %s (%s)', (re, why) => {
-        const lines = readFileSync(join(REPO_ROOT, PROMPT), 'utf-8').split('\n');
+        const lines = readFileSync(join(CANON_ROOT, PROMPT), 'utf-8').split('\n');
         const hits = lines
             .map((line, i) => [i + 1, line] as const)
             .filter(([, line]) => re.test(line));
@@ -446,6 +470,6 @@ describe('промпт-контракт: ralph.md переносим, площа
     it('ralph.md отправляет за проектной спецификой в ralph.project.md', () => {
         // Обратная сторона запретов: убрать площадочное мало — сессия обязана знать, где
         // его искать, иначе переносимость куплена ценой незнания.
-        expect(readFileSync(join(REPO_ROOT, PROMPT), 'utf-8')).toMatch(/ralph\.project\.md/);
+        expect(readFileSync(join(CANON_ROOT, PROMPT), 'utf-8')).toMatch(/ralph\.project\.md/);
     });
 });

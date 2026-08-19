@@ -22,15 +22,20 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createOrchestrator } from '../core/orchestrator.ts';
 
-const FIXTURE_PATH = path.join(
-    process.cwd(),
-    '.claude',
-    'ralph',
-    'tests',
+// Путь к фикстуре — от каталога МОДУЛЯ, а не от CWD: ядро запускается и своим клоном
+// канона, и каталогом `.claude/ralph` у потребителя, CWD в этих раскладках разный.
+const FIXTURE_PATH = path.resolve(
+    import.meta.dirname,
     '__fixtures__',
     'foreign-project',
     'ralph.config.json',
 );
+
+// Боевой конфиг потребителя приходит СНАРУЖИ, путём в `RALPH_REAL_CONFIG` — тем же
+// приёмом, что словарь имён в `project-traces.ts`. В каноне `ralph.config.json` не
+// существует вовсе (он принадлежит потребителю), поэтому «фикстура не повторяет боевых
+// значений» здесь недоказуемо: проверка гоняется там, где боевой конфиг есть.
+const REAL_CONFIG_PATH = (process.env.RALPH_REAL_CONFIG ?? '').trim();
 
 const FLAGS_DRY = { once: false, dry: true, reset: false, resubmit: false, deployResolved: false };
 
@@ -52,31 +57,29 @@ function loadFixtureRaw() {
 }
 
 describe('фикстурный чужой проект — сама фикстура (#371)', () => {
-    it('не пересекается по ключевым значениям с боевым ralph.config.json', () => {
-        const raw = loadFixtureRaw();
-        const real = JSON.parse(
-            fs.readFileSync(
-                path.join(process.cwd(), '.claude', 'ralph', 'ralph.config.json'),
-                'utf-8',
-            ),
-        );
-        expect(raw.common.board.owner).not.toBe(real.common.board.owner);
-        expect(raw.common.installCmd).not.toBe(real.common.installCmd);
-        expect(raw.common.runnerWorktreeDirname).not.toBe(real.common.runnerWorktreeDirname);
-        // #51: у боевого конфига блока `deployCheck` больше нет вовсе — деплоя в проекте
-        // не существует, шов выключен (`adapters.deployCheck: "none"`). Сравниваем через
-        // `?.`, а не выкидываем ассерт: фикстура ЧУЖОГО проекта деплой имеет, и требование
-        // «фикстура не повторяет боевые значения» для неё остаётся в силе.
-        expect(raw.common.deployCheck?.healthUrl).not.toBe(real.common.deployCheck?.healthUrl);
-        expect(raw.common.deployCheck?.healthUrl).toBeTruthy();
-        expect(raw.common.phases[0].milestone).not.toBe(real.common.phases[0].milestone);
-        expect(raw.common.phases[0].branch).not.toBe(real.common.phases[0].branch);
-        expect(raw.common.prompt).not.toBe(real.common.prompt);
-        expect(raw.common.modelRouting.labels['complexity:medium']).not.toBe(
-            real.common.modelRouting.labels['complexity:medium'],
-        );
-        expect(raw.common.gate.checks).not.toEqual(real.common.gate.checks);
-    });
+    it.skipIf(REAL_CONFIG_PATH === '')(
+        'не пересекается по ключевым значениям с боевым ralph.config.json',
+        () => {
+            const raw = loadFixtureRaw();
+            const real = JSON.parse(fs.readFileSync(REAL_CONFIG_PATH, 'utf-8'));
+            expect(raw.common.board.owner).not.toBe(real.common.board.owner);
+            expect(raw.common.installCmd).not.toBe(real.common.installCmd);
+            expect(raw.common.runnerWorktreeDirname).not.toBe(real.common.runnerWorktreeDirname);
+            // #51: у боевого конфига блока `deployCheck` больше нет вовсе — деплоя в проекте
+            // не существует, шов выключен (`adapters.deployCheck: "none"`). Сравниваем через
+            // `?.`, а не выкидываем ассерт: фикстура ЧУЖОГО проекта деплой имеет, и требование
+            // «фикстура не повторяет боевые значения» для неё остаётся в силе.
+            expect(raw.common.deployCheck?.healthUrl).not.toBe(real.common.deployCheck?.healthUrl);
+            expect(raw.common.deployCheck?.healthUrl).toBeTruthy();
+            expect(raw.common.phases[0].milestone).not.toBe(real.common.phases[0].milestone);
+            expect(raw.common.phases[0].branch).not.toBe(real.common.phases[0].branch);
+            expect(raw.common.prompt).not.toBe(real.common.prompt);
+            expect(raw.common.modelRouting.labels['complexity:medium']).not.toBe(
+                real.common.modelRouting.labels['complexity:medium'],
+            );
+            expect(raw.common.gate.checks).not.toEqual(real.common.gate.checks);
+        },
+    );
 });
 
 describe('dry-run переносимости ядра на чужом конфиге (#371)', () => {

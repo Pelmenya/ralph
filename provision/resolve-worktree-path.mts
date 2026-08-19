@@ -31,7 +31,9 @@ const configPath = fileURLToPath(new URL('../ralph.config.json', import.meta.url
 // если резолв когда-нибудь начнёт дёргать git или писать в лог, это увидят сразу, а не
 // в виде тихо неверного пути.
 function unexpected(name: string): never {
-    throw new Error(`resolve-worktree-path: неожиданный вызов ${name} — резолв пути перестал быть чистым`);
+    throw new Error(
+        `resolve-worktree-path: неожиданный вызов ${name} — резолв пути перестал быть чистым`,
+    );
 }
 const stubEnv: WorktreeEnv = {
     sh: () => unexpected('sh'),
