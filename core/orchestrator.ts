@@ -3497,7 +3497,17 @@ export function createOrchestrator(env: OrchestratorEnv) {
             deployEnabledFn = () => adapters.deployCheck.isEnabled(),
             loadStateFn = loadState,
             phaseIndexOfFn = phaseIndexOf,
-            phaseMergedFn = phaseMerged,
+            // Мердж-статус предыдущей фазы спрашиваем у ШВА — ровно как это делает
+            // runLoop, — а не у команд GitHub напрямую. Дефолт `phaseMerged` остался
+            // здесь с тех пор, когда форж был один, и вскрылся только на ВТОРОЙ фазе:
+            // цикл C4 ниже проверяет фазы ДО текущей, поэтому при единственной записи в
+            // `phases` он не выполняется ни разу. На не-GitHub площадке это означало, что
+            // многофазный конфиг не стартовал НИКОГДА: `gh` там честно падает, и старт
+            // вставал fail-closed с диагнозом «инвариант не подтверждён» — то есть о
+            // чужой команде в ядре человеку сообщали как о несмердженной фазе.
+            // Лениво (как `checkAuthFn`/`deployEnabledFn` выше): реестр адаптеров к
+            // моменту вызова preflight собран, а снимок поля на этапе дефолта — нет.
+            phaseMergedFn = (phase: { branch: string }) => adapters.taskSource.isPhaseMerged(phase),
             saveStateFn = saveState,
             pushEventFn = pushEvent,
             once = ONCE,
@@ -3512,7 +3522,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             deployEnabledFn?: () => boolean;
             loadStateFn?: typeof loadState;
             phaseIndexOfFn?: typeof phaseIndexOf;
-            phaseMergedFn?: typeof phaseMerged;
+            phaseMergedFn?: (phase: { branch: string }) => boolean;
             saveStateFn?: typeof saveState;
             pushEventFn?: typeof pushEvent;
             once?: boolean;

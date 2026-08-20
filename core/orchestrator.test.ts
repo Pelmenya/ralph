@@ -3200,6 +3200,40 @@ describe('preflight — валидация конфига/среды и подг
         expect(() => preflight(cfg, deps)).toThrow(/Не смог проверить мердж-статус/);
     });
 
+    // Регресс: C4 обязан спрашивать мердж-статус у ШВА, а не у команд GitHub.
+    // Оба теста выше инжектят `phaseMergedFn`, поэтому ДЕФОЛТ не проверял никто — а
+    // дефолтом там стояла GitHub-реализация (`gh pr list`). Вскрылось это только на
+    // второй фазе живого прогона не-GitHub площадки: цикл C4 идёт по фазам ДО текущей,
+    // значит при единственной записи в `phases` не выполняется ни разу, и многофазный
+    // конфиг там не стартовал никогда. Поэтому здесь `phaseMergedFn` намеренно УДАЛЯЕТСЯ
+    // из deps: тест на подменённой функции прошёл бы и до фикса.
+    it('C4 берёт мердж-статус из adapters.taskSource, а не из команд форжа', () => {
+        const cfg = validCfg({
+            phases: [
+                { milestone: 'M1', branch: 'feature/m1' },
+                { milestone: 'M2', branch: 'feature/m2' },
+            ],
+        });
+        const { taskSource } = ralph.getAdapters();
+        const original = taskSource.isPhaseMerged;
+        const seamCall = vi.fn(() => true);
+        // Подмена ПОСЛЕ сборки реестра — она же доказывает ленивость дефолта: снимок
+        // поля на этапе объявления параметра этой подмены не увидел бы.
+        taskSource.isPhaseMerged = seamCall;
+        const deps = okDeps({
+            loadStateFn: () => ({ count: 0, milestone: 'M2', submitted: false, noProgress: 0 }),
+            phaseIndexOfFn: () => 1,
+        }) as Record<string, unknown>;
+        delete deps.phaseMergedFn;
+        try {
+            preflight(cfg, deps);
+        } finally {
+            taskSource.isPhaseMerged = original;
+        }
+        expect(seamCall).toHaveBeenCalledTimes(1);
+        expect(seamCall).toHaveBeenCalledWith({ milestone: 'M1', branch: 'feature/m1' });
+    });
+
     it('git rev-parse падает → fail «Не git-репозиторий»', () => {
         const deps = okDeps({ loadStateFn: fakeState, shFn: shThrowingOn('rev-parse') });
         expect(() => preflight(validCfg(), deps)).toThrow(/Не git-репозиторий/);
