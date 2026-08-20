@@ -3233,10 +3233,15 @@ export function createOrchestrator(env: OrchestratorEnv) {
         log,
         fail,
         ghJson,
-        // #49: голову PR гейт спрашивает у шва форжа. Здесь — GitHub-реализация (дефолт
-        // контекста); мердж-путь runLoop прокидывает в tryMergePhase метод ВЫБРАННОГО
-        // адаптера, поэтому недефолтный taskSource меняет и прогон чеков, а не только мердж.
-        prHeadSha,
+        // #49/#15: голову PR гейт спрашивает у ШВА — и здесь тоже, лениво (реестр к моменту
+        // вызова собран). Раньше сюда уходила GitHub-реализация как «дефолт контекста», а
+        // правильный примитив приезжал только прокидом из runLoop в tryMergePhase. Разница
+        // вскрылась на `gateRunChecks`: он зовёт checksGreen БЕЗ prHeadShaFn — и молча
+        // получал `gh pr view` при любом выбранном адаптере. Это класс дефекта #14 («тихий
+        // дефолт»), и чинить его прокидом в каждом вызывающем значит держать барьер на
+        // дисциплине: забыл строку — дефект вернулся, сьют зелёный. Дефолт, ведущий к шву,
+        // закрывает канал структурно; явный прокид мердж-пути остаётся как есть.
+        prHeadSha: (prNumber: number) => adapters.taskSource.pullRequestHeadSha(prNumber),
         safeBranch,
         findOpenPr,
         ensureClean,
@@ -3300,12 +3305,12 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // config?. — до main() (юнит-тесты, строящие runtime без main()) config ещё не
         // инициализирован; читать .profileName напрямую дало бы TypeError вместо базового
         // состава чеков. undefined ⇒ gateChecksFor берёт базу (безопасный дефолт вне цикла).
-        // #49: `prHeadShaFn` здесь НЕ прокидывается — упадёт в дефолт `env.prHeadSha`, то
-        // есть в GitHub-реализацию. Сегодня это безопасно (боевой мердж идёт через
-        // tryMergePhase, а этот метод существует ради контрактного сьюта #370, и свап шва
-        // `gate` запрещён барьером #415), но ровно здесь «тихий GitHub-дефолт» вернётся,
-        // как только гейт-шов зароутится по-настоящему: снятие #415 обязано прокинуть сюда
-        // метод выбранного taskSource — иначе на площадке чеки снова спросят голову у `gh`.
+        // #49/#15: `prHeadShaFn` здесь не прокидывается намеренно — дефолт `env.prHeadSha`
+        // САМ ведёт к шву (composition root отдаёт гейту ленивую обёртку над выбранным
+        // taskSource). Раньше он вёл в GitHub-реализацию, и место было заряжено: снятие
+        // барьера со шва `gate` вернуло бы дефект #14 автоматически, а помнить про эту
+        // строку пришлось бы сессии, которая её не открывает. Барьер на класс «тихий
+        // дефолт» — tests/seam-defaults.test.ts.
         const green = checksGreen(branch, prNumber, { checks: gateChecksFor(config?.profileName) });
         if (green) {
             return { green: true, verifiedHead: gateGetVerifiedHead(), redCheck: null };
