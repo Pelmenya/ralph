@@ -104,13 +104,15 @@ function build(server: FakeServer = {}) {
         return {};
     };
 
+    const logs: string[] = [];
     const adapter = createSourcecraftTaskSource({
         api,
         org: ORG,
         repo: REPO,
         authorAllowlist: () => ['dev'],
+        log: (line: string) => logs.push(line),
     });
-    return { adapter, calls };
+    return { adapter, calls, logs };
 }
 
 const milestone = (name: string, slug: string) => ({ name, slug, status: 'open' });
@@ -609,7 +611,7 @@ describe('намерения кодер-сессии: формы запросо�
         });
     });
 
-    it('milestone новой карточке НЕ ставится: она удлинила бы сдаваемую фазу', () => {
+    it('вехи не просили — в теле её и нет: адрес ставит вызывающий, а не адаптер', () => {
         const { adapter, calls } = build({
             labels: [label('area:devops', 'area-devops')],
             createdIssueSlug: '42',
@@ -617,6 +619,71 @@ describe('намерения кодер-сессии: формы запросо�
         adapter.createIssue({ title: 'т', body: 'б', labels: ['area:devops'] });
         const call = calls.find((c) => c.method === 'POST' && c.path.endsWith('/issues'));
         expect(JSON.stringify(call?.body)).not.toMatch(/milestone/);
+    });
+
+    it('веха задана — адресуется ID, а не slug: имя площадка в этом поле не понимает', () => {
+        const { adapter, calls } = build({
+            labels: [label('area:devops', 'area-devops')],
+            milestones: [{ ...milestone('Бэклог ревью 1', 'beklog-reviu-1'), id: 'uuid-1' }],
+            createdIssueSlug: '42',
+        });
+        adapter.createIssue({
+            title: 'т',
+            body: 'б',
+            labels: ['area:devops'],
+            milestone: 'Бэклог ревью 1',
+        });
+        const call = calls.find((c) => c.method === 'POST' && c.path.endsWith('/issues'));
+        expect(call?.body).toEqual({
+            title: 'т',
+            description: 'б',
+            label_slugs: ['area-devops'],
+            milestone_id: 'uuid-1',
+        });
+    });
+
+    it('НЕГАТИВНЫЙ: у вехи нет id → карточка без адреса, а не запрос с пустым milestone_id', () => {
+        // Ревью PR !6: `id` брался из ответа без проверки, и веха без него давала
+        // `milestone_id: ""`. Площадка такой запрос отвергает, отказ летит наверх — и
+        // карточка теряется ровно там, где правило обещает обратное.
+        const { adapter, calls, logs } = build({
+            labels: [label('area:devops', 'area-devops')],
+            milestones: [milestone('Бэклог ревью 1', 'beklog-reviu-1')],
+            createdIssueSlug: '42',
+        });
+        expect(
+            adapter.createIssue({
+                title: 'т',
+                body: 'б',
+                labels: ['area:devops'],
+                milestone: 'Бэклог ревью 1',
+            }),
+        ).toBe(42);
+        const call = calls.find((c) => c.method === 'POST' && c.path.endsWith('/issues'));
+        expect(JSON.stringify(call?.body)).not.toMatch(/milestone/);
+        expect(logs.join('\n')).toMatch(/Бэклог ревью 1/);
+    });
+
+    it('НЕГАТИВНЫЙ: вехи из конфига на площадке нет → карточка без неё, но громко в лог', () => {
+        // Отказ здесь означал бы потерянную находку: адрес — удобство чтения бэклога,
+        // сама карточка дороже. Молчать при этом нельзя — ключ конфига врёт, и узнать
+        // об этом человек может только из лога.
+        const { adapter, calls, logs } = build({
+            labels: [label('area:devops', 'area-devops')],
+            milestones: [],
+            createdIssueSlug: '42',
+        });
+        expect(
+            adapter.createIssue({
+                title: 'т',
+                body: 'б',
+                labels: ['area:devops'],
+                milestone: 'Бэклог ревью 1',
+            }),
+        ).toBe(42);
+        const call = calls.find((c) => c.method === 'POST' && c.path.endsWith('/issues'));
+        expect(JSON.stringify(call?.body)).not.toMatch(/milestone/);
+        expect(logs.join('\n')).toMatch(/Бэклог ревью 1/);
     });
 
     it('НЕГАТИВНЫЙ: метки нет в репозитории → отказ, а не карточка без меток', () => {

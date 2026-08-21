@@ -229,7 +229,7 @@ describe('ядро не исполняет команд форжа (#55)', () =>
     // счётчики доски для дашборда. Вынести их одним заходом значит переписать половину
     // ядра; это отдельная работа, а не попутная.
     const DEBT: Record<string, number> = {
-        'core/orchestrator.ts': 29,
+        'core/orchestrator.ts': 27,
         'core/deploy-check.ts': 3,
         'runtime/monitor-panel.mts': 5,
     };

@@ -109,11 +109,20 @@ function runPhase({
     // #115-ревью: код возврата сессии АРБИТРА. Ненулевой — падение его сессии, а не
     // отказ по существу: состояние «арбитр отработал» при этом фиксироваться не должно.
     arbiterCode = 0,
+    // #16: сколько НЕЗАКРЫТЫХ карточек уже лежит в каждой накопительной вехе. Через тот же
+    // шов, которым петля считает очередь фазы: потолок вехи считается её содержимым, а не
+    // числом, которое тест мог бы подсунуть мимо форжа.
+    backlogCounts = {} as Record<string, number>,
 } = {}) {
     const prompts: string[] = [];
     const logs: string[] = [];
     const models: string[] = [];
-    const issues: Array<{ title: string; body: string; labels: readonly string[] }> = [];
+    const issues: Array<{
+        title: string;
+        body: string;
+        labels: readonly string[];
+        milestone?: string;
+    }> = [];
     const journal: Array<{ pass: number; counts: Record<string, number>; pr: number | null }> = [];
     const saved: RalphState[] = [];
     const addBlockedLabelFn = vi.fn();
@@ -143,7 +152,13 @@ function runPhase({
                 saved.push(JSON.parse(JSON.stringify(st)) as RalphState);
             },
             openIssuesFn: () => [],
-            allOpenIssuesFn: () => [],
+            allOpenIssuesFn: (milestone: string) =>
+                Array.from({ length: backlogCounts[milestone] ?? 0 }, (_, i) => ({
+                    number: 900 + i,
+                    title: 'уже лежит',
+                    labels: [],
+                    author: { login: 'owner' },
+                })),
             hasAnyIssuesFn: () => true,
             findOpenPrFn: () => ({ number: PR, labels: [] }),
             createPrFn: () => PR,
@@ -424,6 +439,83 @@ describe('крит. 2: поток новых minor/nit не продлевает
         expect(s.issues).toHaveLength(5);
         expect(s.issues[0].labels).toEqual(['complexity:low', 'area:core', 'backlog']);
         expect(s.issues[0].body).toContain(`PR #${String(PR)}`);
+    });
+
+    // ── Адрес карточек лестницы (#16) ───────────────────────────────────────────────
+    //
+    // Проверяется ПРИМЕНЕНИЕ, а не работоспособность выбора: арифметика перебора вех
+    // покрыта юнит-тестами `pickBacklogMilestone`, и они останутся зелёными, даже если
+    // петля перестанет звать её вовсе. Здесь карточка проходит весь цикл сдачи.
+
+    it('карточки лестницы уезжают в накопительную веху, а не в общий бэклог', () => {
+        const s = runPhase({
+            passes: [{ findings: [minor('нейминг', 1), nit('пробел', 2)] }],
+            config: cfg({
+                review: {
+                    ...cfg().review,
+                    backlogMilestone: ['Бэклог 1', 'Бэклог 2'],
+                },
+            }),
+        });
+
+        expect(s.issues.map((i) => i.milestone)).toEqual(['Бэклог 1', 'Бэклог 1']);
+        expect(s.merged()).toBe(true);
+    });
+
+    it('веха добита до потолка — остаток уезжает в следующую номерную, а не поверх', () => {
+        const s = runPhase({
+            // Четыре карточки уже лежат: при потолке 5 в первую веху влезает ровно одна.
+            backlogCounts: { 'Бэклог 1': 4 },
+            passes: [{ findings: [minor('нейминг', 1), nit('пробел', 2), nit('запятая', 3)] }],
+            config: cfg({
+                review: {
+                    ...cfg().review,
+                    backlogMilestone: ['Бэклог 1', 'Бэклог 2'],
+                },
+            }),
+        });
+
+        expect(s.issues.map((i) => i.milestone)).toEqual(['Бэклог 1', 'Бэклог 2', 'Бэклог 2']);
+    });
+
+    it('карточка, рождённая ВО ВРЕМЯ бэклог-фазы, адресуется в СЛЕДУЮЩУЮ веху', () => {
+        // Иначе фаза не сходится: разбор косметики порождал бы косметику в собственную
+        // очередь ровно с той скоростью, с какой ревью её находит.
+        const s = runPhase({
+            passes: [{ findings: [nit('пробел', 1)] }],
+            state: mkState({ milestone: 'Бэклог 1' }),
+            config: cfg({
+                phases: [{ milestone: 'Бэклог 1', branch: 'feature/backlog-1' }],
+                review: {
+                    ...cfg().review,
+                    backlogMilestone: ['Бэклог 1', 'Бэклог 2'],
+                },
+            }),
+        });
+
+        expect(s.issues.map((i) => i.milestone)).toEqual(['Бэклог 2']);
+    });
+
+    it('вехи кончились — карточка всё равно заводится, без адреса и с записью в лог', () => {
+        const s = runPhase({
+            backlogCounts: { 'Бэклог 1': 5 },
+            passes: [{ findings: [nit('пробел', 1)] }],
+            config: cfg({
+                review: { ...cfg().review, backlogMilestone: 'Бэклог 1' },
+            }),
+        });
+
+        expect(s.issues).toHaveLength(1);
+        expect(s.issues[0].milestone).toBeUndefined();
+        expect(s.logs.join('\n')).toMatch(/Накопительной вехи.*не нашлось/s);
+    });
+
+    it('ключ не задан — прежнее поведение: карточка без вехи и без единого предупреждения', () => {
+        const s = runPhase({ passes: [{ findings: [nit('пробел', 1)] }] });
+
+        expect(s.issues).toHaveLength(1);
+        expect(s.issues[0].milestone).toBeUndefined();
+        expect(s.logs.join('\n')).not.toMatch(/веха|вехи/i);
     });
 
     it('major держит мердж, а следующий проход с одной косметикой его отпускает', () => {

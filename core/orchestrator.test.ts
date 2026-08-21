@@ -10095,4 +10095,101 @@ describe('намерения сессии на стороне GitHub: argv, а �
             ),
         ).toBeNull();
     });
+
+    it('createIssue: веха задана — адрес ставится ОТДЕЛЬНОЙ командой после создания', () => {
+        // Не флагом создания (ревью правок PR !6): его отказ неотличим от транспортного,
+        // а разбирать текст ошибки — гонка, которую не выиграть. Здесь же отказ второй
+        // команды стоит адреса, но не карточки.
+        const calls: Array<string[]> = [];
+        const num = ralph.createIssue(
+            { title: 'т', body: 'б', labels: [], milestone: 'Бэклог ревью 1' },
+            {
+                runArgvFn: (_file: string, args: string[]) => {
+                    calls.push(args);
+                    return 'https://github.com/org/repo/issues/7\n';
+                },
+            },
+        );
+        expect(num).toBe(7);
+        expect(calls).toHaveLength(2);
+        expect(calls[0]).not.toContain('--milestone');
+        expect(calls[1]).toEqual(['issue', 'edit', '7', '--milestone', 'Бэклог ревью 1']);
+    });
+
+    it('НЕГАТИВНЫЙ: болтливый вывод форжа не уводит адресацию на ЧУЖУЮ карточку', () => {
+        // Номер берётся из URL, а не из хвоста вывода. Пока он был нужен только логу,
+        // «последние цифры строки» годились; целью мутации так брать нельзя — предупреждение
+        // форжа с числом в конце отправило бы `issue edit` в чужую карточку (ревью правок).
+        const calls: Array<string[]> = [];
+        const num = ralph.createIssue(
+            { title: 'т', body: 'б', labels: [], milestone: 'Бэклог ревью 1' },
+            {
+                runArgvFn: (_file: string, args: string[]) => {
+                    calls.push(args);
+                    return 'https://github.com/org/repo/issues/7\nwarning: retry after 30\n';
+                },
+                logFn: () => {},
+            },
+        );
+        expect(num).toBe(7);
+        expect(calls[1]).toEqual(['issue', 'edit', '7', '--milestone', 'Бэклог ревью 1']);
+    });
+
+    it('НЕГАТИВНЫЙ: в выводе несколько номеров → не правим ничего, номер неизвестен', () => {
+        // Взять первый или последний — одинаково значит угадать порядок чужого вывода, а
+        // ошибка стоит правки ЧУЖОЙ карточки (ревью правок PR !6, круг 4).
+        const calls: Array<string[]> = [];
+        const logs: string[] = [];
+        const num = ralph.createIssue(
+            { title: 'т', body: 'б', labels: [], milestone: 'Бэклог ревью 1' },
+            {
+                runArgvFn: (_file: string, args: string[]) => {
+                    calls.push(args);
+                    return 'warning: см. https://github.com/org/repo/issues/999\nhttps://github.com/org/repo/issues/7\n';
+                },
+                logFn: (line: string) => logs.push(line),
+            },
+        );
+        expect(num).toBeNull();
+        expect(calls).toHaveLength(1);
+        expect(logs.join('\n')).toMatch(/несколько номеров/);
+    });
+
+    it('НЕГАТИВНЫЙ: адрес не поставился → карточка остаётся, отказ уходит в лог', () => {
+        // Прежняя редакция повторяла СОЗДАНИЕ и на транспортном отказе давала дубль, а на
+        // незнакомой формулировке — теряла карточку. Теперь отказ адресации не может ни
+        // того, ни другого: карточка уже создана, страдает только её адрес.
+        const logs: string[] = [];
+        const num = ralph.createIssue(
+            { title: 'т', body: 'б', labels: [], milestone: 'Нет такой' },
+            {
+                runArgvFn: (_file: string, args: string[]) => {
+                    if (args.includes('--milestone')) throw new Error("'Нет такой' not found");
+                    return 'https://github.com/org/repo/issues/7\n';
+                },
+                logFn: (line: string) => logs.push(line),
+            },
+        );
+        expect(num).toBe(7);
+        expect(logs.join('\n')).toMatch(/Нет такой/);
+    });
+
+    it('НЕГАТИВНЫЙ: номер карточки не отдан → адресовать нечего, второй команды нет', () => {
+        const calls: Array<string[]> = [];
+        const logs: string[] = [];
+        expect(
+            ralph.createIssue(
+                { title: 'т', body: 'б', labels: [], milestone: 'Бэклог ревью 1' },
+                {
+                    runArgvFn: (_file: string, args: string[]) => {
+                        calls.push(args);
+                        return 'created';
+                    },
+                    logFn: (line: string) => logs.push(line),
+                },
+            ),
+        ).toBeNull();
+        expect(calls).toHaveLength(1);
+        expect(logs.join('\n')).toMatch(/Бэклог ревью 1/);
+    });
 });

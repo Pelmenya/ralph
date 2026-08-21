@@ -159,5 +159,71 @@ export function createGithubForgeCommands(env: GithubForgeCommandsEnv) {
         runArgvFn('gh', mergeArgs);
     }
 
-    return { mergePr, phaseMerged, mergedPhasePr, addBlockedLabel, removeBlockedLabel };
+    // #16: заведение карточки и её адрес. `gh issue create` печатает URL созданной
+    // карточки — номер берём ИЗ URL, а не из хвоста вывода: он теперь не только для лога,
+    // а цель второй команды, и «последние цифры строки» при болтливом выводе указали бы на
+    // чужую карточку (ревью правок PR !6). Номер не разобрался — карточка ВСЁ РАВНО
+    // создана, поэтому null, а не исключение: откатывать нечего, а падение здесь заставило
+    // бы петлю повторить создание и наплодить дубли.
+    //
+    // Веха ставится ОТДЕЛЬНОЙ командой уже после создания. Флагом создания было нельзя: на
+    // неизвестной вехе команда падает целиком, карточку не заведя, а отличить этот отказ от
+    // транспортного можно только по тексту ошибки — гонка, которую не выиграть. Узкий матч
+    // терял карточку на формулировке `could not add to milestone …`, широкий срабатывал на
+    // таймауте (в сообщение попадает сама команда, а в ней флаг есть всегда) и повтор
+    // создания давал ДУБЛЬ. Разделение снимает оба режима: создание однозначно, а провал
+    // адресации стоит адреса, но не находки.
+    function createIssue(
+        {
+            title,
+            body,
+            labels: names,
+            milestone,
+        }: { title: string; body: string; labels: readonly string[]; milestone?: string },
+        { runArgvFn = shArgv, logFn = log }: { runArgvFn?: ShArgvFn; logFn?: LogFn } = {},
+    ): number | null {
+        const args = ['issue', 'create', '--title', title, '--body', body];
+        for (const name of names) args.push('--label', name);
+        const out = String(runArgvFn('gh', args) ?? '').trim();
+        // Номеров в выводе может оказаться несколько (предупреждение форжа со ссылкой на
+        // соседнюю карточку — обычное дело), и «взять первый» ничем не лучше «взять
+        // последний»: и то и другое угадывает порядок чужого вывода, а ценой ошибки будет
+        // `issue edit` по ЧУЖОЙ карточке. Поэтому неоднозначность — отказ разбирать:
+        // карточка создана, но её номер мы честно не знаем.
+        const found = [...out.matchAll(/\/issues\/(\d+)(?:\D|$)/g)].map((m) => Number(m[1]));
+        const unique = [...new Set(found.filter((n) => Number.isInteger(n) && n > 0))];
+        const num = unique.length === 1 ? unique[0] : null;
+        if (unique.length > 1) {
+            logFn(
+                `⚠ В выводе форжа несколько номеров карточек (${unique.join(', ')}) — какой из них ` +
+                    `у «${title}», неизвестно. Карточка создана; ничего по этому номеру не правлю.`,
+            );
+        }
+        if (!milestone) return num;
+        if (num === null) {
+            logFn(
+                `⚠ Номер новой карточки «${title}» не разобран из вывода форжа — адресовать ` +
+                    `её в веху «${milestone}» нечем, карточка осталась без адреса.`,
+            );
+            return num;
+        }
+        try {
+            runArgvFn('gh', ['issue', 'edit', String(num), '--milestone', milestone]);
+        } catch (e: unknown) {
+            logFn(
+                `⚠ Веха «${milestone}» карточке #${String(num)} не поставлена ` +
+                    `(${String((e as Error)?.message ?? '').split('\n')[0]}) — сама карточка заведена.`,
+            );
+        }
+        return num;
+    }
+
+    return {
+        createIssue,
+        mergePr,
+        phaseMerged,
+        mergedPhasePr,
+        addBlockedLabel,
+        removeBlockedLabel,
+    };
 }

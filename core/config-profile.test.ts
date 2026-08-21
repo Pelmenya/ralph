@@ -289,6 +289,74 @@ describe('resolveProfile — сборка итогового конфига из
     });
 });
 
+// #16: накопительная веха карточек лестницы. Ключи валидируются на старте (инвариант №1):
+// молча проглоченный мусор здесь означает не «адреса нет», а «адрес пропал незаметно».
+describe('review.backlogMilestone / backlogMilestoneCap — схема ключей адреса', () => {
+    const boom = (m: string) => {
+        throw new Error(m);
+    };
+    const withReview = (review: unknown) => ({
+        defaultProfile: 'prod',
+        common: { phases: [{ milestone: 'M', branch: 'b' }] },
+        profiles: { prod: { review } },
+    });
+
+    it('строка, список строк и отсутствие ключа — валидны', () => {
+        expect(() => resolveProfile(withReview({}), 'prod', boom)).not.toThrow();
+        expect(() =>
+            resolveProfile(withReview({ backlogMilestone: 'Бэклог 1' }), 'prod', boom),
+        ).not.toThrow();
+        expect(() =>
+            resolveProfile(
+                withReview({ backlogMilestone: ['Бэклог 1', 'Бэклог 2'], backlogMilestoneCap: 3 }),
+                'prod',
+                boom,
+            ),
+        ).not.toThrow();
+    });
+
+    it('не строка и не список строк → стоп, а не молчаливое «адреса нет»', () => {
+        expect(() => resolveProfile(withReview({ backlogMilestone: 42 }), 'prod', boom)).toThrow(
+            /backlogMilestone/,
+        );
+        expect(() =>
+            resolveProfile(withReview({ backlogMilestone: ['Бэклог 1', 7] }), 'prod', boom),
+        ).toThrow(/backlogMilestone/);
+        expect(() => resolveProfile(withReview({ backlogMilestone: [] }), 'prod', boom)).toThrow(
+            /backlogMilestone/,
+        );
+        expect(() => resolveProfile(withReview({ backlogMilestone: '  ' }), 'prod', boom)).toThrow(
+            /backlogMilestone/,
+        );
+    });
+
+    it('потолок — положительное целое; строка "5" и ноль валят старт', () => {
+        // Ноль здесь не «выключить адресацию», а веха, в которую ничего не влезает: такой
+        // конфиг тихо отправлял бы все карточки в общий бэклог.
+        expect(() =>
+            resolveProfile(
+                withReview({ backlogMilestone: 'Бэклог 1', backlogMilestoneCap: '5' }),
+                'prod',
+                boom,
+            ),
+        ).toThrow(/backlogMilestoneCap/);
+        expect(() =>
+            resolveProfile(
+                withReview({ backlogMilestone: 'Бэклог 1', backlogMilestoneCap: 0 }),
+                'prod',
+                boom,
+            ),
+        ).toThrow(/backlogMilestoneCap/);
+        expect(() =>
+            resolveProfile(
+                withReview({ backlogMilestone: 'Бэклог 1', backlogMilestoneCap: 2.5 }),
+                'prod',
+                boom,
+            ),
+        ).toThrow(/backlogMilestoneCap/);
+    });
+});
+
 // #376 (фаза 6): modelRouting провайдер-осведомлён — значение может быть строкой
 // (обратная совместимость, claude-модель) либо объектом { provider, model } (явный выбор
 // провайдера кодер-рантайма). Валидируется на старте resolveProfile — та же fail-closed

@@ -14,6 +14,7 @@ import {
     FIX_REVIEW_MAX_PASSES,
     isBlockingSeverity,
     normalizeReviewOfFixes,
+    pickBacklogMilestone,
     pingPongIssueFor,
     severityOf,
     type FixFinding,
@@ -361,5 +362,121 @@ describe('карточки: незакрытая косметика и закр�
         const issue = backlogIssueFor(c.cosmetic[0], { milestone: 'M1', pr: null });
         expect(issue.body).toContain('src/a.ts:7');
         expect(issue.body).not.toContain('PR #');
+    });
+});
+
+describe('pickBacklogMilestone — адрес накопительной вехи для карточек лестницы', () => {
+    // countOpenFn заодно ведёт журнал вызовов: тест на «лишних запросов к форжу нет»
+    // проверяет не только выбор, но и цену выбора.
+    const counter = (counts: Record<string, number | null>) => {
+        const asked: string[] = [];
+        const countOpenFn = (m: string): number | null => {
+            asked.push(m);
+            // Именно `in`, а не `?? 0`: заданный null — это «не сосчитали», и схлопнуть
+            // его в ноль значило бы проверять не тот случай.
+            return m in counts ? counts[m] : 0;
+        };
+        return { asked, countOpenFn };
+    };
+
+    it('берёт первого кандидата, у которого есть место', () => {
+        const { countOpenFn } = counter({ 'Бэклог 1': 2 });
+        expect(
+            pickBacklogMilestone({
+                candidates: ['Бэклог 1', 'Бэклог 2'],
+                currentPhase: 'Фаза 7',
+                cap: 5,
+                countOpenFn,
+            }),
+        ).toEqual({ milestone: 'Бэклог 1', index: 0, count: 2 });
+    });
+
+    it('веху ТЕКУЩЕЙ фазы пропускает, не спрашивая её наполнения', () => {
+        // Ровно то, ради чего заводилась адресация вперёд: карточка, родившаяся во время
+        // бэклог-фазы, не имеет права попасть в её же очередь — иначе фаза не сходится.
+        const { asked, countOpenFn } = counter({});
+        expect(
+            pickBacklogMilestone({
+                candidates: ['Бэклог 1', 'Бэклог 2'],
+                currentPhase: 'Бэклог 1',
+                cap: 5,
+                countOpenFn,
+            }),
+        ).toEqual({ milestone: 'Бэклог 2', index: 1, count: 0 });
+        expect(asked).toEqual(['Бэклог 2']);
+    });
+
+    it('переполненную веху пропускает — переполнение уезжает в следующую номерную', () => {
+        const { countOpenFn } = counter({ 'Бэклог 1': 5, 'Бэклог 2': 1 });
+        expect(
+            pickBacklogMilestone({
+                candidates: ['Бэклог 1', 'Бэклог 2'],
+                currentPhase: 'Фаза 7',
+                cap: 5,
+                countOpenFn,
+            }),
+        ).toEqual({ milestone: 'Бэклог 2', index: 1, count: 1 });
+    });
+
+    it('наполнение не сосчиталось — веха ПРОПУСКАЕТСЯ, потолок не обходится', () => {
+        // null — «не сосчитали»; у площадки самая частая его причина в том, что вехи там
+        // нет вовсе (резолв имени бросает). Считать это нулём значило бы адресовать
+        // карточку несуществующей вехе, а заодно разрешить обход потолка на любом чихе
+        // форжа: у переполненной вехи одно неотвеченное чтение снова делало бы её годной.
+        const { countOpenFn } = counter({ 'Бэклог 1': null, 'Бэклог 2': 1 });
+        expect(
+            pickBacklogMilestone({
+                candidates: ['Бэклог 1', 'Бэклог 2'],
+                currentPhase: 'Фаза 7',
+                cap: 5,
+                countOpenFn,
+            }),
+        ).toEqual({ milestone: 'Бэклог 2', index: 1, count: 1 });
+    });
+
+    it('ни у одной вехи наполнение не читается — null, карточка поедет без адреса', () => {
+        const { countOpenFn } = counter({ 'Бэклог 1': null, 'Бэклог 2': null });
+        expect(
+            pickBacklogMilestone({
+                candidates: ['Бэклог 1', 'Бэклог 2'],
+                currentPhase: 'Фаза 7',
+                cap: 5,
+                countOpenFn,
+            }),
+        ).toBeNull();
+    });
+
+    it('кандидаты кончились — null, карточка заведётся без адреса', () => {
+        const { countOpenFn } = counter({ 'Бэклог 1': 5 });
+        expect(
+            pickBacklogMilestone({
+                candidates: ['Бэклог 1'],
+                currentPhase: 'Бэклог 2',
+                cap: 5,
+                countOpenFn,
+            }),
+        ).toBeNull();
+        expect(
+            pickBacklogMilestone({
+                candidates: [],
+                currentPhase: 'Фаза 7',
+                cap: 5,
+                countOpenFn,
+            }),
+        ).toBeNull();
+    });
+
+    it('from продолжает перебор с указанного места — добор внутри одного круга', () => {
+        const { asked, countOpenFn } = counter({ 'Бэклог 2': 3 });
+        expect(
+            pickBacklogMilestone({
+                candidates: ['Бэклог 1', 'Бэклог 2'],
+                currentPhase: 'Фаза 7',
+                cap: 5,
+                countOpenFn,
+                from: 1,
+            }),
+        ).toEqual({ milestone: 'Бэклог 2', index: 1, count: 3 });
+        expect(asked).toEqual(['Бэклог 2']);
     });
 });

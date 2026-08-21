@@ -216,6 +216,7 @@ export type GithubTaskSourceFns = {
         title: string;
         body: string;
         labels: readonly string[];
+        milestone?: string;
     }) => number | null;
 };
 

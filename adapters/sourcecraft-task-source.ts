@@ -187,22 +187,40 @@ export function createSourcecraftTaskSource(deps: SourcecraftTaskSourceDeps): Ta
     //
     // Кешируется только НАЙДЕННОЕ: milestone могут завести уже по ходу прогона, и
     // запомненный отрицательный ответ ослепил бы петлю до перезапуска.
-    const slugCache = new Map<string, string>();
-    const milestoneSlug = (name: string): string => {
-        const cached = slugCache.get(name);
+    //
+    // Резолв отдаёт ОБА адреса вехи, потому что площадка спрашивает их в разных местах
+    // разными: фильтр issues понимает `milestone_slug`, а тело создания карточки —
+    // `milestone_id` (#16). Один общий листинг на оба — и один кеш.
+    const milestoneCache = new Map<string, { slug: string; id: string }>();
+    const findMilestone = (name: string): { slug: string; id: string } | null => {
+        const cached = milestoneCache.get(name);
         if (cached !== undefined) return cached;
         const found = pageThrough(`${base}/milestones`, 'items').find(
             (m) => String((m as { name?: unknown }).name ?? '') === name,
-        ) as { slug?: unknown } | undefined;
+        ) as { slug?: unknown; id?: unknown } | undefined;
         const slug = String(found?.slug ?? '');
-        if (!slug) {
+        // Веха без ОБОИХ адресов бесполезна, но требовать оба нельзя: очередь фазы ходит
+        // по slug'у и жила бы без id, а адрес карточки — наоборот. Поэтому пустые поля не
+        // подставляются молча: пустой `milestone_id` площадка отвергает, и отказ уносил бы
+        // с собой карточку (ревью PR !6).
+        const id = String(found?.id ?? '');
+        if (!slug && !id) return null;
+        const resolved = { slug, id };
+        milestoneCache.set(name, resolved);
+        return resolved;
+    };
+
+    // Ненайденная веха ФАЗЫ — отказ: см. выше про C2. Заведение карточки живёт по другому
+    // правилу (адрес дешевле находки) и потому зовёт `findMilestone` напрямую.
+    const milestoneSlug = (name: string): string => {
+        const found = findMilestone(name);
+        if (!found?.slug) {
             throw new Error(
                 `SourceCraft: milestone «${name}» не найден в ${org}/${repo}. Пустая очередь ` +
                     'вместо отказа означала бы «фаза готова» при неразобранных задачах (C2).',
             );
         }
-        slugCache.set(name, slug);
-        return slug;
+        return found.slug;
     };
 
     // #40: имя метки → её slug на площадке. Ядро оперирует ИМЕНАМИ (`complexity:low`),
@@ -607,22 +625,39 @@ export function createSourcecraftTaskSource(deps: SourcecraftTaskSourceDeps): Ta
             });
         },
 
-        // Milestone НЕ ставится сознательно: карточка, попавшая в milestone текущей фазы,
-        // удлинила бы фазу, которую раннер сейчас сдаёт. Найденное вне скоупа — в бэклог,
-        // раскладывает человек.
+        // Веху выбирает ВЫЗЫВАЮЩИЙ, а не адаптер (#16): карточка, попавшая в веху текущей
+        // фазы, удлинила бы фазу, которую раннер сейчас сдаёт, — но знает про текущую фазу
+        // ядро, а не площадка. Не попросили адреса — карточка едет без него, как раньше.
+        //
+        // Веха названа, но её на площадке нет — карточка всё равно заводится, без адреса и
+        // с записью в лог. Отказ здесь стоил бы находки ради удобства чтения бэклога;
+        // молчание стоило бы того, что ключ конфига врёт, а узнать об этом неоткуда.
         createIssue({
             title,
             body,
             labels: names,
+            milestone,
         }: {
             title: string;
             body: string;
             labels: readonly string[];
+            milestone?: string;
         }): number | null {
+            const found = milestone ? findMilestone(milestone) : null;
+            // Адресуем ТОЛЬКО по непустому id: пустая строка в `milestone_id` — не «без
+            // вехи», а невалидный запрос, который площадка отвергает целиком.
+            const target = found?.id ? found : null;
+            if (milestone && !target) {
+                log(
+                    `⚠ Веха «${milestone}» не найдена в ${org}/${repo} (или отдана без id) — ` +
+                        `карточка «${title}» заведена без неё.`,
+                );
+            }
             const created = api('POST', `${base}/issues`, {
                 title,
                 description: body,
                 label_slugs: names.map(labelSlug),
+                ...(target ? { milestone_id: target.id } : {}),
             }) as { slug?: unknown } | null;
             const slug = String(created?.slug ?? '').trim();
             const num = Number(slug);

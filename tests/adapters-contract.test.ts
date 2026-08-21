@@ -271,9 +271,9 @@ function buildFakeTaskSource(): { adapter: TaskSourceAdapter; calls: string[] } 
             if (mutationFails) throw new Error('форж отверг мутацию');
             calls.push(`block-issue:${issue}`);
         },
-        createIssue: ({ title }) => {
+        createIssue: ({ title, milestone }) => {
             if (mutationFails) throw new Error('форж отверг мутацию');
-            calls.push(`create-issue:${title}`);
+            calls.push(`create-issue:${title}${milestone ? `:${milestone}` : ''}`);
             return 101;
         },
     };
@@ -341,11 +341,20 @@ function buildRealTaskSource(): { adapter: TaskSourceAdapter; gateEnv: GateEnv }
         throw new Error('ghJson не подменён в тесте (gate)');
     };
     const shArgvCalls: string[] = [];
+    // Трасса argv пишется ДВУМЯ формами. Плоская (`gh pr merge …`) удобна проверкам по
+    // подстроке и старше этого теста; структурная (`argv:[...]`) сохраняет ГРАНИЦЫ
+    // аргументов — без неё контракт адреса вехи был зелёным, когда флаг и значение
+    // склеивались в один аргумент, то есть до форжа доезжала бессмыслица (ревью PR !6,
+    // круг 5).
+    const traceArgv = (file: string, args: string[]): void => {
+        shArgvCalls.push(`${file} ${args.join(' ')}`);
+        shArgvCalls.push(`argv:${JSON.stringify([file, ...args])}`);
+    };
     let authFails = false;
     const gateEnv = makeGateEnv({
         ghJson: ((cmd: string) => ghJsonImpl(cmd)) as GateEnv['ghJson'],
         shArgv: (file, args) => {
-            shArgvCalls.push(`${file} ${args.join(' ')}`);
+            traceArgv(file, args);
             return '';
         },
         // Пути очереди и мерджа читают gh через ghJson, не sh; для них стаб нейтрален.
@@ -377,7 +386,7 @@ function buildRealTaskSource(): { adapter: TaskSourceAdapter; gateEnv: GateEnv }
     // fail-closed, то есть исключение обязано долететь до вызывающего, а не утонуть.
     const mutationArgv = (file: string, args: string[]): string => {
         if (mutationFails) throw new Error('gh: форж отверг мутацию');
-        shArgvCalls.push(`${file} ${args.join(' ')}`);
+        traceArgv(file, args);
         return '';
     };
     const adapter: TaskSourceAdapter = createGithubTaskSource({
@@ -435,7 +444,7 @@ function buildRealTaskSource(): { adapter: TaskSourceAdapter; gateEnv: GateEnv }
             ralph.closeMilestoneByTitle(title, {
                 ghJsonFn: (cmd: string) => ghJsonImpl(cmd),
                 runArgvFn: (file: string, args: string[]) => {
-                    shArgvCalls.push(`${file} ${args.join(' ')}`);
+                    traceArgv(file, args);
                     return '';
                 },
                 logFn: () => {},
@@ -445,16 +454,21 @@ function buildRealTaskSource(): { adapter: TaskSourceAdapter; gateEnv: GateEnv }
             ralph.commentOnIssue(issue, body, { runArgvFn: mutationArgv }),
         closeIssue: (issue: number) => ralph.closeIssue(issue, { runArgvFn: mutationArgv }),
         blockIssue: (issue: number) => ralph.blockIssue(issue, { runArgvFn: mutationArgv }),
-        createIssue: (input: { title: string; body: string; labels: readonly string[] }) =>
+        createIssue: (input: {
+            title: string;
+            body: string;
+            labels: readonly string[];
+            milestone?: string;
+        }) =>
             ralph.createIssue(input, {
-                // `gh issue create` печатает URL созданной карточки — номер берётся из хвоста.
+                // `gh issue create` печатает URL созданной карточки — номер берётся из него.
                 runArgvFn: (file: string, args: string[]) =>
                     `${mutationArgv(file, args)}https://forge.example/org/repo/issues/101`,
             }),
         syncProjectBoard: () =>
             ralph.syncProjectBoard(
                 (file: string, args: string[]) => {
-                    shArgvCalls.push(`${file} ${args.join(' ')}`);
+                    traceArgv(file, args);
                     return 'ok — синк доски (0 карточек)';
                 },
                 () => {},
@@ -730,6 +744,61 @@ function registerTaskSourceContract(
             expect(adapter.createIssue({ title: 'т', body: 'б', labels: ['area:x'] })).toBe(101);
         });
 
+        it('createIssue доносит веху до форжа — у карточки есть адрес (#16)', () => {
+            // Куда именно ляжет адрес, реализации решают по-разному: у одного форжа это
+            // флаг argv с ИМЕНЕМ вехи, у другого — поле тела с её ID. Поэтому годится
+            // любая из двух форм — но именно ФОРМА, а не «трасса чем-то отличается»:
+            // первая редакция теста сверяла как раз отличие и была зелёной с адресом,
+            // выкинутым из тела запроса (его хватало на лишний GET справочника вех).
+            const { adapter } = build();
+            const hook = adapter as unknown as TaskSourceHook;
+            // Трассу реализации ведут двумя способами: argv-обвязка пишет в
+            // `__shArgvCalls`, транспорт площадки — в `__calls`. Контракту важна любая.
+            const trace = (): string[] => [
+                ...(hook.__shArgvCalls?.() ?? []),
+                ...(hook.__calls?.() ?? []),
+            ];
+            const mid = trace().length;
+            expect(
+                adapter.createIssue({
+                    title: 'т',
+                    body: 'б',
+                    labels: ['area:x'],
+                    milestone: MILESTONE,
+                }),
+            ).toBe(101);
+            const addressed = trace().slice(mid);
+            // Мутации этого вызова: у одной реализации заведение и адресация — две
+            // команды, у другой одна. Смотрим их все, отбрасывая сопутствующие чтения
+            // справочников.
+            const mutation = addressed.filter(
+                (c) => !/^GET /.test(c) && /issue/i.test(c) && !/labels\?|milestones\?/.test(c),
+            );
+            expect(mutation.length).toBeGreaterThan(0);
+            // Форма адреса, а не присутствие имени где-нибудь в строке. Обе прошлые
+            // редакции теста были зелёными при НЕдоехавшем адресе: первая — потому что
+            // трассу меняло сопутствующее чтение справочника вех, вторая — потому что имя
+            // вехи встречалось и в поле с чужим названием, и даже в теле карточки. Отсюда
+            // якоря: команда целиком, ключ вместе со значением. Перечень форм закрытый и
+            // растёт вместе с реализациями шва — это и делает его барьером, а не грепом.
+            expect(mutation.join('\n')).toMatch(
+                new RegExp(
+                    [
+                        // argv форжа: адрес — флаг ИМЕННО команды работы с карточкой,
+                        // а не строка, случайно попавшая в чужой аргумент.
+                        // Структурная форма argv: и бинарь, и команда, и ГРАНИЦА между
+                        // флагом и его значением. Плоская строка ни одного из трёх не
+                        // держала — адрес, ушедший другим бинарём или склеенный с флагом
+                        // в один аргумент, проходил как доехавший.
+                        `^argv:\\["gh","issue","(create|edit)"[^\\n]*,"--milestone","${MILESTONE}"\\]$`,
+                        '"milestone_id":"ms-x"', // тело площадки: ключ + id вехи из фикстуры
+                        `^create-issue:[^:\n]*:${MILESTONE}$`, // трасса фейка шва
+                    ].join('|'),
+                    'm',
+                ),
+            );
+        });
+
         it('НЕГАТИВНЫЙ: намерения fail-closed — отказ форжа долетает исключением', () => {
             const { adapter } = build();
             const hook = adapter as unknown as TaskSourceHook;
@@ -960,10 +1029,13 @@ function buildSourcecraftTaskSource(): { adapter: TaskSourceAdapter; calls: stri
         if (path.includes('/milestones?')) {
             return {
                 items: [
-                    { name: MILESTONE, slug: MILESTONE_SLUG },
+                    // `id` — не для полноты: тело создания карточки адресует веху именно
+                    // им (#16), тогда как фильтр очереди — slug'ом. Одна фикстура на два
+                    // разных адреса той же сущности.
+                    { name: MILESTONE, slug: MILESTONE_SLUG, id: 'ms-x' },
                     // #39: заведён, но без единой карточки — на его slug выборка выше
                     // отдаёт пусто (фильтр не совпадает с MILESTONE_SLUG).
-                    { name: EMPTY_MILESTONE, slug: 'faza-pustaya' },
+                    { name: EMPTY_MILESTONE, slug: 'faza-pustaya', id: 'ms-empty' },
                 ],
             };
         }

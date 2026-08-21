@@ -166,6 +166,51 @@ export function createConfigProfile(env: ConfigProfileEnv) {
         return true;
     }
 
+    // #16: адрес карточек лестницы ревью. Оба ключа необязательны — не задан ни один,
+    // карточки едут как раньше, без вехи. Но ЗАДАННЫЙ мусор валит старт, а не тихо
+    // превращается в «адреса нет» (инвариант №1): именно этот режим отказа задача и
+    // чинила. `backlogMilestone: 42` без барьера означал бы, что человек считает бэклог
+    // разложенным по вехам, а карточки по-прежнему ложатся ровным слоем — и заметить это
+    // можно только вручную пересчитав их через месяц.
+    //
+    // Пустой список и пустая строка тоже отказ: они выглядят как «ключ заполнен», а
+    // работают как «ключа нет». Потолок — положительное ЦЕЛОЕ: ноль означал бы веху, в
+    // которую ничего не влезает (все карточки мимо адреса), дробное — сравнение, которое
+    // сработает на половине карточки.
+    // Возврат: true — валиден; иначе результат failFn (мягкий failFn пробрасываем наверх).
+    function assertValidBacklogMilestone(
+        cfg: Record<string, unknown>,
+        profileName: string,
+        failFn: FailFn = fail,
+    ): unknown {
+        const review = isPlainObject(cfg.review) ? (cfg.review as Record<string, unknown>) : null;
+        if (!review) return true;
+        const where = `ralph.config.json (профиль "${profileName}"): review.`;
+        const milestone = review.backlogMilestone;
+        if (milestone !== undefined) {
+            const list = Array.isArray(milestone) ? milestone : [milestone];
+            const bad =
+                list.length === 0 || list.some((m) => typeof m !== 'string' || m.trim() === '');
+            if (bad) {
+                return failFn(
+                    `${where}backlogMilestone = ${JSON.stringify(milestone)} — ожидалось непустое имя вехи ` +
+                        `либо непустой список имён (#16). Молча принятый мусор означал бы, что карточки лестницы ` +
+                        `по-прежнему ложатся в общий бэклог, тогда как конфиг говорит обратное. ` +
+                        `Убери ключ (прежнее поведение — без адреса) либо задай имена вех.`,
+                );
+            }
+        }
+        const cap = review.backlogMilestoneCap;
+        if (cap !== undefined && (typeof cap !== 'number' || !Number.isInteger(cap) || cap < 1)) {
+            return failFn(
+                `${where}backlogMilestoneCap = ${JSON.stringify(cap)} — ожидалось положительное целое (#16). ` +
+                    `Ноль означал бы веху, в которую не влезает ни одна карточка, строка и дробное — сравнение, ` +
+                    `которое сработает не там. Убери ключ (дефолт) либо задай число.`,
+            );
+        }
+        return true;
+    }
+
     // #48: плейсхолдеры промпта кодер-сессии. Петля подставляет РОВНО `{milestone}` и
     // `{branch}`; всё остальное в фигурных скобках уедет в сессию как есть.
     //
@@ -446,6 +491,10 @@ export function createConfigProfile(env: ConfigProfileEnv) {
         // провайдера по label'ам issue.
         const routingOk = assertValidModelRouting(merged, wanted, failFn);
         if (routingOk !== true) return routingOk; // мягкий failFn — наверх как есть
+        // #16: адрес карточек лестницы — схема обоих ключей (fail-closed: заданный мусор
+        // валит старт, а не превращается в тихое «адреса нет»).
+        const backlogOk = assertValidBacklogMilestone(merged, wanted, failFn);
+        if (backlogOk !== true) return backlogOk; // мягкий failFn — наверх как есть
         // #48: плейсхолдеры промпта — последняя проверка схемы: она про содержимое, а не
         // про форму, и осмысленна только на уже слитом конфиге.
         const promptOk = assertValidPromptPlaceholders(merged, wanted, failFn);
@@ -459,6 +508,7 @@ export function createConfigProfile(env: ConfigProfileEnv) {
         assertValidHaltBeforeDeploy,
         assertValidModelRouting,
         assertValidPromptPlaceholders,
+        assertValidBacklogMilestone,
         resolveProfile,
     };
 }

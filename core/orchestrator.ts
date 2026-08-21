@@ -76,6 +76,9 @@ import type { TSessionRequest } from './session-requests.ts';
 // здесь остаётся оркестрация: сессии, дифф, журнал, карточки.
 import {
     backlogIssueFor,
+    BACKLOG_MILESTONE_CAP,
+    pickBacklogMilestone,
+    type BacklogTarget,
     classifyFixReview,
     countsOf,
     decideAfterFixReview,
@@ -242,6 +245,17 @@ export type RalphConfig = {
         // закрытые споры. Набор меток — проектная специфика (у следующего проекта он свой),
         // поэтому в ядре его нет: пусто ⇒ карточка заводится без меток.
         backlogLabels?: string[];
+        // #16: накопительные вехи для тех же карточек — по порядку, как номерные тома.
+        // Строка принимается как список из одного элемента: конфиг с одной вехой не должен
+        // выглядеть сложнее, чем он есть. Ключа НЕТ ⇒ карточка заводится без адреса
+        // (прежнее поведение). А вот ЗАДАННЫЙ мусор — пустая строка, пустой список,
+        // не-строка — валит старт (assertValidBacklogMilestone): он выглядит как
+        // заполненный ключ, а работает как отсутствующий.
+        backlogMilestone?: string | string[];
+        // #16: сколько открытых карточек веха вмещает, прежде чем переполнение поедет в
+        // следующую номерную. Дефолт — BACKLOG_MILESTONE_CAP: фаза = один PR, и размер
+        // очереди прямо задаёт размер диффа. Заданный — положительное целое, иначе стоп.
+        backlogMilestoneCap?: number;
     };
     reviewModel?: string;
     authorAllowlist: string[];
@@ -2037,20 +2051,6 @@ export function createOrchestrator(env: OrchestratorEnv) {
         runArgvFn('gh', ['issue', 'edit', String(issue), '--add-label', 'blocked']);
     }
 
-    // `gh issue create` печатает URL созданной карточки — номер берём из хвоста. Не нашли
-    // номер — карточка ВСЁ РАВНО создана, поэтому null, а не исключение: откатывать
-    // нечего, а падение здесь заставило бы петлю повторить создание и наплодить дубли.
-    function createIssue(
-        { title, body, labels: names }: { title: string; body: string; labels: readonly string[] },
-        { runArgvFn = shArgv }: { runArgvFn?: typeof shArgv } = {},
-    ): number | null {
-        const args = ['issue', 'create', '--title', title, '--body', body];
-        for (const name of names) args.push('--label', name);
-        const out = String(runArgvFn('gh', args) ?? '').trim();
-        const num = Number(/(\d+)\s*$/.exec(out)?.[1] ?? '');
-        return Number.isInteger(num) && num > 0 ? num : null;
-    }
-
     // ── Применение намерений кодер-сессии (#40) ──────────────────────────────
     //
     // Читает файл-запрос, разбирает (session-requests.ts — чисто, fail-closed) и применяет
@@ -3271,17 +3271,27 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // #55: примитивы форжа живут в адаптере, а не в гейте. Гейт получает их инъекцией
     // (env.mergePr/env.phaseMerged), а шов taskSource — теми же функциями: одна реализация,
     // два потребителя, никакой команды `gh` в ядре.
-    const { mergePr, phaseMerged, mergedPhasePr, addBlockedLabel, removeBlockedLabel } =
-        createGithubForgeCommands({
-            sh,
-            shArgv,
-            shq,
-            log,
-            ghJson,
-            safeBranch,
-            prNumberRe: PR_NUMBER_RE,
-            sha40Re: SHA40_RE,
-        });
+    const {
+        mergePr,
+        phaseMerged,
+        mergedPhasePr,
+        addBlockedLabel,
+        removeBlockedLabel,
+        // #16: заведение карточки с адресом — тоже команды форжа, и живут они там же.
+        // Держать их в ядре «одной строкой с литералом gh» значило обходить храповик
+        // долга, а не соблюдать его: обёртка вокруг литерала скрывает от барьера любое
+        // число новых команд (ревью правок PR !6).
+        createIssue,
+    } = createGithubForgeCommands({
+        sh,
+        shArgv,
+        shq,
+        log,
+        ghJson,
+        safeBranch,
+        prNumberRe: PR_NUMBER_RE,
+        sha40Re: SHA40_RE,
+    });
 
     const {
         gateChecksFor,
@@ -3910,6 +3920,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             title: string;
             body: string;
             labels: readonly string[];
+            milestone?: string;
         }) => number | null;
         recordFixReviewFindingsFn?: (
             phase: Phase,
@@ -4717,6 +4728,76 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         // нет.
                         ...(strippedRouting && replacement ? [replacement] : []),
                     ];
+                    // #16: АДРЕС карточек лестницы — накопительная веха. Без него все они
+                    // ложились в общий бэклог ровным слоем: один круг ревью правок одной
+                    // фазы даёт до четырёх почти одинаковых заголовков, десяток фаз — сорок,
+                    // и найти в них уже нечего.
+                    const backlogMilestones = (
+                        Array.isArray(cfg.review?.backlogMilestone)
+                            ? cfg.review.backlogMilestone
+                            : [cfg.review?.backlogMilestone]
+                    ).filter((m): m is string => typeof m === 'string' && !!m.trim());
+                    const backlogCap = positiveIntOrDefault(
+                        cfg.review?.backlogMilestoneCap,
+                        BACKLOG_MILESTONE_CAP,
+                    );
+                    // Наполнение вехи — её незакрытые карточки. Отказ форжа (в том числе
+                    // «такой вехи нет») петлю не роняет: null означает «не сосчитали», и
+                    // такой кандидат ПРОПУСКАЕТСЯ — иначе одно неотвеченное чтение
+                    // обходило бы потолок, а карточка уезжала бы в веху, которой нет.
+                    const countBacklogOpen = (milestone: string): number | null => {
+                        try {
+                            return allOpenIssuesFn(milestone).length;
+                        } catch {
+                            return null;
+                        }
+                    };
+                    // Ищем адрес ЛЕНИВО и не более раза на круг: сдача без единой карточки
+                    // (обычный случай) не платит за это ни одним запросом к форжу.
+                    // `undefined` — «ещё не искали», `null` — «искали, не нашли».
+                    let backlogTarget: BacklogTarget | null | undefined;
+                    let backlogAddressLogged = false;
+                    const backlogAddress = (): string | undefined => {
+                        if (backlogMilestones.length === 0) return undefined;
+                        if (backlogTarget === undefined) {
+                            backlogTarget = pickBacklogMilestone({
+                                candidates: backlogMilestones,
+                                currentPhase: phase.milestone,
+                                cap: backlogCap,
+                                countOpenFn: countBacklogOpen,
+                            });
+                        }
+                        // Веха добилась до потолка карточками ЭТОГО ЖЕ круга — дальше ищем
+                        // с её места: перебирать уже отвергнутых заново значит платить за
+                        // их наполнение по второму разу.
+                        if (backlogTarget && backlogTarget.count >= backlogCap) {
+                            backlogTarget = pickBacklogMilestone({
+                                candidates: backlogMilestones,
+                                currentPhase: phase.milestone,
+                                cap: backlogCap,
+                                countOpenFn: countBacklogOpen,
+                                from: backlogTarget.index + 1,
+                            });
+                        }
+                        if (!backlogTarget) {
+                            // Молчать нельзя: ключ конфига задан, а карточки едут без
+                            // адреса. Причин три — вехи переполнены, единственная названная
+                            // и есть текущая фаза, либо их наполнение не читается (чаще
+                            // всего потому, что вехи на площадке нет). Все три чинит
+                            // человек, но узнать о них ему неоткуда, кроме лога.
+                            if (!backlogAddressLogged) {
+                                backlogAddressLogged = true;
+                                logFn(
+                                    '⚠ Накопительной вехи для карточек ревью правок не нашлось ' +
+                                        `(кандидаты: ${backlogMilestones.join(', ')}; потолок ${String(backlogCap)}) — ` +
+                                        'карточки заводятся без адреса.',
+                                );
+                            }
+                            return undefined;
+                        }
+                        backlogTarget.count += 1;
+                        return backlogTarget.milestone;
+                    };
                     // #199-приём: карточка, которой нет на доске, для человека равна
                     // потерянной находке — доска источник правды по статусу. `createIssue`
                     // доску не трогает, поэтому синк зовём один раз в конце лестницы (он
@@ -4746,10 +4827,19 @@ export function createOrchestrator(env: OrchestratorEnv) {
                             // Метки берём ИЗ карточки: их выбирает вызывающий (косметика —
                             // backlogLabels, спор — disputeLabels). Перетирать их здесь
                             // одним набором значило бы держать поле `labels` мёртвым.
-                            const num = createIssueFn(issue);
+                            const milestone = backlogAddress();
+                            const num = createIssueFn({
+                                ...issue,
+                                ...(milestone ? { milestone } : {}),
+                            });
                             backlogCards += 1;
+                            // «Адрес запрошен», а не «карточка в вехе»: шов отдаёт номер, а
+                            // не результат адресации, и при её провале (форж отверг веху)
+                            // прежняя формулировка спорила с собственной строкой адаптера
+                            // двумя строками выше — ревью правок PR !6.
                             logFn(
-                                `🗂 Ревью правок → карточка ${num ? `#${String(num)}` : '(номер не отдан форжем)'}: ${issue.title}`,
+                                `🗂 Ревью правок → карточка ${num ? `#${String(num)}` : '(номер не отдан форжем)'}` +
+                                    `${milestone ? `, адрес запрошен: веха «${milestone}»` : ''}: ${issue.title}`,
                             );
                         } catch (e) {
                             logFn(
