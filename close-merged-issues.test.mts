@@ -60,6 +60,7 @@ describe('closeMergedIssues', () => {
         commitMessage: 'Правка (!8)',
         prDescription: () => 'Закрывает #17.',
         issueStatus: () => 'open',
+        issueComments: () => [],
         commentFn: vi.fn(),
         closeFn: vi.fn(),
         logFn: vi.fn(),
@@ -186,6 +187,7 @@ describe('находки ревью по автозакрытию', () => {
                 commitMessage: 'Правка (!8)',
                 prDescription: () => 'Закрывает #17.',
                 issueStatus: () => status,
+                issueComments: () => [],
                 commentFn: () => {},
                 closeFn: () => {},
                 logFn: () => {},
@@ -201,6 +203,7 @@ describe('находки ревью по автозакрытию', () => {
                 commitMessage: 'Правка (!8)',
                 prDescription: () => 'Закрывает #17.',
                 issueStatus: () => status,
+                issueComments: () => [],
                 commentFn: vi.fn(),
                 closeFn,
                 logFn: () => {},
@@ -208,5 +211,52 @@ describe('находки ревью по автозакрытию', () => {
             expect(closeMergedIssues(d)).toEqual([]);
             expect(closeFn).not.toHaveBeenCalled();
         }
+    });
+});
+
+describe('повтор прогона не дублирует причину', () => {
+    // Поймано живьём: комментарий лёг, PATCH статуса вернул 403 — карточка осталась
+    // открытой с висящей причиной. Следующий прогон закроет её, и вторая такая же
+    // причина в ленте выглядела бы как два разных события.
+    const deps = (over = {}) => ({
+        commitMessage: 'Правка (!8)',
+        prDescription: () => 'Закрывает #17.',
+        issueStatus: () => 'open',
+        issueComments: () => [],
+        commentFn: vi.fn(),
+        closeFn: vi.fn(),
+        logFn: vi.fn(),
+        ...over,
+    });
+
+    it('причина несёт машинный след — иначе свой комментарий не узнать', () => {
+        const d = deps();
+        closeMergedIssues(d);
+        expect(String(d.commentFn.mock.calls[0]?.[1])).toContain('ralph:auto-closed');
+    });
+
+    it('след уже стоит — карточка закрывается, но причина не пишется второй раз', () => {
+        const d = deps({
+            issueComments: () => ['Закрыта автоматически… <!-- ralph:auto-closed -->'],
+        });
+        expect(closeMergedIssues(d)).toEqual([17]);
+        expect(d.closeFn).toHaveBeenCalledWith(17);
+        expect(d.commentFn).not.toHaveBeenCalled();
+    });
+
+    it('чужие комментарии следом не считаются', () => {
+        const d = deps({ issueComments: () => ['а я думаю, это надо доделать'] });
+        closeMergedIssues(d);
+        expect(d.commentFn).toHaveBeenCalledTimes(1);
+    });
+
+    it('чтение комментариев упало — причину пишем, а не пропускаем закрытие', () => {
+        const d = deps({
+            issueComments: () => {
+                throw new Error('форж не ответил');
+            },
+        });
+        expect(closeMergedIssues(d)).toEqual([17]);
+        expect(d.commentFn).toHaveBeenCalledTimes(1);
     });
 });

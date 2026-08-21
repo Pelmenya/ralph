@@ -29,6 +29,19 @@ export const MAX_CLOSES_PER_MERGE = 10;
  */
 const RESOLVED_STATUSES = new Set(['closed', 'declined', 'duplicate']);
 
+/**
+ * Машинный след автозакрытия в тексте комментария.
+ *
+ * Нужен потому, что порядок «сначала причина, потом закрытие» имеет цену: если комментарий
+ * лёг, а закрытие упало, повтор прогона оставит второй такой же. Это не гипотеза ревью —
+ * поймано живьём на первом же боевом прогоне: комментарий на карточке появился, а PATCH
+ * статуса вернул 403, и карточка осталась открытой с висящей причиной.
+ *
+ * Маркер невидим в отрендеренном markdown, поэтому человек его не воспроизведёт случайно,
+ * а повторный прогон узнаёт свой след и причину не дублирует.
+ */
+const AUTO_CLOSE_MARKER = '<!-- ralph:auto-closed -->';
+
 // Начало строки: маркеры списка, цитаты и жирный шрифт пропускаем, слово — первое.
 // `\b` тут не годится: он ASCII-only, и после кириллического «закрывает» границы
 // слова не видит вовсе. Отсекаем продолжение слова явным взглядом вперёд.
@@ -88,6 +101,8 @@ export type CloseDeps = {
     commitMessage: string;
     prDescription: (pr: number) => string;
     issueStatus: (issue: number) => string;
+    /** Тела уже оставленных комментариев карточки — по ним узнаём свой прошлый след. */
+    issueComments: (issue: number) => string[];
     commentFn: (issue: number, body: string) => void;
     closeFn: (issue: number) => void;
     logFn: (msg: string) => void;
@@ -98,7 +113,8 @@ export type CloseDeps = {
  * пропущенный отказ вернул бы ровно ту проблему, ради которой всё это заведено.
  */
 export function closeMergedIssues(deps: CloseDeps): number[] {
-    const { commitMessage, prDescription, issueStatus, commentFn, closeFn, logFn } = deps;
+    const { commitMessage, prDescription, issueStatus, issueComments, commentFn, closeFn, logFn } =
+        deps;
     const pr = prNumberFromCommit(commitMessage);
     if (pr === null) {
         logFn('Коммит не выглядит мерджем PR — закрывать нечего.');
@@ -131,15 +147,30 @@ export function closeMergedIssues(deps: CloseDeps): number[] {
                 continue;
             }
             // Сначала причина, потом закрытие: закрытие без следа неотличимо от потери.
-            // Цена этого порядка названа честно: если комментарий лёг, а закрытие упало,
-            // повтор прогона оставит второй такой же комментарий (ревью). Дубль
-            // косметичен, карточка, закрытая без причины, — нет.
-            commentFn(
-                issue,
-                `Закрыта автоматически: PR !${String(pr)} смерджен в main и назвал эту карточку ` +
-                    'в описании («Закрывает»). Связь PR↔задача на площадке карточку не закрывает, ' +
-                    'поэтому это делает CI.',
-            );
+            // Порядок сохранён, а его цена — дубль причины при повторе — снята маркером:
+            // свой прошлый след узнаём и второй раз не пишем. Отказ ЧТЕНИЯ комментариев
+            // не мешает закрытию: причина уже стоит либо появится, дубль дешевле пропуска.
+            let alreadyExplained = false;
+            try {
+                alreadyExplained = issueComments(issue).some((body) =>
+                    body.includes(AUTO_CLOSE_MARKER),
+                );
+            } catch (e) {
+                logFn(
+                    `#${String(issue)}: не смог прочитать комментарии (${(e as Error).message.split('\n')[0]}) — ` +
+                        'пишу причину заново.',
+                );
+            }
+            if (alreadyExplained) {
+                logFn(`#${String(issue)}: причина уже оставлена прошлым прогоном — не дублирую.`);
+            } else {
+                commentFn(
+                    issue,
+                    `Закрыта автоматически: PR !${String(pr)} смерджен в main и назвал эту карточку ` +
+                        'в описании («Закрывает»). Связь PR↔задача на площадке карточку не закрывает, ' +
+                        `поэтому это делает CI.\n\n${AUTO_CLOSE_MARKER}`,
+                );
+            }
             closeFn(issue);
             closed.push(issue);
             logFn(`#${String(issue)}: закрыта по намерению PR !${String(pr)}.`);
@@ -166,10 +197,14 @@ function main(): void {
         console.log(`🗂 автозакрытие: ${msg}`);
     };
 
-    // Выключатель: без токена автоматики просто нет. Красить main на каждом пуше из-за
-    // незаведённого секрета нельзя — это барьер, который чинят выключением барьера.
+    // Второй эшелон для ЛОКАЛЬНОГО и ручного запуска. Выключателем это НЕ является, и
+    // прежняя формулировка врала: в CI площадка резолвит `${{ secrets.… }}` на разборе
+    // конфига и, не найдя секрета, валит ВЕСЬ прогон — вместе с гейтом — ещё до старта
+    // задачи. Проверено живьём: три красных прогона на пуш в main с текстом
+    // «value 'SOURCECRAFT_TOKEN' not defined for value source 'secrets'».
+    // Значит секрет — предусловие механизма, а не опция; заводится ДО включения workflow.
     if (!process.env['SOURCECRAFT_TOKEN']) {
-        log('секрет SOURCECRAFT_TOKEN не задан — автозакрытие выключено.');
+        log('SOURCECRAFT_TOKEN не задан — закрывать нечем, выхожу (запуск вне CI?).');
         return;
     }
     const remote = parseRemote(sh('git', ['remote', 'get-url', 'origin']));
@@ -190,6 +225,16 @@ function main(): void {
         prDescription: (pr) => {
             const res = api('GET', `${base}/pulls/${String(pr)}`) as Record<string, unknown> | null;
             return String(res?.['description'] ?? '');
+        },
+        issueComments: (issue) => {
+            const res = api('GET', `${base}/issues/${String(issue)}/comments`) as Record<
+                string,
+                unknown
+            > | null;
+            const list = res?.['issue_comments'];
+            return Array.isArray(list)
+                ? list.map((c) => String((c as { body?: unknown }).body ?? ''))
+                : [];
         },
         issueStatus: (issue) => {
             const res = api('GET', `${base}/issues/${String(issue)}`) as Record<
