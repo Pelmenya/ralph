@@ -42,6 +42,9 @@ const RESOLVED_STATUSES = new Set(['closed', 'declined', 'duplicate']);
  */
 const AUTO_CLOSE_MARKER = '<!-- ralph:auto-closed -->';
 
+/** Предел обхода ленты комментариев: страниц по 100, больше — уже не лента, а сбой. */
+const COMMENT_PAGES_MAX = 20;
+
 // Начало строки: маркеры списка, цитаты и жирный шрифт пропускаем, слово — первое.
 // `\b` тут не годится: он ASCII-only, и после кириллического «закрывает» границы
 // слова не видит вовсе. Отсекаем продолжение слова явным взглядом вперёд.
@@ -63,7 +66,10 @@ const CLOSE_LINE_RE =
  * механизм с правом закрывать чужие карточки не должен догадываться, что имел в виду
  * автор, а «ничего не закрыл» видно в логе.
  */
-const REFS_RUN_RE = /^[\s:—–-]*(#\d+(?:\s*(?:,|и|and)?\s*#\d+)*)/iu;
+// Разделитель ОБЯЗАТЕЛЕН (ревью). Со знаком `?` он был необязательным, и
+// «Закрывает #17 #18 затронута» закрывало обе карточки — ровно тот риск ложного
+// закрытия, ради которого разбор и сделан буквальным.
+const REFS_RUN_RE = /^[\s:—–-]*(#\d+(?:\s*(?:,|и|and)\s*#\d+)*)/iu;
 const ISSUE_RE = /#(\d+)/g;
 
 /**
@@ -103,6 +109,8 @@ export type CloseDeps = {
     issueStatus: (issue: number) => string;
     /** Тела уже оставленных комментариев карточки — по ним узнаём свой прошлый след. */
     issueComments: (issue: number) => string[];
+    /** Метки карточки: `blocked` означает ручной разбор, и снимает её человек. */
+    issueLabels: (issue: number) => string[];
     commentFn: (issue: number, body: string) => void;
     closeFn: (issue: number) => void;
     logFn: (msg: string) => void;
@@ -113,8 +121,16 @@ export type CloseDeps = {
  * пропущенный отказ вернул бы ровно ту проблему, ради которой всё это заведено.
  */
 export function closeMergedIssues(deps: CloseDeps): number[] {
-    const { commitMessage, prDescription, issueStatus, issueComments, commentFn, closeFn, logFn } =
-        deps;
+    const {
+        commitMessage,
+        prDescription,
+        issueStatus,
+        issueComments,
+        issueLabels,
+        commentFn,
+        closeFn,
+        logFn,
+    } = deps;
     const pr = prNumberFromCommit(commitMessage);
     if (pr === null) {
         logFn('Коммит не выглядит мерджем PR — закрывать нечего.');
@@ -144,6 +160,17 @@ export function closeMergedIssues(deps: CloseDeps): number[] {
             // и `inProgress`/`paused` — это открытая работа, а не закрытая (ревью).
             if (RESOLVED_STATUSES.has(issueStatus(issue))) {
                 logFn(`#${String(issue)}: уже решена — пропускаю.`);
+                continue;
+            }
+            // `blocked` — не статус, а МЕТКА: раннер вешает её, когда упёрся в ручной
+            // гейт, и снимает её человек. Закрыть такую карточку значит стереть просьбу
+            // о разборе, оставив метку висеть на закрытом (ревью). Владение состоянием
+            // здесь важнее автоматизации: чья метка — того и решение.
+            if (issueLabels(issue).includes('blocked')) {
+                logFn(
+                    `#${String(issue)}: помечена blocked — ждёт человека, не трогаю ` +
+                        '(снять метку и закрыть — его решение).',
+                );
                 continue;
             }
             // Сначала причина, потом закрытие: закрытие без следа неотличимо от потери.
@@ -197,12 +224,13 @@ function main(): void {
         console.log(`🗂 автозакрытие: ${msg}`);
     };
 
-    // Второй эшелон для ЛОКАЛЬНОГО и ручного запуска. Выключателем это НЕ является, и
-    // прежняя формулировка врала: в CI площадка резолвит `${{ secrets.… }}` на разборе
-    // конфига и, не найдя секрета, валит ВЕСЬ прогон — вместе с гейтом — ещё до старта
-    // задачи. Проверено живьём: три красных прогона на пуш в main с текстом
-    // «value 'SOURCECRAFT_TOKEN' not defined for value source 'secrets'».
-    // Значит секрет — предусловие механизма, а не опция; заводится ДО включения workflow.
+    // `SOURCECRAFT_TOKEN` в CI площадка отдаёт САМА — это её предопределённая
+    // переменная, секрет репозитория для неё не нужен (ревью нашло это в доке
+    // площадки; до того конфиг тянул значение из `secrets`, и его отсутствие валило
+    // ВЕСЬ прогон вместе с гейтом ещё на разборе — три красных пуша в main).
+    //
+    // Проверка остаётся для запуска ВНЕ CI: там переменной нет, и честнее сказать это
+    // строкой, чем получить 401 на первом запросе.
     if (!process.env['SOURCECRAFT_TOKEN']) {
         log('SOURCECRAFT_TOKEN не задан — закрывать нечем, выхожу (запуск вне CI?).');
         return;
@@ -226,14 +254,36 @@ function main(): void {
             const res = api('GET', `${base}/pulls/${String(pr)}`) as Record<string, unknown> | null;
             return String(res?.['description'] ?? '');
         },
+        // Лента читается ПО СТРАНИЦАМ: одной страницы мало — маркер прошлого прогона
+        // мог уехать за её край, и тогда причина написалась бы второй раз (ревью).
+        // Обход ограничен: зациклившийся сервер не должен вешать задачу CI, а «не всё
+        // прочитали» здесь стоит дубля комментария, а не потери карточки.
         issueComments: (issue) => {
-            const res = api('GET', `${base}/issues/${String(issue)}/comments`) as Record<
+            const out: string[] = [];
+            let token = '';
+            for (let page = 0; page < COMMENT_PAGES_MAX; page += 1) {
+                const query = `?page_size=100${token ? `&page_token=${encodeURIComponent(token)}` : ''}`;
+                const res = api(
+                    'GET',
+                    `${base}/issues/${String(issue)}/comments${query}`,
+                ) as Record<string, unknown> | null;
+                const list = res?.['issue_comments'];
+                if (Array.isArray(list))
+                    out.push(...list.map((c) => String((c as { body?: unknown }).body ?? '')));
+                const next = String(res?.['next_page_token'] ?? '');
+                if (!next || next === token) return out;
+                token = next;
+            }
+            return out;
+        },
+        issueLabels: (issue) => {
+            const res = api('GET', `${base}/issues/${String(issue)}`) as Record<
                 string,
                 unknown
             > | null;
-            const list = res?.['issue_comments'];
-            return Array.isArray(list)
-                ? list.map((c) => String((c as { body?: unknown }).body ?? ''))
+            const labels = res?.['labels'];
+            return Array.isArray(labels)
+                ? labels.map((l) => String((l as { name?: unknown }).name ?? ''))
                 : [];
         },
         issueStatus: (issue) => {

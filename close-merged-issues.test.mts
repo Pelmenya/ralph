@@ -61,6 +61,7 @@ describe('closeMergedIssues', () => {
         prDescription: () => 'Закрывает #17.',
         issueStatus: () => 'open',
         issueComments: () => [],
+        issueLabels: () => [],
         commentFn: vi.fn(),
         closeFn: vi.fn(),
         logFn: vi.fn(),
@@ -188,6 +189,7 @@ describe('находки ревью по автозакрытию', () => {
                 prDescription: () => 'Закрывает #17.',
                 issueStatus: () => status,
                 issueComments: () => [],
+                issueLabels: () => [],
                 commentFn: () => {},
                 closeFn: () => {},
                 logFn: () => {},
@@ -204,6 +206,7 @@ describe('находки ревью по автозакрытию', () => {
                 prDescription: () => 'Закрывает #17.',
                 issueStatus: () => status,
                 issueComments: () => [],
+                issueLabels: () => [],
                 commentFn: vi.fn(),
                 closeFn,
                 logFn: () => {},
@@ -223,6 +226,7 @@ describe('повтор прогона не дублирует причину', (
         prDescription: () => 'Закрывает #17.',
         issueStatus: () => 'open',
         issueComments: () => [],
+        issueLabels: () => [],
         commentFn: vi.fn(),
         closeFn: vi.fn(),
         logFn: vi.fn(),
@@ -258,5 +262,52 @@ describe('повтор прогона не дублирует причину', (
         });
         expect(closeMergedIssues(d)).toEqual([17]);
         expect(d.commentFn).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe('второй круг ревью: разделитель и метка blocked', () => {
+    it('номера без разделителя — только первый', () => {
+        // Разделитель был необязательным, и «#17 #18 затронута» закрывало обе.
+        expect(closesFromDescription('Закрывает #17 #18 затронута, но не закрывается')).toEqual([
+            17,
+        ]);
+        // Разрешённые формы по-прежнему работают.
+        expect(closesFromDescription('Закрывает #10 и #12')).toEqual([10, 12]);
+        expect(closesFromDescription('Закрывает #1, #2')).toEqual([1, 2]);
+    });
+
+    it('карточка с меткой blocked не закрывается: её держит человек', () => {
+        const closeFn = vi.fn();
+        const commentFn = vi.fn();
+        const logFn = vi.fn();
+        const d = {
+            commitMessage: 'Правка (!8)',
+            prDescription: () => 'Закрывает #17.',
+            issueStatus: () => 'open',
+            issueComments: () => [],
+            issueLabels: () => ['blocked', 'area:core'],
+            commentFn,
+            closeFn,
+            logFn,
+        };
+        expect(closeMergedIssues(d)).toEqual([]);
+        expect(closeFn).not.toHaveBeenCalled();
+        // И причины не пишем: метка не повод оставлять след в чужой карточке.
+        expect(commentFn).not.toHaveBeenCalled();
+        expect(logFn.mock.calls.flat().join(' ')).toMatch(/blocked/);
+    });
+
+    it('прочие метки закрытию не мешают', () => {
+        const d = {
+            commitMessage: 'Правка (!8)',
+            prDescription: () => 'Закрывает #17.',
+            issueStatus: () => 'open',
+            issueComments: () => [],
+            issueLabels: () => ['complexity:low', 'area:core'],
+            commentFn: vi.fn(),
+            closeFn: vi.fn(),
+            logFn: vi.fn(),
+        };
+        expect(closeMergedIssues(d)).toEqual([17]);
     });
 });
