@@ -2933,6 +2933,10 @@ describe('preflight — валидация конфига/среды и подг
         // Проверка авторизации форжа идёт через шов (#35), а не через shFn: боевой дефолт
         // ушёл бы в настоящий gh/curl и упёрся в предохранитель побочек.
         checkAuthFn: () => {},
+        // #17: карточки текущей фазы preflight читает через шов — «зелёному» пути нужен
+        // пустой ответ, иначе боевой дефолт ушёл бы в настоящий форж и упёрся в
+        // предохранитель побочек (как checkAuthFn выше).
+        allOpenIssuesFn: () => [],
         phaseIndexOfFn: () => 0,
         phaseMergedFn: () => true,
         saveStateFn: () => {},
@@ -3236,6 +3240,104 @@ describe('preflight — валидация конфига/среды и подг
         }
         expect(seamCall).toHaveBeenCalledTimes(1);
         expect(seamCall).toHaveBeenCalledWith({ milestone: 'M1', branch: 'feature/m1' });
+    });
+
+    // ── Ранняя проверка конфликта human+complexity (#17) ────────────────────────
+    // До #10 фильтр `human` стоял ВНУТРИ openIssues — до отсева blocked и чужих авторов,
+    // поэтому конфликтная карточка роняла петлю на первом чтении очереди. После переезда
+    // фильтра поверх шва (withHumanFilter) шов отдаёт уже отсеянное, и карточка, помеченная
+    // `blocked` либо созданная чужим автором, доживала до сдачи фазы — то есть до C2, когда
+    // итерации ночи уже сгорели. Здесь проверяется, что старт ловит её раньше первой итерации.
+    const conflictIssue = (overrides = {}) => ({
+        number: 90,
+        title: 'Карточка с двумя метками',
+        labels: [{ name: 'human' }, { name: 'complexity:low' }],
+        author: { login: 'owner' },
+        ...overrides,
+    });
+
+    it('#17: карточка с human и complexity:* в текущей фазе → fail ДО первой итерации', () => {
+        const deps = okDeps({
+            loadStateFn: fakeState,
+            allOpenIssuesFn: () => [conflictIssue()],
+        });
+        expect(() => preflight(validCfg(), deps)).toThrow(/конфликт замысла/);
+        expect(() => preflight(validCfg(), deps)).toThrow(/#90/);
+    });
+
+    // Именно эти два случая доживали до сдачи фазы: очередь их отсеивает, а сдача (C2)
+    // смотрит полный список — поэтому preflight обязан спрашивать ПОЛНЫЙ список тоже.
+    it('#17: конфликт ловится и когда карточка blocked или заведена чужим автором', () => {
+        const blocked = conflictIssue({
+            number: 91,
+            labels: [{ name: 'human' }, { name: 'complexity:low' }, { name: 'blocked' }],
+        });
+        const foreign = conflictIssue({ number: 92, author: { login: 'stranger' } });
+        for (const issue of [blocked, foreign]) {
+            const deps = okDeps({ loadStateFn: fakeState, allOpenIssuesFn: () => [issue] });
+            expect(() => preflight(validCfg(), deps)).toThrow(/конфликт замысла/);
+        }
+    });
+
+    it('#17: карточка только с human (без complexity) старт не роняет', () => {
+        const deps = okDeps({
+            loadStateFn: fakeState,
+            allOpenIssuesFn: () => [conflictIssue({ labels: [{ name: 'human' }] })],
+        });
+        expect(() => preflight(validCfg(), deps)).not.toThrow();
+    });
+
+    it('#17: карточки текущей фазы читаются РОВНО один раз (в цикл чтение не уехало)', () => {
+        const allOpenIssuesFn = vi.fn(() => []);
+        preflight(validCfg(), okDeps({ loadStateFn: fakeState, allOpenIssuesFn }));
+        expect(allOpenIssuesFn).toHaveBeenCalledTimes(1);
+        expect(allOpenIssuesFn).toHaveBeenCalledWith('M1');
+    });
+
+    // Форж мог не ответить, и цена ошибки здесь несимметрична: жёсткий стоп на транзиентной
+    // помехе стоит целой ночи AFK, а пропущенная ранняя проверка — только раннего диагноза,
+    // потому что C2 на сдаче остаётся вторым эшелоном. Поэтому предупреждение, а не стоп.
+    it('#17: чтение карточек упало → предупреждение в лог, старт продолжается', () => {
+        const logs: string[] = [];
+        const deps = okDeps({
+            loadStateFn: fakeState,
+            logFn: (m: string) => logs.push(m),
+            allOpenIssuesFn: () => {
+                throw new Error('форж не ответил');
+            },
+        });
+        expect(() => preflight(validCfg(), deps)).not.toThrow();
+        expect(logs.join('\n')).toMatch(/форж не ответил/);
+        expect(logs.join('\n')).toMatch(/C2|сдач/);
+    });
+
+    it('#17: все фазы пройдены (state.milestone === null) → карточки не читаются', () => {
+        const allOpenIssuesFn = vi.fn(() => []);
+        const deps = okDeps({
+            loadStateFn: () => ({ count: 0, milestone: null, submitted: false, noProgress: 0 }),
+            allOpenIssuesFn,
+        });
+        expect(() => preflight(validCfg(), deps)).not.toThrow();
+        expect(allOpenIssuesFn).not.toHaveBeenCalled();
+    });
+
+    // Тот же регресс, что у C4 (!3): дефолт обязан идти через шов, иначе на не-GitHub
+    // площадке проверка либо не работает, либо врёт про `gh`. Ключ намеренно УДАЛЯЕТСЯ
+    // из deps — тест на подменённой функции прошёл бы и мимо дефолта.
+    it('#17: полный список карточек берётся из adapters.taskSource, а не из команд форжа', () => {
+        const { taskSource } = ralph.getAdapters();
+        const original = taskSource.listAllOpenIssues;
+        const seamCall = vi.fn(() => []);
+        taskSource.listAllOpenIssues = seamCall;
+        const deps = okDeps({ loadStateFn: fakeState }) as Record<string, unknown>;
+        delete deps.allOpenIssuesFn;
+        try {
+            preflight(validCfg(), deps);
+        } finally {
+            taskSource.listAllOpenIssues = original;
+        }
+        expect(seamCall).toHaveBeenCalledTimes(1);
+        expect(seamCall).toHaveBeenCalledWith('M1');
     });
 
     it('git rev-parse падает → fail «Не git-репозиторий»', () => {

@@ -151,6 +151,10 @@ describe('dry-run переносимости ядра на чужом конфи
                 deployBlock: null,
             }),
             phaseIndexOfFn: () => 0,
+            // #17: ранняя проверка конфликта human+complexity читает карточки фазы через
+            // шов — дефолт ушёл бы в настоящий форж (собранный БЕЗ выбора из фикстуры),
+            // ровно как checkAuthFn выше.
+            allOpenIssuesFn: () => [],
             saveStateFn: () => {},
             pushEventFn: () => false,
             dry: true,
