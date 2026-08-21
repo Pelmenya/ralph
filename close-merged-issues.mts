@@ -23,10 +23,34 @@ import { createSourcecraftTaskSource } from './adapters/sourcecraft-task-source.
 /** Больше этого за один мердж не закрываем: описание не должно уметь смести бэклог. */
 export const MAX_CLOSES_PER_MERGE = 10;
 
+/**
+ * РЕШЁННЫЕ статусы площадки — только эти означают «карточку трогать не надо». Остальные
+ * четыре (`open`, `inProgress`, `paused` и незаданный) — открытая работа.
+ */
+const RESOLVED_STATUSES = new Set(['closed', 'declined', 'duplicate']);
+
 // Начало строки: маркеры списка, цитаты и жирный шрифт пропускаем, слово — первое.
 // `\b` тут не годится: он ASCII-only, и после кириллического «закрывает» границы
 // слова не видит вовсе. Отсекаем продолжение слова явным взглядом вперёд.
-const CLOSE_LINE_RE = /^[\s>*_-]*(?:закрывает|закрывают|closes|fixes)(?!\p{L})/iu;
+// Начало строки: маркеры списка (`-`, `+`, `*`, `1.`), чекбоксы и цитаты пропускаем —
+// намерение в чеклисте это то же намерение (ревью).
+const CLOSE_LINE_RE =
+    /^[\s>*_+-]*(?:\[[ xX]\]\s*)?(?:\d+[.)]\s*)?(?:закрывает|закрывают|closes|fixes)(?!\p{L})/iu;
+
+/**
+ * Номера идут СРАЗУ за словом намерения и разделяются только запятой либо «и»/«and».
+ *
+ * Первая версия брала все `#N` из строки, и это возвращало ровно тот класс ложных связей,
+ * от которого механизм защищает: `Закрывает external/team#17; #18 затронута` закрывало и
+ * чужой номер (он ведь тоже `#17`), и соседний, названный контекстом. Теперь разбор
+ * останавливается на первом не-номере, а форма `owner/repo#N` не совпадает вовсе —
+ * список начинается с решётки.
+ *
+ * Цена — строгость формы: «Закрывает задачу #17» не считается намерением. Это осознанно:
+ * механизм с правом закрывать чужие карточки не должен догадываться, что имел в виду
+ * автор, а «ничего не закрыл» видно в логе.
+ */
+const REFS_RUN_RE = /^[\s:—–-]*(#\d+(?:\s*(?:,|и|and)?\s*#\d+)*)/iu;
 const ISSUE_RE = /#(\d+)/g;
 
 /**
@@ -34,17 +58,25 @@ const ISSUE_RE = /#(\d+)/g;
  * Тело не смотрим намеренно — «см. соседний PR (!7)» там обычное дело.
  */
 export function prNumberFromCommit(message: string): number | null {
-    const subject = message.split('\n')[0] ?? '';
-    const m = /\(!(\d+)\)\s*$/.exec(subject.trim());
-    return m ? Number(m[1]) : null;
+    const subject = (message.split('\n')[0] ?? '').trim();
+    // Squash-коммит: площадка дописывает `(!N)` в хвост заголовка.
+    const squashed = /\(!(\d+)\)\s*$/.exec(subject);
+    if (squashed) return Number(squashed[1]);
+    // Merge-коммит: политика веток squash не требует, и такой мердж молча не закрывал
+    // ничего (ревью). Форма фиксированная — «Merge pull request !N».
+    const merged = /^merge pull request !(\d+)\b/i.exec(subject);
+    return merged ? Number(merged[1]) : null;
 }
 
 /** Номера карточек, которые автор PR назвал закрываемыми. Порядок — как в тексте. */
 export function closesFromDescription(description: string): number[] {
     const found: number[] = [];
     for (const line of description.split('\n')) {
-        if (!CLOSE_LINE_RE.test(line)) continue;
-        for (const m of line.matchAll(ISSUE_RE)) {
+        const intent = CLOSE_LINE_RE.exec(line);
+        if (!intent) continue;
+        const run = REFS_RUN_RE.exec(line.slice(intent[0].length));
+        if (!run) continue;
+        for (const m of run[1].matchAll(ISSUE_RE)) {
             const n = Number(m[1]);
             if (!found.includes(n)) found.push(n);
         }
@@ -88,13 +120,20 @@ export function closeMergedIssues(deps: CloseDeps): number[] {
     const failed: string[] = [];
     for (const issue of wanted) {
         try {
-            // Статус спрашиваем ДО мутации: повторный прогон (переzапуск CI, ручной вызов)
-            // не должен выглядеть как новое событие в ленте карточки.
-            if (issueStatus(issue) !== 'open') {
-                logFn(`#${String(issue)}: уже не открыта — пропускаю.`);
+            // Статус спрашиваем ДО мутации: повторный прогон (перезапуск CI, ручной
+            // вызов) не должен выглядеть как новое событие в ленте карточки.
+            //
+            // Пропускаем только РЕШЁННЫЕ состояния. Первая версия сравнивала с `open` и
+            // тем самым молча не закрывала карточку в работе: у площадки статусов шесть,
+            // и `inProgress`/`paused` — это открытая работа, а не закрытая (ревью).
+            if (RESOLVED_STATUSES.has(issueStatus(issue))) {
+                logFn(`#${String(issue)}: уже решена — пропускаю.`);
                 continue;
             }
             // Сначала причина, потом закрытие: закрытие без следа неотличимо от потери.
+            // Цена этого порядка названа честно: если комментарий лёг, а закрытие упало,
+            // повтор прогона оставит второй такой же комментарий (ревью). Дубль
+            // косметичен, карточка, закрытая без причины, — нет.
             commentFn(
                 issue,
                 `Закрыта автоматически: PR !${String(pr)} смерджен в main и назвал эту карточку ` +

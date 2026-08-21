@@ -145,3 +145,68 @@ describe('parseRemote', () => {
         expect(parseRemote('не-адрес')).toBeNull();
     });
 });
+
+describe('находки ревью по автозакрытию', () => {
+    it('номер чужого трекера в намерении не закрывает здешнюю карточку', () => {
+        // Ровно класс ложных связей, ради которого механизм и не смотрит на linked_issues.
+        expect(closesFromDescription('Закрывает external/team#17')).toEqual([]);
+        expect(closesFromDescription('Закрывает pelmenya/ralph#7 и #8')).toEqual([]);
+    });
+
+    it('после первого не-номера разбор останавливается', () => {
+        // «#18 затронута, но не закрывается» стояло в той же строке и закрывалось вместе
+        // с намерением. Разделители — только запятая и «и»/«and».
+        expect(closesFromDescription('Закрывает #17; #18 затронута, но не закрывается')).toEqual([
+            17,
+        ]);
+        expect(closesFromDescription('Закрывает #10 и #12. Оба пойманы живьём.')).toEqual([10, 12]);
+        expect(closesFromDescription('Закрывает #1, #2, #3 — все три')).toEqual([1, 2, 3]);
+    });
+
+    it('форма без номера сразу после слова намерением не считается', () => {
+        // Молчаливое «ничего не закрыл» видно в логе; догадываться, что имел в виду
+        // автор, механизм с правом мутации не должен.
+        expect(closesFromDescription('Закрывает задачу #17')).toEqual([]);
+    });
+
+    it('маркеры списка и чекбоксы не мешают намерению', () => {
+        expect(closesFromDescription('- [x] Закрывает #17')).toEqual([17]);
+        expect(closesFromDescription('+ Закрывает #18')).toEqual([18]);
+        expect(closesFromDescription('1. Закрывает #19')).toEqual([19]);
+    });
+
+    it('merge-коммит тоже опознаётся, а не молча пропускается', () => {
+        expect(prNumberFromCommit('Merge pull request !8 from feature/x')).toBe(8);
+        expect(prNumberFromCommit('Правка (!8)')).toBe(8);
+    });
+
+    it('inProgress и paused — открытые состояния, их закрываем', () => {
+        for (const status of ['open', 'inProgress', 'paused']) {
+            const d = {
+                commitMessage: 'Правка (!8)',
+                prDescription: () => 'Закрывает #17.',
+                issueStatus: () => status,
+                commentFn: () => {},
+                closeFn: () => {},
+                logFn: () => {},
+            };
+            expect(closeMergedIssues(d)).toEqual([17]);
+        }
+    });
+
+    it('closed, declined и duplicate — уже решённые, их не трогаем', () => {
+        for (const status of ['closed', 'declined', 'duplicate']) {
+            const closeFn = vi.fn();
+            const d = {
+                commitMessage: 'Правка (!8)',
+                prDescription: () => 'Закрывает #17.',
+                issueStatus: () => status,
+                commentFn: vi.fn(),
+                closeFn,
+                logFn: () => {},
+            };
+            expect(closeMergedIssues(d)).toEqual([]);
+            expect(closeFn).not.toHaveBeenCalled();
+        }
+    });
+});
