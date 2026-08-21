@@ -3611,6 +3611,11 @@ export function createOrchestrator(env: OrchestratorEnv) {
             // Лениво (как `checkAuthFn`/`deployEnabledFn` выше): реестр адаптеров к
             // моменту вызова preflight собран, а снимок поля на этапе дефолта — нет.
             phaseMergedFn = (phase: { branch: string }) => adapters.taskSource.isPhaseMerged(phase),
+            // #17: ПОЛНЫЙ список открытых карточек текущей фазы — тот же примитив, что
+            // читает цикл сдачи (C2), и по той же причине через шов: список нужен без
+            // фильтров blocked/автора, иначе ранняя проверка пропустит ровно те две
+            // разновидности конфликтной карточки, ради которых она заводится.
+            allOpenIssuesFn = adapters.taskSource.listAllOpenIssues,
             saveStateFn = saveState,
             pushEventFn = pushEvent,
             once = ONCE,
@@ -3626,6 +3631,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             loadStateFn?: typeof loadState;
             phaseIndexOfFn?: typeof phaseIndexOf;
             phaseMergedFn?: (phase: { branch: string }) => boolean;
+            allOpenIssuesFn?: (milestone: string) => Issue[];
             saveStateFn?: typeof saveState;
             pushEventFn?: typeof pushEvent;
             once?: boolean;
@@ -3846,6 +3852,41 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     );
                 }
             }
+        }
+
+        // #17: конфликт `human` + `complexity:*` вскрываем ЗДЕСЬ, на старте, а не на сдаче.
+        //
+        // Пока фильтр `human` жил внутри `openIssues` (до #10), он стоял ДО отсева
+        // `blocked` и чужих авторов и ронял петлю на первом же чтении очереди. После
+        // переезда поверх шва (`withHumanFilter`) шов отдаёт уже отсеянное, и конфликтная
+        // карточка, помеченная `blocked` либо заведённая чужим автором, в очередь не
+        // попадает вовсе — доживает до C2 на сдаче фазы. Отказ ДО мерджа при этом
+        // гарантирован по-прежнему, но итерации фазы успевают сгореть: для AFK-прогона
+        // это потерянная ночь ради ошибки, видной на старте.
+        //
+        // Читаем ПОЛНЫЙ список (`listAllOpenIssues`) и ровно один раз за прогон. В цикл
+        // эту проверку тащить нельзя: там она удвоила бы чтение очереди на КАЖДОЙ
+        // итерации ради ответа, который меняется раз в жизнь фазы.
+        //
+        // `excludeHumanIssues` зовём ЯВНО, хотя боевой шов уже обёрнут фильтром: обёртка —
+        // деталь сборки реестра, а барьер обязан стоять здесь независимо от того, кто и чем
+        // обернул шов сегодня. Двойной прогон фильтра идемпотентен.
+        //
+        // Отказ ЧТЕНИЯ — предупреждение, а не стоп, и это осознанный размен. Жёсткий
+        // fail-closed на транзиентной помехе форжа стоил бы целой ночи AFK, а цена пропуска
+        // — только ранний диагноз: C2 на сдаче остаётся вторым эшелоном и по-прежнему не
+        // пускает двусмысленную карточку в main.
+        if (state.milestone) {
+            let phaseIssues: Issue[] | null = null;
+            try {
+                phaseIssues = allOpenIssuesFn(state.milestone);
+            } catch (e) {
+                logFn(
+                    `⚠ Не смог прочитать карточки фазы "${state.milestone}" (${(e as Error).message}) — ` +
+                        `ранняя проверка конфликта 'human'+'complexity:*' пропущена; барьер сдачи (C2) остаётся.`,
+                );
+            }
+            if (phaseIssues) excludeHumanIssues(phaseIssues, failFn);
         }
 
         logFn(
