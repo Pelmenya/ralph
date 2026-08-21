@@ -17,6 +17,7 @@ import { resolve } from 'node:path';
 // @ts-expect-error — JS-entry раннера без деклараций типов (тот же приём, что в
 // orchestrator.test.ts, #366): дефолт ralph.js — ре-экспорт runtime фабрики.
 import ralph from '../ralph.js';
+import { LADDER_CARD_MARKER } from '../core/review-of-fixes.ts';
 import type { RalphConfig } from '../core/orchestrator.ts';
 import type { RalphState } from '../core/state-lock.ts';
 import { normalizeReviewOfFixes } from '../core/review-of-fixes.ts';
@@ -113,6 +114,15 @@ function runPhase({
     // шов, которым петля считает очередь фазы: потолок вехи считается её содержимым, а не
     // числом, которое тест мог бы подсунуть мимо форжа.
     backlogCounts = {} as Record<string, number>,
+    // #18: карточки, которые УЖЕ лежат в вехе, целиком — с заголовком и датой. Счётчиком
+    // (`backlogCounts`) срок годности не проверить: он синтезирует безымянные карточки,
+    // а чистка отличает свою косметику от чужой карточки именно по заголовку.
+    backlogIssues = {} as Record<
+        string,
+        Array<{ number: number; title: string; createdAt?: string; body?: string }>
+    >,
+    // Часы прогона — параметром: иначе тест на срок годности недетерминирован.
+    now = Date.parse('2026-08-21T00:00:00Z'),
 } = {}) {
     const prompts: string[] = [];
     const logs: string[] = [];
@@ -125,6 +135,8 @@ function runPhase({
     }> = [];
     const journal: Array<{ pass: number; counts: Record<string, number>; pr: number | null }> = [];
     const saved: RalphState[] = [];
+    const closedIssues: number[] = [];
+    const issueComments: Array<{ issue: number; body: string }> = [];
     const addBlockedLabelFn = vi.fn();
     const pushEventFn = vi.fn();
     const syncProjectBoardFn = vi.fn();
@@ -152,18 +164,40 @@ function runPhase({
                 saved.push(JSON.parse(JSON.stringify(st)) as RalphState);
             },
             openIssuesFn: () => [],
-            allOpenIssuesFn: (milestone: string) =>
-                Array.from({ length: backlogCounts[milestone] ?? 0 }, (_, i) => ({
+            allOpenIssuesFn: (milestone: string) => {
+                const explicit = backlogIssues[milestone];
+                if (explicit) {
+                    return explicit
+                        .filter((i) => !closedIssues.includes(i.number))
+                        .map((i) => ({ labels: [], author: { login: 'owner' }, ...i }));
+                }
+                return Array.from({ length: backlogCounts[milestone] ?? 0 }, (_, i) => ({
                     number: 900 + i,
                     title: 'уже лежит',
                     labels: [],
                     author: { login: 'owner' },
-                })),
+                }));
+            },
+            nowFn: () => now,
+            closeIssueFn: (issue: number) => {
+                closedIssues.push(issue);
+            },
+            commentOnIssueFn: (issue: number, body: string) => {
+                issueComments.push({ issue, body });
+            },
             hasAnyIssuesFn: () => true,
             findOpenPrFn: () => ({ number: PR, labels: [] }),
             createPrFn: () => PR,
             phasePrBodyFn: () => 'тело PR',
-            getIssueFn: (number: number) => ({ number, title: 'задача', body: 'тело' }),
+            getIssueFn: (number: number) => {
+                // #18: чистка спрашивает тело, чтобы увидеть маркер лестницы. Отдаём то,
+                // что положил тест: подменять его «телом вообще» значило бы, что маркер
+                // в сценарии не проверяется вовсе.
+                const card = Object.values(backlogIssues)
+                    .flat()
+                    .find((i) => i.number === number);
+                return { number, title: card?.title ?? 'задача', body: card?.body ?? 'тело' };
+            },
             prCommentsFn: () => [],
             phaseIndexOfFn: () => (idxCalls++ === 0 ? 0 : 99),
             pickModelFn: () => 'claude-coder',
@@ -256,6 +290,8 @@ function runPhase({
         addBlockedLabelFn,
         pushEventFn,
         syncProjectBoardFn,
+        closedIssues,
+        issueComments,
         ladder: () => normalizeReviewOfFixes(state.reviewOfFixes),
         // Снимки состояния в порядке сохранения — по ним видно, что уехало на диск ДО
         // получения вердикта арбитра (#115-ревью, blocker 2).
@@ -460,6 +496,138 @@ describe('крит. 2: поток новых minor/nit не продлевает
 
         expect(s.issues.map((i) => i.milestone)).toEqual(['Бэклог 1', 'Бэклог 1']);
         expect(s.merged()).toBe(true);
+    });
+
+    // ── Срок годности карточек лестницы (#18) ───────────────────────────────────────
+    //
+    // Здесь тоже проверяется ПРИМЕНЕНИЕ: арифметика порога закрыта юнит-тестами
+    // `staleLadderCards`, и они останутся зелёными, даже если петля перестанет её звать.
+    // Механизм МУТИРУЕТ чужие карточки, поэтому сценарии считают именно мутации.
+
+    const DAY = 24 * 60 * 60 * 1000;
+    const NOW = Date.parse('2026-08-21T00:00:00Z');
+    const oldCard = (number: number, days: number) => ({
+        number,
+        title: `Ревью правок: пробел в ${String(number)}`,
+        createdAt: new Date(NOW - days * DAY).toISOString(),
+        // Маркер — в теле: заголовок набирается руками, и по нему одному чистка закрыла бы
+        // карточку человека (ревью).
+        body: `текст замечания\n\n${LADDER_CARD_MARKER}`,
+    });
+    const staleCfg = (staleDays?: number) =>
+        cfg({
+            review: {
+                ...cfg().review,
+                backlogMilestone: ['Бэклог 1', 'Бэклог 2'],
+                ...(staleDays === undefined ? {} : { backlogStaleDays: staleDays }),
+            },
+        });
+
+    it('порог не задан — ни одной мутации, сколько бы карточка ни лежала', () => {
+        const s = runPhase({
+            backlogIssues: { 'Бэклог 1': [oldCard(901, 400)] },
+            passes: [{ findings: [nit('пробел', 1)] }],
+            config: staleCfg(),
+            now: NOW,
+        });
+
+        expect(s.closedIssues).toEqual([]);
+        expect(s.issueComments).toEqual([]);
+    });
+
+    it('старше порога — закрывается, и в карточке остаётся ПРИЧИНА', () => {
+        const s = runPhase({
+            backlogIssues: { 'Бэклог 1': [oldCard(901, 40), oldCard(902, 5)] },
+            passes: [{ findings: [nit('пробел', 1)] }],
+            config: staleCfg(30),
+            now: NOW,
+        });
+
+        expect(s.closedIssues).toEqual([901]);
+        expect(s.issueComments.map((c) => c.issue)).toEqual([901]);
+        expect(s.issueComments[0]?.body).toMatch(/протухш/i);
+        expect(s.issueComments[0]?.body).toMatch(/30/);
+        expect(s.logs.join('\n')).toMatch(/#901/);
+    });
+
+    it('заголовок наш, а маркера в теле нет — карточка не трогается', () => {
+        // Ровно случай из ревью: человек завёл в вехе карточку с таким же заголовком.
+        // Заголовок — предфильтр, решает маркер, которого руками не набирают.
+        const impostor = {
+            number: 901,
+            title: 'Ревью правок: проверить миграцию',
+            createdAt: new Date(NOW - 400 * DAY).toISOString(),
+            body: 'завёл человек, маркера тут нет',
+        };
+        const s = runPhase({
+            backlogIssues: { 'Бэклог 1': [impostor] },
+            passes: [{ findings: [nit('пробел', 1)] }],
+            config: staleCfg(30),
+            now: NOW,
+        });
+
+        expect(s.closedIssues).toEqual([]);
+        expect(s.logs.join('\n')).toMatch(/без маркера/);
+    });
+
+    it('чужая карточка и карточка спора в той же вехе не трогаются', () => {
+        const s = runPhase({
+            backlogIssues: {
+                'Бэклог 1': [
+                    {
+                        number: 901,
+                        title: 'Настроить бэкапы',
+                        createdAt: new Date(NOW - 400 * DAY).toISOString(),
+                    },
+                    {
+                        number: 902,
+                        title: 'Спор ревью и правок: кто прав',
+                        createdAt: new Date(NOW - 400 * DAY).toISOString(),
+                    },
+                    oldCard(903, 400),
+                ],
+            },
+            passes: [{ findings: [nit('пробел', 1)] }],
+            config: staleCfg(30),
+            now: NOW,
+        });
+
+        expect(s.closedIssues).toEqual([903]);
+    });
+
+    it('--dry-run не закрывает ничего: до чистки дело не доходит вовсе (C1)', () => {
+        const s = runPhase({
+            backlogIssues: { 'Бэклог 1': [oldCard(901, 40)] },
+            passes: [{ findings: [nit('пробел', 1)] }],
+            config: staleCfg(30),
+            dryRun: true,
+            now: NOW,
+        });
+
+        expect(s.closedIssues).toEqual([]);
+        expect(s.issueComments).toEqual([]);
+        // Первый эшелон C1 — сама лестница: в dry она не заводит карточку и потому не
+        // ищет адрес, а чистка живёт внутри поиска адреса. Второй эшелон (guard в самой
+        // чистке) стоит на месте и сегодня недостижим — это осознанно, ровно как у
+        // соседнего `fileBacklogCard`: полагаться на «сюда всё равно не дойдёт» вместо
+        // явного guard'а и есть тихий дефолт.
+        expect(s.logs.join('\n')).toMatch(/DRY: карточка/);
+    });
+
+    it('чистка освобождает место: веха у потолка снова годится под адрес', () => {
+        // Ровно ради этого срок годности и заводился: пять протухших карточек иначе
+        // закрывали бы веху навсегда, и новая косметика ехала бы мимо неё.
+        const s = runPhase({
+            backlogIssues: {
+                'Бэклог 1': [901, 902, 903, 904, 905].map((n) => oldCard(n, 40)),
+            },
+            passes: [{ findings: [nit('пробел', 1)] }],
+            config: staleCfg(30),
+            now: NOW,
+        });
+
+        expect(s.closedIssues).toEqual([901, 902, 903, 904, 905]);
+        expect(s.issues.map((i) => i.milestone)).toEqual(['Бэклог 1']);
     });
 
     it('веха добита до потолка — остаток уезжает в следующую номерную, а не поверх', () => {

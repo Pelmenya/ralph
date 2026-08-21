@@ -58,6 +58,7 @@ type ScIssue = {
     title?: unknown;
     labels?: unknown;
     author?: { slug?: unknown } | null;
+    created_at?: unknown;
 };
 type ScPull = { slug?: unknown; labels?: unknown; status?: unknown };
 // Комментарий PR у площадки (`PullRequestComment` в OpenAPI). Взято ровно то, от чего
@@ -113,6 +114,10 @@ function mapIssue(raw: unknown): Issue {
         title: String(issue.title ?? ''),
         labels: mapLabels(issue.labels),
         author: { login: String(issue.author?.slug ?? '') },
+        // #18: дата заведения — как отдаёт площадка (`created_at`, RFC3339). Пустую
+        // строку не подставляем: «даты нет» и «дата такая-то» — разные ответы, и чистка
+        // обязана видеть первое как «не знаю», а не как «эпоха».
+        ...(issue.created_at ? { createdAt: String(issue.created_at) } : {}),
     };
 }
 

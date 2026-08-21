@@ -77,7 +77,9 @@ import type { TSessionRequest } from './session-requests.ts';
 import {
     backlogIssueFor,
     BACKLOG_MILESTONE_CAP,
+    LADDER_CARD_MARKER,
     pickBacklogMilestone,
+    staleLadderCards,
     type BacklogTarget,
     classifyFixReview,
     countsOf,
@@ -279,6 +281,9 @@ export type RalphConfig = {
         // следующую номерную. Дефолт — BACKLOG_MILESTONE_CAP: фаза = один PR, и размер
         // очереди прямо задаёт размер диффа. Заданный — положительное целое, иначе стоп.
         backlogMilestoneCap?: number;
+        // #18: сколько дней карточка лестницы живёт, прежде чем чистка закроет её как
+        // протухшую. Не задан — чистки нет вовсе.
+        backlogStaleDays?: number;
     };
     reviewModel?: string;
     authorAllowlist: string[];
@@ -419,7 +424,7 @@ export type RalphConfig = {
     };
 };
 
-// Issue в форме `gh issue list --json number,title,labels,author`.
+// Issue в форме `gh issue list --json number,title,labels,author,createdAt`.
 type Issue = {
     number: number;
     title: string;
@@ -1725,7 +1730,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         let raw: Issue[];
         try {
             raw = ghJsonFn<Issue[]>(
-                `gh issue list --milestone ${shq(milestone)} --state open --json number,title,labels,author --limit ${String(ISSUE_LIST_LIMIT)}`,
+                `gh issue list --milestone ${shq(milestone)} --state open --json number,title,labels,author,createdAt --limit ${String(ISSUE_LIST_LIMIT)}`,
             );
             // Проверяем СЫРОЙ ответ, до фильтров: урезание случилось у форжа, и после
             // отсева blocked/чужих оно уже неотличимо от «столько и было».
@@ -1764,7 +1769,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
     ): Issue[] {
         // #10: без `excludeHumanIssues` — фильтр стоит в ядре поверх шва, см. openIssues.
         const issues = ghJsonFn<Issue[]>(
-            `gh issue list --milestone ${shq(milestone)} --state open --json number,title,labels,author --limit ${String(ISSUE_LIST_LIMIT)}`,
+            `gh issue list --milestone ${shq(milestone)} --state open --json number,title,labels,author,createdAt --limit ${String(ISSUE_LIST_LIMIT)}`,
         );
         // #19: именно на пустоте ЭТОГО списка стоит разрешение мерджа (C2). Урезанный
         // ответ, отданный как полный, сдаёт фазу с незакрытой работой — молча.
@@ -3994,6 +3999,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
             labels: readonly string[];
             milestone?: string;
         }) => number | null;
+        closeIssueFn?: (issue: number) => void;
+        commentOnIssueFn?: (issue: number, body: string) => void;
+        nowFn?: () => number;
         recordFixReviewFindingsFn?: (
             phase: Phase,
             prNumber: number | null,
@@ -4085,6 +4093,14 @@ export function createOrchestrator(env: OrchestratorEnv) {
             // #625: см. RunLoopDeps — база диффа правок, карточки петли, журнал прохода.
             branchHeadShaFn = (branch: string) => branchHeadSha(branch),
             createIssueFn = adapters.taskSource.createIssue,
+            // #18: чистка протухшей косметики — МУТАЦИЯ чужих карточек, поэтому оба
+            // примитива идут через шов и оба с DI: тест обязан уметь посчитать, сколько
+            // раз петля тронула трекер, не трогая настоящий форж.
+            closeIssueFn = adapters.taskSource.closeIssue,
+            commentOnIssueFn = adapters.taskSource.commentOnIssue,
+            // Время — параметр, а не `Date.now()` в теле: иначе тест на срок годности
+            // недетерминирован (правило `tests/CLAUDE.md`).
+            nowFn = () => Date.now(),
             recordFixReviewFindingsFn = recordFixReviewFindings as (
                 phase: Phase,
                 prNumber: number | null,
@@ -4817,9 +4833,89 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     // «такой вехи нет») петлю не роняет: null означает «не сосчитали», и
                     // такой кандидат ПРОПУСКАЕТСЯ — иначе одно неотвеченное чтение
                     // обходило бы потолок, а карточка уезжала бы в веху, которой нет.
+                    // #18: срок годности карточек лестницы. Порог не задан — чистки нет
+                    // вовсе; это выключатель, а не дефолт: механизм ЗАКРЫВАЕТ чужие
+                    // карточки, и тихо включённым он быть не имеет права.
+                    const staleDays = cfg.review?.backlogStaleDays;
+                    // Предел мутаций за прогон — тот же по смыслу, что предел намерений
+                    // ревью: баг в пороге не должен успеть смести веху целиком. Число
+                    // равно потолку вехи: больше, чем в неё влезает, чистить не за чем.
+                    let staleBudget = backlogCap;
+                    const sweepStale = (milestone: string, issues: Issue[]): Issue[] => {
+                        if (!staleDays || staleBudget <= 0) return issues;
+                        const doomed = staleLadderCards({
+                            issues,
+                            now: nowFn(),
+                            staleDays,
+                            limit: staleBudget,
+                        });
+                        if (doomed.length === 0) return issues;
+                        // C1 (инвариант №8): --dry-run строго read-only. Второй эшелон:
+                        // сегодня сюда в dry не доходит вовсе — лестница не заводит
+                        // карточку и потому не ищет адрес, — но полагаться на «сюда всё
+                        // равно не дойдёт» вместо явного guard'а и есть тихий дефолт
+                        // (та же причина, что у соседнего fileBacklogCard).
+                        if (dry) {
+                            logFn(
+                                `💤 DRY: протухшая косметика в вехе «${milestone}» не закрывается: ` +
+                                    doomed.map((n) => `#${String(n)}`).join(', '),
+                            );
+                            return issues;
+                        }
+                        const closed = new Set<number>();
+                        for (const issue of doomed) {
+                            try {
+                                // Заголовок — предфильтр, а решает МАРКЕР в теле: его
+                                // набрать руками нельзя, а заголовок можно (ревью). Тело
+                                // читаем только у кандидатов, переживших порог, — их
+                                // единицы, и лишний запрос платится не за каждую карточку
+                                // вехи. Отказ чтения означает «не знаю» и трактуется как
+                                // «не трогать»: молча закрыть чужое дороже, чем пропустить
+                                // своё.
+                                const body = String(getIssueFn(issue).body ?? '');
+                                if (!body.includes(LADDER_CARD_MARKER)) {
+                                    logFn(
+                                        `↩︎ #${String(issue)}: карточка без маркера лестницы — ` +
+                                            'не наша либо заведена до появления маркера, не трогаю.',
+                                    );
+                                    continue;
+                                }
+                                // Причина ОБЯЗАТЕЛЬНА и идёт первой: закрытие без следа
+                                // неотличимо от потери находки.
+                                commentOnIssueFn(
+                                    issue,
+                                    `Закрыта как протухшая: карточка ревью правок пролежала дольше ` +
+                                        `${String(staleDays)} дней. Код с тех пор ушёл вперёд, и замечание ` +
+                                        `относится уже к другому коду — держать его открытым значит копить ` +
+                                        `свалку с адресом. Замечание осталось верным — переоткрой карточку.`,
+                                );
+                                closeIssueFn(issue);
+                                closed.add(issue);
+                                staleBudget -= 1;
+                            } catch (e) {
+                                // Чистка — уборка, а не решение о мердже: её отказ не
+                                // имеет права остановить сдачу фазы (fail-open, как
+                                // заведение карточки).
+                                logFn(
+                                    `⚠ Не смог закрыть протухшую карточку #${String(issue)} ` +
+                                        `(не критично): ${String((e as Error).message).split('\n')[0]}`,
+                                );
+                            }
+                        }
+                        if (closed.size > 0) {
+                            logFn(
+                                `🧹 Веха «${milestone}»: закрыто как протухшее — ` +
+                                    [...closed].map((n) => `#${String(n)}`).join(', '),
+                            );
+                        }
+                        return issues.filter((i) => !closed.has(i.number));
+                    };
                     const countBacklogOpen = (milestone: string): number | null => {
                         try {
-                            return allOpenIssuesFn(milestone).length;
+                            // Чистим ДО подсчёта: веха, добитая до потолка протухшей
+                            // косметикой, иначе осталась бы непригодной навсегда — а
+                            // именно ради неё срок годности и заводился.
+                            return sweepStale(milestone, allOpenIssuesFn(milestone)).length;
                         } catch {
                             return null;
                         }

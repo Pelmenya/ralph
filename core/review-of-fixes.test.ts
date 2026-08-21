@@ -3,6 +3,8 @@
 // сценарии через настоящий runLoop — в tests/review-of-fixes-scenarios.test.ts.
 import { describe, expect, it } from 'vitest';
 import {
+    BACKLOG_TITLE_PREFIX,
+    DISPUTE_TITLE_PREFIX,
     SEVERITY_LEVELS,
     backlogIssueFor,
     classifyFixReview,
@@ -10,6 +12,7 @@ import {
     decideAfterFixReview,
     emptyReviewOfFixes,
     findingKey,
+    staleLadderCards,
     FIX_REVIEW_MAX_DISPUTES,
     FIX_REVIEW_MAX_PASSES,
     isBlockingSeverity,
@@ -478,5 +481,54 @@ describe('pickBacklogMilestone — адрес накопительной вех�
             }),
         ).toEqual({ milestone: 'Бэклог 2', index: 1, count: 3 });
         expect(asked).toEqual(['Бэклог 2']);
+    });
+});
+
+describe('срок годности карточек лестницы (#18)', () => {
+    const DAY = 24 * 60 * 60 * 1000;
+    const now = Date.parse('2026-08-21T00:00:00Z');
+    const card = (over: Record<string, unknown> = {}) => ({
+        number: 1,
+        title: `${BACKLOG_TITLE_PREFIX}потерянный пробел`,
+        createdAt: new Date(now - 40 * DAY).toISOString(),
+        ...over,
+    });
+
+    it('выключатель: порог не задан — ни одной карточки на закрытие', () => {
+        expect(staleLadderCards({ issues: [card()], now, staleDays: undefined })).toEqual([]);
+        expect(staleLadderCards({ issues: [card()], now, staleDays: 0 })).toEqual([]);
+    });
+
+    it('старше порога — на закрытие, моложе — нет', () => {
+        expect(staleLadderCards({ issues: [card()], now, staleDays: 30 })).toEqual([1]);
+        const fresh = card({ number: 2, createdAt: new Date(now - 5 * DAY).toISOString() });
+        expect(staleLadderCards({ issues: [fresh], now, staleDays: 30 })).toEqual([]);
+    });
+
+    it('ровно порог не закрывается — граница принадлежит карточке', () => {
+        const edge = card({ createdAt: new Date(now - 30 * DAY).toISOString() });
+        expect(staleLadderCards({ issues: [edge], now, staleDays: 30 })).toEqual([]);
+    });
+
+    it('чужая карточка в той же вехе не трогается — заголовок не наш', () => {
+        const human = card({ number: 3, title: 'Настроить бэкапы Postgres' });
+        expect(staleLadderCards({ issues: [human], now, staleDays: 30 })).toEqual([]);
+    });
+
+    it('карточка СПОРА не трогается никогда — её решает человек, а не срок', () => {
+        const dispute = card({ number: 4, title: `${DISPUTE_TITLE_PREFIX}кто прав` });
+        expect(staleLadderCards({ issues: [dispute], now, staleDays: 30 })).toEqual([]);
+    });
+
+    it('карточка без даты не трогается: «не знаю возраст» — не повод закрывать', () => {
+        const undated = card({ number: 5, createdAt: undefined });
+        expect(staleLadderCards({ issues: [undated], now, staleDays: 30 })).toEqual([]);
+        const broken = card({ number: 6, createdAt: 'позавчера' });
+        expect(staleLadderCards({ issues: [broken], now, staleDays: 30 })).toEqual([]);
+    });
+
+    it('предел за прогон: больше названного числа карточек за раз не закрываем', () => {
+        const many = Array.from({ length: 10 }, (_, i) => card({ number: i + 1 }));
+        expect(staleLadderCards({ issues: many, now, staleDays: 30, limit: 3 })).toEqual([1, 2, 3]);
     });
 });
