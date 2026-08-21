@@ -6,7 +6,9 @@
 // не по связи, а по явному намерению автора PR — строке «Закрывает #N».
 import { describe, expect, it, vi } from 'vitest';
 import {
+    COMMENT_PAGES_MAX,
     closeMergedIssues,
+    collectComments,
     closesFromDescription,
     parseRemote,
     prNumberFromCommit,
@@ -309,5 +311,54 @@ describe('второй круг ревью: разделитель и метка
             logFn: vi.fn(),
         };
         expect(closeMergedIssues(d)).toEqual([17]);
+    });
+});
+
+describe('обход ленты комментариев', () => {
+    const page = (bodies: string[], next = '') => ({
+        issue_comments: bodies.map((body) => ({ body })),
+        ...(next ? { next_page_token: next } : {}),
+    });
+
+    it('собирает ВСЕ страницы, а не первую', () => {
+        const pages = [page(['a'], 'p2'), page(['b'], 'p3'), page(['c'])];
+        let i = 0;
+        expect(collectComments(() => pages[i++])).toEqual(['a', 'b', 'c']);
+    });
+
+    it('токен уходит в запрос следующей страницы', () => {
+        const queries: string[] = [];
+        const pages = [page(['a'], 'p2'), page(['b'])];
+        let i = 0;
+        collectComments((q) => {
+            queries.push(q);
+            return pages[i++];
+        });
+        expect(queries[0]).not.toContain('page_token');
+        expect(queries[1]).toContain('page_token=p2');
+    });
+
+    it('ОТКАЗ на повторе любого виденного токена, а не только соседнего', () => {
+        // Цикл A → B → A: соседи различаются, а обход не сходится.
+        const pages = [page(['a'], 'A'), page(['b'], 'B'), page(['c'], 'A')];
+        let i = 0;
+        expect(() => collectComments(() => pages[i++])).toThrow(/уже виденный page_token/);
+    });
+
+    it('ОТКАЗ при упоре в предел: собранное не выдаётся за полную ленту', () => {
+        // Токены всё время новые — повтор не срабатывает, обход упирается в предел.
+        let n = 0;
+        expect(() =>
+            collectComments(() => {
+                n += 1;
+                return page([`c${String(n)}`], `p${String(n)}`);
+            }),
+        ).toThrow(/не сошёлся за/);
+        expect(n).toBe(COMMENT_PAGES_MAX);
+    });
+
+    it('пустой ответ и отсутствие ленты — не отказ, а пустая лента', () => {
+        expect(collectComments(() => null)).toEqual([]);
+        expect(collectComments(() => ({}))).toEqual([]);
     });
 });

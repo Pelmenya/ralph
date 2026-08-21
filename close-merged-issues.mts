@@ -43,7 +43,51 @@ const RESOLVED_STATUSES = new Set(['closed', 'declined', 'duplicate']);
 const AUTO_CLOSE_MARKER = '<!-- ralph:auto-closed -->';
 
 /** Предел обхода ленты комментариев: страниц по 100, больше — уже не лента, а сбой. */
-const COMMENT_PAGES_MAX = 20;
+export const COMMENT_PAGES_MAX = 20;
+
+/**
+ * Обход ленты комментариев по страницам — fail-closed на любой неполноте.
+ *
+ * Первая версия молча возвращала собранное: цикл `A → B → A` дочитывался до предела, а
+ * последняя страница терялась ВСЕГДА (выход из `for` возвращал накопленное как полный
+ * ответ). Ревью назвало цену: маркер прошлого прогона мог оказаться ровно в потерянном
+ * хвосте, и механизм написал бы причину второй раз — то есть заявленная идемпотентность
+ * держалась бы на «комментариев мало».
+ *
+ * Неполнота — ОТКАЗ, а не половина данных: вызывающий трактует его как «не знаю» и
+ * пишет причину заново. Дубль комментария дешевле, чем тихое враньё о полноте, но врать
+ * при этом не надо — отказ виден в логе.
+ *
+ * Повтор ЛЮБОГО ранее виденного токена, а не только соседнего: сервер, гоняющий по кругу
+ * из трёх страниц, обходом не сходится точно так же.
+ */
+export function collectComments(fetchPage: (query: string) => unknown): string[] {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    let token = '';
+    for (let page = 0; page < COMMENT_PAGES_MAX; page += 1) {
+        const query = `?page_size=100${token ? `&page_token=${encodeURIComponent(token)}` : ''}`;
+        const res = fetchPage(query) as Record<string, unknown> | null;
+        const list = res?.['issue_comments'];
+        if (Array.isArray(list))
+            out.push(...list.map((c) => String((c as { body?: unknown }).body ?? '')));
+        const next = String(res?.['next_page_token'] ?? '');
+        // Пустой токен — сервер сказал «больше нет»: единственный штатный конец обхода.
+        if (!next) return out;
+        if (seen.has(next)) {
+            throw new Error(
+                `обход ленты комментариев получил уже виденный page_token на странице ${String(page + 1)} — ` +
+                    'сервер отвечает не по спеке, сколько комментариев осталось за кадром, неизвестно.',
+            );
+        }
+        seen.add(next);
+        token = next;
+    }
+    throw new Error(
+        `обход ленты комментариев не сошёлся за ${String(COMMENT_PAGES_MAX)} страниц — ` +
+            'считать собранное полной лентой нельзя.',
+    );
+}
 
 // Начало строки: маркеры списка, цитаты и жирный шрифт пропускаем, слово — первое.
 // `\b` тут не годится: он ASCII-only, и после кириллического «закрывает» границы
@@ -258,24 +302,11 @@ function main(): void {
         // мог уехать за её край, и тогда причина написалась бы второй раз (ревью).
         // Обход ограничен: зациклившийся сервер не должен вешать задачу CI, а «не всё
         // прочитали» здесь стоит дубля комментария, а не потери карточки.
-        issueComments: (issue) => {
-            const out: string[] = [];
-            let token = '';
-            for (let page = 0; page < COMMENT_PAGES_MAX; page += 1) {
-                const query = `?page_size=100${token ? `&page_token=${encodeURIComponent(token)}` : ''}`;
-                const res = api(
-                    'GET',
-                    `${base}/issues/${String(issue)}/comments${query}`,
-                ) as Record<string, unknown> | null;
-                const list = res?.['issue_comments'];
-                if (Array.isArray(list))
-                    out.push(...list.map((c) => String((c as { body?: unknown }).body ?? '')));
-                const next = String(res?.['next_page_token'] ?? '');
-                if (!next || next === token) return out;
-                token = next;
-            }
-            return out;
-        },
+        // Лента читается ПО СТРАНИЦАМ и fail-closed на неполноте — см. collectComments.
+        issueComments: (issue) =>
+            collectComments((query) =>
+                api('GET', `${base}/issues/${String(issue)}/comments${query}`),
+            ),
         issueLabels: (issue) => {
             const res = api('GET', `${base}/issues/${String(issue)}`) as Record<
                 string,
