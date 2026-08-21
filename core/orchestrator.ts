@@ -177,10 +177,33 @@ const SESSIONS_DIR = path.join(CLAUDE_DIR, 'ralph', 'sessions');
 // #40: файл-запрос кодер-сессии (JSONL намерений). Гитигнорен, как ralph.log/state:
 // это канал одной итерации, а не история — применённое стирается сразу.
 const REQUESTS_PATH = path.join(CLAUDE_DIR, 'ralph', 'ralph.requests.jsonl');
-// #37: предел выборки карточек фазы для чтения меток. Не «сколько влезет», а граница, за
-// которой ответ перестаёт быть доказательством: упёршись в неё, milestoneLabels отказывает,
-// а не отдаёт неполный список (см. её докблок).
-const MILESTONE_LABELS_LIMIT = 200;
+// Предел выборки карточек фазы — ОДИН на все три вопроса к форжу (очередь, полный список,
+// метки). Не «сколько влезет», а граница, за которой ответ перестаёт быть доказательством:
+// упёршись в неё, функция отказывает, а не отдаёт неполный список.
+//
+// #19: раньше предел стоял только у чтения меток, а очередь и полный список шли БЕЗ
+// `--limit` — то есть на дефолте `gh`, который равен 30. «Полный список открытых карточек
+// фазы» полным не был, и урезание было молчаливым: ответ на 31-й карточке выглядит ровно
+// так же, как исчерпывающий. На этом ответе стоит разрешение мерджа (C2) и ранняя проверка
+// конфликта меток (#17) — оба барьера слепли синхронно. У SourceCraft этой дыры нет:
+// её `listIssues` идёт через `pageThrough`, который обходит страницы и сам отказывает.
+const ISSUE_LIST_LIMIT = 200;
+
+/**
+ * Отказ вместо неполного ответа. Отличить «ровно предел карточек и есть» от «нам отдали
+ * первую страницу» нечем, поэтому равенство трактуется как урезание: тихая полнота здесь
+ * хуже честного отказа. Фаза из 200 карточек — сама по себе повод разобраться (правило
+ * «не более 5 карточек в вехе, отдаваемой фазой»).
+ */
+function assertNotTruncated(count: number, milestone: string, what: string): void {
+    if (count >= ISSUE_LIST_LIMIT) {
+        throw new Error(
+            `${what} фазы «${milestone}»: вернулось не меньше предела выборки ` +
+                `(${String(ISSUE_LIST_LIMIT)}) — считать ответ полным нельзя, часть карточек ` +
+                'могла остаться за пределом. Разбери веху на несколько или подними предел осознанно.',
+        );
+    }
+}
 
 // ── Типы контрактов ──────────────────────────────────────────────────────────
 // Фаза в форме, которую хранит config.phases.
@@ -1695,16 +1718,22 @@ export function createOrchestrator(env: OrchestratorEnv) {
      *   Чужие issues не исполняем; они остаются открытыми и сознательно блокируют сдачу
      *   фазы до триажа человеком — fail-closed вместо молчаливого игнора.
      */
-    function openIssues(milestone: string): Issue[] {
+    function openIssues(
+        milestone: string,
+        { ghJsonFn = ghJson, failFn = fail }: { ghJsonFn?: typeof ghJson; failFn?: FailFn } = {},
+    ): Issue[] {
         let raw: Issue[];
         try {
-            raw = ghJson<Issue[]>(
-                `gh issue list --milestone ${shq(milestone)} --state open --json number,title,labels,author`,
+            raw = ghJsonFn<Issue[]>(
+                `gh issue list --milestone ${shq(milestone)} --state open --json number,title,labels,author --limit ${String(ISSUE_LIST_LIMIT)}`,
             );
+            // Проверяем СЫРОЙ ответ, до фильтров: урезание случилось у форжа, и после
+            // отсева blocked/чужих оно уже неотличимо от «столько и было».
+            assertNotTruncated(raw.length, milestone, 'Очередь карточек');
         } catch (e) {
-            return fail(
+            return failFn(
                 `gh issue list упал (после ретраев): ${(e as Error).message}\nПроверь: gh auth status, milestone "${milestone}" существует.`,
-            );
+            ) as unknown as Issue[];
         }
         // #10: `human` здесь БОЛЬШЕ НЕ фильтруется. Фильтр переехал в ядро, поверх шва
         // (`withHumanFilter`): пока он жил тут, площадка со своим адаптером шла мимо
@@ -1729,11 +1758,18 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // НЕ пробрасывается вызывающему: его дефолтный failFn — `fail`, т.е. process.exit(1),
     // так что процесс гаснет на месте (fail-closed на двусмысленности замысла), а не через
     // исключение, которое вызывающий обязан перехватить.
-    function allOpenIssues(milestone: string): Issue[] {
+    function allOpenIssues(
+        milestone: string,
+        { ghJsonFn = ghJson }: { ghJsonFn?: typeof ghJson } = {},
+    ): Issue[] {
         // #10: без `excludeHumanIssues` — фильтр стоит в ядре поверх шва, см. openIssues.
-        return ghJson<Issue[]>(
-            `gh issue list --milestone ${shq(milestone)} --state open --json number,title,labels,author`,
+        const issues = ghJsonFn<Issue[]>(
+            `gh issue list --milestone ${shq(milestone)} --state open --json number,title,labels,author --limit ${String(ISSUE_LIST_LIMIT)}`,
         );
+        // #19: именно на пустоте ЭТОГО списка стоит разрешение мерджа (C2). Урезанный
+        // ответ, отданный как полный, сдаёт фазу с незакрытой работой — молча.
+        assertNotTruncated(issues.length, milestone, 'Полный список карточек');
+        return issues;
     }
 
     // C5 (#39): были ли у фазы задачи ВООБЩЕ — `--state all`, то есть вместе с закрытыми.
@@ -1763,18 +1799,13 @@ export function createOrchestrator(env: OrchestratorEnv) {
         { ghJsonFn = ghJson }: { ghJsonFn?: typeof ghJson } = {},
     ): string[] {
         const issues = ghJsonFn<Array<{ labels?: Array<{ name?: string }> }>>(
-            `gh issue list --milestone ${shq(milestone)} --state all --json labels --limit ${String(MILESTONE_LABELS_LIMIT)}`,
+            `gh issue list --milestone ${shq(milestone)} --state all --json labels --limit ${String(ISSUE_LIST_LIMIT)}`,
         );
         // Ответ, упёршийся в предел, — это «часть карточек мы не видели», и отдать его как
         // полный значит пропустить эскалацию МОЛЧА: вызывающий не отличит «сложных задач
         // нет» от «до них не дочитали». Поэтому отказ — вызывающий трактует его как зону
         // риска и усиливает ревью. Фаза из 200 карточек — сама по себе повод разобраться.
-        if (issues.length >= MILESTONE_LABELS_LIMIT) {
-            throw new Error(
-                `Карточек фазы «${milestone}» не меньше лимита выборки (${String(MILESTONE_LABELS_LIMIT)}) — ` +
-                    'полный список меток не гарантирован, считать его исчерпывающим нельзя.',
-            );
-        }
+        assertNotTruncated(issues.length, milestone, 'Метки карточек');
         return issues.flatMap((i) =>
             (i.labels ?? []).map((l) => String(l.name ?? '')).filter((n) => n !== ''),
         );
@@ -6581,8 +6612,11 @@ export function createOrchestrator(env: OrchestratorEnv) {
         chooseLogPath,
         sideEffectAttempts,
         closeMilestoneByTitle,
-        // #39: у соседних openIssues/allOpenIssues DI-хука на чтение gh нет, у этой —
-        // есть, поэтому контрактный сьют проверяет её боевой, а не фейком.
+        // #19: у ЭТИХ ДВУХ DI-хук на чтение gh появился вместе с пределом выборки —
+        // раньше их нельзя было проверить иначе как через runLoop, и предел проверять
+        // было нечем. Теперь контрактный сьют берёт их боевыми, как соседей ниже.
+        openIssues,
+        allOpenIssues,
         hasAnyIssues,
         milestoneLabels,
         // #37: и у этой — свой DI-хук на чтение gh, поэтому контракт проверяет её боевой.
