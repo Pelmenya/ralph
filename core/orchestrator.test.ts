@@ -2908,6 +2908,75 @@ describe('runClaude — #611: решение о повторе по структ
     });
 });
 
+describe('выборка карточек фазы не урезается молча (#19)', () => {
+    // `gh issue list` без `--limit` отдаёт первые 30 и выглядит при этом как полная
+    // выборка. На пустоте этого ответа стоит и разрешение мерджа (C2), и ранняя проверка
+    // конфликта меток (#17) — оба барьера слепли бы синхронно и молча.
+    const issue = (number: number) => ({
+        number,
+        title: `карточка ${String(number)}`,
+        labels: [],
+        author: { login: 'owner' },
+    });
+    const many = (n: number) => Array.from({ length: n }, (_, i) => issue(i + 1));
+    const LIMIT = 200;
+
+    it('обе выборки просят предел явно, а не полагаются на дефолт форжа', () => {
+        const commands: string[] = [];
+        const ghJsonFn = ((cmd: string) => {
+            commands.push(cmd);
+            return [];
+        }) as never;
+        ralph.openIssues('M1', { ghJsonFn, failFn: () => undefined });
+        ralph.allOpenIssues('M1', { ghJsonFn });
+        expect(commands).toHaveLength(2);
+        for (const cmd of commands) expect(cmd).toContain(`--limit ${String(LIMIT)}`);
+    });
+
+    it('полный список ровно в предел → отказ, а не молчаливая полнота (C2)', () => {
+        const ghJsonFn = (() => many(LIMIT)) as never;
+        expect(() => ralph.allOpenIssues('M1', { ghJsonFn })).toThrow(/предел|полным нельзя/i);
+    });
+
+    it('очередь ровно в предел → тот же отказ, и считается СЫРОЙ ответ, до фильтров', () => {
+        // Все карточки blocked: после фильтра очередь пуста, и если бы предел проверялся
+        // после отсева, урезание выглядело бы как «работы нет».
+        const blocked = many(LIMIT).map((i) => ({ ...i, labels: [{ name: 'blocked' }] }));
+        const ghJsonFn = (() => blocked) as never;
+        const reasons: string[] = [];
+        ralph.openIssues('M1', {
+            ghJsonFn,
+            failFn: (msg: string) => {
+                reasons.push(msg);
+                return undefined;
+            },
+        });
+        expect(reasons.join('\n')).toMatch(/предел/i);
+    });
+
+    it('ответ короче предела проходит — барьер не мешает обычной фазе', () => {
+        const ghJsonFn = (() => many(LIMIT - 1)) as never;
+        expect(ralph.allOpenIssues('M1', { ghJsonFn })).toHaveLength(LIMIT - 1);
+        // У очереди длину не сверяем: она ещё отсеивает чужих авторов по
+        // `config.authorAllowlist`, и в юните этот список свой. Проверяем то, что
+        // относится к барьеру, — что отказа не было вовсе.
+        const reasons: string[] = [];
+        ralph.openIssues('M1', {
+            ghJsonFn,
+            failFn: (msg: string) => {
+                reasons.push(msg);
+                return undefined;
+            },
+        });
+        expect(reasons).toEqual([]);
+    });
+
+    it('метки карточек фазы держат тот же предел — вопрос другой, граница одна', () => {
+        const ghJsonFn = (() => many(LIMIT).map(() => ({ labels: [{ name: 'x' }] }))) as never;
+        expect(() => ralph.milestoneLabels('M1', { ghJsonFn })).toThrow(/предел/i);
+    });
+});
+
 describe('preflight — валидация конфига/среды и подготовка контекста (#99)', () => {
     // preflight принимает cfg и зависимости с побочками (sh/fail/log/загрузка state/
     // свип milestones/проверка мерджа) параметрами — как ensureTunnel. Инжектируем их,

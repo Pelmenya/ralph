@@ -397,6 +397,48 @@ describe('пагинация: страница ≠ вся очередь', () =>
         // фильтр: «фаза готова», пока хвост очереди не прочитан.
         expect(adapter.listAllOpenIssues(MILESTONE).map((i) => i.number)).toEqual([1, 2]);
     });
+
+    // #19: у обхода страниц ДВА способа не сойтись, и оба до сих пор были только в коде —
+    // ни один не сторожил тест. Обрыв выборки здесь стоит дороже, чем кажется: неполная
+    // очередь читается петлёй как «фаза готова» (C2), то есть молчаливое урезание сдаёт
+    // фазу с незакрытой работой. У GitHub-реализации та же дыра закрыта пределом
+    // `--limit` и отказом на равенстве (core/orchestrator.ts) — свойство одно на обе.
+    it('НЕГАТИВНЫЙ: сервер повторил page_token → отказ, а не собранная половина', () => {
+        const { adapter } = build({
+            milestones: [milestone(MILESTONE, MILESTONE_SLUG)],
+            issuePages: [
+                { issues: [issue(1)], next_page_token: 'p2' },
+                // Последняя страница фейка отдаётся снова и снова — ровно так выглядит
+                // зациклившийся сервер: тот же токен на второй и третьей итерации.
+                { issues: [issue(2)], next_page_token: 'p3' },
+            ],
+        });
+        expect(() => adapter.listAllOpenIssues(MILESTONE)).toThrow(/ТОТ ЖЕ page_token/);
+    });
+
+    it('НЕГАТИВНЫЙ: обход не сошёлся за предел страниц → отказ, а не обрыв выборки', () => {
+        // Токен каждый раз НОВЫЙ — повторение не срабатывает, и выборка упирается уже
+        // в предел числа страниц. Второй способ оборваться, и он тоже обязан быть громким.
+        const calls: string[] = [];
+        let page = 0;
+        const api = ((method: string, path: string) => {
+            calls.push(`${method} ${path}`);
+            if (path.includes('/milestones?'))
+                return { items: [milestone(MILESTONE, MILESTONE_SLUG)] };
+            if (path.includes('/issues?')) {
+                page += 1;
+                return { issues: [issue(page)], next_page_token: `p${String(page)}` };
+            }
+            return {};
+        }) as SourcecraftApi;
+        const adapter = createSourcecraftTaskSource({
+            api,
+            org: ORG,
+            repo: REPO,
+            authorAllowlist: () => ['owner'],
+        });
+        expect(() => adapter.listAllOpenIssues(MILESTONE)).toThrow(/не сошёлся за/);
+    });
 });
 
 describe('пагинация: неизвестность отличается от конца данных (#43)', () => {
