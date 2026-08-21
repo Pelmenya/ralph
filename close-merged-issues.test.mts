@@ -345,6 +345,19 @@ describe('обход ленты комментариев', () => {
         expect(() => collectComments(() => pages[i++])).toThrow(/уже виденный page_token/);
     });
 
+    it('ровно предел страниц, где последняя без токена — штатный конец, не отказ', () => {
+        // Граница: обход обязан пройти ровно `COMMENT_PAGES_MAX` страниц и вернуть всё.
+        let n = 0;
+        const bodies = collectComments(() => {
+            n += 1;
+            return n < COMMENT_PAGES_MAX
+                ? page([`c${String(n)}`], `p${String(n)}`)
+                : page([`c${String(n)}`]);
+        });
+        expect(n).toBe(COMMENT_PAGES_MAX);
+        expect(bodies).toHaveLength(COMMENT_PAGES_MAX);
+    });
+
     it('ОТКАЗ при упоре в предел: собранное не выдаётся за полную ленту', () => {
         // Токены всё время новые — повтор не срабатывает, обход упирается в предел.
         let n = 0;
@@ -357,8 +370,18 @@ describe('обход ленты комментариев', () => {
         expect(n).toBe(COMMENT_PAGES_MAX);
     });
 
-    it('пустой ответ и отсутствие ленты — не отказ, а пустая лента', () => {
-        expect(collectComments(() => null)).toEqual([]);
-        expect(collectComments(() => ({}))).toEqual([]);
+    it('пустая лента ЖИВОЙ формы проходит: массив есть, он пуст', () => {
+        // Ровно то, чем отвечает площадка на карточке без комментариев (проверено curl'ом).
+        expect(collectComments(() => ({ issue_comments: [], next_page_token: '' }))).toEqual([]);
+    });
+
+    it('ОТКАЗ на испорченном конверте: пустота и мусор — не «комментариев нет»', () => {
+        // Иначе испорченный ответ молча превращается в «маркера нет» и даёт дубль
+        // причины без единой строки в логе (ревью).
+        expect(() => collectComments(() => null)).toThrow(/неожиданной форме/);
+        expect(() => collectComments(() => ({}))).toThrow(/неожиданной форме/);
+        expect(() => collectComments(() => ({ issue_comments: 'нет' }))).toThrow(
+            /неожиданной форме/,
+        );
     });
 });
