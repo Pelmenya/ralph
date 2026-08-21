@@ -1623,6 +1623,52 @@ export function createOrchestrator(env: OrchestratorEnv) {
     }
 
     /**
+     * Шов задач, у которого обе очереди уже очищены от `human` (#10).
+     *
+     * Фильтр живёт ЗДЕСЬ, в ядре поверх шва, а не в реализациях. Раньше он стоял внутри
+     * `openIssues`/`allOpenIssues` — двух функций на `gh issue list`, — и площадка со
+     * своим адаптером шла мимо него: тот фильтровал `blocked` и автора, а `human` нет.
+     * Копия фильтра в каждом адаптере разъедется ровно так же, как разъехалась эта.
+     *
+     * Цена промаха несимметрична и потому неочевидна. У фильтра ДВЕ работы, и вторая
+     * важнее: он применяется и к очереди, и к проверке сдачи фазы (C2). Карточка `human`
+     * внутри фазы держала сдачу открытой, а её собственный критерий наступает ПОСЛЕ
+     * мерджа этой же фазы — замкнутый круг, в котором фаза не сдаётся ни при каком числе
+     * итераций.
+     *
+     * Обёртка, а не фильтр по месту вызова: вызывающих у очереди трое, и «забыл в одном»
+     * это ровно тот тихий дефолт, что уже стоил нам #14. Здесь забыть структурно негде.
+     *
+     * ДВА следствия переезда, оба осознанные:
+     *
+     * 1. Конфликт `human`+`complexity:*` теперь вскрывается ПОЗЖЕ. Раньше фильтр стоял
+     *    до отсева `blocked`/чужих авторов и ронял петлю на первом же чтении очереди;
+     *    теперь шов отдаёт уже отсеянное, и конфликтная карточка, помеченная `blocked`
+     *    или чужая, доживает до сдачи фазы — там её ловит C2 (`listAllOpenIssues` внутри
+     *    адаптеров не фильтрует ничего). Отказ ДО мерджа по-прежнему гарантирован, но
+     *    итерации фазы успевают сгореть. Ранняя проверка на старте — #17.
+     * 2. Реализация шва обязана быть ПЛОСКИМ объектом: спред копирует только собственные
+     *    перечислимые свойства, и у класса с методами на прототипе обёртка вернула бы
+     *    объект с двумя методами вместо полного шва. Обе сегодняшние реализации — литералы
+     *    из фабрик: createGithubTaskSource (adapters/adapters-impl.ts) и
+     *    createSourcecraftTaskSource (adapters/sourcecraft-task-source.ts); что это так и
+     *    осталось, сторожит тест по обоим ЭТИМ файлам. Прочие швы через спред не ходят,
+     *    их форма здесь не ограничивается.
+     */
+    function withHumanFilter(
+        seam: TaskSourceAdapter,
+        failFn: (msg: string) => unknown = fail,
+    ): TaskSourceAdapter {
+        return {
+            ...seam,
+            listReadyIssues: (milestone: string) =>
+                excludeHumanIssues(seam.listReadyIssues(milestone), failFn),
+            listAllOpenIssues: (milestone: string) =>
+                excludeHumanIssues(seam.listAllOpenIssues(milestone), failFn),
+        };
+    }
+
+    /**
      * Рабочая очередь фазы: открытые issues МИНУС human МИНУС blocked МИНУС чужие авторы.
      *
      * - human (#410): задача человека, раннер её не исполняет (см. excludeHumanIssues).
@@ -1646,11 +1692,13 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 `gh issue list упал (после ретраев): ${(e as Error).message}\nПроверь: gh auth status, milestone "${milestone}" существует.`,
             );
         }
-        // excludeHumanIssues — ВНЕ try/catch: его failFn (конфликт human+complexity) не
-        // должен маскироваться под «gh issue list упал».
+        // #10: `human` здесь БОЛЬШЕ НЕ фильтруется. Фильтр переехал в ядро, поверх шва
+        // (`withHumanFilter`): пока он жил тут, площадка со своим адаптером шла мимо
+        // него — её очередь фильтровала `blocked` и автора, а `human` нет. Копия правила
+        // в каждой реализации разъезжается; одна общая — нет.
         const allow = config.authorAllowlist;
         return (
-            excludeHumanIssues(raw)
+            raw
                 .filter((i) => !(i.labels || []).some((l) => l.name === 'blocked'))
                 .filter((i) => allow.includes((i.author && i.author.login) as string))
                 // gh отдаёт новые-первыми; порядок работы — по возрастанию номера (порядок задач в плане)
@@ -1668,10 +1716,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // так что процесс гаснет на месте (fail-closed на двусмысленности замысла), а не через
     // исключение, которое вызывающий обязан перехватить.
     function allOpenIssues(milestone: string): Issue[] {
-        return excludeHumanIssues(
-            ghJson<Issue[]>(
-                `gh issue list --milestone ${shq(milestone)} --state open --json number,title,labels,author`,
-            ),
+        // #10: без `excludeHumanIssues` — фильтр стоит в ядре поверх шва, см. openIssues.
+        return ghJson<Issue[]>(
+            `gh issue list --milestone ${shq(milestone)} --state open --json number,title,labels,author`,
         );
     }
 
@@ -2958,6 +3005,25 @@ export function createOrchestrator(env: OrchestratorEnv) {
         if (!dirtyNow) return true;
         try {
             shArgvFn('git', ['add', '-A']);
+            // #12: спрашиваем ИНДЕКС, а не полагаемся на код возврата `git commit`.
+            // Между `git status` выше и коммитом ниже стоит `git add -A`, и он способен
+            // сам устранить «грязь»: порченый индекс показывает весь репозиторий как
+            // удалённый (` D` на каждом файле), хотя на диске всё совпадает с HEAD.
+            // Тогда `git commit` честно отдаёт 1 «nothing to commit», прежний код читал
+            // это как «работу спасти не удалось» и ОСТАНАВЛИВАЛ цикл — при чистом дереве
+            // и без единого потерянного файла (поймано живьём, ~627 файлов с ` D`).
+            //
+            // Стоп — самая дорогая реакция в системе, она превращает AFK в HITL. Тратить
+            // её на «всё в порядке, терять нечего» хуже, чем не иметь стопа: человек
+            // перестаёт верить стопам вообще.
+            const staged = shFn('git diff --cached --name-only');
+            if (!staged.trim()) {
+                logFn(
+                    `✓ Остаток сессии (${context}) исчез сам: после git add -A в индексе пусто — ` +
+                        `дерево совпадает с HEAD, терять нечего, цикл продолжается.\n${dirtyNow}`,
+                );
+                return true;
+            }
             shArgvFn('git', [
                 'commit',
                 '--no-verify',
@@ -3323,6 +3389,28 @@ export function createOrchestrator(env: OrchestratorEnv) {
         return { green: false, verifiedHead: null, redCheck };
     }
 
+    // Сборка набора швов + фильтр `human` поверх выбранного taskSource (#10). Отдельная
+    // функция, потому что мест сборки два (старт и пересборка после чтения конфига), и
+    // фильтр обязан быть в обоих: «применили в одном» — тот же класс дефекта, ради
+    // которого стоит барьер tests/seam-defaults.test.ts.
+    //
+    // Object.freeze контейнера — механизм, а не гигиена. Ревью !5 показало, что текстовый
+    // барьер канала обходится присваиванием ПОЛЯ (`adapters.taskSource = сырой шов` после
+    // санкционированной сборки): фильтр снят, весь сьют зелёный. Замороженный контейнер в
+    // strict mode роняет такую запись TypeError'ом на первом же исполнении — в том числе
+    // в main(), куда тесты не заходят. Текстовый скан канала остаётся вторым эшелоном:
+    // он красит обход ещё в сьюте, до запуска (tests/false-stop-scenarios.test.ts).
+    //
+    // Сам taskSource НЕ заморожен, и это осознанно: подмена его метода после сборки —
+    // легальный приём тестов (C4-тест доказывает ленивость DI-дефолтов, подменяя
+    // isPhaseMerged на живом наборе и возвращая его в finally), а запись
+    // `adapters.taskSource.метод = …` в ядре сторожит текстовый запрет цепочек там же,
+    // где и скан канала.
+    function buildRuntimeAdapters(): RalphAdapters {
+        const built = buildAdapters(adapterRegistries, adapterSelection, fail);
+        return Object.freeze({ ...built, taskSource: withHumanFilter(built.taskSource) });
+    }
+
     // Реестр доступных реализаций по швам. Ключи (github/npm/telegram/github-actions/claude)
     // фиксируют, ЧЬЯ реализация; выбор из них — resolveAdapterSelection по config.adapters.
     // Значения методов — те же боевые функции (сигнатуры адаптеров уже боевых, лишние опции
@@ -3421,7 +3509,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // main() пересоберёт с выбором из config.adapters (fail-closed). Здесь fail недостижим:
     // дефолтный выбор всегда указывает на зарегистрированные реализации.
     adapterSelection = resolveAdapterSelection(undefined, fail);
-    adapters = buildAdapters(adapterRegistries, adapterSelection, fail);
+    adapters = buildRuntimeAdapters();
 
     // ── State ────────────────────────────────────────────────────────────────
     // Схема: { count, milestone, submitted }.
@@ -6153,7 +6241,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // конфига). Дефолтная сборка выше дала рабочий набор для юнит-тестов; здесь — боевой
         // выбор. Свап реализации шва = правка config.adapters, не кода (переносимость #204).
         adapterSelection = resolveAdapterSelection(config.adapters, fail);
-        adapters = buildAdapters(adapterRegistries, adapterSelection, fail);
+        adapters = buildRuntimeAdapters();
         // Абсолютный путь конфига раннера фиксируем ДО любого chdir: прокинем его монитору,
         // чтобы панель читала ТОТ ЖЕ конфиг, что раннер (дерево человека), а не свою копию в
         // worktree на детач-коммите, которая могла отстать (#SiaT8).
@@ -6461,6 +6549,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // fail-closed на конфликте human+complexity).
         isHumanIssue,
         excludeHumanIssues,
+        withHumanFilter,
         pickModel,
         pickRuntime,
         coderRuntimeRunFor,

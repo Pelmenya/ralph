@@ -131,6 +131,25 @@ describe('stripComments — граница «код vs комментарий-п
         const bad = "const owner = 'AcmeCorp';\n";
         expect(SAMPLE.test(stripComments(bad))).toBe(true);
     });
+
+    it('blankStrings: проза в строковом литерале сканам КОНСТРУКЦИЙ не видна, код цел', () => {
+        // Сканы вида «запись в поле adapters» ловят синтаксис, а не значения, — и текст
+        // подсказки `adapters.coderRuntime='kimi'` для них ложная тревога (ревью !5).
+        const source = 'log("подсказка: adapters.coderRuntime=\'kimi\'");\nconst x = 1;\n';
+        const out = stripComments(source, { blankStrings: true });
+        expect(out).not.toContain('coderRuntime');
+        // Код вокруг литерала и сами кавычки остаются: границы строки видны, нумерация
+        // строк не съезжает.
+        expect(out).toContain('log("");');
+        expect(out).toContain('const x = 1;');
+    });
+
+    it('blankStrings по умолчанию выключен: строка остаётся кодом (контракт #367)', () => {
+        // Полярность у сканов разная: `core-purity` ищет проектные ЗНАЧЕНИЯ, и для него
+        // содержимое строки — код. Смена дефолта молча ослепила бы этот скан.
+        const bad = "const owner = 'AcmeCorp';\n";
+        expect(stripComments(bad)).toContain('AcmeCorp');
+    });
 });
 
 describe('набор сканируемых модулей ядра', () => {
