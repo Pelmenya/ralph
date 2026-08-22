@@ -872,3 +872,75 @@ describe('resolveProfile — раскладка корней (канон, зад
         expect(() => resolveProfile(withRoots('/path/to/app'), 'prod', boom)).toThrow(/roots/);
     });
 });
+
+describe('resolveProfile — скрипты потребителя (канон, задача 23)', () => {
+    const boom = (m: string) => {
+        throw new Error(m);
+    };
+    const withScripts = (consumerScripts: unknown) => ({
+        defaultProfile: 'prod',
+        common: { phases: [{ milestone: 'M', branch: 'b' }] },
+        profiles: {
+            prod: consumerScripts === undefined ? {} : { consumerScripts },
+        },
+    });
+    const LEGAL = {
+        projectSync: 'scripts/project-sync.mjs',
+        reviewFindingsJournal: 'scripts/review-findings-journal.mjs',
+    };
+
+    it('секции нет — старт не ломается: обе обёртки просто выключены', () => {
+        // Скрипты принадлежат потребителю, и у площадки, где доска — проекция статуса,
+        // синка нет вовсе. Требовать секцию значило бы навязать чужой файл каждому.
+        expect(resolveProfile(withScripts(undefined), 'prod', boom).profileName).toBe('prod');
+    });
+
+    it('законная секция доезжает до конфига целиком', () => {
+        expect(resolveProfile(withScripts(LEGAL), 'prod', boom).consumerScripts).toEqual(LEGAL);
+    });
+
+    it('задан только один скрипт — законно: второй выключен осознанно', () => {
+        const cfg = resolveProfile(withScripts({ projectSync: LEGAL.projectSync }), 'prod', boom);
+        expect(cfg.consumerScripts).toEqual({ projectSync: LEGAL.projectSync });
+    });
+
+    it('секция не объект — отказ, а не молчаливое игнорирование', () => {
+        expect(() => resolveProfile(withScripts('scripts/'), 'prod', boom)).toThrow(
+            /consumerScripts/,
+        );
+        expect(() => resolveProfile(withScripts([LEGAL.projectSync]), 'prod', boom)).toThrow(
+            /consumerScripts/,
+        );
+    });
+
+    it('пустая секция — отказ: выглядит заполненной, работает как отсутствующая', () => {
+        expect(() => resolveProfile(withScripts({}), 'prod', boom)).toThrow(/ни одного скрипта/);
+    });
+
+    it('незнакомый ключ — отказ, и он называет известные', () => {
+        // Опечатка в имени ключа — ровно тот отказ, который задача и чинила: ядро молча
+        // не звало бы скрипт, а лог сказал бы «выключен», хотя человек его задал.
+        expect(() =>
+            resolveProfile(withScripts({ ...LEGAL, projectSyncs: 'scripts/x.mjs' }), 'prod', boom),
+        ).toThrow(/projectSyncs/);
+        expect(() =>
+            resolveProfile(withScripts({ ...LEGAL, projectSyncs: 'scripts/x.mjs' }), 'prod', boom),
+        ).toThrow(/projectSync, reviewFindingsJournal/);
+    });
+
+    it('значение не строка или пустое — отказ с именем ключа', () => {
+        for (const bad of [42, null, '', '   ', ['a']]) {
+            expect(() => resolveProfile(withScripts({ projectSync: bad }), 'prod', boom)).toThrow(
+                /projectSync/,
+            );
+        }
+    });
+
+    it('путь, начинающийся с дефиса, — отказ: node прочтёт его как свой флаг', () => {
+        // `node --eval …` вместо `node <путь>`: аргумент уходит в argv первым, и всё, что
+        // начинается с дефиса, node разбирает как опцию — то есть исполняет не тот код.
+        expect(() =>
+            resolveProfile(withScripts({ projectSync: '--eval=console.log(1)' }), 'prod', boom),
+        ).toThrow(/дефис/);
+    });
+});

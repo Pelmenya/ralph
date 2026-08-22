@@ -48,6 +48,11 @@ export function isPlainObject(v: unknown): v is Record<string, unknown> {
 // повод остановиться, а не тихо нейтрализовать (fail-closed, как и вся схема профилей).
 const FORBIDDEN_KEYS = ['__proto__', 'constructor', 'prototype'];
 
+// Скрипты потребителя, которые умеет звать ядро (канон, задача 23). Список закрыт: он же
+// служит проверкой опечатки в имени ключа — незнакомый ключ валит старт, а не тихо
+// выключает скрипт.
+export const CONSUMER_SCRIPT_KEYS = ['projectSync', 'reviewFindingsJournal'] as const;
+
 // Скан ВСЕЙ глубины, а не только уровней, куда рекурсирует мердж: объект из профиля по
 // ключу, которого нет в common, копируется присваиванием — без этого обхода его нутро
 // не проверялось бы вовсе, и инвариант «в конфиге не бывает опасных ключей» был бы
@@ -491,6 +496,67 @@ export function createConfigProfile(env: ConfigProfileEnv) {
         }
     }
 
+    // Канон, задача 23: скрипты ПОТРЕБИТЕЛЯ, которые зовёт ядро (синк доски, журнал
+    // находок ревью). В каноне их нет вовсе, и раньше ядро звало их по зашитым путям —
+    // то есть молча требовало у каждого потребителя файл с таким именем в таком месте.
+    //
+    // Секция необязательна: у площадки, где доска — проекция статуса, синка нет вовсе, и
+    // «журнала не веду» — законный выбор. Но ЗАДАННАЯ секция проверяется целиком, потому
+    // что оба вызова fail-open: «файла нет» неотличимо от «прошло успешно», и опечатка в
+    // пути осталась бы видна только через месяц пустого журнала.
+    //
+    // Отдельно про опечатку в ИМЕНИ ключа: `projectSyncs` вместо `projectSync` — тот же
+    // класс отказа, но подлее. Ядро скажет «синк выключен: ключа нет», человек прочтёт
+    // это как ошибку в конфиге ядра, а ключ у него в файле есть — глазами видно.
+    // Возврат: true — валиден; иначе результат failFn (мягкий failFn пробрасываем наверх).
+    function assertValidConsumerScripts(
+        cfg: Record<string, unknown>,
+        profileName: string,
+        failFn: FailFn = fail,
+    ): unknown {
+        const raw = cfg.consumerScripts;
+        if (raw === undefined) return true; // секции нет — обе обёртки выключены осознанно
+        const where = `ralph.config.json (профиль "${profileName}"): consumerScripts`;
+        if (!isPlainObject(raw)) {
+            return failFn(
+                `${where} — не объект (получено ${JSON.stringify(raw)}). Ожидались пути скриптов ` +
+                    `потребителя: { ${CONSUMER_SCRIPT_KEYS.join(', ')} } (канон, задача 23).`,
+            );
+        }
+        const keys = Object.keys(raw);
+        if (keys.length === 0) {
+            return failFn(
+                `${where} задан, но не содержит ни одного скрипта. Пустая секция выглядит ` +
+                    `настроенной, а работает как отсутствующая: убери её (обе обёртки выключены) ` +
+                    `либо задай путь — ${CONSUMER_SCRIPT_KEYS.join(' и/или ')}.`,
+            );
+        }
+        for (const key of keys) {
+            if (!(CONSUMER_SCRIPT_KEYS as readonly string[]).includes(key)) {
+                return failFn(
+                    `${where}.${key} — незнакомый ключ. Известные: ${CONSUMER_SCRIPT_KEYS.join(', ')}. ` +
+                        `Опечатка в имени ключа тихо выключила бы скрипт: ядро сказало бы «выключен, ключа нет», ` +
+                        `а ключ в файле есть.`,
+                );
+            }
+            const value = raw[key];
+            if (typeof value !== 'string' || value.trim() === '') {
+                return failFn(
+                    `${where}.${key} = ${JSON.stringify(value)} — ожидался непустой путь к скрипту. ` +
+                        `Вызов fail-open: мусор здесь означал бы «скрипт молча не отработал», а не отказ.`,
+                );
+            }
+            if (value.trim().startsWith('-')) {
+                return failFn(
+                    `${where}.${key} = ${JSON.stringify(value)} — путь начинается с дефиса. ` +
+                        `Ядро зовёт скрипт как \`node <путь>\`, и всё, что начинается с дефиса, node разбирает ` +
+                        `как СВОЮ опцию (\`--eval\` и подобные) — исполнилось бы не то, что задумано.`,
+                );
+            }
+        }
+        return true;
+    }
+
     function resolveProfile(raw: unknown, name: unknown, failFn: FailFn = fail): unknown {
         if (!isPlainObject(raw)) return failFn('ralph.config.json: ожидался JSON-объект.');
         if (!isPlainObject(raw.common)) {
@@ -551,6 +617,10 @@ export function createConfigProfile(env: ConfigProfileEnv) {
         // про форму, и осмысленна только на уже слитом конфиге.
         const promptOk = assertValidPromptPlaceholders(merged, wanted, failFn);
         if (promptOk !== true) return promptOk; // мягкий failFn — наверх как есть
+        // Канон, задача 23: пути скриптов потребителя — до раскладки корней: это ещё схема
+        // конфига, а корни лезут на диск.
+        const scriptsOk = assertValidConsumerScripts(merged, wanted, failFn);
+        if (scriptsOk !== true) return scriptsOk; // мягкий failFn — наверх как есть
         // Канон, задача 21: раскладка корней. Последней в ряду — она про место на диске,
         // и осмысленна только когда остальная схема уже признана целой.
         const rootsOk = assertValidRoots(merged, wanted, failFn);
@@ -565,6 +635,7 @@ export function createConfigProfile(env: ConfigProfileEnv) {
         assertValidModelRouting,
         assertValidPromptPlaceholders,
         assertValidBacklogMilestone,
+        assertValidConsumerScripts,
         assertValidRoots,
         resolveProfile,
     };
