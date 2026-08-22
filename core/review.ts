@@ -78,6 +78,10 @@ type ReviewConfig = {
 type ReviewCfg = {
     review?: ReviewConfig;
     reviewModel?: string;
+    // Скрипты ПОТРЕБИТЕЛЯ, которые зовёт ядро. Путь приходит из конфига, а не зашит в код:
+    // в каноне этих файлов нет вовсе, и раньше ядро молча требовало, чтобы у потребителя
+    // лежал файл с таким именем в таком месте (канон, задача 23).
+    consumerScripts?: { projectSync?: string; reviewFindingsJournal?: string };
 };
 
 // Фаза в форме, которую хранит config.phases: recordReviewFindings берёт из неё milestone.
@@ -446,15 +450,19 @@ export function createReviewModule(env: ReviewEnv) {
                     `в ленте: ${seen}) — счёт будет нулевым. Похоже, allowlist задан в терминах другого форжа.`,
             );
         }
+        const journal = getConfig().consumerScripts?.reviewFindingsJournal;
+        if (!journal) {
+            // Молчать нельзя: журнал находок — метрика, по которой судят о ревью, и её
+            // отсутствие обязано быть ВИДНЫМ решением, а не следствием того, что файла нет.
+            logFn(
+                '📊 Журнал находок выключен: в конфиге нет consumerScripts.reviewFindingsJournal.',
+            );
+            return;
+        }
         try {
             const out = runArgvFn(
                 'node',
-                [
-                    'scripts/review-findings-journal.mjs',
-                    String(prNumber),
-                    phase.milestone,
-                    ...authors,
-                ],
+                [journal, String(prNumber), phase.milestone, ...authors],
                 { input: JSON.stringify(comments) },
             );
             logFn(`📊 Находки ревью зафиксированы в журнале: ${String(out).trim()}`);
@@ -484,9 +492,16 @@ export function createReviewModule(env: ReviewEnv) {
             logFn('⚠ Журнал находок (ревью правок): номер PR неизвестен, запись пропущена.');
             return;
         }
+        const journal = getConfig().consumerScripts?.reviewFindingsJournal;
+        if (!journal) {
+            logFn(
+                '📊 Журнал находок выключен: в конфиге нет consumerScripts.reviewFindingsJournal.',
+            );
+            return;
+        }
         try {
             const out = runArgvFn('node', [
-                'scripts/review-findings-journal.mjs',
+                journal,
                 String(prNumber),
                 phase.milestone,
                 `--counts=${JSON.stringify(counts)}`,

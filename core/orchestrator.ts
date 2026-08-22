@@ -269,6 +269,9 @@ export type RalphConfig = {
     // месте, где корень понадобится. `null` означает старую раскладку «всё в каталоге ядра»,
     // и это не то же самое, что «раскладка пустая».
     rootsResolved?: TResolvedRoots | null;
+    // Скрипты ПОТРЕБИТЕЛЯ, которые зовёт ядро: их нет в каноне, и путь к ним — часть
+    // контракта потребителя, а не зашитая строка (канон, задача 23).
+    consumerScripts?: { projectSync?: string; reviewFindingsJournal?: string };
     phases: Phase[];
     prompt?: string;
     model?: string;
@@ -3019,8 +3022,20 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // #252: сама мутация — через argv (shArgv), без значений извне (нет инъекции), но
     // направление единообразно с остальными мутациями раннера.
     function syncProjectBoard(runArgvFn: ShArgvFn = shArgv, logFn: LogFn = log): void {
+        // Путь скрипта — из конфига ПОТРЕБИТЕЛЯ (канон, задача 23). Раньше он был зашит
+        // строкой, то есть ядро молча требовало файл с таким именем у каждого, кто его
+        // подключит; у площадок, где доска — проекция статуса, синк не нужен вовсе, и
+        // «файла нет» выглядело точно так же, как «синк прошёл».
+        // `config?`, а не `config`: фабрику собирают и до main() (тесты, монитор), и тогда
+        // конфига ещё нет вовсе — обёртка, чья работа «не ронять прогон», обязана пережить
+        // и это.
+        const script = config?.consumerScripts?.projectSync;
+        if (!script) {
+            logFn('🗂 Синк доски выключен: в конфиге нет consumerScripts.projectSync.');
+            return;
+        }
         try {
-            const out = runArgvFn('node', ['scripts/project-sync.mjs']);
+            const out = runArgvFn('node', [script]);
             logFn(`🗂 ${String(out).trim().split('\n').pop()}`);
         } catch (e) {
             // String(e?.message ?? e), а не e.message: throw не-Error уронил бы TypeError

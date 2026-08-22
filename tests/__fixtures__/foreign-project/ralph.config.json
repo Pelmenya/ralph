@@ -5,7 +5,9 @@
         "maxIterations": 5,
         "maxTurns": 50,
         "claudeTimeoutMs": 1800000,
-        "authorAllowlist": ["orbital-bot"],
+        "authorAllowlist": [
+            "orbital-bot"
+        ],
         "model": "fixture-coder-model-default",
         "fallbackModel": "fixture-coder-model-default",
         "permissionMode": "fixture-permission-mode",
@@ -17,11 +19,25 @@
         },
         "gate": {
             "checks": [
-                ["format", "pnpm run format:check"],
-                ["build", "pnpm run build"],
-                ["test", "pnpm run test"]
+                [
+                    "format",
+                    "pnpm run format:check"
+                ],
+                [
+                    "build",
+                    "pnpm run build"
+                ],
+                [
+                    "test",
+                    "pnpm run test"
+                ]
             ],
-            "prodChecks": [["audit", "pnpm run audit"]],
+            "prodChecks": [
+                [
+                    "audit",
+                    "pnpm run audit"
+                ]
+            ],
             "prodDropChecks": []
         },
         "blockedHealAttempts": 1,
@@ -56,7 +72,9 @@
             "escalated": "claude-fable-5",
             "fallback": "claude-opus-4-8",
             "escalateOn": [],
-            "escalateOnPaths": ["infra/**"],
+            "escalateOnPaths": [
+                "infra/**"
+            ],
             "maxTurns": 20,
             "diffLimit": 10000
         },
@@ -73,7 +91,11 @@
                 "milestone": "Sputnik Tracker · Фаза 1: Каркас",
                 "branch": "feature/sputnik-phase-1-scaffold"
             }
-        ]
+        ],
+        "consumerScripts": {
+            "projectSync": "scripts/orbital-board-sync.mjs",
+            "reviewFindingsJournal": "scripts/orbital-findings.mjs"
+        }
     },
     "profiles": {
         "playground": {}

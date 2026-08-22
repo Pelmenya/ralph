@@ -23,9 +23,14 @@ import ralph from '../ralph.js';
 // функция под тестом дёрнет их без явного override — забытый override становится ошибкой
 // теста, а не тихим проходом через боевой gh/shell. Чистые коллабораторы (shq,
 // isPlainObject, matchRiskPaths, phaseDiffFiles, log, getConfig) — рабочие заглушки.
+// Путь журнала находок — из конфига потребителя (канон, задача 23): в каноне этого скрипта
+// нет, и ядро больше не требует его молча по зашитому имени. Тесты задают его так же, как
+// это делает потребитель, — а тот, кто журнал не ведёт, ключ просто не задаёт.
+const JOURNAL_SCRIPT = 'scripts/orbital-findings.mjs';
+
 function makeEnv(over: Partial<ReviewEnv> = {}): ReviewEnv {
     return {
-        getConfig: () => ({}),
+        getConfig: () => ({ consumerScripts: { reviewFindingsJournal: JOURNAL_SCRIPT } }),
         ghJson: () => {
             throw new Error('ghJson не подменён в тесте');
         },
@@ -390,7 +395,7 @@ describe('recordFixReviewFindings — журнальная запись прох
         expect(calls).toHaveLength(1);
         expect(calls[0].file).toBe('node');
         expect(calls[0].args).toEqual([
-            'scripts/review-findings-journal.mjs',
+            JOURNAL_SCRIPT,
             '42',
             'M1',
             `--counts=${JSON.stringify(COUNTS)}`,
@@ -506,7 +511,7 @@ describe('recordReviewFindings — best-effort вызов журнала нах�
         recordReviewFindings({ milestone: 'M1' }, 42, ['alice', 'bob']);
         expect(shArgv.mock.calls[0].slice(0, 2)).toEqual([
             'node',
-            ['scripts/review-findings-journal.mjs', '42', 'M1', 'alice', 'bob'],
+            [JOURNAL_SCRIPT, '42', 'M1', 'alice', 'bob'],
         ]);
     });
 
@@ -605,12 +610,7 @@ describe('recordReviewFindings — best-effort вызов журнала нах�
             makeEnv({ shArgv, prComments: () => COMMENTS }),
         );
         recordReviewFindings({ milestone: 'M1' }, 7, ['alice', '', '  ', 123, null] as unknown[]);
-        expect(shArgv.mock.calls[0][1]).toEqual([
-            'scripts/review-findings-journal.mjs',
-            '7',
-            'M1',
-            'alice',
-        ]);
+        expect(shArgv.mock.calls[0][1]).toEqual([JOURNAL_SCRIPT, '7', 'M1', 'alice']);
     });
 
     it('номер PR неизвестен (0 / не целое) → запись пропущена, журнал не зовётся', () => {

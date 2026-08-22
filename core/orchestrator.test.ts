@@ -8747,7 +8747,7 @@ describe('syncProjectBoard', () => {
             },
             (m: string) => logs.push(m),
         );
-        expect(argvCalls).toEqual([['node', ['scripts/project-sync.mjs']]]);
+        expect(argvCalls).toEqual([['node', [REAL_CONFIG.consumerScripts.projectSync]]]);
         expect(logs[0]).toContain('доска в порядке');
     });
 
