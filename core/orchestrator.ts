@@ -44,6 +44,7 @@ import { createExec, loadJson, chooseLogPath } from './exec.ts';
 import { createSourcecraftTaskSource } from '../adapters/sourcecraft-task-source.ts';
 import { createSourcecraftApi } from '../adapters/sourcecraft-api.ts';
 import { createConfigProfile, isPlainObject } from './config-profile.ts';
+import type { TConsumerScripts, TConsumerScriptsResolved } from './config-profile.ts';
 import { createStateLock } from './state-lock.ts';
 import type { RalphState } from './state-lock.ts';
 import { createTunnelCheck } from './tunnel-check.ts';
@@ -269,6 +270,12 @@ export type RalphConfig = {
     // месте, где корень понадобится. `null` означает старую раскладку «всё в каталоге ядра»,
     // и это не то же самое, что «раскладка пустая».
     rootsResolved?: TResolvedRoots | null;
+    // Скрипты ПОТРЕБИТЕЛЯ, которые зовёт ядро: их нет в каноне, и путь к ним — часть
+    // контракта потребителя, а не зашитая строка (канон, задача 23). `consumerScripts` —
+    // то, что написано в файле; исполняется РЕЗОЛВНУТОЕ, где относительный путь уже
+    // заякорен к `consumerRoot` (иначе база пути — «где случился chdir»).
+    consumerScripts?: TConsumerScripts;
+    consumerScriptsResolved?: TConsumerScriptsResolved | null;
     phases: Phase[];
     prompt?: string;
     model?: string;
@@ -358,11 +365,14 @@ export type RalphConfig = {
     runnerWorktreePath?: string;
     // #204 (фаза 4): проектная специфика, вынесенная из кода ядра в конфиг.
     // installCmd — команда установки зависимостей (дефолт `npm ci`); runnerWorktreeDirname —
-    // имя соседнего дерева раннера (дефолт — `<имя-репо>-ralph`); board — доска Projects
-    // для project-sync.mjs; gate — состав чеков (валидируется resolveGateChecks).
+    // имя соседнего дерева раннера (дефолт — `<имя-репо>-ralph`); gate — состав чеков
+    // (валидируется resolveGateChecks).
+    //
+    // Поля адресата доски здесь нет намеренно (канон, задача 23): доску настраивает скрипт
+    // потребителя, ядро о ней не знает вовсе. Объявленное, но никем не читаемое поле — это
+    // дока, которая врёт: она обещает, что ядро им распорядится.
     installCmd?: string;
     runnerWorktreeDirname?: string;
-    board?: { owner?: string; number?: number };
     gate?: { checks?: unknown; prodChecks?: unknown; prodDropChecks?: unknown };
     // #369 (фаза 5): выбор реализации каждого шва по ключу (форж/гейт/нотификатор/деплой/
     // рантайм). Опционально — отсутствующий шов берёт канон-дефолт (ADAPTER_DEFAULTS);
@@ -3019,8 +3029,20 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // #252: сама мутация — через argv (shArgv), без значений извне (нет инъекции), но
     // направление единообразно с остальными мутациями раннера.
     function syncProjectBoard(runArgvFn: ShArgvFn = shArgv, logFn: LogFn = log): void {
+        // Путь скрипта — из конфига ПОТРЕБИТЕЛЯ (канон, задача 23). Раньше он был зашит
+        // строкой, то есть ядро молча требовало файл с таким именем у каждого, кто его
+        // подключит; у площадок, где доска — проекция статуса, синк не нужен вовсе, и
+        // «файла нет» выглядело точно так же, как «синк прошёл».
+        // `config?`, а не `config`: фабрику собирают и до main() (тесты, монитор), и тогда
+        // конфига ещё нет вовсе — обёртка, чья работа «не ронять прогон», обязана пережить
+        // и это.
+        const script = config?.consumerScriptsResolved?.projectSync;
+        if (!script) {
+            logFn('🗂 Синк доски выключен: в конфиге нет consumerScripts.projectSync.');
+            return;
+        }
         try {
-            const out = runArgvFn('node', ['scripts/project-sync.mjs']);
+            const out = runArgvFn('node', [script]);
             logFn(`🗂 ${String(out).trim().split('\n').pop()}`);
         } catch (e) {
             // String(e?.message ?? e), а не e.message: throw не-Error уронил бы TypeError

@@ -11,10 +11,6 @@
         "permissionMode": "fixture-permission-mode",
         "installCmd": "pnpm install --frozen-lockfile",
         "runnerWorktreeDirname": "sputnik-tracker-ralph",
-        "board": {
-            "owner": "OrbitalLabs",
-            "number": 42
-        },
         "gate": {
             "checks": [
                 ["format", "pnpm run format:check"],
@@ -73,7 +69,11 @@
                 "milestone": "Sputnik Tracker · Фаза 1: Каркас",
                 "branch": "feature/sputnik-phase-1-scaffold"
             }
-        ]
+        ],
+        "consumerScripts": {
+            "projectSync": "scripts/orbital-board-sync.mjs",
+            "reviewFindingsJournal": "scripts/orbital-findings.mjs"
+        }
     },
     "profiles": {
         "playground": {}

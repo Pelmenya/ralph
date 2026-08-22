@@ -8747,8 +8747,34 @@ describe('syncProjectBoard', () => {
             },
             (m: string) => logs.push(m),
         );
-        expect(argvCalls).toEqual([['node', ['scripts/project-sync.mjs']]]);
+        expect(argvCalls).toEqual([['node', [REAL_CONFIG.consumerScriptsResolved.projectSync]]]);
         expect(logs[0]).toContain('доска в порядке');
+    });
+
+    it('путь синка не задан — шов ВЫКЛЮЧЕН вслух, а не тихо ничего не делает', () => {
+        // Канон, задача 23: скрипт принадлежит потребителю, и «его нет» обязано читаться в
+        // логе. Раньше путь был зашит строкой, вызов fail-open, и отсутствие файла выглядело
+        // ровно как успешный синк — доска могла расходиться неделями.
+        const logs: string[] = [];
+        const argvCalls: string[][] = [];
+        try {
+            ralph.setConfigForTests({
+                ...REAL_CONFIG,
+                consumerScriptsResolved: { projectSync: null, reviewFindingsJournal: null },
+            });
+            ralph.syncProjectBoard(
+                (file: string, args: string[]) => {
+                    argvCalls.push([file, ...args]);
+                    return '';
+                },
+                (m: string) => logs.push(m),
+            );
+        } finally {
+            ralph.setConfigForTests(REAL_CONFIG);
+        }
+        expect(argvCalls).toEqual([]);
+        expect(logs.join('\n')).toMatch(/выключен/i);
+        expect(logs.join('\n')).toContain('consumerScripts.projectSync');
     });
 
     it('не бросает, когда синк упал — фаза уже смерджена, ронять её нельзя', () => {

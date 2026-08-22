@@ -10,7 +10,7 @@
 import { describe, expect, it } from 'vitest';
 import { existsSync, readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { basename, join, resolve, sep } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import { denyNamePattern, traceFindings } from './project-traces.ts';
 // Стриппер комментариев — общий с `seam-defaults`: граница «код vs комментарий»
 // одна на все сканы, и чинить её надо в одном месте.
@@ -519,5 +519,158 @@ describe('промпт-контракт: ralph.md переносим, площа
         // Обратная сторона запретов: убрать площадочное мало — сессия обязана знать, где
         // его искать, иначе переносимость куплена ценой незнания.
         expect(readFileSync(join(CANON_ROOT, PROMPT), 'utf-8')).toMatch(/ralph\.project\.md/);
+    });
+});
+
+// ── Канон, задача 23: ядро не зовёт скриптов потребителя по зашитым путям ────
+// В каноне папки `scripts/` нет вовсе, а ядро звало `scripts/project-sync.mjs` и
+// `scripts/review-findings-journal.mjs` строкой — то есть молча требовало, чтобы у каждого
+// потребителя лежал файл с таким именем в таком месте. Отказ при этом был тихим: обе
+// обёртки fail-open, и «файла нет» выглядело ровно как «синк прошёл».
+describe('пути скриптов потребителя приходят из конфига, а не из кода', () => {
+    // Три формы одного дефекта — скан по одной пропускал бы остальные (второй проход !21).
+    // 1) литерал пути к исполняемому файлу ГДЕ УГОДНО в коде: вынесенная константа
+    //    (`const S = 'scripts/x.mjs'; runArgvFn('node', [S])`) — самая обычная форма.
+    //    Спецификатор импорта исключён (`from '…'`, `import('…')`): его резолвит рантайм
+    //    модулей, а не интерпретатор командой, и пакет с subpath-импортом
+    //    (`some-pkg/dist/index.js`) покрасил бы барьер сообщением про совсем другую
+    //    болезнь. URL исключён двоеточием в классе символов;
+    const SCRIPT_PATH = /(?<!from\s)(?<!import\()['"`]([^'"`\s:]*\/[^'"`\s]*\.[cm]?[jt]s)['"`]/g;
+    // 2) argv-форма — ловит и имя файла без папки (`['x.mjs']`), которое первый скан не
+    //    видит. Ведущий дефис исключён: `['--flag', script]` — опция node, а не путь;
+    const NODE_ARGV = /\(\s*['"`]node['"`]\s*,\s*\[\s*['"`](?!-)([^'"`]+)['"`]/g;
+    // 3) команда целиком (`sh('node scripts/x.mjs')`) — с любым префиксом и любыми флагами
+    //    перед путём: `cd … && node …`, `node --enable-source-maps …`. Требовать, чтобы
+    //    литерал начинался с `node ` (первый заход), значило потерять ровно те формы, в
+    //    которых зашитый путь и живёт. Строка лога, показывающая ту же команду человеку,
+    //    тоже находка, и это НЕ ложное срабатывание: ядро называет файл, которого у
+    //    потребителя может не быть, — тот же дефект, просто в другой одежде.
+    const NODE_CMD = /['"`][^'"`]*\bnode\s+[^'"`]*?([^'"`\s]+\.[cm]?[jt]s)\b/g;
+
+    /**
+     * Находки зашитых путей — чистая функция (как `forgeHits` выше и по той же причине:
+     * скан внутри `it.each` доказать нечем), и `existsInCanon` у неё ПАРАМЕТР.
+     *
+     * Критерий — не подстрока `scripts/`, а факт: путь ведёт к файлу, которого в каноне
+     * НЕТ, значит это файл потребителя, зашитый в продукт. Свои файлы канон адресует
+     * законно, и их тут больше всего — относительные импорты соседних модулей
+     * (`../shared/side-effect-guard.ts`) и пути в конфигах (`./tests/test-setup.ts`);
+     * запрещать их значило бы получить барьер, который отключат первым же исключением.
+     * Побочный эффект назван вслух: переименование модуля ядра без правки импортов
+     * покрасит и ЭТОТ тест — сообщением про скрипты потребителя, хотя болезнь другая.
+     * Глобы (со звёздочкой) — не пути к файлу и находкой не считаются.
+     */
+    function scriptPathHits(
+        code: string,
+        existsInCanon: (rel: string) => boolean,
+    ): Array<readonly [number, string]> {
+        const at = (index: number) => code.slice(0, index).split('\n').length;
+        return (
+            [...code.matchAll(SCRIPT_PATH), ...code.matchAll(NODE_ARGV), ...code.matchAll(NODE_CMD)]
+                .filter((m) => !m[1].includes('*') && !existsInCanon(m[1]))
+                .map((m) => [at(m.index), m[0].replace(/\s+/g, ' '), m[1]] as const)
+                // Дедуп по СТРОКЕ И ПУТИ, а не по тексту совпадения: один и тот же вызов ловят
+                // два скана разными кусками текста, и в отчёте о поломке он двоился бы.
+                .filter(([n, , p], i, arr) => arr.findIndex(([m, , q]) => m === n && q === p) === i)
+                .map(([n, text]) => [n, text] as const)
+                .sort((a, b) => a[0] - b[0])
+        );
+    }
+
+    // Опись канона: путь, которого здесь нет, ведёт наружу — к файлу потребителя. Считается
+    // от ДВУХ баз, потому что обе законны: от корня канона (пути в конфигах) и от каталога
+    // самого файла (импорты соседей, `../shared/...`).
+    const existsFor =
+        (rel: string) =>
+        (p: string): boolean => {
+            // База «от каталога файла» держится В ПРЕДЕЛАХ канона: `../../scripts/x.mjs`
+            // из подмодуля и абсолютный путь уводят наружу — в дерево потребителя, которое
+            // на машине автора есть, а на чистом клоне нет. Барьер, чей вердикт зависит от
+            // чужого дерева, зелен ровно там, где дефект и живёт (тот же класс сторожит
+            // outside-deps.test.ts).
+            const near = resolve(dirname(join(CANON_ROOT, rel)), p);
+            const inside = near === CANON_ROOT || near.startsWith(CANON_ROOT + sep);
+            return existsSync(join(CANON_ROOT, p)) || (inside && existsSync(near));
+        };
+    const existsInCanon = existsFor('core/orchestrator.ts');
+
+    it('скану есть что сканировать, и барьер краснеет на подсунутом пути', () => {
+        expect(CORE).toContain('core/orchestrator.ts');
+        expect(CORE).toContain('core/review.ts');
+        // Исходный инцидент задачи 23 — обязан краснеть в ЛЮБОЙ форме, а не только инлайном.
+        expect(
+            scriptPathHits("runArgvFn('node', ['scripts/project-sync.mjs'])", existsInCanon),
+        ).toEqual([[1, "'scripts/project-sync.mjs'"]]);
+        expect(
+            scriptPathHits(
+                "const S = 'scripts/project-sync.mjs';\nrunArgvFn('node', [S]);",
+                existsInCanon,
+            ),
+        ).not.toEqual([]);
+        expect(
+            scriptPathHits("runArgvFn('node', [join(root, 'scripts/x.mjs')])", existsInCanon),
+        ).not.toEqual([]);
+        // Класс, а не инцидент: другая папка — та же болезнь; имя без папки ловит argv-форма.
+        expect(
+            scriptPathHits("shArgv('node', ['tools/board-sync.mjs'])", existsInCanon),
+        ).not.toEqual([]);
+        expect(scriptPathHits("shArgv('node', ['journal.mjs'])", existsInCanon)).not.toEqual([]);
+        expect(scriptPathHits("sh('node bin/journal.mjs --counts')", existsInCanon)).not.toEqual(
+            [],
+        );
+        // Путь из конфига — законная форма, ради которой задача и делалась.
+        expect(scriptPathHits("runArgvFn('node', [script])", existsInCanon)).toEqual([]);
+        // Флаг интерпретатора — не путь: иначе барьер краснеет, объясняя не то.
+        expect(
+            scriptPathHits(
+                "runArgvFn('node', ['--experimental-strip-types', script])",
+                existsInCanon,
+            ),
+        ).toEqual([]);
+        // Показ команды человеку тоже находка, и это НЕ послабление барьера: ядро называет
+        // файл, которого у потребителя может не быть, — тот же зашитый контракт, просто в
+        // тексте лога. Ловить его дешевле, чем терять `cd … && node …` ради этого исключения.
+        expect(
+            scriptPathHits("logFn('Запусти вручную: node tools/x.mjs')", existsInCanon),
+        ).not.toEqual([]);
+        // Формы, которые первый заход барьера терял: префикс команды и флаг интерпретатора.
+        expect(scriptPathHits('sh(`cd ${wt} && node scripts/x.mjs`)', existsInCanon)).not.toEqual(
+            [],
+        );
+        expect(
+            scriptPathHits("sh('node --enable-source-maps scripts/x.mjs')", existsInCanon),
+        ).not.toEqual([]);
+        // Спецификатор импорта — не аргумент интерпретатора: его резолвит рантайм модулей.
+        expect(scriptPathHits("import x from 'some-pkg/dist/index.js';", existsInCanon)).toEqual(
+            [],
+        );
+        expect(scriptPathHits("const u = 'https://example.com/app.js';", existsInCanon)).toEqual(
+            [],
+        );
+        // Путь наружу канона — находка, даже если на ЭТОЙ машине файл есть: дерево
+        // потребителя рядом с подмодулем на чистом клоне отсутствует.
+        expect(
+            scriptPathHits("runArgvFn('node', ['../../scripts/x.mjs'])", existsInCanon),
+        ).not.toEqual([]);
+        // Имя поля конфига словом `scripts` барьер не трогает: запрещён ПУТЬ, а не слово.
+        expect(scriptPathHits('cfg.consumerScripts?.projectSync', existsInCanon)).toEqual([]);
+        // Свои файлы канон адресует законно — и это проверяется ПОДМЕНОЙ описи, а не верой
+        // в дерево: с описью, где файл есть, находки нет; с описью, где его нет, — есть.
+        const own = "path.join(dir, 'runtime/monitor.js')";
+        expect(scriptPathHits(own, (rel) => rel === 'runtime/monitor.js')).toEqual([]);
+        expect(scriptPathHits(own, () => false)).not.toEqual([]);
+    });
+
+    it.each(CORE)('%s — без зашитых путей к скриптам потребителя', (rel) => {
+        const hits = scriptPathHits(
+            stripComments(readFileSync(join(CANON_ROOT, rel), 'utf-8')),
+            existsFor(rel),
+        );
+        const detail = hits.map(([n, line]) => `\n  ${n}: ${line.trim()}`).join('');
+        expect(
+            hits,
+            `Зашитый путь скрипта в ${rel} — его место в ralph.config.json ` +
+                `(consumerScripts):${detail}`,
+        ).toEqual([]);
     });
 });

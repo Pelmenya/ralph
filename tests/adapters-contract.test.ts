@@ -35,6 +35,7 @@ import type {
     TaskSourceAdapter,
 } from '../adapters/adapters.ts';
 import {
+    BOARD_SYNC_TASK_SOURCES,
     createCoderRuntime,
     createGithubActionsDeploy,
     createGithubTaskSource,
@@ -1479,3 +1480,50 @@ registerCoderRuntimeContract(
     () => buildRealRuntime({ status: 2, stdout: '', stderr: 'boom' }),
     () => buildRealRuntime({ status: null, stdout: '', stderr: '', signal: 'SIGTERM' }),
 );
+
+// ── Канон, задача 23: реестр площадок с синком доски сверяется с реализациями ──────────
+// `BOARD_SYNC_TASK_SOURCES` решает, законен ли `consumerScripts.projectSync` в конфиге.
+// Список, отвязанный от реальности, врёт в обе стороны и молча: заменят проводку `syncBoard`
+// на no-op — реестр по-прежнему разрешит ключ, и скрипт перестанет зваться без единого
+// сигнала; появится площадка с настоящим синком, а реестр забудут — рабочий конфиг
+// отвергается сообщением, которое про этот адаптер неправда. Просьба в комментарии барьером
+// не является (правило №3), поэтому здесь тест.
+describe('реестр площадок с синком доски (канон, задача 23)', () => {
+    // Флейворы, чьё поведение здесь известно. Реестр сверяется С НИМ, а не с догадкой:
+    // имя, дописанное в BOARD_SYNC_TASK_SOURCES без реализации, роняет первый же тест.
+    const KNOWN_TASK_SOURCES = ['github', 'sourcecraft'] as const;
+
+    it('в реестре только известные площадки — дописанное имя без реализации краснеет', () => {
+        // Обратную сторону («новая площадка с настоящим синком, а реестр забыли») этот тест
+        // не ловит и ловить не может: имени у флейвора в контрактном сьюте нет. Ловит её
+        // ревью нового адаптера — там же, где решают, зовёт ли он скрипт потребителя.
+        for (const name of BOARD_SYNC_TASK_SOURCES) {
+            expect(
+                KNOWN_TASK_SOURCES,
+                `реестр называет площадку "${name}", которой тест не знает`,
+            ).toContain(name);
+        }
+    });
+
+    it('github в реестре — и его syncBoard ДОЕЗЖАЕТ до инжектированной функции', () => {
+        expect(BOARD_SYNC_TASK_SOURCES).toContain('github');
+        let called = 0;
+        // Проверяется ПРОВОДКА маппера, а не боевая обёртка: у неё своя ветка «путь не
+        // задан — выключено», и она сказала бы «не зовётся» о совершенно исправном шве.
+        // Остальные поля адаптеру этого теста не нужны — приведение сужает набор осознанно.
+        const fns = {
+            syncProjectBoard: () => {
+                called += 1;
+            },
+        } as unknown as Parameters<typeof createGithubTaskSource>[0];
+        createGithubTaskSource(fns).syncBoard();
+        expect(called).toBe(1);
+    });
+
+    it('sourcecraft НЕ в реестре — и его syncBoard действительно ничего не делает', () => {
+        expect(BOARD_SYNC_TASK_SOURCES).not.toContain('sourcecraft');
+        const { adapter, calls } = buildSourcecraftTaskSource();
+        adapter.syncBoard();
+        expect(calls).toEqual([]);
+    });
+});

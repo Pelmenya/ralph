@@ -23,9 +23,19 @@ import ralph from '../ralph.js';
 // функция под тестом дёрнет их без явного override — забытый override становится ошибкой
 // теста, а не тихим проходом через боевой gh/shell. Чистые коллабораторы (shq,
 // isPlainObject, matchRiskPaths, phaseDiffFiles, log, getConfig) — рабочие заглушки.
+// Путь журнала находок — из конфига потребителя (канон, задача 23): в каноне этого скрипта
+// нет, и ядро больше не требует его молча по зашитому имени. Тесты задают его так же, как
+// это делает потребитель, — а тот, кто журнал не ведёт, ключ просто не задаёт.
+const JOURNAL_SCRIPT = 'scripts/orbital-findings.mjs';
+
 function makeEnv(over: Partial<ReviewEnv> = {}): ReviewEnv {
     return {
-        getConfig: () => ({}),
+        getConfig: () => ({
+            consumerScriptsResolved: {
+                projectSync: null,
+                reviewFindingsJournal: JOURNAL_SCRIPT,
+            },
+        }),
         ghJson: () => {
             throw new Error('ghJson не подменён в тесте');
         },
@@ -371,6 +381,23 @@ describe('assertKnownReviewModels — fail-closed планка моделей р
 // #625: журнал различает проходы. Запись прохода — отдельная функция: счёт ей приносит
 // петля (только она знает, что в проходе НОВОГО), в форж эта запись не ходит вовсе.
 describe('recordFixReviewFindings — журнальная запись прохода ревью правок (#625)', () => {
+    it('журнал не задан → запись прохода правок тоже выключена вслух', () => {
+        const shArgv = vi.fn(() => 'ok');
+        const logs: string[] = [];
+        const { recordFixReviewFindings } = createReviewModule(
+            makeEnv({
+                shArgv,
+                getConfig: () => ({
+                    consumerScriptsResolved: { projectSync: null, reviewFindingsJournal: null },
+                }),
+                log: (m: string) => logs.push(m),
+            }),
+        );
+        recordFixReviewFindings({ milestone: 'M1' }, 42, COUNTS, 1);
+        expect(shArgv).not.toHaveBeenCalled();
+        expect(logs.join('\n')).toMatch(/выключен/i);
+    });
+
     const COUNTS = { blocker: 1, major: 0, minor: 2, nit: 0, unmarked: 0, total: 3 };
 
     it('зовёт журнал через argv с готовым счётом и номером прохода', () => {
@@ -390,7 +417,7 @@ describe('recordFixReviewFindings — журнальная запись прох
         expect(calls).toHaveLength(1);
         expect(calls[0].file).toBe('node');
         expect(calls[0].args).toEqual([
-            'scripts/review-findings-journal.mjs',
+            JOURNAL_SCRIPT,
             '42',
             'M1',
             `--counts=${JSON.stringify(COUNTS)}`,
@@ -506,8 +533,57 @@ describe('recordReviewFindings — best-effort вызов журнала нах�
         recordReviewFindings({ milestone: 'M1' }, 42, ['alice', 'bob']);
         expect(shArgv.mock.calls[0].slice(0, 2)).toEqual([
             'node',
-            ['scripts/review-findings-journal.mjs', '42', 'M1', 'alice', 'bob'],
+            [JOURNAL_SCRIPT, '42', 'M1', 'alice', 'bob'],
         ]);
+    });
+
+    // Канон, задача 23: журнал — скрипт ПОТРЕБИТЕЛЯ, и «его нет» обязано читаться в логе.
+    // Раньше путь был зашит строкой, вызов fail-open, и отсутствие файла выглядело как
+    // прошедшая запись: метрика ревью тихо исчезала, а по ней судят, крепнет ли ревью.
+    it('журнал не задан → шов выключен вслух, скрипт не зовётся (лента читается)', () => {
+        const shArgv = vi.fn(() => 'ok');
+        const prComments = vi.fn(() => COMMENTS);
+        const logs: string[] = [];
+        const { recordReviewFindings } = createReviewModule(
+            makeEnv({
+                shArgv,
+                prComments,
+                getConfig: () => ({
+                    consumerScriptsResolved: { projectSync: null, reviewFindingsJournal: null },
+                }),
+                log: (m: string) => logs.push(m),
+            }),
+        );
+        recordReviewFindings({ milestone: 'M1' }, 42, ['alice']);
+        expect(shArgv).not.toHaveBeenCalled();
+        // Лента при этом ЧИТАЕТСЯ, и это осознанно (второй проход ревью !21): её диагностика
+        // — про ревью и про allowlist, а не про журнал. Тот же allowlist фильтрует
+        // комментарии для сессии правок, и там расхождение логинов гасится молча; убрать
+        // чтение ради экономии round-trip значило бы погасить единственный сигнал о нём.
+        expect(prComments).toHaveBeenCalled();
+        expect(logs.join('\n')).toMatch(/выключен/i);
+        expect(logs.join('\n')).toContain('consumerScripts.reviewFindingsJournal');
+    });
+
+    it('журнал выключен И лента не прочиталась → в логе сказано про ОБА факта', () => {
+        // Иначе видимость выключенного журнала условна по доступности форжа, а лог говорит
+        // «записи о находках не будет» про журнал, которого нет вовсе (третий проход !21).
+        const logs: string[] = [];
+        const { recordReviewFindings } = createReviewModule(
+            makeEnv({
+                shArgv: vi.fn(() => 'ok'),
+                prComments: () => {
+                    throw new Error('форж недоступен');
+                },
+                getConfig: () => ({
+                    consumerScriptsResolved: { projectSync: null, reviewFindingsJournal: null },
+                }),
+                log: (m: string) => logs.push(m),
+            }),
+        );
+        recordReviewFindings({ milestone: 'M1' }, 42, ['alice']);
+        expect(logs.join('\n')).toContain('форж недоступен');
+        expect(logs.join('\n')).toContain('Журнал находок при этом выключен');
     });
 
     // #37: лента уходит на stdin, а не в argv. Предел одного аргумента у ядра ОС жёсткий,
@@ -567,7 +643,7 @@ describe('recordReviewFindings — best-effort вызов журнала нах�
         // Красным это не делаем — фаза уже смерджена; но тихим тоже: так же выглядит
         // ревью-сессия, которая до форжа не достучалась.
         expect(shArgv).toHaveBeenCalledTimes(1);
-        expect(logs.join('\n')).toMatch(/нет ни одного комментария/i);
+        expect(logs.join('\n')).toContain('Комментарии ревью: у PR #42 нет ни одного');
     });
 
     it('комментарии есть, но ни один автор не доверенный → предупреждение в лог', () => {
@@ -605,12 +681,7 @@ describe('recordReviewFindings — best-effort вызов журнала нах�
             makeEnv({ shArgv, prComments: () => COMMENTS }),
         );
         recordReviewFindings({ milestone: 'M1' }, 7, ['alice', '', '  ', 123, null] as unknown[]);
-        expect(shArgv.mock.calls[0][1]).toEqual([
-            'scripts/review-findings-journal.mjs',
-            '7',
-            'M1',
-            'alice',
-        ]);
+        expect(shArgv.mock.calls[0][1]).toEqual([JOURNAL_SCRIPT, '7', 'M1', 'alice']);
     });
 
     it('номер PR неизвестен (0 / не целое) → запись пропущена, журнал не зовётся', () => {

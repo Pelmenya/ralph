@@ -34,6 +34,7 @@
 // отдаёт, и вторая копия формы разъехалась бы с ним молча. Импорт только типовой —
 // зависимость идёт «ядро → абстракция», как ей и положено.
 import type { ReviewComment } from '../adapters/adapters.ts';
+import type { TConsumerScriptsResolved } from './config-profile.ts';
 
 type ExecOpts = { env?: NodeJS.ProcessEnv; input?: string };
 type ShFn = (cmd: string, opts?: ExecOpts) => string;
@@ -78,6 +79,12 @@ type ReviewConfig = {
 type ReviewCfg = {
     review?: ReviewConfig;
     reviewModel?: string;
+    // Скрипты ПОТРЕБИТЕЛЯ, которые зовёт ядро. Путь приходит из конфига, а не зашит в код:
+    // в каноне этих файлов нет вовсе, и раньше ядро молча требовало, чтобы у потребителя
+    // лежал файл с таким именем в таком месте (канон, задача 23). Читается РЕЗОЛВНУТАЯ
+    // секция (`consumerScriptsResolved`), а не сырая: относительный путь означает «от места
+    // запуска», а место запуска у петли меняется вместе с worktree фазы.
+    consumerScriptsResolved?: TConsumerScriptsResolved | null;
 };
 
 // Фаза в форме, которую хранит config.phases: recordReviewFindings берёт из неё milestone.
@@ -379,7 +386,7 @@ export function createReviewModule(env: ReviewEnv) {
     // числом (PRD `docs/ralph-reliability/prd.md` п.4). Зовётся сразу после мерджа, тем же
     // приёмом, что closeMilestoneByTitle/syncProjectBoard: best-effort, лог вместо throw —
     // косметика наблюдаемости не имеет права уронить уже смерджённую фазу. Журнал живёт в
-    // рантайм-каталоге раннера (JOURNAL_PATH в scripts/review-findings-journal.mjs), не в
+    // рантайм-каталоге раннера (это решает сам скрипт журнала у потребителя), не в
     // git — раннер нигде не коммитит в main напрямую, только через ревьюенные PR.
     // #252: мутация — через argv (shArgv), не строкой через шелл. Номер PR, milestone
     // и логины авторов уходят отдельными элементами argv — shq() больше не нужен для
@@ -412,14 +419,23 @@ export function createReviewModule(env: ReviewEnv) {
         // Шов fail-closed, а вся запись в журнал — fail-open: сбой чтения гасим здесь, но
         // ЗАПИСЬ при этом не делаем вовсе. Записать в журнал нули после непрочитанного
         // ревью хуже пропуска: пропуск виден дырой в ряду фаз, а нули читаются как факт.
+        // Адрес журнала берётся ЗДЕСЬ, до чтения ленты, а возврат — ниже, после диагностики
+        // (второй и третий проходы ревью !21). Порядок именно такой, потому что у двух
+        // фактов разные адресаты: «журнал выключен» обязано быть видно ВСЕГДА, в том числе
+        // когда форж недоступен, а лента нужна не журналу — её диагностика про ревью и про
+        // allowlist, и тот же allowlist молча фильтрует комментарии для сессии правок.
+        const journal = getConfig().consumerScriptsResolved?.reviewFindingsJournal;
         let comments: ReviewComment[];
         try {
             comments = prCommentsFn(prNumber);
         } catch (e) {
             const why = String((e as Error)?.message ?? e).split('\n')[0];
             logFn(
-                `⚠ Не смог прочитать комментарии PR #${String(prNumber)} (${why}) — ` +
-                    'записи о находках не будет: ноль находок и непрочитанное ревью в журнале неразличимы.',
+                journal
+                    ? `⚠ Не смог прочитать комментарии PR #${String(prNumber)} (${why}) — ` +
+                          'записи о находках не будет: ноль находок и непрочитанное ревью в журнале неразличимы.'
+                    : `⚠ Не смог прочитать комментарии PR #${String(prNumber)} (${why}). ` +
+                          '📊 Журнал находок при этом выключен: в конфиге нет consumerScripts.reviewFindingsJournal.',
             );
             return;
         }
@@ -430,7 +446,7 @@ export function createReviewModule(env: ReviewEnv) {
         // логе обязан быть, иначе тихий ноль не отличить от честного.
         if (comments.length === 0) {
             logFn(
-                `⚠ Журнал находок: у PR #${String(prNumber)} нет ни одного комментария — ` +
+                `⚠ Комментарии ревью: у PR #${String(prNumber)} нет ни одного — ` +
                     'проверь, что ревью-сессия их действительно оставляет.',
             );
         } else if (authors.length > 0 && !comments.some((c) => authors.includes(c.author ?? ''))) {
@@ -441,20 +457,23 @@ export function createReviewModule(env: ReviewEnv) {
             // сторожит публичный репозиторий и ослаблять его нельзя), но молчать нельзя тоже.
             const seen = [...new Set(comments.map((c) => c.author ?? ''))].slice(0, 5).join(', ');
             logFn(
-                `⚠ Журнал находок: у PR #${String(prNumber)} ${String(comments.length)} комментариев, ` +
+                `⚠ Комментарии ревью: у PR #${String(prNumber)} ${String(comments.length)} комментариев, ` +
                     `но ни один автор не входит в authorAllowlist (ждём: ${authors.join(', ')}; ` +
                     `в ленте: ${seen}) — счёт будет нулевым. Похоже, allowlist задан в терминах другого форжа.`,
             );
         }
+        if (!journal) {
+            // Молчать нельзя: журнал находок — метрика, по которой судят о ревью, и её
+            // отсутствие обязано быть ВИДНЫМ решением, а не следствием того, что файла нет.
+            logFn(
+                '📊 Журнал находок выключен: в конфиге нет consumerScripts.reviewFindingsJournal.',
+            );
+            return;
+        }
         try {
             const out = runArgvFn(
                 'node',
-                [
-                    'scripts/review-findings-journal.mjs',
-                    String(prNumber),
-                    phase.milestone,
-                    ...authors,
-                ],
+                [journal, String(prNumber), phase.milestone, ...authors],
                 { input: JSON.stringify(comments) },
             );
             logFn(`📊 Находки ревью зафиксированы в журнале: ${String(out).trim()}`);
@@ -484,9 +503,16 @@ export function createReviewModule(env: ReviewEnv) {
             logFn('⚠ Журнал находок (ревью правок): номер PR неизвестен, запись пропущена.');
             return;
         }
+        const journal = getConfig().consumerScriptsResolved?.reviewFindingsJournal;
+        if (!journal) {
+            logFn(
+                '📊 Журнал находок выключен: в конфиге нет consumerScripts.reviewFindingsJournal.',
+            );
+            return;
+        }
         try {
             const out = runArgvFn('node', [
-                'scripts/review-findings-journal.mjs',
+                journal,
                 String(prNumber),
                 phase.milestone,
                 `--counts=${JSON.stringify(counts)}`,
