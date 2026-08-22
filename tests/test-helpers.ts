@@ -5,12 +5,14 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { createHash } from 'node:crypto';
 import { vi, type Mock } from 'vitest';
 // @ts-expect-error — JS-entry раннера без деклараций типов (тот же приём, что в
 // orchestrator.test.ts, #366): дефолт ralph.js — ре-экспорт runtime фабрики.
 import ralphDefault from '../ralph.js';
 import type { RalphConfig } from '../core/orchestrator.ts';
 import type { RalphState } from '../core/state-lock.ts';
+import { createOrchestrator } from '../core/orchestrator.ts';
 
 // ralph.js — module.exports = createOrchestrator(...) того же runtime, поэтому его
 // поверхность точно описывается ReturnType<typeof createOrchestrator>. Типизируем runLoop
@@ -220,4 +222,227 @@ export function makeRunLoopScenario(
         pushTexts: () => pushEventFn.mock.calls.map((c: unknown[]) => c[0] as string),
         maxBlockedHeals: () => Math.max(0, ...saved.map((s) => s.blockedHeals ?? 0)),
     };
+}
+
+// ── Фикстурный цикл на конфиге ЧУЖОГО проекта ────────────────────────────────
+// Общая обвязка двух барьеров: переносимости (`porting-dry-run`) и чистоты продукта
+// (`product-root-purity`). Раньше она стояла копией в обоих, и ревью !21 показало цену:
+// копии разъехались — во втором цикл обрывался на preflight, то есть барьер утверждал
+// «прогон ничего не пишет», не дойдя до самого прогона.
+
+/** Путь фикстуры — от каталога МОДУЛЯ: CWD у клона канона и у подмодуля разный. */
+export const FIXTURE_CONFIG_PATH = path.resolve(
+    import.meta.dirname,
+    '__fixtures__',
+    'foreign-project',
+    'ralph.config.json',
+);
+
+const FIXTURE_FLAGS = {
+    once: false,
+    dry: true,
+    reset: false,
+    resubmit: false,
+    deployResolved: false,
+};
+
+/** Оркестратор с фейками моста entry: профиль фикстуры не prod, телеграм и gate-env не зовут. */
+export function buildFixtureRuntime() {
+    return createOrchestrator({
+        argv: [],
+        flags: FIXTURE_FLAGS,
+        external: {
+            sendTelegramMessage: () => false,
+            telegramConfigFromEnv: () => ({ token: '', chatId: '' }),
+            buildSanitizedGateEnv: () => ({}),
+        },
+    });
+}
+
+/** Резолвнутый конфиг фикстуры + установка его как фабричного (боевой путь делает main()). */
+export function loadFixtureConfig(runtime: ReturnType<typeof buildFixtureRuntime>) {
+    const raw = JSON.parse(fs.readFileSync(FIXTURE_CONFIG_PATH, 'utf-8')) as unknown;
+    const cfg = runtime.resolveProfile(raw, 'playground', (msg: string) => {
+        throw new Error(msg);
+    }) as Parameters<typeof runtime.preflight>[0];
+    runtime.setConfigForTests(cfg);
+    return cfg;
+}
+
+/**
+ * preflight + один dry-проход runLoop на фикстуре. КАЖДЫЙ коллаборатор подменён: дефолты
+ * читают `adapters.*` фабрики, собранной без выбора из фикстуры, и ушли бы в настоящий
+ * форж мимо предохранителя.
+ */
+export function runFixtureLoop(
+    runtime: ReturnType<typeof buildFixtureRuntime>,
+    cfg: Parameters<typeof runtime.preflight>[0],
+): {
+    logs: string[];
+    shCalls: string[];
+    runClaudeCalls: Array<{ prompt: string; model?: string }>;
+    openIssuesCalls: string[];
+    authChecked: number;
+    savedStates: unknown[];
+    ctx: ReturnType<typeof runtime.preflight>;
+} {
+    const logs: string[] = [];
+    const shCalls: string[] = [];
+    const runClaudeCalls: Array<{ prompt: string; model?: string }> = [];
+    const openIssuesCalls: string[] = [];
+    const savedStates: unknown[] = [];
+    let authChecked = 0;
+    const logFn = (m: string) => logs.push(m);
+    // Фейковый shFn — единственная точка, куда preflight мог бы дотянуться до настоящего
+    // git/gh: `git rev-parse`, `git status --porcelain` и проверка авторизации НЕ гейтятся
+    // dry-флагом. Реальный `sh()` под RALPH_NO_SIDE_EFFECTS=1 бросил бы, но бросок половина
+    // вызовов глотает try/catch-ем — отсюда фейк, а не расчёт на предохранитель.
+    const shFn = (cmd: string) => {
+        shCalls.push(cmd);
+        return '';
+    };
+    const boom = (msg: string) => {
+        throw new Error(msg);
+    };
+
+    const ctx = runtime.preflight(cfg, {
+        shFn,
+        // #35: авторизация форжа спрашивается через ШОВ, а не через shFn — боевой дефолт
+        // ушёл бы в настоящий gh/curl мимо фейка и упёрся бы в предохранитель.
+        checkAuthFn: () => {
+            authChecked += 1;
+        },
+        failFn: boom,
+        logFn,
+        loadStateFn: () => ({
+            count: 0,
+            milestone: (cfg.phases as Array<{ milestone: string }>)[0].milestone,
+            submitted: false,
+            noProgress: 0,
+            gateHeals: 0,
+            blockedHeals: 0,
+            reviewModelFloor: null,
+            lastReviewModel: null,
+            reReviewPending: false,
+            reviewOfFixes: null,
+            deployBlock: null,
+        }),
+        phaseIndexOfFn: () => 0,
+        // #17: ранняя проверка конфликта human+complexity читает карточки фазы через шов —
+        // дефолт ушёл бы в настоящий форж, собранный БЕЗ выбора из фикстуры.
+        allOpenIssuesFn: () => [],
+        saveStateFn: () => {},
+        pushEventFn: () => false,
+        dry: true,
+    });
+
+    const fixtureIssue = {
+        number: 101,
+        title: 'Чужой issue фикстурного проекта',
+        labels: [{ name: 'complexity:medium' }],
+        author: { login: 'orbital-bot' },
+    };
+
+    // #369: дефолты коллабораторов читают `adapters.*` фабрики, собранной без выбора из
+    // фикстуры (main() их не звал), поэтому подменяется КАЖДЫЙ: необращённые к ним ветки
+    // прохода всё равно проходят через связывание параметров при входе в runLoop.
+    runtime.runLoop(cfg, ctx, {
+        dry: true,
+        once: false,
+        logFn,
+        shFn,
+        saveStateFn: (st: unknown) => savedStates.push(st),
+        openIssuesFn: (milestone: string) => {
+            openIssuesCalls.push(milestone);
+            return [fixtureIssue];
+        },
+        allOpenIssuesFn: () => [],
+        hasAnyIssuesFn: () => true,
+        // #50: карточку для промпта читает петля — дефолт ушёл бы в шов, собранный без
+        // выбора из фикстуры, и dry-проход потрогал бы настоящий форж.
+        getIssueFn: (number: number) => ({
+            number,
+            title: fixtureIssue.title,
+            body: 'тело карточки из фикстуры',
+        }),
+        prCommentsFn: () => [],
+        findOpenPrFn: () => null,
+        removeBlockedLabelFn: () => {},
+        addBlockedLabelFn: () => {},
+        phaseMergedFn: () => true,
+        mergedPhasePrFn: () => null,
+        closeMilestoneByTitleFn: () => boom('closeMilestoneByTitleFn не должен вызываться в dry'),
+        syncProjectBoardFn: () => boom('syncProjectBoardFn не должен вызываться в dry'),
+        mergedShaOfFn: () => '',
+        waitForDeployRunFn: () => ({ ok: false }) as never,
+        checkProdHealthFn: () => ({ ok: false }) as never,
+        runClaudeFn: (prompt: string, opts: { model?: string }) => {
+            runClaudeCalls.push({ prompt, model: opts.model });
+            return 0;
+        },
+    });
+
+    return { logs, shCalls, runClaudeCalls, openIssuesCalls, authChecked, savedStates, ctx };
+}
+
+// ── Снимок дерева: путь → отпечаток содержимого и режима ─────────────────────
+// Живёт здесь, а не в тестовом файле: импорт из `*.test.ts` протащил бы за собой прогон
+// всех его `describe` (ревью !22).
+
+/** `.git` меняется от самого `git status`; `node_modules` не продукт — его ставит потребитель. */
+const SNAPSHOT_SKIP = new Set(['.git', 'node_modules']);
+
+/**
+ * Снимок дерева для сравнения «до/после»: ловит появление файла, его перезапись, смену
+ * бита исполнения и подмену символической ссылки.
+ *
+ * Хэш содержимого, а не `git status`: статус отвечает на вопрос «как git видит путь», и
+ * перезапись уже существующего игнорируемого файла его не меняет вовсе — самый вероятный
+ * след прогона проходил бы мимо. Режим в ключе — потому что бит исполнения git отслеживает,
+ * и снимок по одному содержимому был бы тут слабее статуса (ревью !22).
+ *
+ * Fail-closed: нечитаемый файл или каталог — отказ, а не пропуск; иначе сломанные права
+ * превратили бы снимок в тождество.
+ *
+ * Цена — чтение всего дерева: под каталогом продукта лежат рантайм-артефакты (`ralph.log`,
+ * `sessions/`), и после ночной фазы снимок стоит уже не миллисекунды. Это осознанно: они и
+ * есть предмет проверки, а исключить их значило бы ослепить барьер ровно там, где он нужен.
+ */
+export function snapshotTree(root: string): Map<string, string> {
+    const out = new Map<string, string>();
+    const walk = (dir: string) => {
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+            if (SNAPSHOT_SKIP.has(entry.name)) continue;
+            const full = path.join(dir, entry.name);
+            const rel = path.relative(root, full);
+            if (entry.isSymbolicLink()) {
+                // Ссылку не разыменовываем: git видит её обычным путём, и подмена цели —
+                // такое же изменение дерева, как правка файла.
+                out.set(rel, `symlink:${fs.readlinkSync(full)}`);
+                continue;
+            }
+            if (entry.isDirectory()) {
+                walk(full);
+                continue;
+            }
+            if (!entry.isFile()) continue;
+            const exec = (fs.statSync(full).mode & 0o111) !== 0 ? 'x' : '-';
+            const hash = createHash('sha256').update(fs.readFileSync(full)).digest('hex');
+            out.set(rel, `${exec}:${hash}`);
+        }
+    };
+    walk(root);
+    return out;
+}
+
+/** Различие снимков — человеку в отказ: что появилось, исчезло, изменилось. */
+export function diffSnapshots(before: Map<string, string>, after: Map<string, string>): string[] {
+    const out: string[] = [];
+    for (const [rel, mark] of after) {
+        const was = before.get(rel);
+        if (was === undefined) out.push(`появился: ${rel}`);
+        else if (was !== mark) out.push(`изменился: ${rel}`);
+    }
+    for (const rel of before.keys()) if (!after.has(rel)) out.push(`исчез: ${rel}`);
+    return out.sort();
 }

@@ -19,17 +19,12 @@
 // попадёт в общий журнал sideEffectAttempts, который сверяет afterEach (test-setup.ts).
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
-import path from 'node:path';
-import { createOrchestrator } from '../core/orchestrator.ts';
-
-// Путь к фикстуре — от каталога МОДУЛЯ, а не от CWD: ядро запускается и своим клоном
-// канона, и каталогом `.claude/ralph` у потребителя, CWD в этих раскладках разный.
-const FIXTURE_PATH = path.resolve(
-    import.meta.dirname,
-    '__fixtures__',
-    'foreign-project',
-    'ralph.config.json',
-);
+import {
+    FIXTURE_CONFIG_PATH,
+    buildFixtureRuntime,
+    loadFixtureConfig,
+    runFixtureLoop,
+} from './test-helpers.ts';
 
 // Боевой конфиг потребителя приходит СНАРУЖИ, путём в `RALPH_REAL_CONFIG` — тем же
 // приёмом, что словарь имён в `project-traces.ts`. В каноне `ralph.config.json` не
@@ -37,23 +32,9 @@ const FIXTURE_PATH = path.resolve(
 // значений» здесь недоказуемо: проверка гоняется там, где боевой конфиг есть.
 const REAL_CONFIG_PATH = (process.env.RALPH_REAL_CONFIG ?? '').trim();
 
-const FLAGS_DRY = { once: false, dry: true, reset: false, resubmit: false, deployResolved: false };
-
-// Мост из entry (телеграм/gate-env) — фейки, профиль фикстуры не prod, их не зовут.
-function buildRuntime() {
-    return createOrchestrator({
-        argv: [],
-        flags: FLAGS_DRY,
-        external: {
-            sendTelegramMessage: () => false,
-            telegramConfigFromEnv: () => ({ token: '', chatId: '' }),
-            buildSanitizedGateEnv: () => ({}),
-        },
-    });
-}
-
+/** Сырой конфиг фикстуры — для сравнения ЗНАЧЕНИЙ с боевым (обвязка цикла — в хелперах). */
 function loadFixtureRaw() {
-    return JSON.parse(fs.readFileSync(FIXTURE_PATH, 'utf-8'));
+    return JSON.parse(fs.readFileSync(FIXTURE_CONFIG_PATH, 'utf-8'));
 }
 
 describe('фикстурный чужой проект — сама фикстура (#371)', () => {
@@ -84,11 +65,8 @@ describe('фикстурный чужой проект — сама фиксту
 
 describe('dry-run переносимости ядра на чужом конфиге (#371)', () => {
     it('resolveProfile инициализирует фикстуру без ошибок и без подмешивания боевых значений', () => {
-        const runtime = buildRuntime();
-        const raw = loadFixtureRaw();
-        const cfg = runtime.resolveProfile(raw, 'playground', (msg: string) => {
-            throw new Error(msg);
-        }) as Record<string, unknown>;
+        const runtime = buildFixtureRuntime();
+        const cfg: Record<string, unknown> = loadFixtureConfig(runtime);
 
         expect(cfg.profileName).toBe('playground');
         expect((cfg.board as { owner: string }).owner).toBe('OrbitalLabs');
@@ -105,125 +83,25 @@ describe('dry-run переносимости ядра на чужом конфи
     });
 
     it('preflight + один dry-проход runLoop планируют фазу СТРОГО из фикстуры, не трогая реальные git/gh/claude', () => {
-        const runtime = buildRuntime();
-        const raw = loadFixtureRaw();
-        const cfg = runtime.resolveProfile(raw, 'playground', (msg: string) => {
-            throw new Error(msg);
-        }) as Parameters<typeof runtime.preflight>[0];
+        // Обвязка цикла — общая с барьером чистоты продукта (`test-helpers.ts`): пока она
+        // стояла копией в обоих, копии разъехались, и один из барьеров проверял меньше,
+        // чем обещал его же название (ревью !21).
+        const runtime = buildFixtureRuntime();
+        const cfg = loadFixtureConfig(runtime);
+        const { shCalls, runClaudeCalls, openIssuesCalls, authChecked, savedStates, ctx } =
+            runFixtureLoop(runtime, cfg);
 
-        // pickModel (не подменяем — хотим ПРОВЕРИТЬ реальный роутинг) читает фабричный
-        // config, который в бою присваивает main(); здесь — тестовый хук #204.
-        runtime.setConfigForTests(cfg);
-
-        const logs: string[] = [];
-        const shCalls: string[] = [];
-        // Фейковый shFn — единственная точка, куда preflight мог бы дотянуться до
-        // настоящего git/gh (git rev-parse/gh auth status/git status --porcelain — они НЕ
-        // гейтятся dry-флагом). Реальный sh() под RALPH_NO_SIDE_EFFECTS=1 бросил бы.
-        const fakeSh = (cmd: string) => {
-            shCalls.push(cmd);
-            return '';
-        };
-
-        let authChecked = 0;
-        const ctx = runtime.preflight(cfg, {
-            shFn: fakeSh,
-            // Авторизация форжа проверяется через шов (#35), а не через shFn: боевой
-            // дефолт ушёл бы в настоящий gh/curl мимо фейка и упал бы предохранителем.
-            checkAuthFn: () => {
-                authChecked += 1;
-            },
-            failFn: (msg: string) => {
-                throw new Error(msg);
-            },
-            logFn: (m: string) => logs.push(m),
-            loadStateFn: () => ({
-                count: 0,
-                milestone: (cfg.phases as Array<{ milestone: string }>)[0].milestone,
-                submitted: false,
-                noProgress: 0,
-                gateHeals: 0,
-                blockedHeals: 0,
-                reviewModelFloor: null,
-                lastReviewModel: null,
-                reReviewPending: false,
-                reviewOfFixes: null,
-                deployBlock: null,
-            }),
-            phaseIndexOfFn: () => 0,
-            // #17: ранняя проверка конфликта human+complexity читает карточки фазы через
-            // шов — дефолт ушёл бы в настоящий форж (собранный БЕЗ выбора из фикстуры),
-            // ровно как checkAuthFn выше.
-            allOpenIssuesFn: () => [],
-            saveStateFn: () => {},
-            pushEventFn: () => false,
-            dry: true,
-        });
-
+        // Результат ИМЕННО preflight: состояние фазы собрано из фикстуры, а не из чужого
+        // дефолта. Не дубль `openIssuesCalls` — тот про вопрос к форжу, этот про то, с чем
+        // петля вообще стартовала (ревью !22: ассерт терялся при выносе обвязки).
         expect(ctx.state.milestone).toBe('Sputnik Tracker · Фаза 1: Каркас');
+
         // git только ЧИТАЕТСЯ через подменённый shFn — ни одного реального вызова.
         expect(shCalls.some((c) => c.includes('git rev-parse'))).toBe(true);
         // Авторизацию форжа preflight спрашивает у шва и НЕ знает про `gh`: раньше здесь
         // стояло ожидание `gh auth status`, то есть сам тест переносимости требовал GitHub.
-        // Чем именно проверяет каждая реализация — предмет adapters-contract.test.ts.
         expect(authChecked).toBe(1);
         expect(shCalls.some((c) => c.includes('gh auth status'))).toBe(false);
-
-        const fixtureIssue = {
-            number: 101,
-            title: 'Чужой issue фикстурного проекта',
-            labels: [{ name: 'complexity:medium' }],
-            author: { login: 'orbital-bot' },
-        };
-
-        const openIssuesCalls: string[] = [];
-        const runClaudeCalls: Array<{ prompt: string; model?: string }> = [];
-        const savedStates: unknown[] = [];
-
-        runtime.runLoop(cfg, ctx, {
-            dry: true,
-            once: false,
-            logFn: (m: string) => logs.push(m),
-            shFn: fakeSh,
-            saveStateFn: (s: unknown) => savedStates.push(s),
-            // #369: дефолты этих коллабораторов читают adapters.* — фабрика собрала
-            // адаптеры без выбора из фикстуры (main() их не звал), поэтому КАЖДЫЙ
-            // такой дефолт подменяем явно; необращённые к ним ветки этого dry-прохода
-            // всё равно проходят через связывание параметров при входе в runLoop.
-            openIssuesFn: (milestone: string) => {
-                openIssuesCalls.push(milestone);
-                return [fixtureIssue];
-            },
-            allOpenIssuesFn: () => [],
-            hasAnyIssuesFn: () => true,
-            // #50: карточку для промпта читает петля — тот же случай, что у соседей:
-            // дефолт ушёл бы в шов, собранный без выбора из фикстуры, и dry-проход
-            // потрогал бы настоящий форж.
-            getIssueFn: (number: number) => ({
-                number,
-                title: fixtureIssue.title,
-                body: 'тело карточки из фикстуры',
-            }),
-            prCommentsFn: () => [],
-            findOpenPrFn: () => null,
-            removeBlockedLabelFn: () => {},
-            addBlockedLabelFn: () => {},
-            phaseMergedFn: () => true,
-            mergedPhasePrFn: () => null,
-            closeMilestoneByTitleFn: () => {
-                throw new Error('closeMilestoneByTitleFn не должен вызываться в dry-режиме');
-            },
-            syncProjectBoardFn: () => {
-                throw new Error('syncProjectBoardFn не должен вызываться в dry-режиме');
-            },
-            mergedShaOfFn: () => '',
-            waitForDeployRunFn: () => ({ ok: false }) as never,
-            checkProdHealthFn: () => ({ ok: false }) as never,
-            runClaudeFn: (prompt: string, opts: { model?: string }) => {
-                runClaudeCalls.push({ prompt, model: opts.model });
-                return 0;
-            },
-        });
 
         // Фаза/milestone — только из фикстуры, не боевой milestone потребителя.
         expect(openIssuesCalls).toEqual(['Sputnik Tracker · Фаза 1: Каркас']);
