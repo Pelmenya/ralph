@@ -65,13 +65,45 @@ import { classifyActivity, silenceThresholdMs, type Activity } from './deadman.t
 // раннера), чем и держится семантика «панель читает лог своего дерева» (#404).
 const RALPH_DIR = path.resolve(import.meta.dirname, '..');
 const REPO_DIR = path.resolve(RALPH_DIR, '..', '..');
+
+// --runtime-dir <путь> (канон, задача 22): каталог СОСТОЯНИЯ наблюдаемого экземпляра.
+// Раннер прокидывает его при авто-спавне, когда состояние уехало из каталога ядра. Без
+// флага — прежняя раскладка, файлы рядом с ядром.
+//
+// Разбирается ДО путей ниже намеренно: панель, читающая не тот каталог, не падает — она
+// показывает пустую фазу и «раннер молчит», то есть врёт ровно в ту сторону, ради которой
+// её и смотрят. Молчаливая слепота дороже отсутствия панели.
+export function resolveRuntimeDir(args: string[], fallback: string): string {
+    const idx = args.indexOf('--runtime-dir');
+    if (idx === -1) return fallback;
+    if (args.indexOf('--runtime-dir', idx + 1) !== -1) {
+        throw new Error('--runtime-dir передан дважды: какой из них наблюдать — не догадка.');
+    }
+    const value = args[idx + 1];
+    // Значения нет либо следом идёт другой флаг: без проверки панель молча взяла бы «--once»
+    // за путь или откатилась к прежней раскладке — и в обоих случаях показывала бы пустоту
+    // как «раннер молчит» (ревью !19). Наблюдатель, который врёт, хуже отсутствующего.
+    if (!value || value.startsWith('--')) {
+        throw new Error('--runtime-dir без значения: панели нечего наблюдать.');
+    }
+    if (!path.isAbsolute(value)) {
+        throw new Error(
+            `--runtime-dir ${value} относительный: он резолвился бы от места запуска панели, ` +
+                'а она стартует из другого каталога, чем раннер.',
+        );
+    }
+    return value;
+}
+
+const RUNTIME_DIR = resolveRuntimeDir(process.argv.slice(2), RALPH_DIR);
+
 // #386: раннер разводит боевой ralph.log и не-боевой ralph.dry.log (chooseLogPath, exec.ts).
 // Панель выбирает между ними тем же кодом — см. monitorLogPath. LOG_PATH (боевой) остаётся
 // дефолтом readLogTail для ручных вызовов/тестов; snapshot() переопределяет его по профилю.
-const LOG_PATH_BATTLE = path.join(RALPH_DIR, 'ralph.log');
-const LOG_PATH_SIDELINE = path.join(RALPH_DIR, 'ralph.dry.log');
+const LOG_PATH_BATTLE = path.join(RUNTIME_DIR, 'ralph.log');
+const LOG_PATH_SIDELINE = path.join(RUNTIME_DIR, 'ralph.dry.log');
 const LOG_PATH = LOG_PATH_BATTLE;
-const STATE_PATH = path.join(RALPH_DIR, 'ralph.state.json');
+const STATE_PATH = path.join(RUNTIME_DIR, 'ralph.state.json');
 
 // #386: путь лога, который читает панель, = путь, в который пишет наблюдаемый прогон.
 // Раннер решает его через chooseLogPath по РЕЗОЛВНУТОМУ профилю (боевой ralph.log только

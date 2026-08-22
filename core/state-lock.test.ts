@@ -582,3 +582,18 @@ describe('acquireLock — pid-reuse, гонка реклейма и битый �
         expect(live.removeFn).not.toHaveBeenCalled();
     });
 });
+
+describe('маркер зависимостей и его читатель смотрят в один путь (ревью !19)', () => {
+    it('абсолютный путь маркера не склеивается с деревом', async () => {
+        // Склейка увела бы запись внутрь дерева, а проверка читает runtimeDir: маркер не
+        // находился бы никогда, и `npm ci` шёл бы перед каждым гейтом — незаметно, просто
+        // «гейт стал медленным».
+        const { underRoot } = await import('./roots.ts');
+        expect(underRoot('/work/tree', '/state/prod/.deps-lock.sha')).toBe(
+            '/state/prod/.deps-lock.sha',
+        );
+        expect(underRoot('/work/tree', '.claude/ralph/.deps-lock.sha')).toBe(
+            '/work/tree/.claude/ralph/.deps-lock.sha',
+        );
+    });
+});

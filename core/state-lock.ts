@@ -10,7 +10,7 @@
 //
 // Почему фабрика, а не набор standalone-экспортов (как в ralph-util.ts): эти функции —
 // НЕ чистые. Им нужен контекст ralph.js, который standalone-функция взять неоткуда:
-// module-level пути (STATE_PATH/LOCK_PATH/…), флаг DRY (#C1 read-only), лениво
+// module-level пути (state/lock/…), флаг DRY (#C1 read-only), лениво
 // инициализируемый `config` (defaultState берёт первую фазу), общий предохранитель
 // побочек #138 (тот же журнал sideEffectAttempts, что у ralph.js), а также
 // process-примитивы processAlive/cmdlineIncludes, которые остаются в ralph.js (их делит
@@ -21,6 +21,7 @@
 // из ralph.js.
 
 import fs from 'node:fs';
+import { underRoot, writeFileAtomic } from './roots.ts';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { execSync } from 'node:child_process';
@@ -57,9 +58,11 @@ type RemoveFn = (p: string) => void;
 type LogFn = (msg: string) => void;
 type FailFn = (msg: string) => void;
 
-// Контекст ralph.js, захватываемый фабрикой один раз. Пути и DRY — значения (не меняются
-// после старта); config — через геттер (заполняется в main() ПОСЛЕ загрузки модуля, а
-// defaultState читает его лениво, в момент вызова). guardSideEffect — обёртка ralph.js
+// Контекст ralph.js, захватываемый фабрикой один раз. Пути читаются ЛЕНИВО, при каждом
+// обращении: их адрес известен только после чтения конфига (`runtimeDir` из контракта
+// корней), а фабрика собирается раньше — захваченное значение осталось бы прежним, и
+// состояние уехало бы в старое место молча. DRY — значение; config — через геттер
+// (заполняется в main() ПОСЛЕ загрузки модуля, а defaultState читает его лениво). guardSideEffect — обёртка ralph.js
 // (уже с hint'ом #145): её вызов пишет в ОБЩИЙ журнал sideEffectAttempts, поэтому боевые
 // дефолты writeFn/removeFn краснят тест забытым моком ровно как раньше.
 export type StateLockEnv = {
@@ -81,11 +84,9 @@ export type StateLockEnv = {
 };
 
 export function createStateLock(env: StateLockEnv) {
+    // Пути НЕ деструктурируем — см. докблок типа: они меняются между сборкой фабрики и
+    // первым обращением. Остальное — значения, их можно взять сразу.
     const {
-        statePath,
-        lockPath: LOCK_PATH,
-        lockMarkerPath: LOCK_MARKER_PATH,
-        ralphPath: RALPH_PATH,
         dry: DRY,
         getConfig,
         log,
@@ -130,11 +131,11 @@ export function createStateLock(env: StateLockEnv) {
     // failFn инжектируется (дефолт — module-level fail): preflight пробрасывает свой
     // failFn, чтобы юнит-тест ловил fail старой схемы через исключение, а не process.exit.
     function loadState(failFn: FailFn = fail): RalphState {
-        const s = loadJson(statePath, null) as RalphState | null;
+        const s = loadJson(env.statePath, null) as RalphState | null;
         if (!s) return defaultState();
         if (s.milestone === undefined) {
             failFn(
-                `${statePath} старой схемы (phaseIndex). Раннер адресует фазы по имени milestone. ` +
+                `${env.statePath} старой схемы (phaseIndex). Раннер адресует фазы по имени milestone. ` +
                     `Запусти --reset (вернёт на первую фазу конфига) или пропиши руками: { count, milestone: <имя фазы>, submitted: false }.`,
             );
         }
@@ -148,8 +149,10 @@ export function createStateLock(env: StateLockEnv) {
         if (DRY) return;
         // Тот же guard, что у sh(): забытый saveStateFn в тесте перезаписал бы state
         // ЖИВОГО прогона — гейт мерджа гоняет npm run test прямо в worktree раннера.
-        guardSideEffect(`saveState(${statePath})`);
-        fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+        guardSideEffect(`saveState(${env.statePath})`);
+        // Целиком или никак: прерванный прогон иначе оставляет полуфайл, который следующий
+        // старт читает как «состояния нет» — то есть теряет фазу вместе с её PR.
+        writeFileAtomic(env.statePath, JSON.stringify(state, null, 2));
     }
 
     // ── Маркер зависимостей: .deps-lock.sha ──────────────────────────────────
@@ -178,7 +181,10 @@ export function createStateLock(env: StateLockEnv) {
         const h = lockHash(dir, readFn);
         if (!h) return;
         try {
-            writeFn(path.join(dir, LOCK_MARKER_PATH), h);
+            // Абсолютный путь маркера остаётся собой: склейка увела бы его внутрь дерева,
+            // а читатель ниже смотрит в runtimeDir — маркер не находился бы никогда, и
+            // `npm ci` шёл бы перед каждым гейтом (ревью !19).
+            writeFn(underRoot(dir, env.lockMarkerPath), h);
         } catch {}
     }
 
@@ -224,7 +230,8 @@ export function createStateLock(env: StateLockEnv) {
         if (!current) return; // нет package-lock.json — сверять нечего
         let prev: string | null = null;
         try {
-            if (existsFn(LOCK_MARKER_PATH)) prev = String(readFn(LOCK_MARKER_PATH, 'utf-8')).trim();
+            if (existsFn(env.lockMarkerPath))
+                prev = String(readFn(env.lockMarkerPath, 'utf-8')).trim();
         } catch {}
         if (prev === current) return;
         logFn(
@@ -237,13 +244,13 @@ export function createStateLock(env: StateLockEnv) {
 
     // ── Файл-лок от двойного запуска: ralph.lock (#176/#177/#178) ─────────────
 
-    // Сверка «за pid действительно наш ralph.js» — по пути RALPH_PATH в cmdline. Тот же приём,
-    // что isRalphMonitorProcess. ВНИМАНИЕ: RALPH_PATH относительный и уникальности проекта не
-    // гарантирует (см. коммент у объявления RALPH_PATH) — для лока это лишь ложный отказ при
+    // Сверка «за pid действительно наш ralph.js» — по пути env.ralphPath в cmdline. Тот же приём,
+    // что isRalphMonitorProcess. ВНИМАНИЕ: env.ralphPath относительный и уникальности проекта не
+    // гарантирует (см. коммент у объявления env.ralphPath) — для лока это лишь ложный отказ при
     // pid-reuse (fail-closed), не снос чужого процесса. Переиспользованный pid (чужой процесс
     // под тем же номером) → подстроки нет → false, лок считается сиротой.
     function isRalphProcess(pid: number, readFn: ReadFn = fs.readFileSync): boolean {
-        return cmdlineIncludes(pid, RALPH_PATH, readFn);
+        return cmdlineIncludes(pid, env.ralphPath, readFn);
     }
 
     // Держит ли лок ЖИВОЙ раннер: номер занят (kill 0) И cmdline подтверждает ralph.js.
@@ -269,7 +276,7 @@ export function createStateLock(env: StateLockEnv) {
     // #138: забытый writeFn в тесте иначе насорил бы настоящим ralph.lock в дереве тестов.
     function writeLock(
         pid: number = process.pid,
-        { writeFn, lockPath = LOCK_PATH }: { writeFn?: WriteFn; lockPath?: string } = {},
+        { writeFn, lockPath = env.lockPath }: { writeFn?: WriteFn; lockPath?: string } = {},
     ): void {
         const doWrite: WriteFn =
             writeFn ||
@@ -284,7 +291,7 @@ export function createStateLock(env: StateLockEnv) {
     // предохранителем #138. ENOENT при удалении не ошибка: лок уже снят (гонка, ручная
     // чистка) — цель «файла нет» достигнута, а не «удаление провалилось».
     function removeLock({
-        lockPath = LOCK_PATH,
+        lockPath = env.lockPath,
         removeFn,
     }: { lockPath?: string; removeFn?: RemoveFn } = {}): void {
         const doRemove: RemoveFn =
@@ -306,7 +313,7 @@ export function createStateLock(env: StateLockEnv) {
     // tail/vim по ralph.js → ложный «живой раннер» и отказ старта). Две оговорки: (1) снимаем
     // ТОЛЬКО если файл ещё держит наш pid — если лок в странной гонке украли/переписали,
     // слепой unlink снёс бы чужой; (2) путь передаётся АБСОЛЮТНЫЙ, зафиксированный ДО chdir в
-    // worktree, — относительный LOCK_PATH после chdir указал бы внутрь дерева раннера (тот же
+    // worktree, — относительный путь лока после chdir указал бы внутрь дерева раннера (тот же
     // прецедент, что репойнт logTarget, #SiaUB). Свои побочки — через DI под #138.
     function releaseLockIfOurs(
         lockPath: string,
@@ -352,7 +359,7 @@ export function createStateLock(env: StateLockEnv) {
     // него исполнение не продолжается, return в тестах нужен мок-failFn, который не роняет
     // процесс.
     function acquireLock({
-        lockPath = LOCK_PATH,
+        lockPath = env.lockPath,
         pid = process.pid,
         readFn = fs.readFileSync,
         procReadFn = fs.readFileSync,

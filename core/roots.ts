@@ -20,7 +20,7 @@
  * TS-модуль без билд-шага: исполняется нативным type stripping Node 24 (erasable-only).
  */
 import { createHash } from 'node:crypto';
-import { lstatSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, lstatSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { threadId } from 'node:worker_threads';
 import { guardSideEffect } from '../shared/side-effect-guard.ts';
@@ -270,10 +270,50 @@ export function instanceNamespace(consumerRoot: string, instance: string): strin
     return `${slug === '' ? 'instance' : slug}-${digest}`;
 }
 
+/**
+ * Путь относительно базы — но абсолютный остаётся собой.
+ *
+ * `path.join('/work/tree', '/state/ralph.log')` даёт `/work/tree/state/ralph.log`: склейка
+ * молча теряет абсолютность, и файл уезжает ВНУТРЬ дерева работы — ровно туда, откуда его
+ * увозили. Отказ при этом тихий: раннер пишет лог в одно место, монитор читает другое и
+ * показывает «раннер молчит» (ревью !19).
+ */
+export function underRoot(base: string, p: string): string {
+    return isAbsolute(p) ? p : join(base, p);
+}
+
 type TWriteDeps = {
-    writeFn?: (path: string, data: string) => void;
+    /** `mode` — права, с которыми создать временный файл (права цели, если она была). */
+    writeFn?: (path: string, data: string, mode?: number) => void;
     renameFn?: (from: string, to: string) => void;
+    /** Права существующего целевого файла; `null` — файла ещё нет. */
+    modeOfFn?: (path: string) => number | null;
 };
+
+/**
+ * Права существующего файла состояния; `null` — файла ещё нет (новый получит права от umask).
+ *
+ * `lstat`, а не `stat`, и символическая ссылка — ОТКАЗ (ревью !20). Через ссылку сюда
+ * приехали бы права её цели: подставленная ссылка на файл 0666 сделала бы новый state
+ * доступным на запись всем, причём тихо. И сам `rename` поверх ссылки заменил бы саму
+ * ссылку, а не то, на что она указывает, — состояние оказалось бы не там, где его ждут.
+ */
+function modeOf(p: string): number | null {
+    let st;
+    try {
+        st = lstatSync(p);
+    } catch {
+        return null;
+    }
+    if (st.isSymbolicLink()) {
+        throw new Error(
+            `Файл состояния ${p} — символическая ссылка. Ни права, ни место записи в этом ` +
+                `случае не те, что предполагает вызывающий: замена пошла бы поверх ссылки, а ` +
+                `права приехали бы от её цели.`,
+        );
+    }
+    return st.mode & 0o777;
+}
 
 // Счётчик в пределах ПОТОКА: имени временного файла нужна уникальность, а не случайность
 // (`Math.random()` дал бы недетерминированный тест на ровном месте). Поэтому в имя входит и
@@ -292,11 +332,16 @@ let tmpCounter = 0;
  * которого мы уходим.
  */
 export function writeFileAtomic(target: string, data: string, deps: TWriteDeps = {}): void {
+    // Права задаются ПРИ СОЗДАНИИ временного файла, а не отдельным `chmod` после записи:
+    // между записью и chmod оставалось окно, в котором файл существует с правами от umask,
+    // и оно же было гонкой — chmod мог примениться уже не к тому иноду (ревью !20).
+    // Флаг `wx` — создать эксклюзивно: имя временного уникально по процессу, потоку и
+    // счётчику, и совпадение означало бы не «перезапишем», а что-то, чего мы не понимаем.
     const write =
         deps.writeFn ??
-        ((p: string, text: string) => {
+        ((p: string, text: string, mode?: number) => {
             guardSideEffect(`writeFileAtomic(${p})`, 'Подмени writeFn/renameFn в тесте.');
-            writeFileSync(p, text);
+            writeFileSync(p, text, mode === undefined ? { flag: 'wx' } : { flag: 'wx', mode });
         });
     const rename =
         deps.renameFn ??
@@ -305,11 +350,16 @@ export function writeFileAtomic(target: string, data: string, deps: TWriteDeps =
             renameSync(from, to);
         });
 
+    // Права ЦЕЛЕВОГО файла переносятся на временный: `rename` кладёт поверх новый инод со
+    // своими правами от umask, и state, лежавший 0600, после первой же записи стал бы
+    // читаемым всем — тихо, без единого сообщения (ревью !19).
+    const mode = deps.modeOfFn ? deps.modeOfFn(target) : modeOf(target);
+
     tmpCounter += 1;
     const tmp = join(
         dirname(target),
         `.tmp-${String(process.pid)}-${String(threadId)}-${String(tmpCounter)}-${basename(target)}`,
     );
-    write(tmp, data);
+    write(tmp, data, mode ?? undefined);
     rename(tmp, target);
 }

@@ -20,6 +20,7 @@ import {
     maybePushDeadman,
     monitorLogPath,
     openPhasePRs,
+    resolveRuntimeDir,
 } from './monitor-panel.mts';
 // @ts-expect-error — JS-entry раннера без деклараций типов.
 import { pushEvent as pushEventReal } from '../ralph.js';
@@ -497,5 +498,64 @@ describe('openPhasePRs — поиск PR текущей фазы по ветке
         const shFn = vi.fn((_cmd: string) => '[]');
         const result = openPhasePRs(config, state, shFn);
         expect(result).toEqual({ error: 'no-branch' });
+    });
+});
+
+describe('--runtime-dir: панель смотрит в каталог состояния экземпляра (канон, задача 22)', () => {
+    // Флаг разбирается при загрузке модуля, поэтому проба — через свежий импорт с
+    // подменённым argv. Проверять его иначе нечем, а без проверки он немой: панель,
+    // читающая не тот каталог, НЕ падает — она показывает «раннер молчит» при живом
+    // прогоне, то есть врёт ровно в ту сторону, ради которой её и смотрят.
+    const ARGV = process.argv;
+    afterEach(() => {
+        process.argv = ARGV;
+        vi.resetModules();
+    });
+
+    it('с флагом лог берётся из указанного каталога, а не рядом с ядром', async () => {
+        process.argv = [...ARGV.slice(0, 2), '--runtime-dir', '/path/to/state/prod-abc'];
+        vi.resetModules();
+        const fresh = await import('./monitor-panel.mts');
+        expect(fresh.monitorLogPath({ profileName: 'prod' } as never)).toBe(
+            path.join('/path/to/state/prod-abc', 'ralph.log'),
+        );
+        expect(fresh.monitorLogPath({ profileName: 'playground' } as never)).toBe(
+            path.join('/path/to/state/prod-abc', 'ralph.dry.log'),
+        );
+    });
+
+    it('без флага — прежняя раскладка: файлы рядом с ядром', async () => {
+        process.argv = [...ARGV.slice(0, 2)];
+        vi.resetModules();
+        const fresh = await import('./monitor-panel.mts');
+        expect(fresh.monitorLogPath({ profileName: 'prod' } as never)).toMatch(/ralph\.log$/);
+        expect(fresh.monitorLogPath({ profileName: 'prod' } as never)).not.toContain(
+            '/path/to/state/',
+        );
+    });
+});
+
+describe('--runtime-dir: разбор флага fail-closed (ревью !19)', () => {
+    it('без флага — прежняя раскладка', () => {
+        expect(resolveRuntimeDir(['--once'], '/legacy/ralph')).toBe('/legacy/ralph');
+    });
+
+    it('значения нет либо следом другой флаг — отказ, а не «--once» в роли пути', () => {
+        expect(() => resolveRuntimeDir(['--runtime-dir'], '/legacy')).toThrow(/без значения/);
+        expect(() => resolveRuntimeDir(['--runtime-dir', '--once'], '/legacy')).toThrow(
+            /без значения/,
+        );
+    });
+
+    it('относительный путь — отказ: панель стартует из другого каталога, чем раннер', () => {
+        expect(() => resolveRuntimeDir(['--runtime-dir', 'state'], '/legacy')).toThrow(
+            /относительный/,
+        );
+    });
+
+    it('флаг дважды — отказ, а не тихий выбор первого', () => {
+        expect(() =>
+            resolveRuntimeDir(['--runtime-dir', '/a', '--runtime-dir', '/b'], '/legacy'),
+        ).toThrow(/дважды/);
     });
 });

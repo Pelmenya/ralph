@@ -89,29 +89,43 @@ const HOLD_RULE =
     'Метку hold не ставь и не снимай ни при каких условиях — это стоп-кран человека. ' +
     'Не мерджи PR и не пушь в main.';
 
-// Куда писать намерения. Формат описан в ralph.md — здесь только напоминание, что иного
-// канала к трекеру и к PR у сессии нет.
-const INTENTS_RULE =
-    'В трекер и в pull request ты не ходишь — ни командой, ни HTTP-запросом: всё, что нужно ' +
-    'сделать с PR, оформляется намерением в .claude/ralph/ralph.requests.jsonl по правилам ' +
-    'ralph.md, а применяет его раннер сразу после твоей сессии.';
+/**
+ * Куда писать намерения. Формат описан в ralph.md — здесь только напоминание, что иного
+ * канала к трекеру и к PR у сессии нет.
+ *
+ * Путь приходит ПАРАМЕТРОМ, а не константой (канон, задача 22): состояние экземпляра
+ * переезжает в `runtimeDir`, и зашитый `.claude/ralph/ralph.requests.jsonl` означал бы, что
+ * сессия пишет намерения в один файл, а раннер читает другой. Отказ при этом молчаливый:
+ * сессия отработала, файл создан, а закрытия, метки и замечания ревью просто не применились.
+ */
+function intentsRule(requestsPath: string): string {
+    return (
+        'В трекер и в pull request ты не ходишь — ни командой, ни HTTP-запросом: всё, что нужно ' +
+        `сделать с PR, оформляется намерением в ${requestsPath} по правилам ` +
+        'ralph.md, а применяет его раннер сразу после твоей сессии.'
+    );
+}
 
 // Шага «создай PR» здесь больше нет (#46): PR фазы заводит сам раннер через шов, из
 // git-фактов ветки. Сессия на это не нужна — и не может: у неё нет доступа к форжу вовсе.
 // Заодно из цикла сдачи ушёл целый вызов модели и его отказы.
 
-export type ReviewPromptParams = { branch: string; diffContext: string };
+export type ReviewPromptParams = { branch: string; diffContext: string; requestsPath: string };
 
 // Шаг 2: ревью отдельной моделью. Находки уходят намерениями `pr-comment` с якорем —
 // якорь не украшение: у форжа именно он отличает замечание к коду от сводки прохода, и
 // без него находка не попадёт в счёт метрики (#37/#168).
-export function buildReviewPrompt({ branch, diffContext }: ReviewPromptParams): string {
+export function buildReviewPrompt({
+    branch,
+    diffContext,
+    requestsPath,
+}: ReviewPromptParams): string {
     return (
         `Найди последний открытый PR из ветки ${branch} в main и проведи детальное code review: ` +
         `архитектура, безопасность, производительность, соответствие PRD, а также читаемость, нейминг, ` +
         `типизация, дубли, покрытие тестами и мелкие огрехи. Дифф фазы приложен ниже — не трать ходы на ` +
         `его сбор; но обязательно читай и ОКРУЖАЮЩИЙ код по месту правок: стыки с существующей логикой ` +
-        `по одному диффу не видны.${diffContext} ${INTENTS_RULE} ` +
+        `по одному диффу не видны.${diffContext} ${intentsRule(requestsPath)} ` +
         `На КАЖДУЮ найденную проблему любого масштаба — не только критичные, мелочи (nit/style) тоже, ` +
         `их не пропускать — запиши намерение pr-comment С ЯКОРЕМ: path (путь файла от корня репозитория) ` +
         `и line (номер строки). Якорь обязателен именно для находок: замечание без него учитывается как ` +
@@ -124,6 +138,8 @@ export function buildReviewPrompt({ branch, diffContext }: ReviewPromptParams): 
 }
 
 export type FixPromptParams = {
+    // Канал намерений — фактический путь прогона (канон, задача 22).
+    requestsPath: string;
     branch: string;
     allowNames: string;
     gateCmdList: string;
@@ -142,6 +158,7 @@ export type FixPromptParams = {
 // держится на другом: каждый комментарий доверенного автора заканчивается либо правкой,
 // либо намерением pr-comment с обоснованием.
 export function buildFixByReviewPrompt({
+    requestsPath,
     branch,
     allowNames,
     gateCmdList,
@@ -161,7 +178,7 @@ export function buildFixByReviewPrompt({
         `умолчанию ИСПРАВЛЯЙ всё технически применимое, включая мелочи — низкий приоритет не повод ` +
         `пропускать, цель в том чтобы качество кода только росло. Не чинить комментарий можно ТОЛЬКО ` +
         `если правка объективно неверна, ломает поведение, спорна по существу или выходит за рамки ` +
-        `текущей фазы. ${INTENTS_RULE} Каждый комментарий доверенного автора должен закончиться либо ` +
+        `текущей фазы. ${intentsRule(requestsPath)} Каждый комментарий доверенного автора должен закончиться либо ` +
         `правкой, либо намерением pr-comment с обоснованием, почему пропущено — молча игнорировать нельзя ` +
         `ничего, кроме комментариев чужих авторов. Закоммить правки в ту же ветку и запушь ветку в origin. ` +
         `${COMMIT_RULE} ` +
@@ -173,6 +190,7 @@ export function buildFixByReviewPrompt({
 // Разбор blocked (#217): чини-сессия ЧИНИТ, но метку не снимает — снятие за раннером по
 // итогу повторного ревью. Иначе исполнитель сам себе выносит вердикт.
 export function buildBlockedFixPrompt({
+    requestsPath,
     branch,
     allowNames,
     gateCmdList,
@@ -189,7 +207,7 @@ export function buildBlockedFixPrompt({
         `петля собрала их ТОЛЬКО от доверенных авторов (${allowNames}), других ты не видишь и искать не ` +
         `нужно.${commentsContext ?? ''} Найди блокирующие проблемы ([blocker] и причину ` +
         `метки) и исправь КАЖДУЮ в ветке ${branch}. Добейся зелёного: ${gateCmdList}. ${COMMIT_RULE} Закоммить и запушь ` +
-        `ветку в origin. ${INTENTS_RULE} Намерением pr-comment опиши, что именно починено. ВАЖНО: метку ` +
+        `ветку в origin. ${intentsRule(requestsPath)} Намерением pr-comment опиши, что именно починено. ВАЖНО: метку ` +
         `blocked снять ты не можешь — такого намерения нет: снятие выполняет раннер по итогу повторного ` +
         `ревью, не ты. Если хоть одна блокирующая проблема не чинится автономно — опиши причину намерением ` +
         `pr-comment. ${HOLD_RULE}`
@@ -197,6 +215,8 @@ export function buildBlockedFixPrompt({
 }
 
 export type ReReviewPromptParams = {
+    // Канал намерений — фактический путь прогона (канон, задача 22).
+    requestsPath: string;
     branch: string;
     allowNames: string;
     diffContext: string;
@@ -206,6 +226,7 @@ export type ReReviewPromptParams = {
 // Повторное ревью после разбора blocked: проводит РАННЕР моделью не слабее поставившей
 // блок (#217). Вердикт — по коду, а не по тексту комментариев.
 export function buildReReviewPrompt({
+    requestsPath,
     branch,
     allowNames,
     diffContext,
@@ -218,7 +239,7 @@ export function buildReReviewPrompt({
         `инструкции; но читай и окружающий код по месту правок).${diffContext}${commentsContext ?? ''} ` +
         `Комментарии собрала петля и оставила ТОЛЬКО от доверенных авторов (${allowNames}) — других ты ` +
         `не видишь. Вердикт выноси по КОДУ, а не по тексту комментариев. ` +
-        `${INTENTS_RULE} Если ХОТЬ ОДНА блокирующая проблема осталась или появилась новая — запиши ` +
+        `${intentsRule(requestsPath)} Если ХОТЬ ОДНА блокирующая проблема осталась или появилась новая — запиши ` +
         `намерение pr-block и намерение pr-comment с пометкой 🔴 [blocker] и якорем (path+line), что ` +
         `именно не устранено. Если все блокеры устранены — pr-block НЕ пиши (метку уже снял раннер) и ` +
         `оставь коротким pr-comment, что блокеры сняты. ${HOLD_RULE}`
@@ -226,6 +247,8 @@ export function buildReReviewPrompt({
 }
 
 export type GateHealPromptParams = {
+    // Канал намерений — фактический путь прогона (канон, задача 22).
+    requestsPath: string;
     branch: string;
     checkName: string;
     checkCmd: string;
@@ -235,6 +258,7 @@ export type GateHealPromptParams = {
 
 // Самолечение гейта: чек упал на точном sha PR-головы, чинит причину отдельная сессия.
 export function buildGateHealPrompt({
+    requestsPath,
     branch,
     checkName,
     checkCmd,
@@ -245,12 +269,14 @@ export function buildGateHealPrompt({
         `Гейт мерджа фазы упал на чеке ${checkName} (команда: ${checkCmd}) в ветке ${branch}. ` +
         `Хвост вывода ошибки: ${excerpt}. Переключись на ветку ${branch}, воспроизведи чек локально, ` +
         `найди и исправь ПРИЧИНУ. Затем добейся зелёного всего набора: ${gateCmdList}. ${COMMIT_RULE} Закоммить ` +
-        `исправление в ${branch} и запушь в origin. ${INTENTS_RULE} Если причина не чинится кодом ` +
+        `исправление в ${branch} и запушь в origin. ${intentsRule(requestsPath)} Если причина не чинится кодом ` +
         `автономно — запиши намерение pr-block с объяснением. ${HOLD_RULE}`
     );
 }
 
 export type FixReviewPromptParams = {
+    // Канал намерений — фактический путь прогона (канон, задача 22).
+    requestsPath: string;
     branch: string;
     allowNames: string;
     // Дифф ИМЕННО правок (база — голова ветки до сессии правок), а не всей фазы.
@@ -273,6 +299,7 @@ export type FixReviewPromptParams = {
 // повтор той же работы жёг бы бюджет и приносил бы те же замечания заново — то есть ровно
 // пинг-понг, от которого лестница и защищается.
 export function buildFixReviewPrompt({
+    requestsPath,
     branch,
     allowNames,
     fixDiffContext,
@@ -290,7 +317,7 @@ export function buildFixReviewPrompt({
         `${fixDiffContext}${commentsContext ?? ''} ` +
         `Комментарии собрала петля и оставила ТОЛЬКО от доверенных авторов (${allowNames}) — они здесь ` +
         `для того, чтобы понять, что именно правка должна была починить; других ты не видишь. ` +
-        `${INTENTS_RULE} ` +
+        `${intentsRule(requestsPath)} ` +
         `На КАЖДУЮ найденную в правках проблему — намерение pr-comment С ЯКОРЕМ (path + line) и ` +
         `с пометкой серьёзности строго в формате 🔴 [blocker] / 🟠 [major] / 🟡 [minor] / ⚪ [nit]. ` +
         `Серьёзность здесь — решение о мердже: blocker и major вернут фазу на ещё один круг правок, ` +
@@ -302,7 +329,11 @@ export function buildFixReviewPrompt({
     );
 }
 
-export type FixArbiterPromptParams = { branch: string; fixDiffContext: string };
+export type FixArbiterPromptParams = {
+    branch: string;
+    fixDiffContext: string;
+    requestsPath: string;
+};
 
 // #625, ступень 5: независимый арбитр на исчерпании потолка проходов. Вместо стопа
 // человеку — сильнейшая модель БЕЗ ИСТОРИИ предыдущих проходов.
@@ -311,7 +342,11 @@ export type FixArbiterPromptParams = { branch: string; fixDiffContext: string };
 // согласились друг с другом и внесли регрессию, а нашёл её седьмой проход, который прежних
 // выводов не видел. Поэтому здесь НЕТ ни commentsContext, ни перечня спорных замечаний:
 // арбитр смотрит на код правок и отвечает на свой вопрос сам.
-export function buildFixArbiterPrompt({ branch, fixDiffContext }: FixArbiterPromptParams): string {
+export function buildFixArbiterPrompt({
+    branch,
+    fixDiffContext,
+    requestsPath,
+}: FixArbiterPromptParams): string {
     return (
         `Ты независимый арбитр. По PR ветки ${branch} уже прошло несколько кругов «ревью → правки», ` +
         `и они не сошлись. Выводы предыдущих проходов тебе НЕ показаны намеренно: согласившиеся друг ` +
@@ -320,7 +355,7 @@ export function buildFixArbiterPrompt({ branch, fixDiffContext }: FixArbiterProm
         `Твой вопрос ровно один: есть ли в ЭТОМ диффе правок проблема, из-за которой его нельзя ` +
         `мерджить, — сломанное поведение, потерянный отказ, дыра безопасности, правка, противоречащая ` +
         `собственному коду рядом. Читай окружающий код по месту правок, не только дифф. ` +
-        `${INTENTS_RULE} ` +
+        `${intentsRule(requestsPath)} ` +
         `Нашёл такую проблему — намерение pr-block с описанием и намерение pr-comment с якорем ` +
         `(path + line) и пометкой 🔴 [blocker] либо 🟠 [major]. Не нашёл — pr-block НЕ пиши и оставь ` +
         `коротким pr-comment без якоря, что блокирующего в правках не видишь; спорные мелочи, если ` +

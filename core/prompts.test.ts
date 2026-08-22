@@ -5,6 +5,11 @@
 // ломаются молча: подстановка параметров и отсутствие площадочной механики. Второе
 // дублирует барьер чистоты намеренно: барьер грепает файл целиком и скажет «в модуле есть
 // gh», а эти тесты покажут, В КАКОМ промпте.
+// Канал намерений в промпте — фактический путь прогона (канон, задача 22): раньше он
+// был зашит константой, и после переезда состояния сессия писала бы намерения в один файл,
+// а раннер читал другой — молча, без единого красного.
+const REQUESTS = '/path/to/runtime/ralph.requests.jsonl';
+
 import { describe, expect, it } from 'vitest';
 import {
     buildBlockedFixPrompt,
@@ -22,22 +27,38 @@ const BRANCH = 'feature/m1';
 const GATE = 'npm run lint, npm run test';
 
 const ALL: Array<[string, string]> = [
-    ['ревью', buildReviewPrompt({ branch: BRANCH, diffContext: '<дифф>' })],
+    ['ревью', buildReviewPrompt({ branch: BRANCH, diffContext: '<дифф>', requestsPath: REQUESTS })],
     [
         'правки по ревью',
-        buildFixByReviewPrompt({ branch: BRANCH, allowNames: 'owner', gateCmdList: GATE }),
+        buildFixByReviewPrompt({
+            branch: BRANCH,
+            allowNames: 'owner',
+            gateCmdList: GATE,
+            requestsPath: REQUESTS,
+        }),
     ],
     [
         'разбор blocked',
-        buildBlockedFixPrompt({ branch: BRANCH, allowNames: 'owner', gateCmdList: GATE }),
+        buildBlockedFixPrompt({
+            branch: BRANCH,
+            allowNames: 'owner',
+            gateCmdList: GATE,
+            requestsPath: REQUESTS,
+        }),
     ],
     [
         'повторное ревью',
-        buildReReviewPrompt({ branch: BRANCH, allowNames: 'owner', diffContext: '<дифф>' }),
+        buildReReviewPrompt({
+            branch: BRANCH,
+            allowNames: 'owner',
+            diffContext: '<дифф>',
+            requestsPath: REQUESTS,
+        }),
     ],
     [
         'ревью правок',
         buildFixReviewPrompt({
+            requestsPath: REQUESTS,
             branch: BRANCH,
             allowNames: 'owner',
             fixDiffContext: '<дифф правок>',
@@ -47,11 +68,16 @@ const ALL: Array<[string, string]> = [
     ],
     [
         'арбитр ревью правок',
-        buildFixArbiterPrompt({ branch: BRANCH, fixDiffContext: '<дифф правок>' }),
+        buildFixArbiterPrompt({
+            branch: BRANCH,
+            fixDiffContext: '<дифф правок>',
+            requestsPath: REQUESTS,
+        }),
     ],
     [
         'самолечение гейта',
         buildGateHealPrompt({
+            requestsPath: REQUESTS,
             branch: BRANCH,
             checkName: 'test',
             checkCmd: 'npm run test',
@@ -67,7 +93,9 @@ describe('промпты сессий: подстановка параметро
     });
 
     it('ревью получает контекст диффа, а не собирает его сам', () => {
-        expect(buildReviewPrompt({ branch: BRANCH, diffContext: '<дифф>' })).toContain('<дифф>');
+        expect(
+            buildReviewPrompt({ branch: BRANCH, diffContext: '<дифф>', requestsPath: REQUESTS }),
+        ).toContain('<дифф>');
     });
 
     // #66: правило коммита — профилактика к барьеру в коде (раннер коммитит остаток сам).
@@ -90,10 +118,20 @@ describe('промпты сессий: подстановка параметро
         // Раньше здесь был прошит список npm-скриптов ДРУГОГО проекта: сессия честно
         // пыталась выполнить команду, которой в этом репозитории нет вовсе.
         expect(
-            buildFixByReviewPrompt({ branch: BRANCH, allowNames: 'o', gateCmdList: GATE }),
+            buildFixByReviewPrompt({
+                branch: BRANCH,
+                allowNames: 'o',
+                gateCmdList: GATE,
+                requestsPath: REQUESTS,
+            }),
         ).toContain(GATE);
         expect(
-            buildBlockedFixPrompt({ branch: BRANCH, allowNames: 'o', gateCmdList: GATE }),
+            buildBlockedFixPrompt({
+                branch: BRANCH,
+                allowNames: 'o',
+                gateCmdList: GATE,
+                requestsPath: REQUESTS,
+            }),
         ).toContain(GATE);
     });
 
@@ -102,6 +140,7 @@ describe('промпты сессий: подстановка параметро
     // в потолок снова — повтор становится холостым.
     it('resumed → сессия знает, что продолжает прерванный разбор, и смотрит историю ветки', () => {
         const prompt = buildFixByReviewPrompt({
+            requestsPath: REQUESTS,
             branch: BRANCH,
             allowNames: 'owner',
             gateCmdList: GATE,
@@ -113,7 +152,12 @@ describe('промпты сессий: подстановка параметро
 
     it('по умолчанию пометки продолжения нет — первая сессия разбирает с нуля', () => {
         expect(
-            buildFixByReviewPrompt({ branch: BRANCH, allowNames: 'owner', gateCmdList: GATE }),
+            buildFixByReviewPrompt({
+                branch: BRANCH,
+                allowNames: 'owner',
+                gateCmdList: GATE,
+                requestsPath: REQUESTS,
+            }),
         ).not.toMatch(/ПРОДОЛЖЕНИЕ прерванного разбора/);
     });
 
@@ -121,6 +165,7 @@ describe('промпты сессий: подстановка параметро
     // блокеры), опечатка в нём не ловится тестами buildFixByReviewPrompt выше.
     it('resumed у разбора blocked → та же пометка продолжения и взгляд в историю ветки', () => {
         const prompt = buildBlockedFixPrompt({
+            requestsPath: REQUESTS,
             branch: BRANCH,
             allowNames: 'owner',
             gateCmdList: GATE,
@@ -132,15 +177,35 @@ describe('промпты сессий: подстановка параметро
 
     it('по умолчанию у разбора blocked пометки продолжения тоже нет', () => {
         expect(
-            buildBlockedFixPrompt({ branch: BRANCH, allowNames: 'owner', gateCmdList: GATE }),
+            buildBlockedFixPrompt({
+                branch: BRANCH,
+                allowNames: 'owner',
+                gateCmdList: GATE,
+                requestsPath: REQUESTS,
+            }),
         ).not.toMatch(/ПРОДОЛЖЕНИЕ прерванного разбора/);
     });
 
     it('сессии, читающие комментарии, знают список доверенных авторов (C3)', () => {
         for (const prompt of [
-            buildFixByReviewPrompt({ branch: BRANCH, allowNames: 'owner', gateCmdList: GATE }),
-            buildBlockedFixPrompt({ branch: BRANCH, allowNames: 'owner', gateCmdList: GATE }),
-            buildReReviewPrompt({ branch: BRANCH, allowNames: 'owner', diffContext: '' }),
+            buildFixByReviewPrompt({
+                branch: BRANCH,
+                allowNames: 'owner',
+                gateCmdList: GATE,
+                requestsPath: REQUESTS,
+            }),
+            buildBlockedFixPrompt({
+                branch: BRANCH,
+                allowNames: 'owner',
+                gateCmdList: GATE,
+                requestsPath: REQUESTS,
+            }),
+            buildReReviewPrompt({
+                branch: BRANCH,
+                allowNames: 'owner',
+                diffContext: '',
+                requestsPath: REQUESTS,
+            }),
         ]) {
             expect(prompt).toContain('owner');
         }
@@ -191,18 +256,21 @@ describe('данные форжа в промпте: карточка и ком�
         const ctx = buildCommentsContext([{ body: '🟠 [major] край', author: 'dev' }]);
         for (const prompt of [
             buildFixByReviewPrompt({
+                requestsPath: REQUESTS,
                 branch: BRANCH,
                 allowNames: 'dev',
                 gateCmdList: GATE,
                 commentsContext: ctx,
             }),
             buildBlockedFixPrompt({
+                requestsPath: REQUESTS,
                 branch: BRANCH,
                 allowNames: 'dev',
                 gateCmdList: GATE,
                 commentsContext: ctx,
             }),
             buildReReviewPrompt({
+                requestsPath: REQUESTS,
                 branch: BRANCH,
                 allowNames: 'dev',
                 diffContext: '',
@@ -249,7 +317,11 @@ describe('промпты сессий: намерение вместо спос�
     });
 
     it('ревью требует якорь у находки — без него она уйдёт в сводку', () => {
-        const prompt = buildReviewPrompt({ branch: BRANCH, diffContext: '' });
+        const prompt = buildReviewPrompt({
+            branch: BRANCH,
+            diffContext: '',
+            requestsPath: REQUESTS,
+        });
         expect(prompt).toMatch(/pr-comment/);
         expect(prompt).toMatch(/path/);
         expect(prompt).toMatch(/line/);
@@ -259,7 +331,12 @@ describe('промпты сессий: намерение вместо спос�
 
     it('чини-сессия не может попросить снять блок — такого намерения нет', () => {
         expect(
-            buildBlockedFixPrompt({ branch: BRANCH, allowNames: 'o', gateCmdList: GATE }),
+            buildBlockedFixPrompt({
+                branch: BRANCH,
+                allowNames: 'o',
+                gateCmdList: GATE,
+                requestsPath: REQUESTS,
+            }),
         ).toMatch(/снять ты не можешь/i);
     });
 });
@@ -269,6 +346,7 @@ describe('промпты сессий: намерение вместо спос�
 // предыдущих проходов). Оба — в промпте, поэтому проверяются здесь.
 describe('лестница ревью правок: предмет прохода и независимость арбитра (#625)', () => {
     const fixReview = buildFixReviewPrompt({
+        requestsPath: REQUESTS,
         branch: BRANCH,
         allowNames: 'owner',
         fixDiffContext: '<дифф правок>',
@@ -293,6 +371,7 @@ describe('лестница ревью правок: предмет проход�
 
     it('арбитр не получает ни комментариев, ни выводов прошлых проходов — только дифф', () => {
         const arbiter = buildFixArbiterPrompt({
+            requestsPath: REQUESTS,
             branch: BRANCH,
             fixDiffContext: '<дифф правок>',
         });
@@ -302,5 +381,21 @@ describe('лестница ревью правок: предмет проход�
         // «учти, что коллеги нашли X» вернуло бы согласие, ради отсутствия которого он и
         // заведён. Формы для подмешивания истории у промпта нет вовсе.
         expect(arbiter).not.toContain('<комментарии>');
+    });
+});
+
+describe('канал намерений в промпте — фактический путь прогона (канон, задача 22)', () => {
+    it('промпт называет переданный путь, а не зашитую константу', () => {
+        // Зашитый путь означал бы, что сессия пишет намерения в один файл, а раннер читает
+        // другой: сессия отработала, файл создан, а закрытия, метки и замечания ревью просто
+        // не применились — молча, без единого красного.
+        const custom = '/path/to/state/prod-1/ralph.requests.jsonl';
+        const prompt = buildReviewPrompt({
+            branch: 'feature/x',
+            diffContext: '',
+            requestsPath: custom,
+        });
+        expect(prompt).toContain(custom);
+        expect(prompt).not.toContain('.claude/ralph/ralph.requests.jsonl');
     });
 });

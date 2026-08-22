@@ -127,6 +127,7 @@ import type {
     RunResult,
     TaskSourceAdapter,
 } from '../adapters/adapters.ts';
+import { underRoot, type TResolvedRoots } from './roots.ts';
 import {
     buildAdapters,
     createCoderRuntime,
@@ -142,43 +143,80 @@ import {
 } from '../adapters/adapters-impl.ts';
 
 const CLAUDE_DIR = '.claude';
-const CONFIG_PATH = path.join(CLAUDE_DIR, 'ralph', 'ralph.config.json');
-const STATE_PATH = path.join(CLAUDE_DIR, 'ralph', 'ralph.state.json');
-const LOG_PATH = path.join(CLAUDE_DIR, 'ralph', 'ralph.log');
-// #386: НЕ боевые прогоны (--dry-run и/или профиль ≠ prod) пишут сюда, не в LOG_PATH —
-// см. chooseLogPath (exec.ts) и инвариант №12.
-const DRY_LOG_PATH = path.join(CLAUDE_DIR, 'ralph', 'ralph.dry.log');
-const MONITOR_PATH = path.join(CLAUDE_DIR, 'ralph', 'runtime', 'monitor.js');
-// Путь к самому раннеру — для cmdline-сверки лока (isRalphProcess): за pid из лок-файла
-// должен стоять именно наш ralph.js (entry), а не чужой процесс, которому ОС отдала
-// переиспользованный номер. Путь ОТНОСИТЕЛЬНЫЙ (CLAUDE_DIR-относительный) — уникальности
-// проекта он НЕ гарантирует: любой другой клон с той же раскладкой, запущенный из своего
-// корня как `node .claude/ralph/ralph.js`, даёт в cmdline ровно ту же подстроку. Для лока
-// это приемлемо — цена промаха при pid-reuse лишь ложный ОТКАЗ старта (fail-closed), а не
-// SIGTERM чужой группе, как было бы у sweepOrphanMonitors. Хочешь настоящую уникальность —
-// резолвь argv держателя через /proc/<pid>/cwd и сравнивай realpath (пока не нужно).
-const RALPH_PATH = path.join(CLAUDE_DIR, 'ralph', 'ralph.js');
-// Файл-лок от двойного запуска (#176). Путь относительный и берётся ДО chdir в worktree,
-// поэтому лок живёт в `.claude/ralph/` ДЕРЕВА ЗАПУСКА (клона), из которого подняли раннер —
-// это «один на клон», а не «один на машину-репозиторий»: два раннера из ОДНОГО клона
-// (playground и prod) делят этот лок и блокируют друг друга, но раннер из ДРУГОГО клона того
-// же origin им не блокируется, хотя гонка за PR/мердж/ветки у них общая через GitHub. Нужен
-// машинно-глобальный лок (по хэшу origin, вне дерева, напр. /tmp) — отдельная задача.
-// Гитигнорен, как ralph.log/state — раннер нигде не коммитит его.
-const LOCK_PATH = path.join(CLAUDE_DIR, 'ralph', 'ralph.lock');
-const MONITOR_OUT = path.join(CLAUDE_DIR, 'ralph', 'monitor.out');
-const MONITOR_PID = path.join(CLAUDE_DIR, 'ralph', 'monitor.pid');
-// Маркер хэша package-lock.json последнего успешного `npm ci` в дереве раннера.
-// Гейт сверяет с ним lock PR-головы и переустанавливает зависимости при расхождении
-// (#SiaUX): фаза, добавившая зависимость, иначе гарантированно красила бы ночной гейт.
-const LOCK_MARKER_PATH = path.join(CLAUDE_DIR, 'ralph', '.deps-lock.sha');
-// #390: stdout/stderr упавших кодер-сессий — сюда, гитигнорено (.gitignore), как
-// ralph.log/ralph.state.json. Имя файла `<issue>-<ts>.log` строит handleCrashedCoderSession,
-// а саму запись (с редактированием секретов) делает saveSessionOutput (exec.ts).
-const SESSIONS_DIR = path.join(CLAUDE_DIR, 'ralph', 'sessions');
-// #40: файл-запрос кодер-сессии (JSONL намерений). Гитигнорен, как ralph.log/state:
-// это канал одной итерации, а не история — применённое стирается сразу.
-const REQUESTS_PATH = path.join(CLAUDE_DIR, 'ralph', 'ralph.requests.jsonl');
+// Прежняя раскладка: и продукт, и состояние в одном каталоге внутри дерева. Пока секции
+// `roots` в конфиге нет, всё остаётся здесь — умолчание, названное вслух (канон, задача 21).
+const LEGACY_DIR = path.join(CLAUDE_DIR, 'ralph');
+const CONFIG_PATH = path.join(LEGACY_DIR, 'ralph.config.json');
+
+/**
+ * Пути СОСТОЯНИЯ экземпляра — один объект вместо россыпи констант, и собирается он той же
+ * функцией, что и переехавшая раскладка. Один источник состава намеренно: пока legacy-пути
+ * перечислялись отдельно, новый файл состояния можно было добавить сюда и забыть добавить
+ * туда — он остался бы в каталоге ядра, а узналось бы это на первом грязном подмодуле
+ * (ревью !19).
+ *
+ * Поля изменяемы: адрес известен только после чтения конфига, а читатели захватывают
+ * объект, а не значение.
+ */
+const RUNTIME = runtimePathsIn(LEGACY_DIR);
+
+/**
+ * Пути состояния ВНУТРИ заданного `runtimeDir` — чистая функция, чтобы состав переехавших
+ * файлов можно было проверить описью, а не чтением. Имена файлов НЕ меняются: их читают
+ * монитор, deadman и человек грепом, и переезд каталога — достаточное изменение за раз.
+ */
+export type TRuntimePaths = {
+    state: string;
+    log: string;
+    dryLog: string;
+    lock: string;
+    monitorOut: string;
+    monitorPid: string;
+    lockMarker: string;
+    sessions: string;
+    requests: string;
+};
+
+export function runtimePathsIn(runtimeDir: string): TRuntimePaths {
+    return {
+        state: path.join(runtimeDir, 'ralph.state.json'),
+        log: path.join(runtimeDir, 'ralph.log'),
+        dryLog: path.join(runtimeDir, 'ralph.dry.log'),
+        lock: path.join(runtimeDir, 'ralph.lock'),
+        monitorOut: path.join(runtimeDir, 'monitor.out'),
+        monitorPid: path.join(runtimeDir, 'monitor.pid'),
+        lockMarker: path.join(runtimeDir, '.deps-lock.sha'),
+        sessions: path.join(runtimeDir, 'sessions'),
+        requests: path.join(runtimeDir, 'ralph.requests.jsonl'),
+    };
+}
+
+/**
+ * Переезд состояния в `runtimeDir` из контракта корней.
+ *
+ * До него все пути CLAUDE_DIR-относительны, и после `process.chdir` в worktree фазы
+ * состояние оказывается ВНУТРИ дерева работы — то есть исчезает вместе с ним ровно тогда,
+ * когда по нему собирались восстанавливаться. Абсолютные пути от `runtimeDir` снимают и
+ * это, и зависимость от места запуска.
+ */
+function repointRuntime(runtimeDir: string): void {
+    Object.assign(RUNTIME, runtimePathsIn(runtimeDir));
+}
+
+/**
+ * Пути ПРОДУКТА — код ядра. Он read-only во время работы и переезжает вместе с подмодулем,
+ * а не со состоянием: смешать их значило бы позволить прогону писать в продукт.
+ */
+const PRODUCT = {
+    monitor: path.join(LEGACY_DIR, 'runtime', 'monitor.js'),
+    // Путь к самому раннеру — для cmdline-сверки лока (isRalphProcess): за pid из лок-файла
+    // должен стоять именно наш ralph.js (entry), а не чужой процесс, которому ОС отдала
+    // переиспользованный номер. Путь ОТНОСИТЕЛЬНЫЙ — уникальности проекта он НЕ гарантирует:
+    // любой другой клон с той же раскладкой даёт в cmdline ровно ту же подстроку. Для лока
+    // это приемлемо: цена промаха при pid-reuse — ложный ОТКАЗ старта (fail-closed), а не
+    // SIGTERM чужой группе, как было бы у sweepOrphanMonitors.
+    entry: path.join(LEGACY_DIR, 'ralph.js'),
+};
 // Предел выборки карточек фазы — ОДИН на все три вопроса к форжу (очередь, полный список,
 // метки). Не «сколько влезет», а граница, за которой ответ перестаёт быть доказательством:
 // упёршись в неё, функция отказывает, а не отдаёт неполный список.
@@ -226,6 +264,11 @@ export type ModelRouteEntry = string | { provider?: string; model: string };
 export type RalphConfig = {
     active?: boolean;
     profileName?: string;
+    // Раскладка корней, уже резолвнутая (канон, задача 21): её кладёт `resolveProfile`,
+    // чтобы резолв — обращения к диску и разворачивание симлинков — не повторялся в каждом
+    // месте, где корень понадобится. `null` означает старую раскладку «всё в каталоге ядра»,
+    // и это не то же самое, что «раскладка пустая».
+    rootsResolved?: TResolvedRoots | null;
     phases: Phase[];
     prompt?: string;
     model?: string;
@@ -561,12 +604,12 @@ export function createOrchestrator(env: OrchestratorEnv) {
 
     // Примитивы исполнения и лога (#365): log/fail/setLogTarget, sh (чтения, #133),
     // shArgv (мутации argv без шелла, #193/#252), ghJson (ретраи чтений, M3) — exec.ts.
-    // Начальная цель лога — cwd-относительный LOG_PATH; main() репойнтит на абсолютный
+    // Начальная цель лога — cwd-относительный RUNTIME.log; main() репойнтит на абсолютный
     // путь внутри worktree раннера ещё ДО chdir (#SiaUB).
     const { log, fail, setLogTarget, sh, shArgv, ghJson, saveSessionOutput } = createExec({
         guardSideEffect,
         sleep,
-        initialLogTarget: LOG_PATH,
+        initialLogTarget: RUNTIME.log,
     });
 
     // #359 (трек «Фреймворк ralph», фаза 2): работа с тремя файлами раннера —
@@ -592,10 +635,19 @@ export function createOrchestrator(env: OrchestratorEnv) {
         releaseLockIfOurs,
         acquireLock,
     } = createStateLock({
-        statePath: STATE_PATH,
-        lockPath: LOCK_PATH,
-        lockMarkerPath: LOCK_MARKER_PATH,
-        ralphPath: RALPH_PATH,
+        // Геттеры, а не значения: адрес состояния известен только после чтения конфига
+        // (`runtimeDir`), а фабрика собирается раньше — захваченное значение осталось бы
+        // прежним, и состояние уехало бы в старое место молча.
+        get statePath() {
+            return RUNTIME.state;
+        },
+        get lockPath() {
+            return RUNTIME.lock;
+        },
+        get lockMarkerPath() {
+            return RUNTIME.lockMarker;
+        },
+        ralphPath: PRODUCT.entry,
         dry: DRY,
         getConfig: () => config,
         log,
@@ -2165,7 +2217,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         } catch (e) {
             pushEventFn(
                 `⛔ Ralph: запрос кодер-сессии не разобрался — ${(e as Error).message}. ` +
-                    `Ничего не применено, файл ${REQUESTS_PATH} оставлен как есть для разбора.`,
+                    `Ничего не применено, файл ${RUNTIME.requests} оставлен как есть для разбора.`,
                 cfg,
                 { logFn },
             );
@@ -2409,7 +2461,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         limitHint +
                         `Применено ${String(i)} из ${String(requests.length)}. ` +
                         (writeErrMsg === null
-                            ? `Остаток сохранён в ${REQUESTS_PATH} и будет повторён.`
+                            ? `Остаток сохранён в ${RUNTIME.requests} и будет повторён.`
                             : `Остаток СОХРАНИТЬ НЕ УДАЛОСЬ (${writeErrMsg}), вот он целиком:\n${text}`),
                     cfg,
                     { logFn },
@@ -2429,7 +2481,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             removeFn();
         } catch (e) {
             pushEventFn(
-                `⚠ Ralph: намерения применены (${String(requests.length)}), но файл ${REQUESTS_PATH} не удалился — ` +
+                `⚠ Ralph: намерения применены (${String(requests.length)}), но файл ${RUNTIME.requests} не удалился — ` +
                     `${(e as Error).message}. Убери его руками, иначе следующая итерация применит их повторно ` +
                     'и остановится на грязном дереве.',
                 cfg,
@@ -2445,22 +2497,22 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // writeFn в тесте затёр бы запрос ЖИВОГО прогона — гейт гоняет тесты в дереве раннера.
     function readSessionRequests(): string | null {
         try {
-            return fs.readFileSync(REQUESTS_PATH, 'utf8');
+            return fs.readFileSync(RUNTIME.requests, 'utf8');
         } catch {
             return null;
         }
     }
 
     function writeSessionRequests(text: string): void {
-        guardSideEffect(`writeSessionRequests(${REQUESTS_PATH})`);
-        fs.writeFileSync(REQUESTS_PATH, text);
+        guardSideEffect(`writeSessionRequests(${RUNTIME.requests})`);
+        fs.writeFileSync(RUNTIME.requests, text);
     }
 
     // #62: удаление применённого запроса. `force: true` — отсутствие файла не ошибка:
     // сессия могла ничего не просить, а до сюда мы доходим и когда файл уже унесли руками.
     function removeSessionRequests(): void {
-        guardSideEffect(`removeSessionRequests(${REQUESTS_PATH})`);
-        fs.rmSync(REQUESTS_PATH, { force: true });
+        guardSideEffect(`removeSessionRequests(${RUNTIME.requests})`);
+        fs.rmSync(RUNTIME.requests, { force: true });
     }
 
     // ── Роутинг моделей по сложности ─────────────────────────────────────────
@@ -3142,7 +3194,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             cfg?: RalphConfig;
         } = {},
     ): { stop: boolean } {
-        const sessionPath = path.join(SESSIONS_DIR, `${issue.number}-${Date.now()}.log`);
+        const sessionPath = path.join(RUNTIME.sessions, `${issue.number}-${Date.now()}.log`);
         // #390: секреты (петля + ключ активного рантайма, инвариант №11) редактируются ДО
         // записи на диск — тот же приём, что telegram-notifier.ts применяет к TG-токену.
         // Запись — вежливая диагностика, а НЕ инвариант: mkdir/writeFile могут бросить
@@ -3860,7 +3912,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             failFn(
                 `Пост-мердж деплой фазы "${b.milestone}" ${pending ? 'не досмотрен' : 'был красным'} ` +
                     `(${b.reason}) — следующая фаза не начинается (#165). Почини прод/деплой и запусти с ` +
-                    `--deploy-resolved, либо очисти state.deployBlock в ${STATE_PATH}.`,
+                    `--deploy-resolved, либо очисти state.deployBlock в ${RUNTIME.state}.`,
             );
         }
 
@@ -3884,7 +3936,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 if (!merged) {
                     failFn(
                         `Инвариант нарушен: предыдущая фаза "${prev.milestone}" (ветка ${prev.branch}) НЕ смерджена, а state указывает на "${state.milestone}". ` +
-                            `Домерджи её PR или поправь ${STATE_PATH} (--reset вернёт на первую фазу конфига).`,
+                            `Домерджи её PR или поправь ${RUNTIME.state} (--reset вернёт на первую фазу конфига).`,
                     );
                 }
             }
@@ -4655,7 +4707,11 @@ export function createOrchestrator(env: OrchestratorEnv) {
                             limit: positiveIntOrDefault(cfg.review?.diffLimit, REVIEW_DIFF_LIMIT),
                         });
                         const reviewCode = runClaudeFn(
-                            buildReviewPrompt({ branch: phase.branch, diffContext }),
+                            buildReviewPrompt({
+                                branch: phase.branch,
+                                diffContext,
+                                requestsPath: RUNTIME.requests,
+                            }),
                             // #221: fallbackModel — явный override (не noFallback:true из M8).
                             // #130: у ревью свой бюджет ходов (review.maxTurns, дефолт 80).
                             // Кодерские 200 ему не нужны — ревью не пишет код, и лишний
@@ -4703,6 +4759,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         runSessionWithTurnRetries(
                             (resumed) =>
                                 buildFixByReviewPrompt({
+                                    requestsPath: RUNTIME.requests,
                                     branch: phase.branch,
                                     allowNames,
                                     gateCmdList: fixGateCmdList,
@@ -5175,6 +5232,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                             );
                             const fixReviewCode = runClaudeFn(
                                 buildFixReviewPrompt({
+                                    requestsPath: RUNTIME.requests,
                                     branch: phase.branch,
                                     allowNames,
                                     fixDiffContext,
@@ -5318,6 +5376,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                             );
                             const arbCode = runClaudeFn(
                                 buildFixArbiterPrompt({
+                                    requestsPath: RUNTIME.requests,
                                     branch: phase.branch,
                                     fixDiffContext: arbiterDiffContext(),
                                 }),
@@ -5785,6 +5844,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     const blocked = runSessionWithTurnRetries(
                         (resumed) =>
                             buildBlockedFixPrompt({
+                                requestsPath: RUNTIME.requests,
                                 branch: phase.branch,
                                 allowNames: cfg.authorAllowlist.join(', '),
                                 gateCmdList: bGateCmdList,
@@ -5891,6 +5951,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     });
                     const rCode = runClaudeFn(
                         buildReReviewPrompt({
+                            requestsPath: RUNTIME.requests,
                             branch: phase.branch,
                             allowNames: cfg.authorAllowlist.join(', '),
                             diffContext: bDiffContext,
@@ -6008,6 +6069,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         .join(', ');
                     const healCode = runClaudeFn(
                         buildGateHealPrompt({
+                            requestsPath: RUNTIME.requests,
                             branch: phase.branch,
                             checkName: redCheck.name,
                             checkCmd: redCheck.cmd,
@@ -6135,7 +6197,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         return cmdlineIncludes(pid, 'monitor.js', readFn);
     }
 
-    // Строгая сверка «за pid именно НАШ ralph-монитор» — по полному пути MONITOR_PATH в
+    // Строгая сверка «за pid именно НАШ ralph-монитор» — по полному пути PRODUCT.monitor в
     // cmdline, а не по родовому имени 'monitor.js' (isMonitorProcess). Нужна ИМЕННО скану
     // /proc (sweepOrphanMonitors, #235-ревью): там фильтр применяется ко ВСЕМ процессам
     // системы, и подстрока 'monitor.js' зацепила бы чужой процесс — pm2-обвязку, любой
@@ -6144,7 +6206,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // нестрогая isMonitorProcess остаётся: там pid взят из файла, который пишет только сам
     // раннер, чужого там взяться неоткуда.
     function isRalphMonitorProcess(pid: number, readFn: ReadFileFn = fs.readFileSync): boolean {
-        return cmdlineIncludes(pid, MONITOR_PATH, readFn);
+        return cmdlineIncludes(pid, PRODUCT.monitor, readFn);
     }
 
     // PID-файл монитора один на все профили. Читаем его в одном месте: и adoptMonitor
@@ -6152,11 +6214,11 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // брали одинаковый дефолт readPidFn — при смене формата файла пришлось бы править два
     // места. Number('') / Number(мусор) → NaN, дальше processAlive(NaN) честно вернёт false.
     function readMonitorPid(): number {
-        return Number(fs.readFileSync(MONITOR_PID, 'utf-8'));
+        return Number(fs.readFileSync(RUNTIME.monitorPid, 'utf-8'));
     }
 
     // Профиль живого монитора по его cmdline (аргументы \0-разделены, парсер тот же, что
-    // у раннера). MONITOR_PID один на все профили, поэтому монитор соседнего профиля
+    // у раннера). RUNTIME.monitorPid один на все профили, поэтому монитор соседнего профиля
     // (playground рядом с prod), перезаписавший файл, не должен сойти за наш — и adopt, и
     // ensureMonitorAlive сверяют профиль этой функцией. cmdline не читается / нет --profile
     // → null (старый сирота без флага резолвил бы defaultProfile — не факт что наш).
@@ -6227,12 +6289,12 @@ export function createOrchestrator(env: OrchestratorEnv) {
             }) as typeof spawn,
             logFn = log,
             writePidFn = (pid) => {
-                guardSideEffect(`startMonitor:writePid(${MONITOR_PID})`);
-                fs.writeFileSync(MONITOR_PID, String(pid));
+                guardSideEffect(`startMonitor:writePid(${RUNTIME.monitorPid})`);
+                fs.writeFileSync(RUNTIME.monitorPid, String(pid));
             },
             openOutFn = () => {
-                guardSideEffect(`startMonitor:openOut(${MONITOR_OUT})`);
-                return fs.openSync(MONITOR_OUT, 'w');
+                guardSideEffect(`startMonitor:openOut(${RUNTIME.monitorOut})`);
+                return fs.openSync(RUNTIME.monitorOut, 'w');
             },
             closeOutFn = (fd) => fs.closeSync(fd),
             adoptFn = adoptMonitor,
@@ -6253,8 +6315,14 @@ export function createOrchestrator(env: OrchestratorEnv) {
             // configPath (#SiaT8) — абсолютный путь конфига раннера (дерево человека): без
             // него монитор читал бы копию из своего worktree на детач-коммите, которая могла
             // отстать от того конфига, по которому реально идёт прогон.
-            const monitorArgv = [MONITOR_PATH];
+            const monitorArgv = [PRODUCT.monitor];
             if (profile) monitorArgv.push('--profile', profile);
+            // Канон, задача 22: панель обязана смотреть в ТОТ ЖЕ каталог состояния, что и
+            // раннер. Без этого флага она читала бы файлы рядом с ядром — а после переезда
+            // их там нет, и панель показывала бы «раннер молчит» при живом прогоне.
+            if (config.rootsResolved) {
+                monitorArgv.push('--runtime-dir', config.rootsResolved.runtimeDir);
+            }
             if (configPath) monitorArgv.push('--config', configPath);
             const child = spawnFn(process.execPath, monitorArgv, {
                 detached: true, // своя группа процессов
@@ -6267,7 +6335,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             });
             child.unref(); // не держим event loop раннера открытым
             writePidFn(child.pid);
-            logFn(`👁  Монитор поднят (pid ${child.pid}) → ${MONITOR_OUT} (tail -f)`);
+            logFn(`👁  Монитор поднят (pid ${child.pid}) → ${RUNTIME.monitorOut} (tail -f)`);
             return child;
         } catch (e) {
             // Монитор — удобство, а не условие работы. Ронять из-за него ночной прогон
@@ -6299,8 +6367,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
             }) as KillFn,
             logFn = log,
             rmPidFn = () => {
-                guardSideEffect(`stopMonitor:rmPid(${MONITOR_PID})`);
-                fs.rmSync(MONITOR_PID, { force: true });
+                guardSideEffect(`stopMonitor:rmPid(${RUNTIME.monitorPid})`);
+                fs.rmSync(RUNTIME.monitorPid, { force: true });
             },
             isMonitorFn = isMonitorProcess,
         } = deps;
@@ -6334,7 +6402,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // (ручной `node monitor.js`, гонка, перезапись файла новым до остановки старого)
     // накапливается вечно. readdirFn возвращает список каталогов /proc (числовые — pid'ы
     // процессов, остальное — служебные /proc/self и т.п., отсекаем регэкспом).
-    // Матчер — СТРОГИЙ isRalphMonitorProcess (полный путь MONITOR_PATH), не нестрогая
+    // Матчер — СТРОГИЙ isRalphMonitorProcess (полный путь PRODUCT.monitor), не нестрогая
     // isMonitorProcess (#235-ревью): скан идёт по всем процессам системы, и подстрока
     // 'monitor.js' зацепила бы чужой monitor.js — sweep снёс бы его группу.
     function listMonitorPids(deps: MonitorDeps = {}): number[] {
@@ -6383,7 +6451,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // alive/профиля) — иначе типовой случай (ровно одна сирота) уходил бы без единого лога
     // подхвата, а `sweep() || adopt()` в main() проскакивал бы adoptMonitor мимо. Побочки
     // (writePidFn, stopFn) — за предохранителем #138 (инв. 2): дефолт пишет реальный
-    // MONITOR_PID (его перечитывает живой prod-раннер) и шлёт SIGTERM реальным процессам,
+    // RUNTIME.monitorPid (его перечитывает живой prod-раннер) и шлёт SIGTERM реальным процессам,
     // поэтому тест без инъекции обязан упасть громко, а не сходить в боевую систему.
     function sweepOrphanMonitors(deps: MonitorDeps = {}): null {
         const {
@@ -6396,8 +6464,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 return stopMonitor(child, d);
             },
             writePidFn = (pid) => {
-                guardSideEffect(`sweepOrphanMonitors:writePid(${MONITOR_PID})`);
-                fs.writeFileSync(MONITOR_PID, String(pid));
+                guardSideEffect(`sweepOrphanMonitors:writePid(${RUNTIME.monitorPid})`);
+                fs.writeFileSync(RUNTIME.monitorPid, String(pid));
             },
             profile,
         } = deps;
@@ -6433,7 +6501,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // ПОЛНЫЙ паритет с adoptMonitor: pid-файл + processAlive + isMonitorProcess (cmdline
     // отсекает чужой процесс с переиспользованным pid) + сверка ПРОФИЛЯ (monitorProfileOf).
     // Без профильной сверки монитор соседнего профиля (playground рядом с prod),
-    // перезаписавший общий MONITOR_PID, всю ночь выдавался бы за наш, а свой мёртвый так и
+    // перезаписавший общий RUNTIME.monitorPid, всю ночь выдавался бы за наш, а свой мёртвый так и
     // не переподнялся бы — ровно та тишина, с которой фаза 2 борется. Молчит на каждой
     // живой итерации своего профиля и не шумит в лог. startMonitor сам умеет адаптировать
     // сироту/спавнить нового и перезаписать pid-файл (а на чужой профиль — заглушить его
@@ -6486,21 +6554,40 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // main: тонкая оркестровка — загрузка конфига в фабричный config (его читают
     // runClaude/openIssues/pickModel и др.), обработка --reset, затем preflight → runLoop.
     function main(): void {
-        // #178: до ЛЮБЫХ побочек (state/лог/git/монитор ниже) — при отказе acquireLockFn
-        // зовёт fail() → process.exit(1) и обрывает исполнение здесь же; return — для
-        // тестового/DI-пути, где failFn мог не завершить процесс.
-        if (!acquireRunnerLock()) return;
-        // Абсолютный путь лока фиксируем ДО chdir в worktree: exit-хендлер ниже снимает СВОЙ
-        // лок (releaseLockIfOurs), а относительный LOCK_PATH после chdir указал бы внутрь дерева
-        // раннера. null в DRY: --dry-run лок не берёт (C1) — снимать нечего.
-        const lockPathAbs = DRY ? null : path.resolve(LOCK_PATH);
-
+        // Конфиг читается ПЕРЕД локом, и это не ослабление барьера #178, а его условие:
+        // адрес лока живёт в конфиге (`roots.runtimeDir`), и лок, взятый до чтения, лёг бы
+        // не туда — «один раннер на runtimeDir» перестало бы что-либо значить. Барьер про
+        // ПОБОЧКИ: worktree, chdir, запись state — они по-прежнему строго после лока, и
+        // сторожит это структурный тест. Чтение файла побочкой не является.
         const raw = loadJson<Record<string, unknown> | null>(CONFIG_PATH, null);
         if (!raw) fail(`Не найден/не парсится ${CONFIG_PATH}`);
         // Резолв здесь, до preflight/runLoop: весь раннер дальше читает ПЛОСКИЙ конфиг и
         // про профили не знает вовсе. Парсим флаг в main(), а не в entry рядом с ONCE/DRY —
         // иначе кривой argv ронял бы process.exit при простом import в тестах.
         config = resolveProfile(raw, parseProfileFlag(argv)) as RalphConfig;
+        // Канон, задача 22: состояние уезжает из каталога ядра. Секции нет — остаётся старая
+        // раскладка (умолчание, названное вслух), и переезжать нечего.
+        const roots = config.rootsResolved ?? null;
+        if (roots) {
+            // Каталог создаётся ДО лока: лок — первый файл, который в нём появится, и без
+            // каталога брать его негде. `recursive` идемпотентен: повторный старт не ломает.
+            guardSideEffect(`mkdir(${roots.runtimeDir})`);
+            fs.mkdirSync(roots.runtimeDir, { recursive: true });
+            repointRuntime(roots.runtimeDir);
+            // Сообщение об этом — НИЖЕ, после setLogTarget: здесь лог ещё нацелен на старый
+            // файл, и строка о переезде ушла бы ровно туда, откуда состояние уезжает
+            // (ревью !19). Заодно это единственная запись до лока — mkdir выше.
+        }
+
+        // #178: до побочек (worktree/chdir/state/монитор ниже) — при отказе acquireLockFn
+        // зовёт fail() → process.exit(1) и обрывает исполнение здесь же; return — для
+        // тестового/DI-пути, где failFn мог не завершить процесс.
+        if (!acquireRunnerLock()) return;
+        // Абсолютный путь лока фиксируем ДО chdir в worktree: exit-хендлер ниже снимает СВОЙ
+        // лок (releaseLockIfOurs), а относительный путь после chdir указал бы внутрь дерева
+        // раннера. С заданным runtimeDir путь уже абсолютен, и resolve здесь безвреден.
+        // null в DRY: --dry-run лок не берёт (C1) — снимать нечего.
+        const lockPathAbs = DRY ? null : path.resolve(RUNTIME.lock);
         // #369: пересобираем набор швов с ВЫБОРОМ из config.adapters (fail-closed на
         // неизвестном шве/имени/незарегистрированной реализации — как остальные проверки
         // конфига). Дефолтная сборка выше дала рабочий набор для юнит-тестов; здесь — боевой
@@ -6522,11 +6609,11 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // нет. DRY при этом остаётся read-only в смысле C1 (git/worktree/state) — просто
         // хозяйский лог-канал больше не общий.
         setLogTarget(
-            path.join(
+            underRoot(
                 worktreePath,
                 chooseLogPath(
                     { dry: DRY, profileName: config.profileName },
-                    { battle: LOG_PATH, sideline: DRY_LOG_PATH },
+                    { battle: RUNTIME.log, sideline: RUNTIME.dryLog },
                 ),
             ),
         );
@@ -6534,10 +6621,11 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // Режим в лог первой строкой: разбирая утренний ralph.log, надо видеть, в каком
         // профиле шёл прогон, не сверяясь с историей команд.
         log(`⚙️  Профиль: ${config.profileName}`);
+        if (roots) log(`🗂  Состояние экземпляра: ${roots.runtimeDir}`);
 
         // #76: раннер переезжает в выделенный worktree ДО всего остального (включая --reset —
-        // state тоже живёт в worktree; STATE_PATH объявлен ВЫШЕ, в шапке модуля, как
-        // CLAUDE_DIR-относительный путь). C1: --dry-run строго read-only — worktree не
+        // state в прежней раскладке живёт в worktree — RUNTIME.state тогда CLAUDE_DIR-
+        // относителен; с заданным runtimeDir он уже абсолютен и от chdir не зависит). C1: --dry-run строго read-only — worktree не
         // создаём и cwd не трогаем; но если дерево раннера УЖЕ поднято, dry читает state/лог
         // оттуда (chdir — тоже read-only), иначе предсказывал бы по застывшему state дерева
         // человека, разойдясь с тем, что реально возьмёт живой запуск (#SiaT3).

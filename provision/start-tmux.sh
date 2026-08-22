@@ -91,7 +91,29 @@ RALPH_CMD="set -a; . $(q "$ENV_FILE"); set +a; exec node .claude/ralph/ralph.js 
 for arg in ${RALPH_ARGS[@]+"${RALPH_ARGS[@]}"}; do RALPH_CMD="$RALPH_CMD $(q "$arg")"; done
 
 MON_WAIT="deadline=\$((SECONDS + ${WORKTREE_WAIT_SEC})); until [ -d $(q "$RUNNER_DIR") ]; do [ \$SECONDS -lt \$deadline ] || { echo \"дерево раннера ${RUNNER_DIR} не появилось за ${WORKTREE_WAIT_SEC}s — дашборд не запущен (сам прогон в верхней панели это не трогает)\" >&2; exit 1; }; sleep 2; done"
-MON_CMD="set -a; . $(q "$ENV_FILE"); set +a; ${MON_WAIT}; cd $(q "$RUNNER_DIR"); exec node .claude/ralph/runtime/monitor.js --profile $(q "$PROFILE") --interval 60 --config $(q "$CONFIG_FILE")"
+# Каталог состояния наблюдаемого экземпляра. Раннер, запущенный с секцией `roots`, пишет
+# state и лог туда, а панель без этого флага читала бы файлы рядом с ядром и показывала бы
+# «раннер молчит» при живом прогоне. Значение берём из того же конфига, по которому идёт
+# раннер; секции нет — флаг не добавляем (прежняя раскладка).
+RUNTIME_DIR=$(node -e '
+const fs = require("node:fs");
+try {
+    const cfg = JSON.parse(fs.readFileSync(process.argv[1], "utf-8"));
+    const profile = process.argv[2];
+    // Профиль НЕ дублирует общие поля, он их дополняет: `runtimeDir` может лежать в
+    // common, а профиль переопределять другой корень. Взяв блок профиля целиком, мы
+    // получили бы пустой runtimeDir на исправном конфиге — и панель молча ушла бы
+    // смотреть в прежний каталог (ревью !20).
+    const roots = { ...(cfg.common?.roots ?? {}), ...(cfg.profiles?.[profile]?.roots ?? {}) };
+    process.stdout.write(roots.runtimeDir ?? "");
+} catch {
+    process.stdout.write("");
+}
+' "$CONFIG_FILE" "$PROFILE")
+MON_RUNTIME_ARG=""
+if [ -n "$RUNTIME_DIR" ]; then MON_RUNTIME_ARG=" --runtime-dir $(q "$RUNTIME_DIR")"; fi
+
+MON_CMD="set -a; . $(q "$ENV_FILE"); set +a; ${MON_WAIT}; cd $(q "$RUNNER_DIR"); exec node .claude/ralph/runtime/monitor.js --profile $(q "$PROFILE") --interval 60 --config $(q "$CONFIG_FILE")${MON_RUNTIME_ARG}"
 
 pane_ralph=$(tmux new-session -d -s "$SESSION" -n ralph -c "$REPO_DIR" -P -F '#{pane_id}')
 tmux send-keys -t "$pane_ralph" "bash -c $(q "$RALPH_CMD")" Enter

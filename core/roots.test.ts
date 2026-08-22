@@ -441,3 +441,98 @@ describe('атомарная запись — что остаётся при о�
         expect(tmpPath).toContain(`-${String(process.pid)}-${String(threadId)}-`);
     });
 });
+
+describe('переезд состояния в runtimeDir (канон, задача 22)', () => {
+    it('все файлы состояния уезжают в runtimeDir, имена не меняются', async () => {
+        // Имена читают монитор, deadman и человек грепом — переезд каталога уже достаточное
+        // изменение за один шаг. А вот НЕ уехавший файл хуже непереезда: половина состояния
+        // окажется в старом каталоге, и восстанавливаться будет не по чему.
+        const { runtimePathsIn } = await import('./orchestrator.ts');
+        const paths = runtimePathsIn('/path/to/app/.ralph/runtime/prod-abc');
+        for (const [field, p] of Object.entries(paths)) {
+            expect(p.startsWith('/path/to/app/.ralph/runtime/prod-abc/'), `${field}: ${p}`).toBe(
+                true,
+            );
+        }
+        expect(paths.state).toMatch(/ralph\.state\.json$/);
+        expect(paths.lock).toMatch(/ralph\.lock$/);
+        expect(paths.log).toMatch(/ralph\.log$/);
+        expect(paths.requests).toMatch(/ralph\.requests\.jsonl$/);
+        expect(paths.sessions).toMatch(/sessions$/);
+    });
+
+    it('состав переехавших путей закрыт: новый файл состояния не забудется молча', async () => {
+        // Тест-опись. Добавил файл в RUNTIME, не добавив сюда, — красный: иначе новый файл
+        // остаётся в каталоге ядра, а узнаётся это на первом же грязном подмодуле.
+        const { runtimePathsIn } = await import('./orchestrator.ts');
+        expect(Object.keys(runtimePathsIn('/path/to/runtime')).sort()).toEqual([
+            'dryLog',
+            'lock',
+            'lockMarker',
+            'log',
+            'monitorOut',
+            'monitorPid',
+            'requests',
+            'sessions',
+            'state',
+        ]);
+    });
+
+    it('два экземпляра — два разных лока, и это следует из namespace', () => {
+        const a = instanceNamespace('/path/to/app', 'prod');
+        const b = instanceNamespace('/path/to/app', 'playground');
+        expect(join('/path/to/app/.ralph/runtime', a, 'ralph.lock')).not.toBe(
+            join('/path/to/app/.ralph/runtime', b, 'ralph.lock'),
+        );
+    });
+});
+
+describe('права файла состояния переживают замену (ревью !19)', () => {
+    it('права целевого файла задаются ПРИ СОЗДАНИИ временного, а не chmod после', () => {
+        // state, лежавший 0600, после первой же записи стал бы читаемым всем. Отдельный
+        // chmod после записи оставлял окно, в котором файл уже есть с правами от umask, —
+        // и был гонкой: применился бы уже не к тому иноду (ревью !20).
+        const s = sandbox();
+        const target = join(s.runtime, 'ralph.state.json');
+        writeFileSync(target, '{}', { mode: 0o600 });
+        let applied: number | undefined;
+        writeFileAtomic(target, '{"phase":2}', {
+            writeFn: (path, data, mode) => {
+                applied = mode;
+                writeFileSync(path, data);
+            },
+            renameFn: (from, to) => writeFileSync(to, readFileSync(from)),
+        });
+        expect(applied).toBe(0o600);
+    });
+
+    it('нового файла ещё нет — переносить нечего, права от umask', () => {
+        const s = sandbox();
+        let applied: number | undefined = 0o777;
+        writeFileAtomic(join(s.runtime, 'fresh.json'), '{}', {
+            writeFn: (path, data, mode) => {
+                applied = mode;
+                writeFileSync(path, data);
+            },
+            renameFn: (from, to) => writeFileSync(to, readFileSync(from)),
+        });
+        expect(applied).toBeUndefined();
+    });
+
+    it('целевой файл — символическая ссылка: отказ, а не права её цели', () => {
+        // Через ссылку приехали бы права цели (подставленная ссылка на 0666 сделала бы
+        // state доступным всем), а rename заменил бы саму ссылку — состояние оказалось бы
+        // не там, где его ждут.
+        const s = sandbox();
+        const real = join(s.base, 'real-state.json');
+        writeFileSync(real, '{}');
+        const link = join(s.runtime, 'ralph.state.json');
+        symlinkSync(real, link);
+        expect(() =>
+            writeFileAtomic(link, '{}', {
+                writeFn: (path, data) => writeFileSync(path, data),
+                renameFn: (from, to) => writeFileSync(to, readFileSync(from)),
+            }),
+        ).toThrow(/символическая ссылка/);
+    });
+});
