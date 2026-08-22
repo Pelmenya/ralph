@@ -614,6 +614,16 @@ export function createConfigProfile(env: ConfigProfileEnv) {
         // имени ключа. Реестр закрыт списком: новый адаптер, которому синк нужен, дописывает
         // себя сюда — и это видно в диффе.
         const adapters = cfg.adapters;
+        // `adapters` не объектом — отдельный отказ (третий проход ревью !21): `null`, число
+        // и массив прошли бы дальше как «швов нет», `taskSource` стал бы дефолтным, и
+        // `projectSync` проехал бы ровно ту проверку, ради которой всё это писалось.
+        // resolveAdapterSelection такую форму тоже не ловит: `adapters ?? {}` + Object.keys.
+        if (adapters !== undefined && !isPlainObject(adapters)) {
+            return failFn(
+                `ralph.config.json (профиль "${profileName}"): adapters = ${JSON.stringify(adapters)} — ` +
+                    `ожидался объект { шов: "реализация" }.`,
+            );
+        }
         const rawTaskSource = isPlainObject(adapters) ? adapters.taskSource : undefined;
         // Нестроковое имя шва здесь НЕ проваливается в дефолт (второй проход ревью !21):
         // `"taskSource": 7` иначе молча читался бы как "github", и `projectSync` проехал бы

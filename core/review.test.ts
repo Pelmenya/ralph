@@ -540,7 +540,7 @@ describe('recordReviewFindings — best-effort вызов журнала нах�
     // Канон, задача 23: журнал — скрипт ПОТРЕБИТЕЛЯ, и «его нет» обязано читаться в логе.
     // Раньше путь был зашит строкой, вызов fail-open, и отсутствие файла выглядело как
     // прошедшая запись: метрика ревью тихо исчезала, а по ней судят, крепнет ли ревью.
-    it('журнал не задан → шов выключен вслух, скрипт не зовётся, лента НЕ читается', () => {
+    it('журнал не задан → шов выключен вслух, скрипт не зовётся (лента читается)', () => {
         const shArgv = vi.fn(() => 'ok');
         const prComments = vi.fn(() => COMMENTS);
         const logs: string[] = [];
@@ -563,6 +563,27 @@ describe('recordReviewFindings — best-effort вызов журнала нах�
         expect(prComments).toHaveBeenCalled();
         expect(logs.join('\n')).toMatch(/выключен/i);
         expect(logs.join('\n')).toContain('consumerScripts.reviewFindingsJournal');
+    });
+
+    it('журнал выключен И лента не прочиталась → в логе сказано про ОБА факта', () => {
+        // Иначе видимость выключенного журнала условна по доступности форжа, а лог говорит
+        // «записи о находках не будет» про журнал, которого нет вовсе (третий проход !21).
+        const logs: string[] = [];
+        const { recordReviewFindings } = createReviewModule(
+            makeEnv({
+                shArgv: vi.fn(() => 'ok'),
+                prComments: () => {
+                    throw new Error('форж недоступен');
+                },
+                getConfig: () => ({
+                    consumerScriptsResolved: { projectSync: null, reviewFindingsJournal: null },
+                }),
+                log: (m: string) => logs.push(m),
+            }),
+        );
+        recordReviewFindings({ milestone: 'M1' }, 42, ['alice']);
+        expect(logs.join('\n')).toContain('форж недоступен');
+        expect(logs.join('\n')).toContain('Журнал находок при этом выключен');
     });
 
     // #37: лента уходит на stdin, а не в argv. Предел одного аргумента у ядра ОС жёсткий,
@@ -622,7 +643,7 @@ describe('recordReviewFindings — best-effort вызов журнала нах�
         // Красным это не делаем — фаза уже смерджена; но тихим тоже: так же выглядит
         // ревью-сессия, которая до форжа не достучалась.
         expect(shArgv).toHaveBeenCalledTimes(1);
-        expect(logs.join('\n')).toMatch(/нет ни одного/i);
+        expect(logs.join('\n')).toContain('Комментарии ревью: у PR #42 нет ни одного');
     });
 
     it('комментарии есть, но ни один автор не доверенный → предупреждение в лог', () => {

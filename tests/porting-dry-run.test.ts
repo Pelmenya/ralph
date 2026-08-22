@@ -44,11 +44,9 @@ describe('фикстурный чужой проект — сама фиксту
             const raw = loadFixtureRaw();
             const real = JSON.parse(fs.readFileSync(REAL_CONFIG_PATH, 'utf-8'));
             // Адресат доски из фикстуры убран вместе с мёртвым полем типа (канон, задача
-            // 23): доску настраивает скрипт потребителя, ядро о ней не знает. Сравниваем по
-            // тому, что ядро действительно читает.
-            expect(raw.common.consumerScripts?.projectSync).not.toBe(
-                real.common.consumerScripts?.projectSync,
-            );
+            // 23): доску настраивает скрипт потребителя, ядро о ней не знает. Сравнением по
+            // `consumerScripts` его не заменить — боевой конфиг эту секцию не задаёт вовсе,
+            // и проверка была бы вырожденной («строка ≠ undefined» при любой фикстуре).
             expect(raw.common.installCmd).not.toBe(real.common.installCmd);
             expect(raw.common.runnerWorktreeDirname).not.toBe(real.common.runnerWorktreeDirname);
             // #51: у боевого конфига блока `deployCheck` больше нет вовсе — деплоя в проекте
