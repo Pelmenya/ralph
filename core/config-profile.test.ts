@@ -815,3 +815,60 @@ describe('resolveProfile — review.fallback не может быть слабе
         ).not.toThrow();
     });
 });
+
+describe('resolveProfile — раскладка корней (канон, задача 21)', () => {
+    const boom = (m: string) => {
+        throw new Error(m);
+    };
+    const withRoots = (roots: unknown) => ({
+        defaultProfile: 'prod',
+        common: { phases: [{ milestone: 'M', branch: 'b' }] },
+        profiles: { prod: roots === undefined ? {} : { roots } },
+    });
+    const LEGAL = {
+        consumerRoot: '/path/to/app',
+        executionRoot: '/path/to/app-ralph',
+        productRoot: '/path/to/app/.ralph/core',
+        runtimeDir: '/path/to/app/.ralph/runtime/prod',
+    };
+
+    it('секции нет — старая раскладка, старт не ломается', () => {
+        // Отсутствие секции означает «всё в каталоге ядра», и это сказано вслух до тех пор,
+        // пока состояние оттуда не уехало. Требовать её сегодня значило бы остановить обе
+        // работающие петли ради ещё не сделанного переезда.
+        expect(resolveProfile(withRoots(undefined), 'prod', boom).profileName).toBe('prod');
+    });
+
+    it('полная законная раскладка проходит, а резолв доезжает до конфига', () => {
+        // Резолв стоит обращений к диску и разворачивает симлинки. Выбросить его результат
+        // значило бы считать то же самое заново в каждом месте, где корень понадобится, —
+        // с шансом получить другой ответ, если дерево между вызовами изменилось.
+        const cfg = resolveProfile(withRoots(LEGAL), 'prod', boom);
+        expect(cfg.roots).toEqual(LEGAL);
+        expect(cfg.rootsResolved).toEqual(LEGAL);
+    });
+
+    it('секции нет — rootsResolved равен null, а не пустому объекту', () => {
+        // «Раскладки нет» и «раскладка пустая» — разные вещи для того, кто её читает.
+        expect(resolveProfile(withRoots(undefined), 'prod', boom).rootsResolved).toBe(null);
+    });
+
+    it('корень пропущен — отказ называет ИМЕННО его, а не «конфиг неверен»', () => {
+        const { runtimeDir: _drop, ...partial } = LEGAL;
+        expect(() => resolveProfile(withRoots(partial), 'prod', boom)).toThrow(/runtimeDir/);
+    });
+
+    it('состояние внутри продукта — отказ на старте, а не грязный подмодуль через день', () => {
+        expect(() =>
+            resolveProfile(
+                withRoots({ ...LEGAL, runtimeDir: '/path/to/app/.ralph/core/runtime' }),
+                'prod',
+                boom,
+            ),
+        ).toThrow(/пересекаются/);
+    });
+
+    it('"roots" не объект — отказ, а не молчаливое игнорирование', () => {
+        expect(() => resolveProfile(withRoots('/path/to/app'), 'prod', boom)).toThrow(/roots/);
+    });
+});

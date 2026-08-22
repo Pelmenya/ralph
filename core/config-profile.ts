@@ -15,6 +15,7 @@
 // зовут существующие тесты (config-profile.test.ts) и monitor.js (мягкий failFn `() => null`).
 
 import { ADAPTER_DEFAULTS, CODER_RUNTIME_PROVIDERS } from '../adapters/adapters-impl.ts';
+import { resolveRoots, type TRootsInput } from './roots.ts';
 
 // fail() боевой уходит в process.exit(1); тестовый failFn может вернуть значение или
 // бросить — поэтому возврат unknown, а не never (мягкий результат пробрасывается наверх).
@@ -455,6 +456,41 @@ export function createConfigProfile(env: ConfigProfileEnv) {
     // Автономный раннер с bypassPermissions не имеет права УГАДЫВАТЬ, в каком режиме он
     // работает: «молча свалился в playground, думая что он prod» — худший исход из всех.
     // failFn инжектируется (как в preflight) — тесты проверяют отказы без process.exit.
+    /**
+     * Раскладка четырёх корней (канон, задача 21): `consumerRoot`, `executionRoot`,
+     * `productRoot`, `runtimeDir`.
+     *
+     * Секция НЕОБЯЗАТЕЛЬНА ровно до переезда состояния (задача 22): её отсутствие означает
+     * старую раскладку «всё в каталоге ядра» — сказанное вслух умолчание, а не догадка о
+     * путях. Но заданная секция проверяется целиком, и полусобранная отвергается: конфиг с
+     * тремя корнями из четырёх выглядит настроенным, и именно поэтому опаснее пустого —
+     * четвёртый путь молча уедет туда, куда упадёт `resolve` от места запуска.
+     *
+     * Возвращает РЕЗОЛВНУТЫЕ корни, а не `true`: резолв разворачивает симлинки и стоит
+     * обращений к диску, и выбросить его результат значило бы пересчитывать то же самое в
+     * каждом месте, где корень понадобится, — с шансом получить другой ответ, если дерево
+     * между вызовами изменилось (ревью !18). Отсутствие секции — `null`: «раскладки нет»
+     * и «раскладка пустая» должны различаться на вкус вызывающего.
+     */
+    function assertValidRoots(
+        cfg: Record<string, unknown>,
+        profileName: string,
+        failFn: FailFn = fail,
+    ): unknown {
+        const raw = cfg.roots;
+        if (raw === undefined) return { rootsResolved: null };
+        if (!isPlainObject(raw)) {
+            return failFn(`ralph.config.json: "roots" в профиле "${profileName}" — не объект.`);
+        }
+        try {
+            return { rootsResolved: resolveRoots(raw as TRootsInput) };
+        } catch (e) {
+            return failFn(
+                `ralph.config.json: "roots" в профиле "${profileName}": ${(e as Error).message}`,
+            );
+        }
+    }
+
     function resolveProfile(raw: unknown, name: unknown, failFn: FailFn = fail): unknown {
         if (!isPlainObject(raw)) return failFn('ralph.config.json: ожидался JSON-объект.');
         if (!isPlainObject(raw.common)) {
@@ -515,7 +551,11 @@ export function createConfigProfile(env: ConfigProfileEnv) {
         // про форму, и осмысленна только на уже слитом конфиге.
         const promptOk = assertValidPromptPlaceholders(merged, wanted, failFn);
         if (promptOk !== true) return promptOk; // мягкий failFn — наверх как есть
-        return { ...merged, profileName: wanted };
+        // Канон, задача 21: раскладка корней. Последней в ряду — она про место на диске,
+        // и осмысленна только когда остальная схема уже признана целой.
+        const rootsOk = assertValidRoots(merged, wanted, failFn);
+        if (!isPlainObject(rootsOk) || !('rootsResolved' in rootsOk)) return rootsOk; // мягкий failFn
+        return { ...merged, profileName: wanted, rootsResolved: rootsOk.rootsResolved };
     }
 
     return {
@@ -525,6 +565,7 @@ export function createConfigProfile(env: ConfigProfileEnv) {
         assertValidModelRouting,
         assertValidPromptPlaceholders,
         assertValidBacklogMilestone,
+        assertValidRoots,
         resolveProfile,
     };
 }
