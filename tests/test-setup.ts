@@ -14,7 +14,21 @@
 // sideEffectAttempts здесь берём напрямую из него (а не из ralph.js/telegram-notifier.ts/
 // security-audit.mjs — они лишь ре-экспортируют тот же массив), сверяем одним afterEach.
 import { afterEach, expect } from 'vitest';
-import { sideEffectAttempts } from '../shared/side-effect-guard.ts';
+import { guardSideEffect, sideEffectAttempts } from '../shared/side-effect-guard.ts';
+
+// Сеть — та же побочка, только незакрытая. Наружу ядро ходит шеллом (`curl` в адаптере
+// площадки), и это уже под предохранителем, а вот глобальный `fetch` обходит его вовсе:
+// ни `sh`, ни `spawnFn` на пути нет. Цена дыры — не «лишний запрос»: тест, которому нужен
+// живой сервер, краснеет там, где сети нет, и зеленеет там, где она есть, то есть
+// проверяет погоду вместо кода. Гейт канона обязан идти на чистом клоне БЕЗ сети.
+const realFetch = globalThis.fetch;
+globalThis.fetch = ((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    const url = typeof input === 'string' ? input : String((input as Request).url ?? input);
+    // При выключенном предохранителе — no-op: настоящий прогон раннера ходит в сеть
+    // законно, запрет живёт только в тестовом окружении.
+    guardSideEffect(`fetch(${url})`, 'Подмени сетевой вызов параметром: прогон идёт без сети.');
+    return realFetch(input, init);
+}) as typeof fetch;
 
 afterEach(() => {
     const attempts = sideEffectAttempts.splice(0);

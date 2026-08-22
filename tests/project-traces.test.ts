@@ -122,6 +122,20 @@ describe('словарь имён — снаружи, а не в дереве (#
         // 'acmeXexample' совпало бы, будь точка неэкранированной.
         expect(traceFindings("const u = 'https://acmeXexample';", { deny })).toEqual([]);
     });
+
+    // Метки и фазы — четвёртый класс из постановки барьера, и единственный путь для него
+    // тот же словарь: структурной формы у них нет, `area:acme` неотличим от любого
+    // двоеточия в тексте. Тест фиксирует, что путь существует и работает, — иначе класс
+    // остался бы пожеланием в описании карточки.
+    it('проектная метка и имя фазы краснеют через словарь', () => {
+        const deny = denyNamePattern({
+            RALPH_TRACE_DENY: 'area:acme,Витрина · Фаза 2',
+        } as NodeJS.ProcessEnv);
+        expect(traceFindings("labels: ['area:acme'],", { deny })).toHaveLength(1);
+        expect(traceFindings('milestone: "Витрина · Фаза 2",', { deny })).toHaveLength(1);
+        // Метки самого канона словарём не задеваются: он перечисляет чужое, а не своё.
+        expect(traceFindings("labels: ['complexity:low'],", { deny })).toEqual([]);
+    });
 });
 
 describe('сплошной скан репозитория ядра', () => {
