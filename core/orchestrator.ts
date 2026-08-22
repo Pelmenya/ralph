@@ -3728,6 +3728,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
             allOpenIssuesFn = adapters.taskSource.listAllOpenIssues,
             saveStateFn = saveState,
             pushEventFn = pushEvent,
+            // Канон, задача 27: наличие скриптов потребителя на диске. Инъекцией — как
+            // остальные побочки preflight: тест проверяет ветки отказа, не трогая диск.
+            existsFn = fs.existsSync,
             once = ONCE,
             dry = DRY,
             resubmit = RESUBMIT,
@@ -3743,6 +3746,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             phaseMergedFn?: (phase: { branch: string }) => boolean;
             allOpenIssuesFn?: (milestone: string) => Issue[];
             saveStateFn?: typeof saveState;
+            existsFn?: (path: string) => boolean;
             pushEventFn?: typeof pushEvent;
             once?: boolean;
             dry?: boolean;
@@ -3768,6 +3772,55 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // кодер-сессии — особенно больно свежему порту с кривым конфигом (инвариант №1:
         // authorAllowlist/TG/review-модели/haltBeforeDeploy тоже валидируются на старте).
         resolveGateChecks(cfg, failFn);
+
+        // Канон, задача 27: заданный скрипт потребителя ищется на диске ДО первой итерации.
+        // Форму пути закрыл валидатор конфига (задача 23), но опечатка в САМОМ пути формы не
+        // нарушает, а стоит дороже опечатки в имени ключа: обе обёртки вокруг вызова
+        // fail-open, и «файла нет» видно одной строкой ⚠ уже ПОСЛЕ мерджа фазы. Через месяц
+        // журнал находок пуст, доска разошлась, и связать это с путём некому.
+        //
+        // ПРЕДУПРЕЖДЕНИЕ, а не отказ, и это решение, а не осторожность (ревью Codex, !22).
+        // Отказ выглядел последовательнее («ключ задан — значит на скрипт рассчитывают»), но
+        // ломает bootstrap при раскладке БЕЗ `roots`: там путь относителен дереву работы,
+        // фаза может завести скрипт сама, а дерево перед стартом стоит на origin/main — петля
+        // встала бы ровно на той работе, ради которой её запустили, и AFK, то есть до утра.
+        // Инвариант «остановка дешевле молчания» выполняется самой строкой в логе: она видна
+        // до первой итерации и попадает в панель монитора.
+        {
+            const scripts = cfg.consumerScriptsResolved ?? null;
+            for (const [key, value] of Object.entries(scripts ?? {})) {
+                if (typeof value !== 'string') continue; // ключа нет либо выключено — нечего искать
+                if (existsFn(value)) continue;
+                // Что сказать про базу — зависит от раскладки, и разница не косметическая.
+                // Якорь называется по КОНФИГУ, а не по текущему каталогу: «не найден от <cwd>»
+                // звало бы process.cwd() в ядро (долг outside-deps), а человеку нужен адрес,
+                // по которому он правит.
+                const anchor = cfg.rootsResolved?.consumerRoot;
+                // Судим по СЫРОМУ значению из конфига, а не по резолвнутому: при заданных
+                // `roots` резолвнутый абсолютен ВСЕГДА (path.resolve), и проверка
+                // `isAbsolute(value)` съела бы ровно ту ветку, ради которой всё написано, —
+                // предупреждение про необновляемое дерево потребителя (ревью Codex, !22).
+                const raw = cfg.consumerScripts?.[key as keyof TConsumerScripts];
+                const rawAbsolute = typeof raw === 'string' && path.isAbsolute(raw);
+                // Абсолютный путь про базу не спрашивают: он сам себе адрес, и любая фраза
+                // про якорь отправила бы человека искать не там.
+                const why = rawAbsolute
+                    ? 'путь абсолютный, то есть от раскладки корней не зависит вовсе'
+                    : anchor
+                      ? `путь якорится к consumerRoot ${anchor}, а это дерево раннер не обновляет: ` +
+                        `скрипт, добавленный фазой, приедет в дерево РАБОТЫ и здесь не появится сам`
+                      : dry
+                        ? 'относительный путь считается от рабочего дерева раннера, а в --dry-run ' +
+                          'переезда в него могло не быть — база проверки тогда другая, чем у живого прогона'
+                        : 'относительный путь считается от рабочего дерева раннера — либо опечатка ' +
+                          'в пути, либо скрипт приедет этой же фазой';
+                logFn(
+                    `⚠ consumerScripts.${key}: скрипта "${value}" нет (${why}). ` +
+                        `Вызов fail-open: если путь неверен, отсутствие больше нигде не всплывёт — ` +
+                        `поправь путь или задай null.`,
+                );
+            }
+        }
 
         // Фаза 5 (#85–88): в prod пуш-события (release/blocked/breaker/rate-limit) —
         // единственный канал «раннер зовёт человека». Пустые RALPH_TG_* деградируют молча

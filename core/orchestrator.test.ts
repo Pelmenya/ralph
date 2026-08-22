@@ -3021,6 +3021,136 @@ describe('preflight — валидация конфига/среды и подг
         ...overrides,
     });
 
+    // ── Канон, задача 27: заданный скрипт потребителя ищется до первой итерации ──
+    // Валидатор конфига проверяет ФОРМУ пути (задача 23), а мир — не его предмет. Опечатка
+    // в самом пути вероятнее опечатки в имени ключа, и стоила бы она дороже: обе обёртки
+    // вокруг вызова fail-open, поэтому «файла нет» видно одной строкой ⚠ после мерджа
+    // фазы — а через месяц журнал находок пуст, и связать это с опечаткой некому.
+    describe('наличие скриптов потребителя (канон, задача 27)', () => {
+        const withScripts = (resolved: Record<string, string | null>, extra = {}) =>
+            validCfg({ consumerScriptsResolved: resolved, ...extra });
+
+        it('путь есть на диске — старт молчит про скрипты', () => {
+            const logs: string[] = [];
+            const seen: string[] = [];
+            preflight(
+                withScripts({ projectSync: '/app/scripts/sync.mjs', reviewFindingsJournal: null }),
+                okDeps({
+                    loadStateFn: fakeState,
+                    logFn: (m: string) => logs.push(m),
+                    existsFn: (p: string) => {
+                        seen.push(p);
+                        return true;
+                    },
+                }),
+            );
+            expect(seen).toEqual(['/app/scripts/sync.mjs']);
+            expect(logs.join('\n')).not.toMatch(/скрипт/i);
+        });
+
+        it('заданного скрипта нет — предупреждение ДО первой итерации, а не ⚠ после мерджа', () => {
+            const logs: string[] = [];
+            preflight(
+                withScripts({
+                    projectSync: null,
+                    reviewFindingsJournal: '/app/scripts/journal.mjs',
+                }),
+                okDeps({
+                    loadStateFn: fakeState,
+                    logFn: (m: string) => logs.push(m),
+                    existsFn: () => false,
+                }),
+            );
+            expect(logs.join('\n')).toContain('consumerScripts.reviewFindingsJournal');
+            expect(logs.join('\n')).toContain('/app/scripts/journal.mjs');
+        });
+
+        it('старт при этом НЕ падает: фаза может сама заводить этот скрипт', () => {
+            // Ревью Codex (!22): дерево перед стартом стоит на origin/main, и фаза, которая
+            // добавляет скрипт, при отказе не смогла бы стартовать вовсе — AFK до утра.
+            expect(() =>
+                preflight(
+                    withScripts({
+                        projectSync: '/app/scripts/sync.mjs',
+                        reviewFindingsJournal: null,
+                    }),
+                    okDeps({ loadStateFn: fakeState, existsFn: () => false }),
+                ),
+            ).not.toThrow();
+        });
+
+        it('предупреждение называет ЯКОРЬ из конфига, а не текущий каталог', () => {
+            // Человек ищет файл там, где правит конфиг: без якоря сообщение отправляет его
+            // не туда, а `process.cwd()` в тексте — это ещё и якорь наружу репозитория.
+            // Сырой путь ОТНОСИТЕЛЬНЫЙ: именно его резолв к consumerRoot и объясняется, а
+            // резолвнутое значение при заданных roots абсолютно всегда.
+            const logs: string[] = [];
+            preflight(
+                withScripts(
+                    { projectSync: '/app/scripts/sync.mjs', reviewFindingsJournal: null },
+                    {
+                        consumerScripts: { projectSync: 'scripts/sync.mjs' },
+                        rootsResolved: {
+                            consumerRoot: '/app',
+                            executionRoot: '/app-ralph',
+                            productRoot: '/app/.ralph/core',
+                            runtimeDir: '/app/.ralph/runtime/prod',
+                        },
+                    },
+                ),
+                okDeps({
+                    loadStateFn: fakeState,
+                    logFn: (m: string) => logs.push(m),
+                    existsFn: () => false,
+                }),
+            );
+            expect(logs.join('\n')).toContain('consumerRoot /app');
+        });
+
+        it('абсолютный путь: предупреждение не поминает якорь — он тут ни при чём', () => {
+            // Иначе фраза про consumerRoot отправляет человека искать файл не туда: адрес
+            // задан целиком, и раскладка корней на него не влияет (ревью Codex, !22).
+            const logs: string[] = [];
+            preflight(
+                withScripts(
+                    { projectSync: '/opt/tools/sync.mjs', reviewFindingsJournal: null },
+                    {
+                        consumerScripts: { projectSync: '/opt/tools/sync.mjs' },
+                        rootsResolved: {
+                            consumerRoot: '/app',
+                            executionRoot: '/app-ralph',
+                            productRoot: '/app/.ralph/core',
+                            runtimeDir: '/app/.ralph/runtime/prod',
+                        },
+                    },
+                ),
+                okDeps({
+                    loadStateFn: fakeState,
+                    logFn: (m: string) => logs.push(m),
+                    existsFn: () => false,
+                }),
+            );
+            expect(logs.join('\n')).toContain('/opt/tools/sync.mjs');
+            expect(logs.join('\n')).not.toContain('consumerRoot');
+            expect(logs.join('\n')).not.toContain('приедет');
+        });
+
+        it('выключенный скрипт (null) диск не трогает вовсе', () => {
+            const seen: string[] = [];
+            preflight(
+                withScripts({ projectSync: null, reviewFindingsJournal: null }),
+                okDeps({
+                    loadStateFn: fakeState,
+                    existsFn: (p: string) => {
+                        seen.push(p);
+                        return true;
+                    },
+                }),
+            );
+            expect(seen).toEqual([]);
+        });
+    });
+
     it('active: false → fail с сообщением про active', () => {
         expect(() => preflight({ active: false }, okDeps())).toThrow(/active/i);
     });
@@ -8802,6 +8932,7 @@ describe('syncProjectBoard', () => {
 
 import path from 'node:path';
 import { createOrchestrator } from './orchestrator.ts';
+import { stripComments } from '../tests/strip-comments.ts';
 
 // Платформенное: тест опирается на POSIX-механизмы, которых на Windows нет
 // (/proc/<pid>/cmdline, пути соседнего worktree, /bin/sh). Раннер живёт на
@@ -10392,5 +10523,43 @@ describe('намерения сессии на стороне GitHub: argv, а �
         ).toBeNull();
         expect(calls).toHaveLength(1);
         expect(logs.join('\n')).toMatch(/Бэклог ревью 1/);
+    });
+});
+
+// ── Канон, задача 27: порядок «переезд в worktree → preflight» ──────────────────────────
+// Проверка наличия скриптов потребителя честна ровно потому, что к моменту preflight cwd уже
+// равен рабочему дереву раннера: относительный путь резолвится там же, где потом пойдёт
+// вызов (`execFileSync` без `cwd` наследует текущий каталог). Переставь `preflight(config)`
+// выше `process.chdir(worktreePath)` — и проверка начнёт искать файлы в дереве человека,
+// оставаясь зелёной на всех юнит-тестах: они зовут preflight напрямую (ревью Codex, !22).
+//
+// Барьер структурный, по тексту main(): поведенческим его не сделать — chdir реального
+// процесса в сьюте запрещён предохранителем побочек. Границы названы вслух, чтобы следующий
+// не принял его за доказательство: он видит ТЕКСТ, а не исполнение, поэтому пропустит и
+// переезд, вынесенный в helper с вызовом после preflight, и возврат в другой каталог между
+// ними; ложно покраснеет на извлечении chdir из main(). Ловит он ровно одно — перестановку
+// двух строк местами, а это и есть та правка, которой барьер боится.
+describe('main(): переезд в worktree предшествует preflight (канон, задача 27)', () => {
+    // Комментарии снимаются тем же стриппером, что и у барьеров чистоты: в докблоке рядом
+    // с вызовом стоит `runLoop(config, preflight(config))` — текстовый скан принял бы его за
+    // второй вызов и покраснел бы на объяснении, а не на коде.
+    const source = stripComments(
+        fs.readFileSync(path.resolve(import.meta.dirname, './orchestrator.ts'), 'utf-8'),
+    );
+
+    it('ВСЕ переезды в worktree стоят выше вызова preflight', () => {
+        const chdirAt = [...source.matchAll(/process\.chdir\(worktreePath\)/g)].map((m) => m.index);
+        // Вызов ищется по имени функции с аргументом, а не по `const ctx = …`: переименование
+        // переменной результата — безобидный рефакторинг, и краснеть на нём барьер не должен.
+        // Пробелы и переносы допускаются: вызов, разложенный форматтером на строки при
+        // добавлении зависимостей, — безобидный рефакторинг, а не перестановка.
+        const preflightAt = [...source.matchAll(/[^.\w]preflight\(\s*config[\s,)]/g)].map(
+            (m) => m.index,
+        );
+        expect(chdirAt.length, 'не нашёл переездов в worktree в main()').toBeGreaterThan(0);
+        expect(preflightAt, 'не нашёл вызова preflight(config) в main()').toHaveLength(1);
+        // Именно ВСЕ, а не первый: ветка dry и ветка живого прогона зовут chdir порознь, и
+        // проверка «первое вхождение раньше» пропустила бы перестановку во второй из них.
+        expect(Math.max(...chdirAt)).toBeLessThan(preflightAt[0]);
     });
 });
