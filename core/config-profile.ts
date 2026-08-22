@@ -533,7 +533,9 @@ export function createConfigProfile(env: ConfigProfileEnv) {
         if (!isPlainObject(section)) {
             return failFn(
                 `${where} — не объект (получено ${JSON.stringify(section)}). Ожидались пути скриптов ` +
-                    `потребителя: { ${CONSUMER_SCRIPT_KEYS.join(', ')} } (канон, задача 23).`,
+                    `потребителя: { ${CONSUMER_SCRIPT_KEYS.join(', ')} } (канон, задача 23). ` +
+                    `Выключается КАЖДЫЙ ключ значением null, а не секция целиком: ` +
+                    `{ ${CONSUMER_SCRIPT_KEYS.map((k) => `"${k}": null`).join(', ')} }.`,
             );
         }
         const keys = Object.keys(section);
@@ -612,19 +614,29 @@ export function createConfigProfile(env: ConfigProfileEnv) {
         // имени ключа. Реестр закрыт списком: новый адаптер, которому синк нужен, дописывает
         // себя сюда — и это видно в диффе.
         const adapters = cfg.adapters;
-        const taskSource =
-            isPlainObject(adapters) && typeof adapters.taskSource === 'string'
-                ? adapters.taskSource
-                : ADAPTER_DEFAULTS.taskSource;
+        const rawTaskSource = isPlainObject(adapters) ? adapters.taskSource : undefined;
+        // Нестроковое имя шва здесь НЕ проваливается в дефолт (второй проход ревью !21):
+        // `"taskSource": 7` иначе молча читался бы как "github", и `projectSync` проехал бы
+        // проверку — разрешительная ошибка там, где весь валидатор строг. Само имя (знакомо
+        // ли оно реестру реализаций) проверяет resolveAdapterSelection позже: список имён
+        // живёт у адаптеров, а не здесь.
+        if (rawTaskSource !== undefined && typeof rawTaskSource !== 'string') {
+            return failFn(
+                `ralph.config.json (профиль "${profileName}"): adapters.taskSource = ` +
+                    `${JSON.stringify(rawTaskSource)} — ожидалось имя реализации строкой.`,
+            );
+        }
+        const taskSource = rawTaskSource ?? ADAPTER_DEFAULTS.taskSource;
         if (
             typeof section.projectSync === 'string' &&
             !(BOARD_SYNC_TASK_SOURCES as readonly string[]).includes(taskSource)
         ) {
             return failFn(
-                `${where}.projectSync задан, но адаптер трекера "${taskSource}" синк доски не зовёт: ` +
-                    `там доска — проекция статуса issue, синхронизировать нечего (syncBoard — осознанный no-op). ` +
-                    `Скрипт не позвался бы никогда, и лог об этом молчал бы. Убери ключ либо задай null. ` +
-                    `Синк зовут: ${BOARD_SYNC_TASK_SOURCES.join(', ')}.`,
+                `${where}.projectSync задан, но синк доски зовут только: ` +
+                    `${BOARD_SYNC_TASK_SOURCES.join(', ')} — а трекер задан как "${taskSource}". ` +
+                    `Там, где доска есть проекция статуса issue, syncBoard — осознанный no-op: скрипт не ` +
+                    `позвался бы никогда, и лог об этом молчал бы. Убери ключ, задай null — либо проверь ` +
+                    `само имя adapters.taskSource, если оно написано с опечаткой.`,
             );
         }
 

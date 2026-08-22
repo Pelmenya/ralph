@@ -43,7 +43,12 @@ describe('фикстурный чужой проект — сама фиксту
         () => {
             const raw = loadFixtureRaw();
             const real = JSON.parse(fs.readFileSync(REAL_CONFIG_PATH, 'utf-8'));
-            expect(raw.common.board.owner).not.toBe(real.common.board.owner);
+            // Адресат доски из фикстуры убран вместе с мёртвым полем типа (канон, задача
+            // 23): доску настраивает скрипт потребителя, ядро о ней не знает. Сравниваем по
+            // тому, что ядро действительно читает.
+            expect(raw.common.consumerScripts?.projectSync).not.toBe(
+                real.common.consumerScripts?.projectSync,
+            );
             expect(raw.common.installCmd).not.toBe(real.common.installCmd);
             expect(raw.common.runnerWorktreeDirname).not.toBe(real.common.runnerWorktreeDirname);
             // #51: у боевого конфига блока `deployCheck` больше нет вовсе — деплоя в проекте
@@ -69,8 +74,9 @@ describe('dry-run переносимости ядра на чужом конфи
         const cfg: Record<string, unknown> = loadFixtureConfig(runtime);
 
         expect(cfg.profileName).toBe('playground');
-        expect((cfg.board as { owner: string }).owner).toBe('OrbitalLabs');
-        expect((cfg.board as { number: number }).number).toBe(42);
+        expect((cfg.consumerScriptsResolved as { projectSync: string }).projectSync).toBe(
+            'scripts/orbital-board-sync.mjs',
+        );
         expect(cfg.installCmd).toBe('pnpm install --frozen-lockfile');
         expect(cfg.runnerWorktreeDirname).toBe('sputnik-tracker-ralph');
         expect((cfg.deployCheck as { healthUrl: string }).healthUrl).toBe(

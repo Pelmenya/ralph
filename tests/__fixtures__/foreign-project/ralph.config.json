@@ -11,10 +11,6 @@
         "permissionMode": "fixture-permission-mode",
         "installCmd": "pnpm install --frozen-lockfile",
         "runnerWorktreeDirname": "sputnik-tracker-ralph",
-        "board": {
-            "owner": "OrbitalLabs",
-            "number": 42
-        },
         "gate": {
             "checks": [
                 ["format", "pnpm run format:check"],

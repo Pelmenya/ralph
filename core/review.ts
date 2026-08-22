@@ -386,7 +386,7 @@ export function createReviewModule(env: ReviewEnv) {
     // числом (PRD `docs/ralph-reliability/prd.md` п.4). Зовётся сразу после мерджа, тем же
     // приёмом, что closeMilestoneByTitle/syncProjectBoard: best-effort, лог вместо throw —
     // косметика наблюдаемости не имеет права уронить уже смерджённую фазу. Журнал живёт в
-    // рантайм-каталоге раннера (JOURNAL_PATH в scripts/review-findings-journal.mjs), не в
+    // рантайм-каталоге раннера (это решает сам скрипт журнала у потребителя), не в
     // git — раннер нигде не коммитит в main напрямую, только через ревьюенные PR.
     // #252: мутация — через argv (shArgv), не строкой через шелл. Номер PR, milestone
     // и логины авторов уходят отдельными элементами argv — shq() больше не нужен для
@@ -409,19 +409,6 @@ export function createReviewModule(env: ReviewEnv) {
     ): void {
         if (!Number.isInteger(prNumber) || prNumber <= 0) {
             logFn(`⚠ Журнал находок: номер PR неизвестен, запись пропущена.`);
-            return;
-        }
-        // Проверка ДО чтения ленты (ревью !21): при выключенном журнале поход в форж —
-        // лишний round-trip на каждой сдаче, а предупреждения ниже («у PR нет комментариев»,
-        // «ни один автор не в allowlist») — тревога о метрике, которой нет. Они идут со
-        // значком ⚠, то есть лезут в панель монитора и вытесняют оттуда настоящий сигнал.
-        const journal = getConfig().consumerScriptsResolved?.reviewFindingsJournal;
-        if (!journal) {
-            // Молчать нельзя: журнал находок — метрика, по которой судят о ревью, и её
-            // отсутствие обязано быть ВИДНЫМ решением, а не следствием того, что файла нет.
-            logFn(
-                '📊 Журнал находок выключен: в конфиге нет consumerScripts.reviewFindingsJournal.',
-            );
             return;
         }
         // #237: прокидываем allowlist авторов в счёт — метрика считает только доверенные
@@ -450,7 +437,7 @@ export function createReviewModule(env: ReviewEnv) {
         // логе обязан быть, иначе тихий ноль не отличить от честного.
         if (comments.length === 0) {
             logFn(
-                `⚠ Журнал находок: у PR #${String(prNumber)} нет ни одного комментария — ` +
+                `⚠ Комментарии ревью: у PR #${String(prNumber)} нет ни одного — ` +
                     'проверь, что ревью-сессия их действительно оставляет.',
             );
         } else if (authors.length > 0 && !comments.some((c) => authors.includes(c.author ?? ''))) {
@@ -461,10 +448,24 @@ export function createReviewModule(env: ReviewEnv) {
             // сторожит публичный репозиторий и ослаблять его нельзя), но молчать нельзя тоже.
             const seen = [...new Set(comments.map((c) => c.author ?? ''))].slice(0, 5).join(', ');
             logFn(
-                `⚠ Журнал находок: у PR #${String(prNumber)} ${String(comments.length)} комментариев, ` +
+                `⚠ Комментарии ревью: у PR #${String(prNumber)} ${String(comments.length)} комментариев, ` +
                     `но ни один автор не входит в authorAllowlist (ждём: ${authors.join(', ')}; ` +
                     `в ленте: ${seen}) — счёт будет нулевым. Похоже, allowlist задан в терминах другого форжа.`,
             );
+        }
+        // Проверка стоит ЗДЕСЬ, а не перед чтением ленты (второй проход ревью !21): лента
+        // нужна не только журналу. Две диагностики выше — про ревью и про allowlist, а не
+        // про метрику: тот же allowlist фильтрует комментарии для сессии правок
+        // (trustedCommentsContext), и там расхождение «логины другого форжа» гасится молча.
+        // Ранний возврат экономил бы round-trip ценой единственного места, где это видно.
+        const journal = getConfig().consumerScriptsResolved?.reviewFindingsJournal;
+        if (!journal) {
+            // Молчать нельзя: журнал находок — метрика, по которой судят о ревью, и её
+            // отсутствие обязано быть ВИДНЫМ решением, а не следствием того, что файла нет.
+            logFn(
+                '📊 Журнал находок выключен: в конфиге нет consumerScripts.reviewFindingsJournal.',
+            );
+            return;
         }
         try {
             const out = runArgvFn(

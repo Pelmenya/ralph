@@ -997,7 +997,19 @@ describe('resolveProfile — скрипты потребителя (канон, 
                 'prod',
                 boom,
             ),
-        ).toThrow(/синк доски не зовёт/);
+        ).toThrow(/синк доски зовут только/);
+    });
+
+    it('имя шва не строкой — отказ, а не молчаливый дефолт "github"', () => {
+        // Иначе `"taskSource": 7` читался бы как дефолт, и projectSync проехал бы проверку
+        // площадки — разрешительная ошибка там, где весь валидатор строг.
+        expect(() =>
+            resolveProfile(
+                cfgWith({ projectSync: LEGAL.projectSync }, { adapters: { taskSource: 7 } }),
+                'prod',
+                boom,
+            ),
+        ).toThrow(/adapters\.taskSource/);
     });
 
     it('журнал находок такой площадке задать можно: его зовёт ядро, а не адаптер', () => {

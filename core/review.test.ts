@@ -556,10 +556,11 @@ describe('recordReviewFindings — best-effort вызов журнала нах�
         );
         recordReviewFindings({ milestone: 'M1' }, 42, ['alice']);
         expect(shArgv).not.toHaveBeenCalled();
-        // Поход в форж до проверки ключа — лишний round-trip на каждой сдаче фазы, а его
-        // предупреждения («нет комментариев», «автор не в allowlist») тревожат о метрике,
-        // которой нет, и лезут значком ⚠ в панель монитора.
-        expect(prComments).not.toHaveBeenCalled();
+        // Лента при этом ЧИТАЕТСЯ, и это осознанно (второй проход ревью !21): её диагностика
+        // — про ревью и про allowlist, а не про журнал. Тот же allowlist фильтрует
+        // комментарии для сессии правок, и там расхождение логинов гасится молча; убрать
+        // чтение ради экономии round-trip значило бы погасить единственный сигнал о нём.
+        expect(prComments).toHaveBeenCalled();
         expect(logs.join('\n')).toMatch(/выключен/i);
         expect(logs.join('\n')).toContain('consumerScripts.reviewFindingsJournal');
     });
@@ -621,7 +622,7 @@ describe('recordReviewFindings — best-effort вызов журнала нах�
         // Красным это не делаем — фаза уже смерджена; но тихим тоже: так же выглядит
         // ревью-сессия, которая до форжа не достучалась.
         expect(shArgv).toHaveBeenCalledTimes(1);
-        expect(logs.join('\n')).toMatch(/нет ни одного комментария/i);
+        expect(logs.join('\n')).toMatch(/нет ни одного/i);
     });
 
     it('комментарии есть, но ни один автор не доверенный → предупреждение в лог', () => {
