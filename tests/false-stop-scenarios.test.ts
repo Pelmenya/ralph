@@ -298,6 +298,8 @@ describe('канал очереди держит freeze, а не только с
                 reset: false,
                 resubmit: false,
                 deployResolved: false,
+                migrate: false,
+                migrateRollback: false,
             },
             external: {
                 sendTelegramMessage: () => false,

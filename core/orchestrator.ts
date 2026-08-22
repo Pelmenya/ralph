@@ -44,6 +44,19 @@ import { createExec, loadJson, chooseLogPath } from './exec.ts';
 import { createSourcecraftTaskSource } from '../adapters/sourcecraft-task-source.ts';
 import { createSourcecraftApi } from '../adapters/sourcecraft-api.ts';
 import { createConfigProfile, isPlainObject } from './config-profile.ts';
+// Опись путей состояния живёт отдельным модулем: её же читает протокол миграции (задача
+// 25), и тянуть ради неё весь оркестратор было бы неверно. Ре-экспорта здесь нет
+// намеренно — у описи один адрес, иначе читатели разойдутся по двум.
+import { runtimePathsIn, type TRuntimePaths } from './runtime-paths.ts';
+import {
+    assertLegacyNotMigrated,
+    assertMigrationSettled,
+    migrateRuntime,
+    planRuntimeMigration,
+    readMigrationJournal,
+    rollbackRuntime,
+    type TMigrationDeps,
+} from './runtime-migration.ts';
 import type { TConsumerScripts, TConsumerScriptsResolved } from './config-profile.ts';
 import { createStateLock } from './state-lock.ts';
 import type { RalphState } from './state-lock.ts';
@@ -160,37 +173,6 @@ const CONFIG_PATH = path.join(LEGACY_DIR, 'ralph.config.json');
  * объект, а не значение.
  */
 const RUNTIME = runtimePathsIn(LEGACY_DIR);
-
-/**
- * Пути состояния ВНУТРИ заданного `runtimeDir` — чистая функция, чтобы состав переехавших
- * файлов можно было проверить описью, а не чтением. Имена файлов НЕ меняются: их читают
- * монитор, deadman и человек грепом, и переезд каталога — достаточное изменение за раз.
- */
-export type TRuntimePaths = {
-    state: string;
-    log: string;
-    dryLog: string;
-    lock: string;
-    monitorOut: string;
-    monitorPid: string;
-    lockMarker: string;
-    sessions: string;
-    requests: string;
-};
-
-export function runtimePathsIn(runtimeDir: string): TRuntimePaths {
-    return {
-        state: path.join(runtimeDir, 'ralph.state.json'),
-        log: path.join(runtimeDir, 'ralph.log'),
-        dryLog: path.join(runtimeDir, 'ralph.dry.log'),
-        lock: path.join(runtimeDir, 'ralph.lock'),
-        monitorOut: path.join(runtimeDir, 'monitor.out'),
-        monitorPid: path.join(runtimeDir, 'monitor.pid'),
-        lockMarker: path.join(runtimeDir, '.deps-lock.sha'),
-        sessions: path.join(runtimeDir, 'sessions'),
-        requests: path.join(runtimeDir, 'ralph.requests.jsonl'),
-    };
-}
 
 /**
  * Переезд состояния в `runtimeDir` из контракта корней.
@@ -534,6 +516,8 @@ export type OrchestratorFlags = {
     reset: boolean;
     resubmit: boolean;
     deployResolved: boolean;
+    migrate: boolean;
+    migrateRollback: boolean;
 };
 
 // Мост из entry к соседям: telegram-notifier.ts (доставка пушей) и gate-env.mts
@@ -564,6 +548,11 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // недоехавшего main. Только человек — снятие блока не может решать сам раннер (тот же
     // принцип, что и hold).
     const DEPLOY_RESOLVED = flags.deployResolved;
+    // Канон, задача 25: режимы переезда состояния. Оба выходят из main() сразу после своей
+    // работы — петля в этом запуске не идёт: переезд и работа над фазой в одном прогоне
+    // означали бы «чиню и еду одновременно».
+    const MIGRATE = flags.migrate;
+    const MIGRATE_ROLLBACK = flags.migrateRollback;
 
     // Конфиг — фабричный (бывший module-level): заполняется в main(). Держим let, а не
     // параметр, чтобы сборка фабрики (require/import ralph.js в юнит-тестах) не запускала
@@ -6640,6 +6629,29 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // про профили не знает вовсе. Парсим флаг в main(), а не в entry рядом с ONCE/DRY —
         // иначе кривой argv ронял бы process.exit при простом import в тестах.
         config = resolveProfile(raw, parseProfileFlag(argv)) as RalphConfig;
+        // Канон, задача 25: команда проверяется ДО первой записи на диск (ревью Codex, !23).
+        // Все три случая — молчаливый сдвиг режима, худший исход для автономного раннера:
+        //   • два режима разом: победил бы порядок веток кода, а не намерение человека;
+        //   • dry + миграция: dry не берёт лок (C1), а протокол пишет — вышла бы правка
+        //     состояния без лока, параллельно живому раннеру. Проверка стоит выше `mkdir`
+        //     каталога состояния: иначе fail-closed уже успел бы создать каталог;
+        //   • миграция без `roots`: переезжать некуда, запуск молча ушёл бы в обычную петлю.
+        if (MIGRATE && MIGRATE_ROLLBACK) {
+            fail('--migrate-runtime и --migrate-rollback вместе: оставь один режим.');
+        }
+        if ((MIGRATE || MIGRATE_ROLLBACK) && DRY) {
+            fail(
+                '--dry-run с режимом миграции несовместим: dry не берёт лок (C1), а переезд ' +
+                    'пишет на диск — состояние правилось бы без лока, параллельно живому раннеру.',
+            );
+        }
+        if ((MIGRATE || MIGRATE_ROLLBACK) && !config.rootsResolved) {
+            fail(
+                'Режим миграции требует секции roots в конфиге: без неё переезжать некуда, ' +
+                    'состояние и так лежит в каталоге ядра.',
+            );
+        }
+
         // Канон, задача 22: состояние уезжает из каталога ядра. Секции нет — остаётся старая
         // раскладка (умолчание, названное вслух), и переезжать нечего.
         const roots = config.rootsResolved ?? null;
@@ -6658,6 +6670,77 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // зовёт fail() → process.exit(1) и обрывает исполнение здесь же; return — для
         // тестового/DI-пути, где failFn мог не завершить процесс.
         if (!acquireRunnerLock()) return;
+
+        // Канон, задача 25: переезд состояния — ПОД ЛОКОМ и только под ним. Лок взят строкой
+        // выше, то есть на этот `runtimeDir` не работает второй экземпляр; старый же
+        // экземпляр останавливает человек, и это часть протокола, а не то, что раннер может
+        // проверить за него. Порядок «лок → миграция → всё остальное» существенен: миграция
+        // трогает состояние, по которому дальше пойдёт вся петля.
+        {
+            const migrationDeps: TMigrationDeps = {
+                existsFn: (p: string) => fs.existsSync(p),
+                readFn: (p: string) => fs.readFileSync(p, 'utf8'),
+                writeFn: (p: string, data: string) => {
+                    guardSideEffect(`migration write(${p})`);
+                    fs.writeFileSync(p, data);
+                },
+                renameFn: (from: string, to: string) => {
+                    guardSideEffect(`migration rename(${from})`);
+                    fs.renameSync(from, to);
+                },
+                removeFn: (p: string) => {
+                    guardSideEffect(`migration rm(${p})`);
+                    fs.rmSync(p, { force: true });
+                },
+                sizeFn: (p: string) => fs.statSync(p).size,
+                // Время идёт параметром, а не Date.now() внутри протокола: журнал переезда
+                // читают глазами, и недетерминированный тест на него читать перестали бы.
+                now: () => new Date().toISOString(),
+            };
+            // Снятие лока на ЛЮБОМ пути выхода — включая отказ протокола и барьеры ниже
+            // (ревью Codex, !23): exit-хендлер ставится сильно позже, и до него лок остался
+            // бы сиротой, а следующий запуск разбирал бы её вместо работы. Регистрируем
+            // сразу после взятия; повторное снятие в общем хендлере идемпотентно.
+            const lockToRelease = DRY ? null : path.resolve(RUNTIME.lock);
+            if (lockToRelease) process.on('exit', () => releaseLockIfOurs(lockToRelease));
+            if (roots) {
+                // Лог режима — в НОВЫЙ каталог: initialLogTarget фабрики захвачен до репойнта
+                // и указывает в старую раскладку, а писать туда после переезда значит заново
+                // создать legacy `ralph.log`, который только что переименован.
+                if (MIGRATE || MIGRATE_ROLLBACK) setLogTarget(RUNTIME.log);
+                if (MIGRATE_ROLLBACK) {
+                    const rolled = rollbackRuntime(roots.runtimeDir, migrationDeps);
+                    log(
+                        `↩️  Состояние возвращено в ${rolled.from} (файлов: ${rolled.files.length}). ` +
+                            `Убери секцию roots из конфига — иначе следующий запуск встанет на несоответствии.`,
+                    );
+                    return;
+                }
+                if (MIGRATE) {
+                    const plan = planRuntimeMigration(
+                        LEGACY_DIR,
+                        roots.runtimeDir,
+                        migrationDeps.existsFn,
+                    );
+                    const started = readMigrationJournal(roots.runtimeDir, migrationDeps);
+                    if (plan.files.length === 0 && started?.status !== 'in-progress') {
+                        log('🗂 Мигрировать нечего: в старой раскладке файлов состояния нет.');
+                    } else {
+                        const done = migrateRuntime(plan, migrationDeps);
+                        log(`🗂 Состояние переехало в ${done.to} (файлов: ${done.files.length}).`);
+                    }
+                    return;
+                }
+                // Незавершённый переезд (и откат, не доведённый правкой конфига) не пускают
+                // петлю дальше: состояние в этот момент лежит в двух местах, и «продолжить»
+                // означало бы выбрать одно из них молча.
+                assertMigrationSettled(roots.runtimeDir, migrationDeps);
+            }
+            // Маркер старой раскладки читается ВСЕГДА, в том числе когда `roots` в конфиге
+            // нет вовсе: иначе запуск со старым конфигом не увидел бы уехавшего состояния и
+            // начал бы новую фазу рядом с ним.
+            assertLegacyNotMigrated(LEGACY_DIR, roots?.runtimeDir ?? null, migrationDeps);
+        }
         // Абсолютный путь лока фиксируем ДО chdir в worktree: exit-хендлер ниже снимает СВОЙ
         // лок (releaseLockIfOurs), а относительный путь после chdir указал бы внутрь дерева
         // раннера. С заданным runtimeDir путь уже абсолютен, и resolve здесь безвреден.

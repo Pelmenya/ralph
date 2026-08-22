@@ -8953,6 +8953,8 @@ const FLAGS_OFF = {
     reset: false,
     resubmit: false,
     deployResolved: false,
+    migrate: false,
+    migrateRollback: false,
 };
 
 // Минимальные внешние JS-коллабораторы (мост из entry): фейки вместо

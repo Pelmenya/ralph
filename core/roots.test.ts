@@ -447,7 +447,7 @@ describe('переезд состояния в runtimeDir (канон, зада�
         // Имена читают монитор, deadman и человек грепом — переезд каталога уже достаточное
         // изменение за один шаг. А вот НЕ уехавший файл хуже непереезда: половина состояния
         // окажется в старом каталоге, и восстанавливаться будет не по чему.
-        const { runtimePathsIn } = await import('./orchestrator.ts');
+        const { runtimePathsIn } = await import('./runtime-paths.ts');
         const paths = runtimePathsIn('/path/to/app/.ralph/runtime/prod-abc');
         for (const [field, p] of Object.entries(paths)) {
             expect(p.startsWith('/path/to/app/.ralph/runtime/prod-abc/'), `${field}: ${p}`).toBe(
@@ -464,7 +464,7 @@ describe('переезд состояния в runtimeDir (канон, зада�
     it('состав переехавших путей закрыт: новый файл состояния не забудется молча', async () => {
         // Тест-опись. Добавил файл в RUNTIME, не добавив сюда, — красный: иначе новый файл
         // остаётся в каталоге ядра, а узнаётся это на первом же грязном подмодуле.
-        const { runtimePathsIn } = await import('./orchestrator.ts');
+        const { runtimePathsIn } = await import('./runtime-paths.ts');
         expect(Object.keys(runtimePathsIn('/path/to/runtime')).sort()).toEqual([
             'dryLog',
             'lock',

@@ -22,6 +22,8 @@
  *   node .claude/ralph/ralph.js --reset     сбросить state на первую фазу конфига
  *   node .claude/ralph/ralph.js --resubmit  повторить полный цикл сдачи фазы (PR/ревью/правки)
  *   node .claude/ralph/ralph.js --deploy-resolved  снять барьер красного пост-мердж деплоя (#165) и продолжить
+ *   node .claude/ralph/ralph.js --migrate-runtime   перевезти состояние в runtimeDir и выйти
+ *   node .claude/ralph/ralph.js --migrate-rollback  вернуть состояние в прежнюю раскладку
  *   node .claude/ralph/ralph.js --profile <name>   профиль конфига (по умолчанию defaultProfile)
  *
  * Требования: gh CLI авторизован, git-репозиторий, ralph.config.json настроен, active: true.
@@ -76,6 +78,12 @@ const flags = {
     reset: argv.includes('--reset'),
     resubmit: argv.includes('--resubmit'),
     deployResolved: argv.includes('--deploy-resolved'),
+    // Канон, задача 25: переезд состояния в runtimeDir и откат к прежней раскладке. Оба —
+    // отдельные РЕЖИМЫ, а не побочный шаг обычного прогона: переезд трогает то самое
+    // состояние, по которому петля продолжает фазу, и совмещать его с работой значило бы
+    // чинить и ехать одновременно.
+    migrate: argv.includes('--migrate-runtime'),
+    migrateRollback: argv.includes('--migrate-rollback'),
 };
 
 // Allowlist известных флагов — fail-closed против тихого сдвига режима (инвариант №1,
@@ -90,6 +98,8 @@ const KNOWN_FLAGS = new Set([
     '--reset',
     '--resubmit',
     '--deploy-resolved',
+    '--migrate-runtime',
+    '--migrate-rollback',
     '--profile',
 ]);
 function assertKnownFlags(args) {
@@ -102,8 +112,9 @@ function assertKnownFlags(args) {
         if (a.startsWith('--profile=')) continue;
         if (!KNOWN_FLAGS.has(a)) {
             console.error(
-                `❌ Неизвестный флаг "${a}". Допустимы: --once, --dry-run, --reset, --resubmit, ` +
-                    `--deploy-resolved, --profile <name> | --profile=<name>.`,
+                `❌ Неизвестный флаг "${a}". Допустимы: ${[...KNOWN_FLAGS]
+                    .filter((f) => f !== '--profile')
+                    .join(', ')}, --profile <name> | --profile=<name>.`,
             );
             process.exit(1);
         }

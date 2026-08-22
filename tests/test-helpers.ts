@@ -244,6 +244,8 @@ const FIXTURE_FLAGS = {
     reset: false,
     resubmit: false,
     deployResolved: false,
+    migrate: false,
+    migrateRollback: false,
 };
 
 /** Оркестратор с фейками моста entry: профиль фикстуры не prod, телеграм и gate-env не зовут. */
