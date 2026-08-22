@@ -30,7 +30,12 @@ const JOURNAL_SCRIPT = 'scripts/orbital-findings.mjs';
 
 function makeEnv(over: Partial<ReviewEnv> = {}): ReviewEnv {
     return {
-        getConfig: () => ({ consumerScripts: { reviewFindingsJournal: JOURNAL_SCRIPT } }),
+        getConfig: () => ({
+            consumerScriptsResolved: {
+                projectSync: null,
+                reviewFindingsJournal: JOURNAL_SCRIPT,
+            },
+        }),
         ghJson: () => {
             throw new Error('ghJson не подменён в тесте');
         },
@@ -376,6 +381,23 @@ describe('assertKnownReviewModels — fail-closed планка моделей р
 // #625: журнал различает проходы. Запись прохода — отдельная функция: счёт ей приносит
 // петля (только она знает, что в проходе НОВОГО), в форж эта запись не ходит вовсе.
 describe('recordFixReviewFindings — журнальная запись прохода ревью правок (#625)', () => {
+    it('журнал не задан → запись прохода правок тоже выключена вслух', () => {
+        const shArgv = vi.fn(() => 'ok');
+        const logs: string[] = [];
+        const { recordFixReviewFindings } = createReviewModule(
+            makeEnv({
+                shArgv,
+                getConfig: () => ({
+                    consumerScriptsResolved: { projectSync: null, reviewFindingsJournal: null },
+                }),
+                log: (m: string) => logs.push(m),
+            }),
+        );
+        recordFixReviewFindings({ milestone: 'M1' }, 42, COUNTS, 1);
+        expect(shArgv).not.toHaveBeenCalled();
+        expect(logs.join('\n')).toMatch(/выключен/i);
+    });
+
     const COUNTS = { blocker: 1, major: 0, minor: 2, nit: 0, unmarked: 0, total: 3 };
 
     it('зовёт журнал через argv с готовым счётом и номером прохода', () => {
@@ -513,6 +535,33 @@ describe('recordReviewFindings — best-effort вызов журнала нах�
             'node',
             [JOURNAL_SCRIPT, '42', 'M1', 'alice', 'bob'],
         ]);
+    });
+
+    // Канон, задача 23: журнал — скрипт ПОТРЕБИТЕЛЯ, и «его нет» обязано читаться в логе.
+    // Раньше путь был зашит строкой, вызов fail-open, и отсутствие файла выглядело как
+    // прошедшая запись: метрика ревью тихо исчезала, а по ней судят, крепнет ли ревью.
+    it('журнал не задан → шов выключен вслух, скрипт не зовётся, лента НЕ читается', () => {
+        const shArgv = vi.fn(() => 'ok');
+        const prComments = vi.fn(() => COMMENTS);
+        const logs: string[] = [];
+        const { recordReviewFindings } = createReviewModule(
+            makeEnv({
+                shArgv,
+                prComments,
+                getConfig: () => ({
+                    consumerScriptsResolved: { projectSync: null, reviewFindingsJournal: null },
+                }),
+                log: (m: string) => logs.push(m),
+            }),
+        );
+        recordReviewFindings({ milestone: 'M1' }, 42, ['alice']);
+        expect(shArgv).not.toHaveBeenCalled();
+        // Поход в форж до проверки ключа — лишний round-trip на каждой сдаче фазы, а его
+        // предупреждения («нет комментариев», «автор не в allowlist») тревожат о метрике,
+        // которой нет, и лезут значком ⚠ в панель монитора.
+        expect(prComments).not.toHaveBeenCalled();
+        expect(logs.join('\n')).toMatch(/выключен/i);
+        expect(logs.join('\n')).toContain('consumerScripts.reviewFindingsJournal');
     });
 
     // #37: лента уходит на stdin, а не в argv. Предел одного аргумента у ядра ОС жёсткий,

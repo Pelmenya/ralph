@@ -14,7 +14,13 @@
 // возвращённые функции сохраняют показательную DI (failFn параметром) — ровно так их
 // зовут существующие тесты (config-profile.test.ts) и monitor.js (мягкий failFn `() => null`).
 
-import { ADAPTER_DEFAULTS, CODER_RUNTIME_PROVIDERS } from '../adapters/adapters-impl.ts';
+import path from 'node:path';
+
+import {
+    ADAPTER_DEFAULTS,
+    BOARD_SYNC_TASK_SOURCES,
+    CODER_RUNTIME_PROVIDERS,
+} from '../adapters/adapters-impl.ts';
 import { resolveRoots, type TRootsInput } from './roots.ts';
 
 // fail() боевой уходит в process.exit(1); тестовый failFn может вернуть значение или
@@ -52,6 +58,18 @@ const FORBIDDEN_KEYS = ['__proto__', 'constructor', 'prototype'];
 // служит проверкой опечатки в имени ключа — незнакомый ключ валит старт, а не тихо
 // выключает скрипт.
 export const CONSUMER_SCRIPT_KEYS = ['projectSync', 'reviewFindingsJournal'] as const;
+
+// Секция в том виде, в каком её пишет потребитель: путь либо `null` — явное «выключено».
+// Тип живёт здесь, рядом с закрытым списком ключей и валидатором, и импортируется теми, кто
+// секцию ЧИТАЕТ (orchestrator, review): три копии литерального типа разъехались бы молча.
+export type TConsumerScripts = Partial<
+    Record<(typeof CONSUMER_SCRIPT_KEYS)[number], string | null>
+>;
+
+// Резолвнутая секция: те же ключи, но каждый присутствует явно — `null` означает «выключено»
+// (ключа нет, задан null либо площадка синк не зовёт). Читающему не нужно гадать, чем
+// отличается отсутствие ключа от выключения: оба уже сведены к одному ответу.
+export type TConsumerScriptsResolved = Record<(typeof CONSUMER_SCRIPT_KEYS)[number], string | null>;
 
 // Скан ВСЕЙ глубины, а не только уровней, куда рекурсирует мердж: объект из профиля по
 // ключу, которого нет в common, копируется присваиванием — без этого обхода его нутро
@@ -505,30 +523,26 @@ export function createConfigProfile(env: ConfigProfileEnv) {
     // что оба вызова fail-open: «файла нет» неотличимо от «прошло успешно», и опечатка в
     // пути осталась бы видна только через месяц пустого журнала.
     //
-    // Отдельно про опечатку в ИМЕНИ ключа: `projectSyncs` вместо `projectSync` — тот же
-    // класс отказа, но подлее. Ядро скажет «синк выключен: ключа нет», человек прочтёт
-    // это как ошибку в конфиге ядра, а ключ у него в файле есть — глазами видно.
-    // Возврат: true — валиден; иначе результат failFn (мягкий failFn пробрасываем наверх).
-    function assertValidConsumerScripts(
-        cfg: Record<string, unknown>,
-        profileName: string,
-        failFn: FailFn = fail,
-    ): unknown {
-        const raw = cfg.consumerScripts;
-        if (raw === undefined) return true; // секции нет — обе обёртки выключены осознанно
-        const where = `ralph.config.json (профиль "${profileName}"): consumerScripts`;
-        if (!isPlainObject(raw)) {
+    // Форма значения: непустой путь ЛИБО `null` — явное «выключено». `null` нужен именно
+    // профилю: `{}` в профиле мерджем растворяется и молча наследует путь из `common`
+    // (ревью !21), то есть выключить унаследованный скрипт было бы нечем — а профиль
+    // playground, дёргающий боевой синк доски, ровно тот отказ, ради которого профили и
+    // заводились.
+    function checkConsumerScriptsShape(section: unknown, where: string, failFn: FailFn): unknown {
+        if (section === undefined) return true;
+        if (!isPlainObject(section)) {
             return failFn(
-                `${where} — не объект (получено ${JSON.stringify(raw)}). Ожидались пути скриптов ` +
+                `${where} — не объект (получено ${JSON.stringify(section)}). Ожидались пути скриптов ` +
                     `потребителя: { ${CONSUMER_SCRIPT_KEYS.join(', ')} } (канон, задача 23).`,
             );
         }
-        const keys = Object.keys(raw);
+        const keys = Object.keys(section);
         if (keys.length === 0) {
             return failFn(
                 `${where} задан, но не содержит ни одного скрипта. Пустая секция выглядит ` +
-                    `настроенной, а работает как отсутствующая: убери её (обе обёртки выключены) ` +
-                    `либо задай путь — ${CONSUMER_SCRIPT_KEYS.join(' и/или ')}.`,
+                    `настроенной, а работает как отсутствующая (в профиле — как наследование пути из ` +
+                    `"common"): убери её либо задай путь — ${CONSUMER_SCRIPT_KEYS.join(' и/или ')}. ` +
+                    `Выключить унаследованный скрипт — значением null.`,
             );
         }
         for (const key of keys) {
@@ -539,14 +553,23 @@ export function createConfigProfile(env: ConfigProfileEnv) {
                         `а ключ в файле есть.`,
                 );
             }
-            const value = raw[key];
+            const value = section[key];
+            if (value === null) continue; // явное «выключено» — законная запись
             if (typeof value !== 'string' || value.trim() === '') {
                 return failFn(
-                    `${where}.${key} = ${JSON.stringify(value)} — ожидался непустой путь к скрипту. ` +
-                        `Вызов fail-open: мусор здесь означал бы «скрипт молча не отработал», а не отказ.`,
+                    `${where}.${key} = ${JSON.stringify(value)} — ожидался непустой путь к скрипту ` +
+                        `либо null (выключено). Вызов fail-open: мусор здесь означал бы «скрипт молча не ` +
+                        `отработал», а не отказ.`,
                 );
             }
-            if (value.trim().startsWith('-')) {
+            if (value !== value.trim()) {
+                return failFn(
+                    `${where}.${key} = ${JSON.stringify(value)} — путь с пробелом по краям. ` +
+                        `Исполняется значение как есть, и такой путь падает ENOENT в рантайме, ` +
+                        `где отказ уже fail-open (одна строка в логе).`,
+                );
+            }
+            if (value.startsWith('-')) {
                 return failFn(
                     `${where}.${key} = ${JSON.stringify(value)} — путь начинается с дефиса. ` +
                         `Ядро зовёт скрипт как \`node <путь>\`, и всё, что начинается с дефиса, node разбирает ` +
@@ -555,6 +578,66 @@ export function createConfigProfile(env: ConfigProfileEnv) {
             }
         }
         return true;
+    }
+
+    /**
+     * Итоговая секция скриптов потребителя: форма (см. checkConsumerScriptsShape), привязка
+     * к площадке и резолв путей от известного корня.
+     *
+     * Возвращает РЕЗОЛВНУТЫЕ пути отдельным полем — по образцу `rootsResolved`: `consumerScripts`
+     * остаётся тем, что написано в файле, а исполняется резолвнутое. Относительный путь — это
+     * «от места запуска», а место запуска у петли меняется (chdir в worktree фазы), поэтому
+     * при заданной раскладке корней путь якорится к `consumerRoot`: скрипт принадлежит дереву
+     * потребителя и обязан находиться там же независимо от того, в каком дереве идёт работа.
+     * Раскладки нет (старая, «всё в каталоге ядра») — путь остаётся относительным, как раньше;
+     * это умолчание сказано вслух, а не подобрано.
+     */
+    function assertValidConsumerScripts(
+        cfg: Record<string, unknown>,
+        profileName: string,
+        failFn: FailFn = fail,
+        consumerRoot: string | null = null,
+    ): unknown {
+        const raw = cfg.consumerScripts;
+        if (raw === undefined) return { consumerScriptsResolved: null };
+        const where = `ralph.config.json (профиль "${profileName}"): consumerScripts`;
+        const shapeOk = checkConsumerScriptsShape(raw, where, failFn);
+        if (shapeOk !== true) return shapeOk;
+        const section = raw as Record<string, unknown>;
+
+        // Привязка к площадке: синк доски зовёт ТОЛЬКО тот taskSource, у которого доска —
+        // отдельная сущность. Там, где доска — проекция статуса issue, `syncBoard` осознанный
+        // no-op, и заданный `projectSync` не позвался бы никогда: ключ в файле есть, скрипт
+        // не зовётся, лог молчит — ровно тот отказ, ради которого отвергается опечатка в
+        // имени ключа. Реестр закрыт списком: новый адаптер, которому синк нужен, дописывает
+        // себя сюда — и это видно в диффе.
+        const adapters = cfg.adapters;
+        const taskSource =
+            isPlainObject(adapters) && typeof adapters.taskSource === 'string'
+                ? adapters.taskSource
+                : ADAPTER_DEFAULTS.taskSource;
+        if (
+            typeof section.projectSync === 'string' &&
+            !(BOARD_SYNC_TASK_SOURCES as readonly string[]).includes(taskSource)
+        ) {
+            return failFn(
+                `${where}.projectSync задан, но адаптер трекера "${taskSource}" синк доски не зовёт: ` +
+                    `там доска — проекция статуса issue, синхронизировать нечего (syncBoard — осознанный no-op). ` +
+                    `Скрипт не позвался бы никогда, и лог об этом молчал бы. Убери ключ либо задай null. ` +
+                    `Синк зовут: ${BOARD_SYNC_TASK_SOURCES.join(', ')}.`,
+            );
+        }
+
+        const resolved: Record<string, string | null> = {};
+        for (const key of CONSUMER_SCRIPT_KEYS) {
+            const value = section[key];
+            if (typeof value !== 'string') {
+                resolved[key] = null; // ключа нет либо явное «выключено»
+                continue;
+            }
+            resolved[key] = consumerRoot ? path.resolve(consumerRoot, value) : value;
+        }
+        return { consumerScriptsResolved: resolved };
     }
 
     function resolveProfile(raw: unknown, name: unknown, failFn: FailFn = fail): unknown {
@@ -586,6 +669,23 @@ export function createConfigProfile(env: ConfigProfileEnv) {
 
         // profileName в итоговом конфиге: раннеру и логам нужно знать режим, а исходный
         // raw после резолва никто не таскает.
+        // Канон, задача 23 (ревью !21): секция скриптов проверяется и в СЫРЫХ блоках, до
+        // мерджа. Пустая секция в профиле мерджем растворяется — на итоговом конфиге её уже
+        // не видно, а человек, написавший `"consumerScripts": {}` в playground, считает
+        // скрипты выключенными, тогда как они унаследовались из `common`.
+        const commonShapeOk = checkConsumerScriptsShape(
+            raw.common.consumerScripts,
+            'ralph.config.json (common): consumerScripts',
+            failFn,
+        );
+        if (commonShapeOk !== true) return commonShapeOk; // мягкий failFn — наверх как есть
+        const profileShapeOk = checkConsumerScriptsShape(
+            (profiles[wanted] as Record<string, unknown>).consumerScripts,
+            `ralph.config.json (профиль "${wanted}"): consumerScripts`,
+            failFn,
+        );
+        if (profileShapeOk !== true) return profileShapeOk; // мягкий failFn — наверх как есть
+
         const merged = deepMerge(
             raw.common,
             profiles[wanted] as Record<string, unknown>,
@@ -617,15 +717,28 @@ export function createConfigProfile(env: ConfigProfileEnv) {
         // про форму, и осмысленна только на уже слитом конфиге.
         const promptOk = assertValidPromptPlaceholders(merged, wanted, failFn);
         if (promptOk !== true) return promptOk; // мягкий failFn — наверх как есть
-        // Канон, задача 23: пути скриптов потребителя — до раскладки корней: это ещё схема
-        // конфига, а корни лезут на диск.
-        const scriptsOk = assertValidConsumerScripts(merged, wanted, failFn);
-        if (scriptsOk !== true) return scriptsOk; // мягкий failFn — наверх как есть
         // Канон, задача 21: раскладка корней. Последней в ряду — она про место на диске,
         // и осмысленна только когда остальная схема уже признана целой.
         const rootsOk = assertValidRoots(merged, wanted, failFn);
         if (!isPlainObject(rootsOk) || !('rootsResolved' in rootsOk)) return rootsOk; // мягкий failFn
-        return { ...merged, profileName: wanted, rootsResolved: rootsOk.rootsResolved };
+        const roots = rootsOk.rootsResolved as { consumerRoot?: string } | null;
+        // Канон, задача 23: скрипты потребителя — ПОСЛЕ корней: их пути якорятся к
+        // `consumerRoot`, и до резолва раскладки якорить не к чему.
+        const scriptsOk = assertValidConsumerScripts(
+            merged,
+            wanted,
+            failFn,
+            roots?.consumerRoot ?? null,
+        );
+        if (!isPlainObject(scriptsOk) || !('consumerScriptsResolved' in scriptsOk)) {
+            return scriptsOk; // мягкий failFn — наверх как есть
+        }
+        return {
+            ...merged,
+            profileName: wanted,
+            rootsResolved: rootsOk.rootsResolved,
+            consumerScriptsResolved: scriptsOk.consumerScriptsResolved,
+        };
     }
 
     return {

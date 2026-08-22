@@ -877,31 +877,44 @@ describe('resolveProfile — скрипты потребителя (канон, 
     const boom = (m: string) => {
         throw new Error(m);
     };
-    const withScripts = (consumerScripts: unknown) => ({
+    const cfgWith = (
+        profileSection: unknown,
+        commonExtra: Record<string, unknown> = {},
+    ): Record<string, unknown> => ({
         defaultProfile: 'prod',
-        common: { phases: [{ milestone: 'M', branch: 'b' }] },
+        common: { phases: [{ milestone: 'M', branch: 'b' }], ...commonExtra },
         profiles: {
-            prod: consumerScripts === undefined ? {} : { consumerScripts },
+            prod: profileSection === undefined ? {} : { consumerScripts: profileSection },
         },
     });
+    const withScripts = (section: unknown) => cfgWith(section);
     const LEGAL = {
         projectSync: 'scripts/project-sync.mjs',
         reviewFindingsJournal: 'scripts/review-findings-journal.mjs',
     };
 
-    it('секции нет — старт не ломается: обе обёртки просто выключены', () => {
+    it('секции нет — старт не ломается, а резолв говорит «секции нет»', () => {
         // Скрипты принадлежат потребителю, и у площадки, где доска — проекция статуса,
         // синка нет вовсе. Требовать секцию значило бы навязать чужой файл каждому.
-        expect(resolveProfile(withScripts(undefined), 'prod', boom).profileName).toBe('prod');
+        const cfg = resolveProfile(withScripts(undefined), 'prod', boom);
+        expect(cfg.profileName).toBe('prod');
+        expect(cfg.consumerScriptsResolved).toBe(null);
     });
 
     it('законная секция доезжает до конфига целиком', () => {
-        expect(resolveProfile(withScripts(LEGAL), 'prod', boom).consumerScripts).toEqual(LEGAL);
+        const cfg = resolveProfile(withScripts(LEGAL), 'prod', boom);
+        expect(cfg.consumerScripts).toEqual(LEGAL);
+        expect(cfg.consumerScriptsResolved).toEqual(LEGAL);
     });
 
-    it('задан только один скрипт — законно: второй выключен осознанно', () => {
+    it('задан только один скрипт — второй в резолве равен null, а не отсутствует', () => {
+        // Читающему не нужно различать «ключа нет» и «выключено»: оба уже сведены к одному
+        // ответу, и ветка «выключено» в ядре одна.
         const cfg = resolveProfile(withScripts({ projectSync: LEGAL.projectSync }), 'prod', boom);
-        expect(cfg.consumerScripts).toEqual({ projectSync: LEGAL.projectSync });
+        expect(cfg.consumerScriptsResolved).toEqual({
+            projectSync: LEGAL.projectSync,
+            reviewFindingsJournal: null,
+        });
     });
 
     it('секция не объект — отказ, а не молчаливое игнорирование', () => {
@@ -917,23 +930,51 @@ describe('resolveProfile — скрипты потребителя (канон, 
         expect(() => resolveProfile(withScripts({}), 'prod', boom)).toThrow(/ни одного скрипта/);
     });
 
+    it('пустая секция В ПРОФИЛЕ — тоже отказ, хотя мердж её растворяет', () => {
+        // Ревью !21: `{}` в профиле сливается с `common` бесследно, и на итоговом конфиге
+        // проверять уже нечего — а человек, написавший это в playground, считает синк
+        // выключенным и получает боевой путь из `common`.
+        expect(() => resolveProfile(cfgWith({}, { consumerScripts: LEGAL }), 'prod', boom)).toThrow(
+            /ни одного скрипта/,
+        );
+    });
+
+    it('null выключает скрипт, унаследованный из common', () => {
+        // Единственный способ сказать «в этом профиле — не зови»: убрать ключ нельзя,
+        // мердж вернёт его из common.
+        const cfg = resolveProfile(
+            cfgWith({ projectSync: null }, { consumerScripts: LEGAL }),
+            'prod',
+            boom,
+        );
+        expect(cfg.consumerScriptsResolved).toEqual({
+            projectSync: null,
+            reviewFindingsJournal: LEGAL.reviewFindingsJournal,
+        });
+    });
+
     it('незнакомый ключ — отказ, и он называет известные', () => {
         // Опечатка в имени ключа — ровно тот отказ, который задача и чинила: ядро молча
         // не звало бы скрипт, а лог сказал бы «выключен», хотя человек его задал.
-        expect(() =>
-            resolveProfile(withScripts({ ...LEGAL, projectSyncs: 'scripts/x.mjs' }), 'prod', boom),
-        ).toThrow(/projectSyncs/);
-        expect(() =>
-            resolveProfile(withScripts({ ...LEGAL, projectSyncs: 'scripts/x.mjs' }), 'prod', boom),
-        ).toThrow(/projectSync, reviewFindingsJournal/);
+        const typo = { ...LEGAL, projectSyncs: 'scripts/x.mjs' };
+        expect(() => resolveProfile(withScripts(typo), 'prod', boom)).toThrow(/projectSyncs/);
+        expect(() => resolveProfile(withScripts(typo), 'prod', boom)).toThrow(
+            /projectSync, reviewFindingsJournal/,
+        );
     });
 
     it('значение не строка или пустое — отказ с именем ключа', () => {
-        for (const bad of [42, null, '', '   ', ['a']]) {
+        for (const bad of [42, '', '   ', ['a']]) {
             expect(() => resolveProfile(withScripts({ projectSync: bad }), 'prod', boom)).toThrow(
                 /projectSync/,
             );
         }
+    });
+
+    it('пробел по краям пути — отказ: исполняется значение как есть', () => {
+        expect(() =>
+            resolveProfile(withScripts({ projectSync: '  scripts/x.mjs' }), 'prod', boom),
+        ).toThrow(/пробелом по краям/);
     });
 
     it('путь, начинающийся с дефиса, — отказ: node прочтёт его как свой флаг', () => {
@@ -942,5 +983,78 @@ describe('resolveProfile — скрипты потребителя (канон, 
         expect(() =>
             resolveProfile(withScripts({ projectSync: '--eval=console.log(1)' }), 'prod', boom),
         ).toThrow(/дефис/);
+    });
+
+    it('синк доски задан площадке, которая его не зовёт, — отказ на старте', () => {
+        // Иначе ключ есть в файле, скрипт не зовётся никогда, и лог молчит — тот же отказ,
+        // ради которого отвергается опечатка в имени ключа, только законный.
+        expect(() =>
+            resolveProfile(
+                cfgWith(
+                    { projectSync: LEGAL.projectSync },
+                    { adapters: { taskSource: 'sourcecraft' } },
+                ),
+                'prod',
+                boom,
+            ),
+        ).toThrow(/синк доски не зовёт/);
+    });
+
+    it('журнал находок такой площадке задать можно: его зовёт ядро, а не адаптер', () => {
+        const cfg = resolveProfile(
+            cfgWith(
+                { reviewFindingsJournal: LEGAL.reviewFindingsJournal },
+                { adapters: { taskSource: 'sourcecraft' } },
+            ),
+            'prod',
+            boom,
+        );
+        expect(cfg.consumerScriptsResolved.reviewFindingsJournal).toBe(LEGAL.reviewFindingsJournal);
+    });
+
+    it('раскладка корней задана — относительный путь якорится к consumerRoot', () => {
+        // База относительного пути иначе — «где случился chdir»: петля работает в worktree
+        // фазы, и скрипт потребителя искался бы там, а не в дереве потребителя.
+        const cfg = resolveProfile(
+            cfgWith(LEGAL, {
+                roots: {
+                    consumerRoot: '/path/to/app',
+                    executionRoot: '/path/to/app-ralph',
+                    productRoot: '/path/to/app/.ralph/core',
+                    runtimeDir: '/path/to/app/.ralph/runtime/prod',
+                },
+            }),
+            'prod',
+            boom,
+        );
+        expect(cfg.consumerScriptsResolved).toEqual({
+            projectSync: '/path/to/app/scripts/project-sync.mjs',
+            reviewFindingsJournal: '/path/to/app/scripts/review-findings-journal.mjs',
+        });
+    });
+
+    it('абсолютный путь остаётся собой, куда бы ни указывал consumerRoot', () => {
+        const cfg = resolveProfile(
+            cfgWith(
+                { projectSync: '/opt/tools/sync.mjs' },
+                {
+                    roots: {
+                        consumerRoot: '/path/to/app',
+                        executionRoot: '/path/to/app-ralph',
+                        productRoot: '/path/to/app/.ralph/core',
+                        runtimeDir: '/path/to/app/.ralph/runtime/prod',
+                    },
+                },
+            ),
+            'prod',
+            boom,
+        );
+        expect(cfg.consumerScriptsResolved.projectSync).toBe('/opt/tools/sync.mjs');
+    });
+
+    it('мягкий failFn: конфиг не собирается из полуфабриката', () => {
+        // Монитор передаёт `() => null` — отказ обязан уехать наверх как есть, а не стать
+        // конфигом с половиной проверенных полей.
+        expect(resolveProfile(withScripts({}), 'prod', () => null)).toBe(null);
     });
 });

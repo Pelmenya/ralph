@@ -44,6 +44,7 @@ import { createExec, loadJson, chooseLogPath } from './exec.ts';
 import { createSourcecraftTaskSource } from '../adapters/sourcecraft-task-source.ts';
 import { createSourcecraftApi } from '../adapters/sourcecraft-api.ts';
 import { createConfigProfile, isPlainObject } from './config-profile.ts';
+import type { TConsumerScripts, TConsumerScriptsResolved } from './config-profile.ts';
 import { createStateLock } from './state-lock.ts';
 import type { RalphState } from './state-lock.ts';
 import { createTunnelCheck } from './tunnel-check.ts';
@@ -270,8 +271,11 @@ export type RalphConfig = {
     // и это не то же самое, что «раскладка пустая».
     rootsResolved?: TResolvedRoots | null;
     // Скрипты ПОТРЕБИТЕЛЯ, которые зовёт ядро: их нет в каноне, и путь к ним — часть
-    // контракта потребителя, а не зашитая строка (канон, задача 23).
-    consumerScripts?: { projectSync?: string; reviewFindingsJournal?: string };
+    // контракта потребителя, а не зашитая строка (канон, задача 23). `consumerScripts` —
+    // то, что написано в файле; исполняется РЕЗОЛВНУТОЕ, где относительный путь уже
+    // заякорен к `consumerRoot` (иначе база пути — «где случился chdir»).
+    consumerScripts?: TConsumerScripts;
+    consumerScriptsResolved?: TConsumerScriptsResolved | null;
     phases: Phase[];
     prompt?: string;
     model?: string;
@@ -361,11 +365,14 @@ export type RalphConfig = {
     runnerWorktreePath?: string;
     // #204 (фаза 4): проектная специфика, вынесенная из кода ядра в конфиг.
     // installCmd — команда установки зависимостей (дефолт `npm ci`); runnerWorktreeDirname —
-    // имя соседнего дерева раннера (дефолт — `<имя-репо>-ralph`); board — доска Projects
-    // для project-sync.mjs; gate — состав чеков (валидируется resolveGateChecks).
+    // имя соседнего дерева раннера (дефолт — `<имя-репо>-ralph`); gate — состав чеков
+    // (валидируется resolveGateChecks).
+    //
+    // Поля адресата доски здесь нет намеренно (канон, задача 23): доску настраивает скрипт
+    // потребителя, ядро о ней не знает вовсе. Объявленное, но никем не читаемое поле — это
+    // дока, которая врёт: она обещает, что ядро им распорядится.
     installCmd?: string;
     runnerWorktreeDirname?: string;
-    board?: { owner?: string; number?: number };
     gate?: { checks?: unknown; prodChecks?: unknown; prodDropChecks?: unknown };
     // #369 (фаза 5): выбор реализации каждого шва по ключу (форж/гейт/нотификатор/деплой/
     // рантайм). Опционально — отсутствующий шов берёт канон-дефолт (ADAPTER_DEFAULTS);
@@ -3029,7 +3036,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // `config?`, а не `config`: фабрику собирают и до main() (тесты, монитор), и тогда
         // конфига ещё нет вовсе — обёртка, чья работа «не ронять прогон», обязана пережить
         // и это.
-        const script = config?.consumerScripts?.projectSync;
+        const script = config?.consumerScriptsResolved?.projectSync;
         if (!script) {
             logFn('🗂 Синк доски выключен: в конфиге нет consumerScripts.projectSync.');
             return;

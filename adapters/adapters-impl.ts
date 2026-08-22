@@ -56,6 +56,15 @@ export const ADAPTER_DEFAULTS = {
     coderRuntime: 'claude',
 } as const;
 
+// Адаптеры трекера, которые ЗОВУТ скрипт синка доски потребителя (канон, задача 23).
+// Список закрыт и лежит рядом с реестром реализаций: у площадки, где доска — проекция
+// статуса issue, `syncBoard` осознанный no-op, и заданный `consumerScripts.projectSync`
+// там не позвался бы никогда — молча, как раньше звался зашитый путь. Валидатор конфига
+// (config-profile.ts) отвергает такую пару, поэтому новый адаптер, которому синк нужен,
+// дописывает себя сюда — иначе его конфиг красный, и это видно сразу, а не через месяц
+// расхождения доски.
+export const BOARD_SYNC_TASK_SOURCES = ['github'] as const;
+
 // Швы в каноничном порядке — единственный источник имён (итерируется резолвером и сборкой).
 export const ADAPTER_SEAMS = Object.keys(ADAPTER_DEFAULTS) as Array<keyof typeof ADAPTER_DEFAULTS>;
 

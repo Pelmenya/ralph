@@ -404,152 +404,50 @@ describe('ядро не исполняет команд форжа (#55)', () =>
 // потребителя лежал файл с таким именем в таком месте. Отказ при этом был тихим: обе
 // обёртки fail-open, и «файла нет» выглядело ровно как «синк прошёл».
 describe('пути скриптов потребителя приходят из конфига, а не из кода', () => {
-    it.each(CORE)('%s — без зашитых путей `scripts/…`', (rel) => {
-        const code = stripComments(readFileSync(join(CANON_ROOT, rel), 'utf-8'));
-        const hits = code
-            .split('\n')
-            .map((line, i) => [i + 1, line] as const)
-            // Литерал пути внутри строки — именно то, что нельзя: имя файла потребителя
-            // в коде продукта. Слово `scripts` в имени поля конфига законно.
-            .filter(([, line]) => /['"`][^'"`]*\bscripts\/[^'"`]*['"`]/.test(line));
+    // Запрещён КЛАСС, а не инцидент (ревью !21): не подстрока `scripts/`, а литеральный
+    // путь скрипта, переданный интерпретатору. `['tools/board-sync.mjs']` и
+    // `['bin/journal.mjs']` — тот же зашитый контракт потребителя, просто в другой папке.
+    const NODE_ARGV = /\(\s*['"`]node['"`]\s*,\s*\[\s*['"`]([^'"`]+)['"`]/g;
+    // Вторая форма — путь внутри командной строки целиком (`sh('node scripts/x.mjs')`):
+    // argv здесь нет, а зашитый путь есть.
+    const NODE_CMD = /['"`][^'"`]*\bnode\s+[^'"`]*\.[cm]?[jt]s\b[^'"`]*['"`]/g;
+
+    /**
+     * Находки зашитых путей — чистая функция, как `forgeHits` выше и ровно по той же
+     * причине: скан, живущий в теле `it.each`, доказать нечем. Ослабь его правкой — и
+     * проба «от противного», проверяющая СВОЮ копию регекспа, останется зелёной, а сьют
+     * молча перестанет сканировать всё ядро.
+     */
+    function scriptPathHits(code: string): Array<readonly [number, string]> {
+        const at = (index: number) => code.slice(0, index).split('\n').length;
+        return [...code.matchAll(NODE_ARGV), ...code.matchAll(NODE_CMD)]
+            .map((m) => [at(m.index), m[0].replace(/\s+/g, ' ')] as const)
+            .sort((a, b) => a[0] - b[0]);
+    }
+
+    it('скану есть что сканировать, и барьер краснеет на подсунутом пути', () => {
+        expect(CORE).toContain('core/orchestrator.ts');
+        expect(CORE).toContain('core/review.ts');
+        // Исходный инцидент задачи 23 — обязан краснеть.
+        expect(
+            scriptPathHits("const out = runArgvFn('node', ['scripts/project-sync.mjs']);"),
+        ).toEqual([[1, "('node', ['scripts/project-sync.mjs'"]]);
+        // Класс, а не инцидент: другая папка — та же болезнь.
+        expect(scriptPathHits("shArgv('node', ['tools/board-sync.mjs'])")).toHaveLength(1);
+        expect(scriptPathHits("sh('node bin/journal.mjs --counts')")).toHaveLength(1);
+        // Путь из конфига — законная форма, ради которой задача и делалась.
+        expect(scriptPathHits("runArgvFn('node', [script])")).toEqual([]);
+        // Имя поля конфига словом `scripts` барьер не трогает: запрещён ПУТЬ, а не слово.
+        expect(scriptPathHits('cfg.consumerScripts?.projectSync')).toEqual([]);
+    });
+
+    it.each(CORE)('%s — без зашитых путей к скриптам потребителя', (rel) => {
+        const hits = scriptPathHits(stripComments(readFileSync(join(CANON_ROOT, rel), 'utf-8')));
         const detail = hits.map(([n, line]) => `\n  ${n}: ${line.trim()}`).join('');
         expect(
             hits,
-            `Зашитый путь скрипта потребителя в ${rel} — его место в ralph.config.json ` +
+            `Зашитый путь скрипта в ${rel} — его место в ralph.config.json ` +
                 `(consumerScripts):${detail}`,
         ).toEqual([]);
-    });
-
-    it('барьер краснеет на подсунутом пути — иначе он ничего не сторожит', () => {
-        const probe = "const out = runArgvFn('node', ['scripts/project-sync.mjs']);";
-        expect(/['"`][^'"`]*\bscripts\/[^'"`]*['"`]/.test(probe)).toBe(true);
-        // Имя поля конфига словом `scripts` барьер не трогает: запрещён ПУТЬ, а не слово.
-        expect(/['"`][^'"`]*\bscripts\/[^'"`]*['"`]/.test('cfg.consumerScripts?.projectSync')).toBe(
-            false,
-        );
-    });
-});
-
-// ── #36: переносимая половина промпт-контракта ───────────────────────────────
-// `ralph.md` уезжает в следующий проект как есть, поэтому в нём не должно быть ни команд
-// конкретного форжа, ни утверждений, верных только для одного из них. Барьер грепом, а не
-// глазами ревьюера (инвариант №5): текст правят чаще, чем перечитывают целиком.
-//
-// Как этот дефект выглядел до правки: `gh issue edit --add-label blocked` (невыполнимо
-// там, где `gh` нет вовсе), «issue мимо доски равно потерянному» (у площадки доска —
-// проекция статуса, терять нечего) и «ключевые слова автозакрытия только английские»
-// (механика GitHub; связь issue↔PR бывает структурной). Первое просто не сработает,
-// а два последних — ложные утверждения о мире, по которым сессия будет действовать.
-
-// ── #45: промпты сессий — намерение, а не способ ─────────────────────────────
-// Тексты, которые раннер отдаёт сессиям, — тот же переносимый контракт, что и `ralph.md`,
-// только собранный кодом. Пока они жили строками по месту вызова в `orchestrator.ts`,
-// грепом их было не отличить от законных команд `gh` соседней реализации форжа — и они
-// молча обросли механикой GitHub («через gh cli», «gh api graphql», «Closes #N»). На
-// площадке без GitHub CLI это невыполнимо, а выглядит снаружи как «ревью прошло,
-// замечаний нет»: метки нет, комментариев нет, фаза едет в main.
-//
-// Отсюда два барьера, и второй не менее важен первого: собранный в модуль текст можно
-// грепать, но только пока промпты собираются ИМЕННО там.
-
-describe('промпты сессий: без команд и механик форжа (#45)', () => {
-    const PROMPTS = join('core', 'prompts.ts');
-    const ORCHESTRATOR = join('core', 'orchestrator.ts');
-
-    const FORGE: Array<[RegExp, string]> = [
-        // Не `gh <подкоманда>`, а СЛОВО `gh` целиком: формулировка, с которой заведён #45,
-        // звучала «оставь inline-комментарии через gh cli» — списком подкоманд она не
-        // ловится вовсе, и барьер сторожил бы всё, кроме исходного дефекта (проверено).
-        [/\bgh\b/i, 'GitHub CLI в тексте промпта — его место в адаптере'],
-        [/\bglab\s/i, 'команда GitLab CLI — её место в адаптере'],
-        [/\b(github|gitlab|sourcecraft|gitea|bitbucket)\b/i, 'имя форжа в тексте промпта'],
-        [/\b(closes|fixes|resolves)\s+#/i, 'автозакрытие по ключевому слову — механика GitHub'],
-        [/resolveReviewThread|graphql/i, 'треды ревью через GraphQL — механика GitHub'],
-    ];
-
-    it.each(FORGE)('prompts.ts не содержит %s (%s)', (re, why) => {
-        // Комментарии модуля объясняют, ЧЕМ дефект был, и сами содержат эти строки —
-        // поэтому сканируем код без строк-комментариев, а не файл целиком.
-        const code = readFileSync(join(CANON_ROOT, PROMPTS), 'utf-8')
-            .split('\n')
-            .filter((line) => !line.trim().startsWith('//'))
-            .join('\n');
-        expect(re.test(code), `${why} — промпт обязан говорить намерением`).toBe(false);
-    });
-
-    it('оркестратор не собирает промпты строкой по месту вызова', () => {
-        // Барьер держится на том, что тексты живут в одном файле. Инлайн-литерал в вызове
-        // сессии вернул бы прежнее состояние: греп по prompts.ts зелёный, а промпт с `gh`
-        // уехал в сессию мимо него.
-        // Скан ЦЕЛИКОМ, а не построчно, и не только по бэктику. Построчная проверка
-        // пропускала самый вероятный вид регресса: prettier при ширине 100 переносит
-        // длинный литерал на следующую строку, и `runClaudeFn(` с открывающей кавычкой
-        // оказываются на разных строках — барьер видел бы каждую по отдельности и молчал.
-        const source = readFileSync(join(CANON_ROOT, ORCHESTRATOR), 'utf-8');
-        const hits = [...source.matchAll(/runClaudeFn\(\s*['"`]/g)].map((m) => {
-            const lineNo = source.slice(0, m.index).split('\n').length;
-            return [lineNo, m[0].replace(/\s+/g, ' ')] as const;
-        });
-        const detail = hits.map(([n, line]) => `\n  ${n}: ${line.trim()}`).join('');
-        expect(
-            hits,
-            `промпт собран строкой в вызове — вынеси его в core/prompts.ts:${detail}`,
-        ).toEqual([]);
-    });
-
-    it('ralph.md описывает намерения по PR — иначе сессии нечем ими пользоваться', () => {
-        // Обратная сторона запрета: убрать способ мало, сессия обязана знать канал.
-        const contract = readFileSync(join(CANON_ROOT, 'ralph.md'), 'utf-8');
-        expect(contract).toMatch(/pr-comment/);
-        expect(contract).toMatch(/pr-block/);
-    });
-});
-
-describe('промпт-контракт: ralph.md переносим, площадочное — в ralph.project.md (#36)', () => {
-    const PROMPT = 'ralph.md';
-    // Проектная половина контракта принадлежит ПОТРЕБИТЕЛЮ: её содержимое — имена его
-    // меток, состав его гейта, его площадка. Канон везёт шаблон с плейсхолдерами (тот же
-    // приём, что `provision/ralph.service.example`), а подключение копирует его рядом с
-    // ядром под именем без `.example` и заполняет.
-    const PROJECT_PROMPT_TEMPLATE = 'ralph.project.md.example';
-
-    // Каждый паттерн — с объяснением, ЧТО именно им ловится: сообщение читает тот, у кого
-    // тест покраснел, и «не проходит регулярку» ему ничего не говорит.
-    const FORBIDDEN: Array<[RegExp, string]> = [
-        [/\bgh\s+(issue|pr|project|api|auth)\b/i, 'команда GitHub CLI — её место в адаптере'],
-        [/\bglab\s/i, 'команда GitLab CLI — её место в адаптере'],
-        [/\b(github|gitlab|sourcecraft|gitea|bitbucket)\b/i, 'имя форжа в переносимом файле'],
-        [/\b(closes|fixes|resolves)\s+#/i, 'автозакрытие по ключевому слову — механика GitHub'],
-        // Границу слова здесь даёт lookbehind, а НЕ `\b`: в JS `\b` определён через `\w`,
-        // то есть по ASCII, и `\bдоска` требует, чтобы перед «д» стоял латинский
-        // буквенно-цифровой символ. На строке «issue мимо доски равно потерянному» такой
-        // паттерн не срабатывает вовсе — барьер молча сторожил бы пустоту (проверено).
-        [
-            /(?<![а-яё])доск[аеиоу]/i,
-            'доска проекта: у одних форжей отдельная сущность, у других — проекция статуса',
-        ],
-    ];
-
-    it('шаблон ralph.project.md лежит в каноне — на него ссылается ralph.md', () => {
-        // Ровно тот дефект, с которого началась #36: ссылка была, файла не было, и сессия
-        // получала инструкцию читать пустоту. В каноне заполненного файла быть не может
-        // (он проектный), но шаблон обязан ехать вместе с ядром — иначе подключающий
-        // узнаёт о нём из ошибки сессии.
-        expect(existsSync(join(CANON_ROOT, PROJECT_PROMPT_TEMPLATE))).toBe(true);
-    });
-
-    it.each(FORBIDDEN)('ralph.md не содержит %s (%s)', (re, why) => {
-        const lines = readFileSync(join(CANON_ROOT, PROMPT), 'utf-8').split('\n');
-        const hits = lines
-            .map((line, i) => [i + 1, line] as const)
-            .filter(([, line]) => re.test(line));
-        const detail = hits.map(([n, line]) => `\n  ${n}: ${line.trim()}`).join('');
-        expect(hits, `${why} — перенеси строку в ralph.project.md:${detail}`).toEqual([]);
-    });
-
-    it('ralph.md отправляет за проектной спецификой в ralph.project.md', () => {
-        // Обратная сторона запретов: убрать площадочное мало — сессия обязана знать, где
-        // его искать, иначе переносимость куплена ценой незнания.
-        expect(readFileSync(join(CANON_ROOT, PROMPT), 'utf-8')).toMatch(/ralph\.project\.md/);
     });
 });

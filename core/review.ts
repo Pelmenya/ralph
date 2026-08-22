@@ -34,6 +34,7 @@
 // отдаёт, и вторая копия формы разъехалась бы с ним молча. Импорт только типовой —
 // зависимость идёт «ядро → абстракция», как ей и положено.
 import type { ReviewComment } from '../adapters/adapters.ts';
+import type { TConsumerScriptsResolved } from './config-profile.ts';
 
 type ExecOpts = { env?: NodeJS.ProcessEnv; input?: string };
 type ShFn = (cmd: string, opts?: ExecOpts) => string;
@@ -80,8 +81,10 @@ type ReviewCfg = {
     reviewModel?: string;
     // Скрипты ПОТРЕБИТЕЛЯ, которые зовёт ядро. Путь приходит из конфига, а не зашит в код:
     // в каноне этих файлов нет вовсе, и раньше ядро молча требовало, чтобы у потребителя
-    // лежал файл с таким именем в таком месте (канон, задача 23).
-    consumerScripts?: { projectSync?: string; reviewFindingsJournal?: string };
+    // лежал файл с таким именем в таком месте (канон, задача 23). Читается РЕЗОЛВНУТАЯ
+    // секция (`consumerScriptsResolved`), а не сырая: относительный путь означает «от места
+    // запуска», а место запуска у петли меняется вместе с worktree фазы.
+    consumerScriptsResolved?: TConsumerScriptsResolved | null;
 };
 
 // Фаза в форме, которую хранит config.phases: recordReviewFindings берёт из неё milestone.
@@ -408,6 +411,19 @@ export function createReviewModule(env: ReviewEnv) {
             logFn(`⚠ Журнал находок: номер PR неизвестен, запись пропущена.`);
             return;
         }
+        // Проверка ДО чтения ленты (ревью !21): при выключенном журнале поход в форж —
+        // лишний round-trip на каждой сдаче, а предупреждения ниже («у PR нет комментариев»,
+        // «ни один автор не в allowlist») — тревога о метрике, которой нет. Они идут со
+        // значком ⚠, то есть лезут в панель монитора и вытесняют оттуда настоящий сигнал.
+        const journal = getConfig().consumerScriptsResolved?.reviewFindingsJournal;
+        if (!journal) {
+            // Молчать нельзя: журнал находок — метрика, по которой судят о ревью, и её
+            // отсутствие обязано быть ВИДНЫМ решением, а не следствием того, что файла нет.
+            logFn(
+                '📊 Журнал находок выключен: в конфиге нет consumerScripts.reviewFindingsJournal.',
+            );
+            return;
+        }
         // #237: прокидываем allowlist авторов в счёт — метрика считает только доверенные
         // комментарии (репо публичный).
         const authors = (Array.isArray(authorAllowlist) ? authorAllowlist : []).filter(
@@ -450,15 +466,6 @@ export function createReviewModule(env: ReviewEnv) {
                     `в ленте: ${seen}) — счёт будет нулевым. Похоже, allowlist задан в терминах другого форжа.`,
             );
         }
-        const journal = getConfig().consumerScripts?.reviewFindingsJournal;
-        if (!journal) {
-            // Молчать нельзя: журнал находок — метрика, по которой судят о ревью, и её
-            // отсутствие обязано быть ВИДНЫМ решением, а не следствием того, что файла нет.
-            logFn(
-                '📊 Журнал находок выключен: в конфиге нет consumerScripts.reviewFindingsJournal.',
-            );
-            return;
-        }
         try {
             const out = runArgvFn(
                 'node',
@@ -492,7 +499,7 @@ export function createReviewModule(env: ReviewEnv) {
             logFn('⚠ Журнал находок (ревью правок): номер PR неизвестен, запись пропущена.');
             return;
         }
-        const journal = getConfig().consumerScripts?.reviewFindingsJournal;
+        const journal = getConfig().consumerScriptsResolved?.reviewFindingsJournal;
         if (!journal) {
             logFn(
                 '📊 Журнал находок выключен: в конфиге нет consumerScripts.reviewFindingsJournal.',
