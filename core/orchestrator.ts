@@ -6254,6 +6254,26 @@ export function createOrchestrator(env: OrchestratorEnv) {
         }
     }
 
+    /**
+     * argv процесса из `/proc/<pid>/cmdline` — аргументы там \0-разделены, хвостовой \0
+     * даёт пустой элемент, его отбрасываем. `null` — процесса нет или читать нечем.
+     *
+     * Нужен там, где решение по cmdline ведёт к СИГНАЛУ. Подстрока для этого не годится
+     * (ревью Codex): `--runtime-dir /srv/app/.ralph-old` содержит `/srv/app/.ralph` целиком,
+     * и чужой монитор прошёл бы сверку — как и любой процесс, у которого наш каталог просто
+     * упомянут в аргументах. Сравнение ПО ЭЛЕМЕНТАМ таких совпадений не знает.
+     */
+    function cmdlineArgv(pid: number, readFn: ReadFileFn = fs.readFileSync): string[] | null {
+        if (!pid) return null;
+        try {
+            return (readFn(`/proc/${pid}/cmdline`, 'utf-8') as string)
+                .split('\0')
+                .filter((arg) => arg !== '');
+        } catch {
+            return null;
+        }
+    }
+
     // Сверка «за этим pid действительно monitor.js». ОС переиспользует pid: после смерти
     // монитора его номер может достаться чужому процессу — kill(pid, 0) тогда врёт «жив»,
     // а kill(-pid) при остановке снёс бы чужую группу.
@@ -6261,16 +6281,53 @@ export function createOrchestrator(env: OrchestratorEnv) {
         return cmdlineIncludes(pid, 'monitor.js', readFn);
     }
 
-    // Строгая сверка «за pid именно НАШ ralph-монитор» — по полному пути PRODUCT.monitor в
-    // cmdline, а не по родовому имени 'monitor.js' (isMonitorProcess). Нужна ИМЕННО скану
-    // /proc (sweepOrphanMonitors, #235-ревью): там фильтр применяется ко ВСЕМ процессам
-    // системы, и подстрока 'monitor.js' зацепила бы чужой процесс — pm2-обвязку, любой
-    // чужой проект со своим monitor.js (имя родовое) — а stopMonitor снёс бы его группу
-    // SIGTERM'ом. Для проверок ПО pid-файлу (adoptMonitor/stopMonitor/ensureMonitorAlive)
-    // нестрогая isMonitorProcess остаётся: там pid взят из файла, который пишет только сам
-    // раннер, чужого там взяться неоткуда.
+    /**
+     * Каталог состояния ЭТОГО экземпляра абсолютным путём.
+     *
+     * Берётся из `RUNTIME`, а не из `config.rootsResolved`: при прежней раскладке секции
+     * `roots` нет вовсе, а каталог состояния есть всегда — просто лежит рядом с ядром.
+     * `path.resolve` там разворачивает его от текущего дерева работы; после `repointRuntime`
+     * путь уже абсолютен, и резолв безвреден.
+     */
+    function instanceRuntimeDir(): string {
+        return path.resolve(path.dirname(RUNTIME.state));
+    }
+
+    /**
+     * Строгая сверка «за pid именно монитор ЭТОГО экземпляра» — по ТОЧНОЙ паре аргументов
+     * `--runtime-dir <наш каталог состояния>`, плюс элемент argv с именем `monitor.js`.
+     *
+     * Нужна ИМЕННО скану `/proc` (`sweepOrphanMonitors`): там фильтр применяется ко ВСЕМ
+     * процессам системы, а `stopMonitor` сносит найденному группу сигналом. Одного
+     * `monitor.js` мало — имя родовое, зацепило бы pm2-обвязку и любой чужой проект.
+     *
+     * Задача 29: раньше здесь стоял `PRODUCT.monitor`, то есть ОТНОСИТЕЛЬНЫЙ путь
+     * `.claude/ralph/runtime/monitor.js`, — а он одинаков у КАЖДОГО потребителя на машине.
+     * Раннер проекта A, стартуя, слал SIGTERM сироте-монитору проекта B; профильная сверка
+     * не спасала, потому что она решает, кого ОСТАВИТЬ, а глушится всё остальное. У лока
+     * тот же приём безопасен и оттого допущен осознанно: цена промаха там — ложный ОТКАЗ
+     * старта, а не сигнал чужой группе. Каталог состояния уникален по построению (он и
+     * заведён, чтобы два экземпляра не делили state, лок и лог), поэтому опознаёт ровно
+     * своего.
+     *
+     * Хвост совместимости: монитор, поднятый раннером ДО этой правки, флага
+     * `--runtime-dir` в cmdline не имеет и скану больше не виден. Это осознанный размен —
+     * не прибрать своего сироту дешевле, чем прибрать чужого; такой монитор глушится
+     * первым же перезапуском раннера через pid-файл либо руками.
+     *
+     * Для проверок ПО pid-файлу (`adoptMonitor`/`stopMonitor`/`ensureMonitorAlive`)
+     * нестрогая `isMonitorProcess` остаётся: там pid взят из файла, который пишет только
+     * сам раннер, чужого там взяться неоткуда.
+     */
     function isRalphMonitorProcess(pid: number, readFn: ReadFileFn = fs.readFileSync): boolean {
-        return cmdlineIncludes(pid, PRODUCT.monitor, readFn);
+        const argv = cmdlineArgv(pid, readFn);
+        if (!argv) return false;
+        const at = argv.indexOf('--runtime-dir');
+        return (
+            at !== -1 &&
+            argv[at + 1] === instanceRuntimeDir() &&
+            argv.some((arg) => path.basename(arg) === 'monitor.js')
+        );
     }
 
     // PID-файл монитора один на все профили. Читаем его в одном месте: и adoptMonitor
@@ -6384,9 +6441,13 @@ export function createOrchestrator(env: OrchestratorEnv) {
             // Канон, задача 22: панель обязана смотреть в ТОТ ЖЕ каталог состояния, что и
             // раннер. Без этого флага она читала бы файлы рядом с ядром — а после переезда
             // их там нет, и панель показывала бы «раннер молчит» при живом прогоне.
-            if (config.rootsResolved) {
-                monitorArgv.push('--runtime-dir', config.rootsResolved.runtimeDir);
-            }
+            //
+            // Задача 29: флаг идёт ВСЕГДА, а не только при заданных `roots`. Он же — адрес
+            // экземпляра, по которому скан `/proc` отличает СВОЙ монитор от монитора
+            // соседнего потребителя; при прежней раскладке без него скан не отличал бы их
+            // вовсе. Путь абсолютный (панель относительный и не принимает: он резолвился бы
+            // от места её запуска).
+            monitorArgv.push('--runtime-dir', instanceRuntimeDir());
             if (configPath) monitorArgv.push('--config', configPath);
             const child = spawnFn(process.execPath, monitorArgv, {
                 detached: true, // своя группа процессов
@@ -6466,7 +6527,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // (ручной `node monitor.js`, гонка, перезапись файла новым до остановки старого)
     // накапливается вечно. readdirFn возвращает список каталогов /proc (числовые — pid'ы
     // процессов, остальное — служебные /proc/self и т.п., отсекаем регэкспом).
-    // Матчер — СТРОГИЙ isRalphMonitorProcess (полный путь PRODUCT.monitor), не нестрогая
+    // Матчер — СТРОГИЙ isRalphMonitorProcess (пара `--runtime-dir <наш каталог>`), не нестрогая
     // isMonitorProcess (#235-ревью): скан идёт по всем процессам системы, и подстрока
     // 'monitor.js' зацепила бы чужой monitor.js — sweep снёс бы его группу.
     function listMonitorPids(deps: MonitorDeps = {}): number[] {
@@ -6523,9 +6584,16 @@ export function createOrchestrator(env: OrchestratorEnv) {
             listPidsFn = listMonitorPids,
             ppidFn = processPpid,
             readCmdlineFn = (pid) => fs.readFileSync(`/proc/${pid}/cmdline`, 'utf-8'),
+            // Пере-сверка ПЕРЕД сигналом — строгая, а не родовая (ревью Codex). `stopMonitor`
+            // по умолчанию проверяет лишь «это вообще monitor.js»: отобранный сканом монитор
+            // мог умереть, а его номер — достаться чужому `monitor.js`, и `kill(-pid)` снёс бы
+            // невиновную группу. Здесь идентичность экземпляра обязана подтвердиться дважды.
             stopFn = (child, d) => {
                 guardSideEffect('sweepOrphanMonitors:stopMonitor');
-                return stopMonitor(child, d);
+                return stopMonitor(child, {
+                    ...d,
+                    isMonitorFn: d?.isMonitorFn ?? isRalphMonitorProcess,
+                });
             },
             writePidFn = (pid) => {
                 guardSideEffect(`sweepOrphanMonitors:writePid(${RUNTIME.monitorPid})`);

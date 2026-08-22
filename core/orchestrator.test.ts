@@ -7242,14 +7242,29 @@ describe('startMonitor — авто-спавн панели прогресса (
         const d = deps({ profile: 'prod' });
         startMonitor(d);
         const [, argv] = d.spawnFn.mock.calls[0];
-        expect(argv.slice(1)).toEqual(['--profile', 'prod']);
+        expect(argv.slice(1, 3)).toEqual(['--profile', 'prod']);
     });
 
-    it('без профиля (прямой вызов) монитор спавнится без лишних флагов', () => {
+    // Задача 29: каталог состояния уходит монитору ВСЕГДА, а не только при заданных `roots`.
+    // Он же адрес экземпляра, по которому скан `/proc` отличает свой монитор от монитора
+    // соседнего потребителя, — без флага скан не отличал бы их вовсе.
+    itPosix('каталог состояния уходит монитору всегда и абсолютным путём', () => {
         const d = deps();
         startMonitor(d);
         const [, argv] = d.spawnFn.mock.calls[0];
-        expect(argv).toHaveLength(1);
+        const at = argv.indexOf('--runtime-dir');
+        expect(at, '--runtime-dir не передан монитору вовсе').toBeGreaterThan(0);
+        // Панель относительный путь не принимает: он резолвился бы от места ЕЁ запуска.
+        expect(path.isAbsolute(argv[at + 1])).toBe(true);
+        expect(argv[at + 1]).toBe(path.resolve('.claude/ralph'));
+    });
+
+    itPosix('без профиля (прямой вызов) лишних флагов нет — кроме адреса экземпляра', () => {
+        const d = deps();
+        startMonitor(d);
+        const [, argv] = d.spawnFn.mock.calls[0];
+        expect(argv.slice(1, 2)).toEqual(['--runtime-dir']);
+        expect(argv).toHaveLength(3);
     });
 
     it('unref: раннер не держится в памяти из-за монитора', () => {
@@ -7598,10 +7613,28 @@ describe('processPpid — ppid процесса из /proc/<pid>/stat (#235)', (
 // родовое имя 'monitor.js' — иначе чужой monitor.js (pm2, чужой проект) попал бы в
 // уборку и был бы прибит SIGTERM'ом всей группе.
 
-describe('isRalphMonitorProcess — строгая сверка по полному пути MONITOR_PATH (#235)', () => {
-    itPosix('cmdline с полным путём .claude/ralph/runtime/monitor.js → наш монитор', () => {
-        const readFn = () => 'node\0.claude/ralph/runtime/monitor.js\0--profile\0prod\0';
-        expect(isRalphMonitorProcess(99, readFn)).toBe(true);
+// Задача 29: сверка опознаёт монитор ЭТОГО экземпляра — по каталогу состояния в cmdline,
+// а не по относительному пути `monitor.js`, одинаковому у каждого потребителя на машине.
+// Скан `/proc` идёт по всем процессам системы и сносит найденному группу сигналом, поэтому
+// цена промаха здесь — убитый процесс соседнего проекта.
+describe('isRalphMonitorProcess — сверка по каталогу состояния экземпляра (задача 29)', () => {
+    // Каталог состояния этого экземпляра в тестовом окружении: пути `RUNTIME` ещё
+    // CLAUDE_DIR-относительны, поэтому резолвим от текущего дерева — ровно как боевой код.
+    const ourRuntimeDir = path.resolve('.claude/ralph');
+    const cmdlineOf =
+        (dir: string, extra = '') =>
+        () =>
+            `node\0.claude/ralph/runtime/monitor.js\0--runtime-dir\0${dir}\0${extra}`;
+
+    itPosix('монитор с НАШИМ каталогом состояния → наш', () => {
+        expect(isRalphMonitorProcess(99, cmdlineOf(ourRuntimeDir, '--profile\0prod\0'))).toBe(true);
+    });
+
+    itPosix('монитор ЧУЖОГО потребителя → НЕ наш, хотя путь к monitor.js тот же', () => {
+        // Суть дефекта 29 одной строкой: относительный `.claude/ralph/runtime/monitor.js`
+        // у соседнего проекта ровно такой же, и прежняя сверка звала его своим.
+        const foreign = cmdlineOf('/srv/other-project/.ralph/runtime', '--profile\0prod\0');
+        expect(isRalphMonitorProcess(99, foreign)).toBe(false);
     });
 
     it('чужой monitor.js по другому пути → НЕ наш (в отличие от нестрогой isMonitorProcess)', () => {
@@ -7611,11 +7644,84 @@ describe('isRalphMonitorProcess — строгая сверка по полно�
         expect(isMonitorProcess(99, cmdline)).toBe(true);
     });
 
+    itPosix('чужой процесс, у которого наш каталог просто в аргументах → НЕ наш', () => {
+        // `tail -f <runtimeDir>/monitor.out` человека содержит наш каталог, но монитором не
+        // является: без родового `monitor.js` в сверке скан снёс бы человеку его же tail.
+        expect(isRalphMonitorProcess(99, () => `tail\0-f\0${ourRuntimeDir}/monitor.out\0`)).toBe(
+            false,
+        );
+    });
+
+    itPosix('каталог-«сосед» с общим началом пути → НЕ наш', () => {
+        // Сравнение подстрокой сюда как раз попалось бы: `<наш>-old` содержит `<наш>` целиком.
+        // Так соседний экземпляр того же дерева оказался бы «своим» и получил бы сигнал.
+        expect(isRalphMonitorProcess(99, cmdlineOf(`${ourRuntimeDir}-old`))).toBe(false);
+    });
+
+    itPosix('наш каталог УПОМЯНУТ в аргументах чужого монитора → НЕ наш', () => {
+        // `--runtime-dir` у него свой, а наш путь пришёл значением другого флага.
+        const foreign = () =>
+            `node\0.claude/ralph/runtime/monitor.js\0--runtime-dir\0/srv/other/.ralph\0` +
+            `--log\0${ourRuntimeDir}/monitor.out\0`;
+        expect(isRalphMonitorProcess(99, foreign)).toBe(false);
+    });
+
+    itPosix('монитор БЕЗ --runtime-dir (поднят раннером до правки) → скану не виден', () => {
+        // Осознанный размен: не прибрать своего сироту дешевле, чем прибрать чужого.
+        expect(isRalphMonitorProcess(99, () => 'node\0.claude/ralph/runtime/monitor.js\0')).toBe(
+            false,
+        );
+    });
+
     it('пустой/нулевой pid → false без чтения /proc', () => {
         const readFn = vi.fn();
         expect(isRalphMonitorProcess(0, readFn)).toBe(false);
         expect(readFn).not.toHaveBeenCalled();
     });
+});
+
+describe('sweepOrphanMonitors — чужие экземпляры не глушатся (задача 29)', () => {
+    // Сверку берём БОЕВУЮ и подсовываем ей только чтение `/proc` — так проверяется, что скан
+    // считается с её вердиктом, а не только что сама сверка умеет отвечать. Подменить чтение
+    // иначе нечем: `listMonitorPids` прокидывает вниз лишь сам матчер.
+    const sweepWith = (cmdline: string) => {
+        const stopFn = vi.fn();
+        const writePidFn = vi.fn();
+        sweepOrphanMonitors({
+            profile: 'prod',
+            logFn: vi.fn(),
+            // readdirFn, а НЕ listPidsFn: подменив список готовым, тест обошёл бы сам отбор —
+            // то есть то место, где сверка и применяется (проверено: так он зеленел вхолостую).
+            readdirFn: () => ['100'],
+            isMonitorFn: (pid: number) => isRalphMonitorProcess(pid, () => cmdline),
+            readCmdlineFn: () => cmdline,
+            ppidFn: () => 1,
+            stopFn,
+            writePidFn,
+        });
+        return { stopFn, writePidFn };
+    };
+
+    itPosix('сирота ЧУЖОГО потребителя сигнала не получает', () => {
+        // Тот же относительный путь к monitor.js, что у нас, — прежняя сверка звала его своим.
+        const { stopFn, writePidFn } = sweepWith(
+            'node\0.claude/ralph/runtime/monitor.js\0--runtime-dir\0/srv/other/.ralph\0',
+        );
+        expect(stopFn, 'Скан послал сигнал монитору чужого потребителя').not.toHaveBeenCalled();
+        expect(writePidFn, 'Чужой монитор записан в наш pid-файл').not.toHaveBeenCalled();
+    });
+
+    itPosix(
+        'свой сирота по-прежнему прибирается — иначе «не глушим» верно и для сломанного',
+        () => {
+            const { writePidFn } = sweepWith(
+                `node\0.claude/ralph/runtime/monitor.js\0--runtime-dir\0${path.resolve('.claude/ralph')}\0--profile\0prod\0`,
+            );
+            // Единственную свою сироту скан ОСТАВЛЯЕТ и записывает в pid-файл (дальше её штатно
+            // подхватит adoptMonitor) — это и есть признак, что она опознана своей.
+            expect(writePidFn).toHaveBeenCalledWith(100);
+        },
+    );
 });
 
 describe('sweepOrphanMonitors — уборка сирот-мониторов мимо monitor.pid (#235)', () => {
