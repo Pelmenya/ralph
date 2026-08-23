@@ -37,8 +37,9 @@
  * до fetch и вплотную к слиянию — и ещё раз после него, но человек, успевший уйти на свою
  * ветку и вернуться на `main` внутри этого промежутка, не виден ни одной из трёх сверок.
  * То же и с чистотой дерева: она сверяется дважды, но мгновение между второй сверкой и
- * слиянием остаётся. Цена остатка мала — `merge --ff-only` сам откажется трогать файл,
- * который человек правит, — но она не ноль, и делать вид, что ноль, здесь нельзя.
+ * слиянием остаётся. Git прикроет только те пути, которые слияние обязано перезаписать, —
+ * правку в СОСЕДНЕМ файле он не заметит и ветку перемотает (ревью, 6-й проход). Цена
+ * остатка мала, но она не ноль, и делать вид, что ноль, здесь нельзя.
  * Отсюда два следствия: окно сужено до предела, какой доступен без сериализации с
  * человеком, а пост-сверка печатает ФАКТЫ (откуда ушли, что слито), а не команду отката —
  * `reset --hard`, выданный вслепую, откатил бы не ту ветку (ревью, 3-й и 4-й проходы).
@@ -63,8 +64,11 @@ export type TConsumerTreeKind =
     'no-roots' | 'same-tree' | 'dirty' | 'off-main' | 'failed' | 'updated';
 
 export type TConsumerTreeDeps = {
-    runArgvFn: (file: string, args: string[]) => string;
+    /** Тот же контракт, что у `shArgv` ядра: argv плюс опции запуска (нам нужен `env`). */
+    runArgvFn: (file: string, args: string[], opts?: { env?: NodeJS.ProcessEnv }) => string;
     logFn: (msg: string) => void;
+    /** Окружение вызывающего. Навязывающие репозиторий переменные снимаются здесь же. */
+    env?: NodeJS.ProcessEnv;
 };
 
 /**
@@ -92,9 +96,51 @@ const MAIN = 'main';
  */
 const FETCH_REF = 'refs/ralph/consumer-main';
 
-/** `git -C <root> …`: свой каталог у каждой команды — `ExecOpts` ядра `cwd` не носит. */
+/**
+ * Переменные, которыми окружение НАВЯЗЫВАЕТ git другой репозиторий. `git -C <root>` их не
+ * перебивает: `GIT_DIR` сильнее ключа `-C`, и команда ушла бы в чужое дерево, а мы бы этого
+ * не заметили — ff прошёл, лог зелёный, обновилось не то (ревью, 6-й проход).
+ *
+ * Взяться им есть откуда: раннер запускают из скрипта, из tmux, а то и из git-хука, который
+ * выставляет их сам. Барьер живёт ЗДЕСЬ, а не в вызывающем: обещание «работаем в
+ * consumerRoot» — часть контракта этой функции, и держать его на чистоте чужого окружения
+ * значит не держать вовсе.
+ */
+export const GIT_CONTEXT_VARS = [
+    'GIT_DIR',
+    'GIT_WORK_TREE',
+    'GIT_INDEX_FILE',
+    'GIT_COMMON_DIR',
+    'GIT_NAMESPACE',
+    'GIT_OBJECT_DIRECTORY',
+    'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+] as const;
+
+/**
+ * Окружение без навязанного репозитория. Остальное наследуется НАМЕРЕННО: `HOME`, конфиг
+ * и credential-хелпер человека нужны, чтобы fetch вообще прошёл авторизацию у форжа.
+ */
+export function stripGitContext(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    const out = { ...env };
+    for (const key of GIT_CONTEXT_VARS) delete out[key];
+    return out;
+}
+
+/**
+ * `git -C <root> …` плюс два запрета, общих на ВСЕ команды этого модуля.
+ *
+ * `core.hooksPath` в никуда: `merge` запускает `post-merge` из конфигурации дерева ЧЕЛОВЕКА,
+ * и хук получил бы полное окружение раннера — с токенами форжа и адресами (ревью, 6-й
+ * проход). Хук там законный (его поставил себе человек), но исполнять его нашими руками и
+ * нашим окружением мы не подряжались: обновление дерева — не то событие, ради которого
+ * человек его писал.
+ *
+ * `submodule.recurse=false` — вторая половина запрета рекурсии в подмодуль продукта; сам
+ * запрет разобран в шапке модуля. Оба ключа стоят на каждой команде намеренно: избирательно
+ * — значит однажды забыть на новой.
+ */
 function gitIn(root: string, args: string[]): string[] {
-    return ['-C', root, ...args];
+    return ['-C', root, '-c', 'core.hooksPath=/dev/null', '-c', 'submodule.recurse=false', ...args];
 }
 
 /**
@@ -106,8 +152,12 @@ function gitIn(root: string, args: string[]): string[] {
  */
 export function updateConsumerTree(
     roots: TResolvedRoots | null,
-    { runArgvFn, logFn }: TConsumerTreeDeps,
+    { runArgvFn, logFn, env }: TConsumerTreeDeps,
 ): TConsumerTreeKind {
+    // Одно окружение на все команды: собирается один раз, чтобы «забыть прокинуть» было
+    // негде. `undefined` означает «вызывающий окружением не распоряжается» — тогда и мы не.
+    const gitEnv = env === undefined ? undefined : { env: stripGitContext(env) };
+    const git = (args: string[]): string => runArgvFn('git', gitIn(consumerRoot, args), gitEnv);
     // Раскладки нет — нет и понятия «дерево потребителя»: пути скриптов в этой раскладке
     // относительны дереву работы, и обновлять нечего. Молча: сообщать не о чем.
     if (!roots) return 'no-roots';
@@ -120,16 +170,14 @@ export function updateConsumerTree(
     // `consumerRoot` и не версионируется вовсе — с учётом untracked дерево было бы грязным
     // всегда, то есть обновление не случалось бы ни разу в той самой раскладке, ради
     // которой оно написано. Untracked-файл, который слияние затопчет, всё равно не пройдёт:
-    // `merge --ff-only` откажется сам и скажет, чем именно.
+    // `merge --ff-only` откажется сам и скажет, чем именно — но только если слияние обязано
+    // его перезаписать: правку в соседнем файле git не заметит (ревью, 6-й проход).
     // `null` — «не знаю»: git промолчать не может, поэтому отказ команды это НЕ «чисто»
     // (то же fail-closed, что у `ensureClean` для дерева работы). Спрашивается дважды —
     // здесь и вплотную к слиянию, — поэтому вынесено функцией.
     const dirtyNow = (): string | null => {
         try {
-            return runArgvFn(
-                'git',
-                gitIn(consumerRoot, ['status', '--porcelain', '--untracked-files=no']),
-            );
+            return git(['status', '--porcelain', '--untracked-files=no']);
         } catch (e) {
             logFn(
                 `⚠ Дерево потребителя ${consumerRoot}: git status не отработал (${(e as Error).message}) — ` +
@@ -153,10 +201,7 @@ export function updateConsumerTree(
     // HEAD — это не сбой, а тот же ответ «не наша ветка», только другим каналом.
     const branchNow = (): string => {
         try {
-            return runArgvFn(
-                'git',
-                gitIn(consumerRoot, ['symbolic-ref', '--quiet', '--short', 'HEAD']),
-            ).trim();
+            return git(['symbolic-ref', '--quiet', '--short', 'HEAD']).trim();
         } catch {
             return '';
         }
@@ -176,7 +221,7 @@ export function updateConsumerTree(
     // оставили, человеку нужно знать, от чего оно ушло.
     const headSha = (): string => {
         try {
-            return runArgvFn('git', gitIn(consumerRoot, ['rev-parse', 'HEAD'])).trim();
+            return git(['rev-parse', 'HEAD']).trim();
         } catch {
             return '';
         }
@@ -197,27 +242,19 @@ export function updateConsumerTree(
             // `--no-write-fetch-head` — про чужое: `FETCH_HEAD` один на репозиторий, и наш
             // fetch затирал бы то, что человек только что нафетчил себе. Его последующий
             // `git merge FETCH_HEAD` слил бы НАШУ цель вместо своей (ревью, 4-й проход).
-            runArgvFn(
-                'git',
-                gitIn(consumerRoot, [
-                    '-c',
-                    'submodule.recurse=false',
-                    'fetch',
-                    '--no-recurse-submodules',
-                    '--no-write-fetch-head',
-                    'origin',
-                    // `+` — принудительное обновление СВОЕГО ref'а: перемотка ветки на
-                    // origin (rebase, force-push) не должна оставлять раннера с отказом.
-                    `+refs/heads/${MAIN}:${FETCH_REF}`,
-                ]),
-            );
+            git([
+                'fetch',
+                '--no-recurse-submodules',
+                '--no-write-fetch-head',
+                'origin',
+                // `+` — принудительное обновление СВОЕГО ref'а: перемотка ветки на
+                // origin (rebase, force-push) не должна оставлять раннера с отказом.
+                `+refs/heads/${MAIN}:${FETCH_REF}`,
+            ]);
             // Дальше работаем ЗАФИКСИРОВАННЫМ sha, а не именем ref'а: имя пришлось бы
             // разрешать ещё раз в момент слияния, а между этими моментами ref может
             // обновить соседний экземпляр раннера того же потребителя.
-            target = runArgvFn(
-                'git',
-                gitIn(consumerRoot, ['rev-parse', '--verify', `${FETCH_REF}^{commit}`]),
-            ).trim();
+            target = git(['rev-parse', '--verify', `${FETCH_REF}^{commit}`]).trim();
         } catch (e) {
             logFn(
                 `⚠ Дерево потребителя ${consumerRoot} не обновилось: не удалось получить ` +
@@ -260,16 +297,7 @@ export function updateConsumerTree(
             // Сливаем зафиксированный sha. Только fast-forward: расхождение разбирает
             // человек, а не раннер. Отказ означает, что у него есть свои коммиты в main,
             // и мердж-коммит поверх них был бы произволом.
-            runArgvFn(
-                'git',
-                gitIn(consumerRoot, [
-                    '-c',
-                    'submodule.recurse=false',
-                    'merge',
-                    '--ff-only',
-                    target,
-                ]),
-            );
+            git(['merge', '--ff-only', target]);
         } catch (e) {
             logFn(
                 `⚠ Дерево потребителя ${consumerRoot} не обновилось (${(e as Error).message}). ` +
@@ -310,7 +338,7 @@ export function updateConsumerTree(
         // подтвердить владение, хуже, чем оставить своё (ревью, 5-й проход).
         if (target)
             try {
-                runArgvFn('git', gitIn(consumerRoot, ['update-ref', '-d', FETCH_REF, target]));
+                git(['update-ref', '-d', FETCH_REF, target]);
             } catch (e) {
                 // Не убрался — исход обновления это не меняет (мусор, а не отказ), но молчать
                 // нельзя: GC-корень в чужом репозитории обязан быть назван вместе с адресом.

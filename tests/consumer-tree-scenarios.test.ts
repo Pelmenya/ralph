@@ -99,11 +99,13 @@ function buildWorld(): World {
             runtimeDir: path.join(root, 'runtime'),
         },
         git,
-        runArgvFn: (file: string, args: string[]): string =>
+        // Окружение берём ИЗ ОПЦИЙ, если модуль их передал: иначе проба на снятие
+        // навязанного `GIT_DIR` доказывала бы чистоплотность теста, а не кода.
+        runArgvFn: (file: string, args: string[], opts?: { env?: NodeJS.ProcessEnv }): string =>
             execFileSync(file, args, {
                 cwd: root,
                 encoding: 'utf-8',
-                env: gitEnv(home),
+                env: opts?.env ?? gitEnv(home),
                 stdio: ['ignore', 'pipe', 'pipe'],
             }).trim(),
         logs,
@@ -173,8 +175,8 @@ function submoduleHas(w: World, sha: string): boolean {
     }
 }
 
-const run = (w: World) =>
-    updateConsumerTree(w.roots, { runArgvFn: w.runArgvFn, logFn: (m) => w.logs.push(m) });
+const run = (w: World, env?: NodeJS.ProcessEnv) =>
+    updateConsumerTree(w.roots, { runArgvFn: w.runArgvFn, logFn: (m) => w.logs.push(m), env });
 
 describe('дерево потребителя после мерджа фазы', () => {
     it('смердженный коммит доезжает: скрипт фазы появляется там, куда заякорен путь', () => {
@@ -261,6 +263,70 @@ describe('дерево потребителя после мерджа фазы',
         w.git(w.consumerRoot, 'fetch', '--recurse-submodules=yes', 'origin', 'main');
 
         expect(submoduleHas(w, newSha)).toBe(true);
+    });
+
+    it('хук post-merge дерева человека не исполняется нашими руками', () => {
+        // Хук там законный — его поставил себе человек, — но он получил бы полное окружение
+        // раннера с токенами форжа, и по событию, ради которого его не писали (ревью, 6-й
+        // проход). Конфиг ЛОКАЛЬНЫЙ: `GIT_CONFIG_GLOBAL=/dev/null` его не отключает.
+        const w = buildWorld();
+        mergePhase(w, 'скрипт синка доски приехал фазой');
+        const marker = path.join(w.root, 'hook-fired.txt');
+        const hook = path.join(w.consumerRoot, '.git', 'hooks', 'post-merge');
+        fs.mkdirSync(path.dirname(hook), { recursive: true });
+        fs.writeFileSync(hook, `#!/bin/sh\necho сработал > "${marker}"\n`, { mode: 0o755 });
+
+        expect(run(w)).toBe('updated');
+
+        expect(fs.existsSync(marker), 'post-merge потребителя исполнился нашими руками').toBe(
+            false,
+        );
+    });
+
+    it('от противного: без запрета тот же хук срабатывает — мир на это способен', () => {
+        const w = buildWorld();
+        mergePhase(w, 'скрипт синка доски приехал фазой');
+        const marker = path.join(w.root, 'hook-fired.txt');
+        const hook = path.join(w.consumerRoot, '.git', 'hooks', 'post-merge');
+        fs.mkdirSync(path.dirname(hook), { recursive: true });
+        fs.writeFileSync(hook, `#!/bin/sh\necho сработал > "${marker}"\n`, { mode: 0o755 });
+
+        w.git(w.consumerRoot, 'pull', '--ff-only', 'origin', 'main');
+
+        expect(fs.existsSync(marker)).toBe(true);
+    });
+
+    it('навязанный GIT_DIR не уводит обновление в чужой репозиторий', () => {
+        // `git -C <root>` НЕ перебивает `GIT_DIR`: без снятия команда ушла бы в чужое дерево,
+        // а лог остался бы зелёным. Раннера запускают и из хуков, которые эти переменные
+        // выставляют сами (ревью, 6-й проход).
+        const w = buildWorld();
+        const sha = mergePhase(w, 'скрипт синка доски приехал фазой');
+        const other = path.join(w.root, 'other');
+        fs.mkdirSync(other, { recursive: true });
+        w.git(other, 'init', '--quiet', '-b', 'main');
+        fs.writeFileSync(path.join(other, 'file.txt'), 'чужое дерево\n');
+        w.git(other, 'add', '-A');
+        w.git(other, 'commit', '--quiet', '-m', 'чужой коммит');
+        const otherHead = w.git(other, 'rev-parse', 'HEAD');
+        const poisoned: NodeJS.ProcessEnv = {
+            ...gitEnv(path.join(w.root, 'home')),
+            GIT_DIR: path.join(other, '.git'),
+            GIT_WORK_TREE: other,
+        };
+        // Проба от противного, и она же — доказательство, что отрава настоящая.
+        expect(
+            execFileSync('git', ['-C', w.consumerRoot, 'rev-parse', '--absolute-git-dir'], {
+                encoding: 'utf-8',
+                env: poisoned,
+                stdio: ['ignore', 'pipe', 'pipe'],
+            }).trim(),
+        ).toBe(fs.realpathSync(path.join(other, '.git')));
+
+        expect(run(w, poisoned)).toBe('updated');
+
+        expect(w.git(w.consumerRoot, 'rev-parse', 'HEAD')).toBe(sha);
+        expect(w.git(other, 'rev-parse', 'HEAD')).toBe(otherHead);
     });
 
     it('разошедшийся main не сливается: локальный коммит человека на месте', () => {

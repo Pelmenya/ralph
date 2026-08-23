@@ -4475,7 +4475,10 @@ describe('runLoop — основной while-цикл: итерации коде
         );
         // Адрес — из раскладки, а не из текущего каталога: обновляется именно дерево
         // потребителя, а не то, в котором раннер работает.
-        expect(shCmds).toContain('git -C /path/to/app status --porcelain --untracked-files=no');
+        // Префикс команд модуля — свой каталог плюс запреты хуков и рекурсии.
+        expect(
+            shCmds.some((c) => c.startsWith('git -C /path/to/app') && c.includes('status')),
+        ).toBe(true);
         expect(
             shCmds.some(
                 (c) => c.startsWith('git -C /path/to/app') && c.includes('merge --ff-only'),
@@ -4516,7 +4519,10 @@ describe('runLoop — основной while-цикл: итерации коде
             }),
         );
         expect(logs.join('\n')).toMatch(/дерево раннера не обновилось/);
-        expect(shCmds).toContain('git -C /path/to/app status --porcelain --untracked-files=no');
+        // Префикс команд модуля — свой каталог плюс запреты хуков и рекурсии.
+        expect(
+            shCmds.some((c) => c.startsWith('git -C /path/to/app') && c.includes('status')),
+        ).toBe(true);
         expect(
             shCmds.some(
                 (c) => c.startsWith('git -C /path/to/app') && c.includes('merge --ff-only'),

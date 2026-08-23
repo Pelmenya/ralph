@@ -3301,7 +3301,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
         runArgvFn: ShArgvFn = shArgv,
         roots: TResolvedRoots | null = config?.rootsResolved ?? null,
     ): void {
-        updateConsumerTree(roots, { runArgvFn, logFn: log });
+        // `env` прокидывается НЕ ради значений, а ради снятия навязанных: `GIT_DIR` и
+        // родня сильнее ключа `-C`, и без них команда ушла бы в чужой репозиторий. Снимает
+        // их сам модуль — обещание «работаем в consumerRoot» его, ему и держать.
+        updateConsumerTree(roots, { runArgvFn, logFn: log, env: process.env });
     }
 
     // L2 → worktree-модель (#77): после гейта не бросаем дерево раннера на PR-голове —

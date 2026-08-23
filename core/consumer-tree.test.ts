@@ -5,7 +5,12 @@
 // Настоящий git — в приёмочном сценарии рядом (`tests/consumer-tree-scenarios.test.ts`):
 // там доказывается, что эта последовательность делает то, что обещает.
 import { describe, it, expect } from 'vitest';
-import { updateConsumerTree, type TConsumerTreeKind } from './consumer-tree.ts';
+import {
+    updateConsumerTree,
+    stripGitContext,
+    GIT_CONTEXT_VARS,
+    type TConsumerTreeKind,
+} from './consumer-tree.ts';
 import type { TResolvedRoots } from './roots.ts';
 
 const CONSUMER = '/path/to/app';
@@ -18,6 +23,8 @@ const ROOTS: TResolvedRoots = {
     runtimeDir: '/path/to/app/.ralph/runtime/prod',
 };
 
+/** Общий префикс наших команд: свой каталог плюс два запрета (хуки, рекурсия). */
+const PREFIX = ['-C', CONSUMER, '-c', 'core.hooksPath=/dev/null', '-c', 'submodule.recurse=false'];
 const BRANCH_ARGS = ['symbolic-ref', '--quiet', '--short', 'HEAD'];
 const BRANCH_KEY = BRANCH_ARGS.join(' ');
 
@@ -33,9 +40,16 @@ function world(replies: Record<string, string | Error | Array<string | Error>> =
     const calls: string[][] = [];
     const logs: string[] = [];
     const queues = new Map<string, Array<string | Error>>();
-    const runArgvFn = (file: string, args: string[]): string => {
+    const envs: Array<NodeJS.ProcessEnv | undefined> = [];
+    const runArgvFn = (
+        file: string,
+        args: string[],
+        opts?: { env?: NodeJS.ProcessEnv },
+    ): string => {
         calls.push([file, ...args]);
-        const key = args.filter((a) => a !== '-C' && a !== CONSUMER).join(' ');
+        envs.push(opts?.env);
+        // Ключ — хвост argv без общего префикса: он одинаков у всех команд и только шумит.
+        const key = args.slice(PREFIX.length).join(' ');
         const declared = replies[key];
         if (declared === undefined) return '';
         if (!Array.isArray(declared)) {
@@ -50,8 +64,9 @@ function world(replies: Record<string, string | Error | Array<string | Error>> =
     };
     return {
         calls,
-        run: (roots: TResolvedRoots | null = ROOTS): TConsumerTreeKind =>
-            updateConsumerTree(roots, { runArgvFn, logFn: (m) => logs.push(m) }),
+        envs,
+        run: (roots: TResolvedRoots | null = ROOTS, env?: NodeJS.ProcessEnv): TConsumerTreeKind =>
+            updateConsumerTree(roots, { runArgvFn, logFn: (m) => logs.push(m), env }),
         /** Только то, что МЕНЯЕТ дерево. Их отсутствие — предмет половины проб ниже. */
         mutations: (): string[][] => calls.filter(([, ...args]) => args.includes('merge')),
         text: (): string => calls.map((c) => c.join(' ')).join('\n'),
@@ -83,33 +98,30 @@ describe('updateConsumerTree — кто держит дерево потреби
         const w = happy();
         expect(w.run()).toBe('updated');
         expect(w.calls).toEqual([
-            ['git', '-C', CONSUMER, 'status', '--porcelain', '--untracked-files=no'],
-            ['git', '-C', CONSUMER, ...BRANCH_ARGS],
+            ['git', ...PREFIX, 'status', '--porcelain', '--untracked-files=no'],
+            ['git', ...PREFIX, ...BRANCH_ARGS],
             [
                 'git',
-                '-C',
-                CONSUMER,
-                '-c',
-                'submodule.recurse=false',
+                ...PREFIX,
                 'fetch',
                 '--no-recurse-submodules',
                 '--no-write-fetch-head',
                 'origin',
                 `+refs/heads/main:${REF}`,
             ],
-            ['git', '-C', CONSUMER, 'rev-parse', '--verify', `${REF}^{commit}`],
+            ['git', ...PREFIX, 'rev-parse', '--verify', `${REF}^{commit}`],
             // Сверки ветки И ЧИСТОТЫ вплотную к слиянию — окно между первыми проверками
             // и командой (ревью, 3-й и 5-й проходы), плюс снимок HEAD для пост-сверки.
-            ['git', '-C', CONSUMER, ...BRANCH_ARGS],
-            ['git', '-C', CONSUMER, 'status', '--porcelain', '--untracked-files=no'],
-            ['git', '-C', CONSUMER, 'rev-parse', 'HEAD'],
+            ['git', ...PREFIX, ...BRANCH_ARGS],
+            ['git', ...PREFIX, 'status', '--porcelain', '--untracked-files=no'],
+            ['git', ...PREFIX, 'rev-parse', 'HEAD'],
             // Сливается зафиксированный sha, а не имя ref'а: имя пришлось бы разрешать
             // повторно, а его мог переписать следующий прогон.
-            ['git', '-C', CONSUMER, '-c', 'submodule.recurse=false', 'merge', '--ff-only', SHA],
-            ['git', '-C', CONSUMER, ...BRANCH_ARGS],
+            ['git', ...PREFIX, 'merge', '--ff-only', SHA],
+            ['git', ...PREFIX, ...BRANCH_ARGS],
             // Уборка со сверкой значения: имя ref'а одно на потребителя, экземпляров
             // раннера может быть несколько (ревью, 4-й проход).
-            ['git', '-C', CONSUMER, 'update-ref', '-d', REF, SHA],
+            ['git', ...PREFIX, 'update-ref', '-d', REF, SHA],
         ]);
         expect(w.log()).toContain(CONSUMER);
     });
@@ -180,7 +192,7 @@ describe('updateConsumerTree — кто держит дерево потреби
     it('fetch не дошёл до записи — чужой ref не удаляем: подтвердить владение нечем', () => {
         const w = world({
             [BRANCH_KEY]: 'main',
-            [`-c submodule.recurse=false fetch --no-recurse-submodules --no-write-fetch-head origin +refs/heads/main:${REF}`]:
+            [`fetch --no-recurse-submodules --no-write-fetch-head origin +refs/heads/main:${REF}`]:
                 new Error('could not read from remote'),
         });
         expect(w.run()).toBe('failed');
@@ -208,9 +220,7 @@ describe('updateConsumerTree — кто держит дерево потреби
         const w = world({
             [BRANCH_KEY]: 'main',
             [`rev-parse --verify ${REF}^{commit}`]: SHA,
-            [`-c submodule.recurse=false merge --ff-only ${SHA}`]: new Error(
-                'Not possible to fast-forward',
-            ),
+            [`merge --ff-only ${SHA}`]: new Error('Not possible to fast-forward'),
         });
         let kind: TConsumerTreeKind | null = null;
         expect(() => {
@@ -253,7 +263,7 @@ describe('updateConsumerTree — кто держит дерево потреби
     it('fetch не прошёл — ни слияния, ни ложного успеха', () => {
         const w = world({
             [BRANCH_KEY]: 'main',
-            [`-c submodule.recurse=false fetch --no-recurse-submodules --no-write-fetch-head origin +refs/heads/main:${REF}`]:
+            [`fetch --no-recurse-submodules --no-write-fetch-head origin +refs/heads/main:${REF}`]:
                 new Error('could not read from remote'),
         });
         expect(w.run()).toBe('failed');
@@ -270,6 +280,47 @@ describe('updateConsumerTree — кто держит дерево потреби
         expect(w.text()).not.toContain('fetch');
     });
 
+    it('sha-256: object id в 64 hex принимается — иначе такому репозиторию отказ навсегда', () => {
+        const long = 'a'.repeat(64);
+        const w = world({ [BRANCH_KEY]: 'main', [`rev-parse --verify ${REF}^{commit}`]: long });
+        expect(w.run()).toBe('updated');
+        expect(w.text()).toContain(`merge --ff-only ${long}`);
+        expect(w.text()).toContain(`update-ref -d ${REF} ${long}`);
+    });
+
+    it('хуки чужого дерева не исполняем: запрет стоит на КАЖДОЙ команде', () => {
+        // `merge` запускает `post-merge` из конфигурации человека, и хук получил бы полное
+        // окружение раннера — с токенами форжа (ревью, 6-й проход). Проба сторожит запрет
+        // на всех командах разом: избирательно — значит однажды забыть на новой.
+        const w = happy();
+        w.run();
+        for (const call of w.calls) {
+            expect(call.join(' ')).toContain('-c core.hooksPath=/dev/null');
+        }
+    });
+
+    it('навязанный окружением репозиторий снимается: GIT_DIR сильнее ключа -C', () => {
+        // `git -C <root>` не перебивает `GIT_DIR`, и команда ушла бы в чужое дерево: ff
+        // прошёл, лог зелёный, обновилось не то. Раннера запускают и из хуков, которые эти
+        // переменные выставляют сами.
+        const poisoned = { PATH: '/usr/bin', HOME: '/home/dev', GIT_DIR: '/other/repo/.git' };
+        const w = happy();
+        expect(w.run(ROOTS, poisoned)).toBe('updated');
+        for (const env of w.envs) {
+            expect(env).toBeDefined();
+            for (const key of GIT_CONTEXT_VARS) expect(env?.[key]).toBeUndefined();
+        }
+        // Остальное наследуется намеренно: без `HOME` и конфига человека fetch не пройдёт
+        // авторизацию у форжа.
+        expect(w.envs[0]?.HOME).toBe('/home/dev');
+    });
+
+    it('окружение не передали — не выдумываем своё', () => {
+        const w = happy();
+        w.run();
+        for (const env of w.envs) expect(env).toBeUndefined();
+    });
+
     it('в подмодули не рекурсирует — и запрет ЯВНЫЙ, а не «мы не просили»', () => {
         // Каталог продукта у потребителя — подмодуль внутри `consumerRoot`, и его код
         // подменяет lifecycle-операция launcher'а, а не побочка соседнего обновления.
@@ -284,5 +335,35 @@ describe('updateConsumerTree — кто держит дерево потреби
         for (const call of w.calls.filter((c) => c.includes('fetch') || c.includes('merge'))) {
             expect(call.join(' ')).toContain('-c submodule.recurse=false');
         }
+    });
+});
+
+describe('stripGitContext — окружение без навязанного репозитория', () => {
+    it('снимает ровно контекстные переменные git, остальное не трогает', () => {
+        const env = {
+            PATH: '/usr/bin',
+            HOME: '/home/dev',
+            RALPH_TG_BOT_TOKEN: 'секрет',
+            GIT_DIR: '/other/.git',
+            GIT_WORK_TREE: '/other',
+            GIT_INDEX_FILE: '/other/.git/index',
+            GIT_COMMON_DIR: '/other/.git',
+            GIT_NAMESPACE: 'ns',
+            GIT_OBJECT_DIRECTORY: '/other/.git/objects',
+            GIT_ALTERNATE_OBJECT_DIRECTORIES: '/alt',
+        };
+        const out = stripGitContext(env);
+        for (const key of GIT_CONTEXT_VARS) expect(out[key]).toBeUndefined();
+        expect(out.PATH).toBe('/usr/bin');
+        expect(out.HOME).toBe('/home/dev');
+        // Секреты петли остаются: их снятие — не работа этой функции, и молчаливое
+        // «заодно почистим» пряталo бы отсутствие настоящего барьера.
+        expect(out.RALPH_TG_BOT_TOKEN).toBe('секрет');
+    });
+
+    it('исходный объект не меняется — вызывающий отдаёт своё окружение, а не теряет его', () => {
+        const env = { GIT_DIR: '/other/.git' };
+        stripGitContext(env);
+        expect(env.GIT_DIR).toBe('/other/.git');
     });
 });
