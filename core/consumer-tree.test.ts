@@ -9,6 +9,8 @@ import { updateConsumerTree, type TConsumerTreeKind } from './consumer-tree.ts';
 import type { TResolvedRoots } from './roots.ts';
 
 const CONSUMER = '/path/to/app';
+const REF = 'refs/ralph/consumer-main';
+const SHA = 'a'.repeat(40);
 const ROOTS: TResolvedRoots = {
     consumerRoot: CONSUMER,
     executionRoot: '/path/to/app-ralph',
@@ -16,28 +18,50 @@ const ROOTS: TResolvedRoots = {
     runtimeDir: '/path/to/app/.ralph/runtime/prod',
 };
 
-/** Мир, где git отвечает по словарю команд: ключ — argv через пробел, значение — ответ. */
-function world(replies: Record<string, string | Error> = {}) {
+const BRANCH_ARGS = ['symbolic-ref', '--quiet', '--short', 'HEAD'];
+const BRANCH_KEY = BRANCH_ARGS.join(' ');
+
+/**
+ * Мир, где git отвечает по словарю команд: ключ — argv через пробел (без `-C <root>`,
+ * одинакового у всех), значение — ответ либо ошибка.
+ *
+ * Массив в значении — ОЧЕРЕДЬ ответов на повторные вызовы одной команды: ветка спрашивается
+ * трижды (до слияния, перед ним и после), и «сменилась между сверками» описывается только
+ * так. Последний ответ очереди залипает — иначе каждый лишний вызов пришлось бы описывать.
+ */
+function world(replies: Record<string, string | Error | Array<string | Error>> = {}) {
     const calls: string[][] = [];
     const logs: string[] = [];
+    const queues = new Map<string, Array<string | Error>>();
     const runArgvFn = (file: string, args: string[]): string => {
         calls.push([file, ...args]);
-        // Ключ — хвост argv без `-C <root>`: он одинаков у всех команд и только шумит.
         const key = args.filter((a) => a !== '-C' && a !== CONSUMER).join(' ');
-        const reply = replies[key];
+        const declared = replies[key];
+        if (declared === undefined) return '';
+        if (!Array.isArray(declared)) {
+            if (declared instanceof Error) throw declared;
+            return declared;
+        }
+        const queue = queues.get(key) ?? [...declared];
+        const reply = (queue.length > 1 ? queue.shift() : queue[0]) as string | Error;
+        queues.set(key, queue);
         if (reply instanceof Error) throw reply;
-        return reply ?? '';
+        return reply;
     };
     return {
         calls,
-        logs,
         run: (roots: TResolvedRoots | null = ROOTS): TConsumerTreeKind =>
             updateConsumerTree(roots, { runArgvFn, logFn: (m) => logs.push(m) }),
-        /** Мутации: всё, что меняет дерево. Их отсутствие — предмет половины проб ниже. */
-        mutations: (): string[][] =>
-            calls.filter(([, ...args]) => args.includes('merge') || args.includes('fetch')),
+        /** Только то, что МЕНЯЕТ дерево. Их отсутствие — предмет половины проб ниже. */
+        mutations: (): string[][] => calls.filter(([, ...args]) => args.includes('merge')),
+        text: (): string => calls.map((c) => c.join(' ')).join('\n'),
+        log: (): string => logs.join('\n'),
+        logs,
     };
 }
+
+/** Мир, где всё в порядке: дерево чистое, на main, fetch принёс sha. */
+const happy = () => world({ [BRANCH_KEY]: 'main', [`rev-parse --verify ${REF}`]: SHA });
 
 describe('updateConsumerTree — кто держит дерево потребителя актуальным', () => {
     it('раскладки корней нет — обновлять нечего, ни одной команды', () => {
@@ -55,12 +79,12 @@ describe('updateConsumerTree — кто держит дерево потреби
         expect(w.calls).toEqual([]);
     });
 
-    it('чистое дерево на main: fetch + merge --ff-only, в логе — каталог', () => {
-        const w = world({ 'symbolic-ref --quiet --short HEAD': 'main' });
+    it('чистое дерево на main: fetch в свой ref, ff-only по sha, уборка ref', () => {
+        const w = happy();
         expect(w.run()).toBe('updated');
         expect(w.calls).toEqual([
             ['git', '-C', CONSUMER, 'status', '--porcelain', '--untracked-files=no'],
-            ['git', '-C', CONSUMER, 'symbolic-ref', '--quiet', '--short', 'HEAD'],
+            ['git', '-C', CONSUMER, ...BRANCH_ARGS],
             [
                 'git',
                 '-C',
@@ -70,23 +94,20 @@ describe('updateConsumerTree — кто держит дерево потреби
                 'fetch',
                 '--no-recurse-submodules',
                 'origin',
-                '+refs/heads/main:refs/ralph/consumer-main',
+                `+refs/heads/main:${REF}`,
             ],
-            // Сливается нафетченное, а не `origin/main`: при нестандартном refspec
-            // remote-tracking ref мог не обновиться, и слияние с ним повторило бы прошлое
-            // состояние, отчитавшись «обновлено» (ревью, 1-й проход).
-            [
-                'git',
-                '-C',
-                CONSUMER,
-                '-c',
-                'submodule.recurse=false',
-                'merge',
-                '--ff-only',
-                'refs/ralph/consumer-main',
-            ],
+            ['git', '-C', CONSUMER, 'rev-parse', '--verify', REF],
+            // Сверка ветки ПЕРЕД слиянием — окно между первой проверкой и командой
+            // (ревью, 3-й проход), плюс снимок HEAD: его печатает пост-сверка.
+            ['git', '-C', CONSUMER, ...BRANCH_ARGS],
+            ['git', '-C', CONSUMER, 'rev-parse', 'HEAD'],
+            // Сливается зафиксированный sha, а не имя ref'а: имя пришлось бы разрешать
+            // повторно, а его мог переписать следующий прогон.
+            ['git', '-C', CONSUMER, '-c', 'submodule.recurse=false', 'merge', '--ff-only', SHA],
+            ['git', '-C', CONSUMER, ...BRANCH_ARGS],
+            ['git', '-C', CONSUMER, 'update-ref', '-d', REF],
         ]);
-        expect(w.logs.join('\n')).toContain(CONSUMER);
+        expect(w.log()).toContain(CONSUMER);
     });
 
     it('untracked-файлы грязью НЕ считаются — иначе обновления не было бы никогда', () => {
@@ -94,7 +115,7 @@ describe('updateConsumerTree — кто держит дерево потреби
         // untracked грязью значило бы не обновлять дерево ровно в той раскладке, ради
         // которой всё написано. Отсюда `--untracked-files=no` в самой команде статуса —
         // тест сторожит именно флаг, а не пустой ответ мира.
-        const w = world({ 'symbolic-ref --quiet --short HEAD': 'main' });
+        const w = happy();
         expect(w.run()).toBe('updated');
         expect(w.calls[0]).toContain('--untracked-files=no');
     });
@@ -102,35 +123,60 @@ describe('updateConsumerTree — кто держит дерево потреби
     it('грязное дерево не трогаем и говорим об этом вслух', () => {
         const w = world({
             'status --porcelain --untracked-files=no': ' M src/app.ts',
-            'symbolic-ref --quiet --short HEAD': 'main',
+            [BRANCH_KEY]: 'main',
         });
         expect(w.run()).toBe('dirty');
         expect(w.mutations()).toEqual([]);
-        const log = w.logs.join('\n');
-        expect(log).toContain(CONSUMER);
-        expect(log).toMatch(/git pull/); // человеку названо, чем закончить самому
+        expect(w.log()).toContain(CONSUMER);
+        expect(w.log()).toMatch(/git pull/); // человеку названо, чем закончить самому
     });
 
     it('дерево на другой ветке — не трогаем, ветка названа', () => {
-        const w = world({ 'symbolic-ref --quiet --short HEAD': 'feature/чинить-верстку' });
+        const w = world({ [BRANCH_KEY]: 'feature/чинить-верстку' });
         expect(w.run()).toBe('off-main');
         expect(w.mutations()).toEqual([]);
-        expect(w.logs.join('\n')).toContain('feature/чинить-верстку');
+        expect(w.log()).toContain('feature/чинить-верстку');
     });
 
     it('detached HEAD (symbolic-ref отказал) — тоже не трогаем', () => {
+        const w = world({ [BRANCH_KEY]: new Error('код 1') });
+        expect(w.run()).toBe('off-main');
+        expect(w.mutations()).toEqual([]);
+        expect(w.log()).toMatch(/detached|не на ветке/i);
+    });
+
+    it('ветку переключили между сверками — слияния не будет, ref всё равно убран', () => {
+        // Окно TOCTOU (ревью, 3-й проход): человек ушёл на свою ветку, пока мы фетчили.
+        // `merge --ff-only` перемотал бы ЕЁ, и молча.
         const w = world({
-            'symbolic-ref --quiet --short HEAD': new Error('код 1'),
+            [BRANCH_KEY]: ['main', 'feature/своё'],
+            [`rev-parse --verify ${REF}`]: SHA,
         });
         expect(w.run()).toBe('off-main');
         expect(w.mutations()).toEqual([]);
-        expect(w.logs.join('\n')).toMatch(/detached|не на ветке/i);
+        expect(w.log()).toContain('feature/своё');
+        expect(w.text()).toContain(`update-ref -d ${REF}`);
+    });
+
+    it('после слияния дерево оказалось не на main — громко, с sha для отката', () => {
+        // Остаток того же окна: сузить его до нуля нечем (атомарного «слей в HEAD, только
+        // если HEAD — main» у git нет), поэтому последствие обязано быть НАЗВАНО.
+        const head = 'b'.repeat(40);
+        const w = world({
+            [BRANCH_KEY]: ['main', 'main', 'feature/своё'],
+            [`rev-parse --verify ${REF}`]: SHA,
+            'rev-parse HEAD': head,
+        });
+        expect(w.run()).toBe('failed');
+        expect(w.log()).toContain(head);
+        expect(w.log()).toMatch(/reset --hard/);
     });
 
     it('ff-only не прошёл (дерево разошлось) — best-effort: лог с причиной, без броска', () => {
         const w = world({
-            'symbolic-ref --quiet --short HEAD': 'main',
-            '-c submodule.recurse=false merge --ff-only refs/ralph/consumer-main': new Error(
+            [BRANCH_KEY]: 'main',
+            [`rev-parse --verify ${REF}`]: SHA,
+            [`-c submodule.recurse=false merge --ff-only ${SHA}`]: new Error(
                 'Not possible to fast-forward',
             ),
         });
@@ -139,9 +185,22 @@ describe('updateConsumerTree — кто держит дерево потреби
             kind = w.run();
         }).not.toThrow();
         expect(kind).toBe('failed');
-        const log = w.logs.join('\n');
-        expect(log).toContain('Not possible to fast-forward');
-        expect(log).toContain(CONSUMER);
+        expect(w.log()).toContain('Not possible to fast-forward');
+        expect(w.log()).toContain(CONSUMER);
+        // Уборка ref'а идёт и по этому пути: оставленный, он держит историю GC-корнем
+        // в репозитории человека (ревью, 3-й проход).
+        expect(w.text()).toContain(`update-ref -d ${REF}`);
+    });
+
+    it('fetch не прошёл — ни слияния, ни ложного успеха', () => {
+        const w = world({
+            [BRANCH_KEY]: 'main',
+            [`-c submodule.recurse=false fetch --no-recurse-submodules origin +refs/heads/main:${REF}`]:
+                new Error('could not read from remote'),
+        });
+        expect(w.run()).toBe('failed');
+        expect(w.mutations()).toEqual([]);
+        expect(w.log()).toContain('could not read from remote');
     });
 
     it('git status не отработал — «не знаю» трактуем как «не трогать»', () => {
@@ -150,6 +209,7 @@ describe('updateConsumerTree — кто держит дерево потреби
         });
         expect(w.run()).toBe('failed');
         expect(w.mutations()).toEqual([]);
+        expect(w.text()).not.toContain('fetch');
     });
 
     it('в подмодули не рекурсирует — и запрет ЯВНЫЙ, а не «мы не просили»', () => {
@@ -159,7 +219,7 @@ describe('updateConsumerTree — кто держит дерево потреби
         // — `on-demand`, то есть молчание здесь означало бы «рекурсируем» (ревью, 1-й
         // проход). Вторая половина — `submodule.recurse` потребителя: его в конфиге может
         // включить он сам, и тогда в подмодуль полез бы ещё и merge.
-        const w = world({ 'symbolic-ref --quiet --short HEAD': 'main' });
+        const w = happy();
         w.run();
         const fetch = w.calls.find((c) => c.includes('fetch'));
         expect(fetch).toContain('--no-recurse-submodules');

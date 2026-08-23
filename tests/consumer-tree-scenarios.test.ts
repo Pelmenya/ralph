@@ -190,6 +190,11 @@ describe('дерево потребителя после мерджа фазы',
         expect(w.git(w.consumerRoot, 'rev-parse', 'HEAD')).toBe(sha);
         // Ветка человека осталась веткой: ff-merge, а не detach, как у дерева раннера.
         expect(w.git(w.consumerRoot, 'symbolic-ref', '--short', 'HEAD')).toBe('main');
+        // Служебный ref за собой убран: оставленный, он держал бы старую историю
+        // GC-корнем в репозитории человека (ревью, 3-й проход).
+        expect(() =>
+            w.git(w.consumerRoot, 'rev-parse', '--verify', 'refs/ralph/consumer-main'),
+        ).toThrow();
     });
 
     it('грязное дерево остаётся ровно таким, каким его оставил человек', () => {

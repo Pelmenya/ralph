@@ -130,26 +130,30 @@ export function updateConsumerTree(
 
     // На какой ветке стоит дерево человека. `symbolic-ref` отказом отвечает на detached
     // HEAD — это не сбой, а тот же ответ «не наша ветка», только другим каналом.
-    let branch = '';
-    try {
-        branch = runArgvFn(
-            'git',
-            gitIn(consumerRoot, ['symbolic-ref', '--quiet', '--short', 'HEAD']),
-        ).trim();
-    } catch {
-        branch = '';
-    }
-    if (branch !== MAIN) {
+    const branchNow = (): string => {
+        try {
+            return runArgvFn(
+                'git',
+                gitIn(consumerRoot, ['symbolic-ref', '--quiet', '--short', 'HEAD']),
+            ).trim();
+        } catch {
+            return '';
+        }
+    };
+    const offMain = (branch: string): TConsumerTreeKind => {
         logFn(
             `⚠ Дерево потребителя ${consumerRoot} не на ${MAIN} ` +
                 `(${branch || 'detached HEAD'}) — не трогаю: переключать ветку человека раннер ` +
                 `не станет. Вернёшься на ${MAIN} — \`git pull --ff-only\` подтянет смердженную фазу.`,
         );
         return 'off-main';
-    }
+    };
+    const branch = branchNow();
+    if (branch !== MAIN) return offMain(branch);
 
+    let target = '';
     try {
-        // `--no-recurse-submodules` — не гигиена, а исполнение обещания абзацем выше:
+        // `--no-recurse-submodules` — не гигиена, а исполнение обещания в шапке модуля:
         // ДЕФОЛТ `fetch.recurseSubmodules` — `on-demand`, то есть fetch, принёсший новый
         // gitlink продукта, сам зашёл бы в его репозиторий и дописал туда объекты и refs.
         // Ровно в тот каталог, который мы объявили неприкосновенным (ревью, 1-й проход).
@@ -168,13 +172,52 @@ export function updateConsumerTree(
                 `+refs/heads/${MAIN}:${FETCH_REF}`,
             ]),
         );
-        // Сливаем свой ref — тот, в который только что фетчили (см. довод у `FETCH_REF`).
-        // Только fast-forward: расхождение разбирает человек, а не раннер. Отказ означает,
-        // что у него есть свои коммиты в main, и мердж-коммит поверх них был бы произволом.
+        // Дальше работаем ЗАФИКСИРОВАННЫМ sha, а не именем ref'а: имя пришлось бы разрешать
+        // ещё раз в момент слияния, а между этими моментами ref может обновить следующий
+        // прогон. Заодно это позволяет убрать ref сразу после — см. `finally` ниже.
+        target = runArgvFn('git', gitIn(consumerRoot, ['rev-parse', '--verify', FETCH_REF])).trim();
+    } catch (e) {
+        logFn(
+            `⚠ Дерево потребителя ${consumerRoot} не обновилось: не удалось получить ` +
+                `origin/${MAIN} (${(e as Error).message}). Разбери руками: ` +
+                `\`git -C ${consumerRoot} pull --ff-only\`.`,
+        );
+        return 'failed';
+    }
+
+    // Между проверкой ветки и слиянием у человека есть окно: он мог переключиться на свою
+    // ветку, и `merge --ff-only` перемотал бы ЕЁ (ревью, 3-й проход). Полностью атомарного
+    // «слей в HEAD, только если HEAD — это main» у git нет вовсе, поэтому окно сужаем до
+    // предела — сверка непосредственно перед командой — и закрываем последствия: сохранённый
+    // sha печатается, если после слияния дерево оказалось не там, где мы его оставили.
+    // Молчаливой перемотки чужой ветки не остаётся ни в одном исходе.
+    const before = (): string => {
+        try {
+            return runArgvFn('git', gitIn(consumerRoot, ['rev-parse', 'HEAD'])).trim();
+        } catch {
+            return '';
+        }
+    };
+    try {
+        const again = branchNow();
+        if (again !== MAIN) return offMain(again);
+        const head = before();
+        // Сливаем зафиксированный sha. Только fast-forward: расхождение разбирает человек,
+        // а не раннер. Отказ означает, что у него есть свои коммиты в main, и мердж-коммит
+        // поверх них был бы произволом.
         runArgvFn(
             'git',
-            gitIn(consumerRoot, ['-c', 'submodule.recurse=false', 'merge', '--ff-only', FETCH_REF]),
+            gitIn(consumerRoot, ['-c', 'submodule.recurse=false', 'merge', '--ff-only', target]),
         );
+        const after = branchNow();
+        if (after !== MAIN) {
+            logFn(
+                `⛔ Дерево потребителя ${consumerRoot}: слияние ушло не в ${MAIN}, а в ` +
+                    `«${after || 'detached HEAD'}» — ветку переключили прямо во время обновления. ` +
+                    `Вернуть как было: \`git -C ${consumerRoot} reset --hard ${head}\`.`,
+            );
+            return 'failed';
+        }
     } catch (e) {
         logFn(
             `⚠ Дерево потребителя ${consumerRoot} не обновилось (${(e as Error).message}). ` +
@@ -182,6 +225,15 @@ export function updateConsumerTree(
                 `потребителя работают прежней версией.`,
         );
         return 'failed';
+    } finally {
+        // Ref за собой убираем всегда. Оставленный, он держит старую историю GC-корнем в
+        // репозитории ЧЕЛОВЕКА — тихо растущая цена за нашу служебную надобность
+        // (ревью, 3-й проход). Sha слияния у нас уже зафиксирован, ref больше не нужен.
+        try {
+            runArgvFn('git', gitIn(consumerRoot, ['update-ref', '-d', FETCH_REF]));
+        } catch {
+            // Не убрался — не повод портить исход: это мусор, а не отказ обновления.
+        }
     }
     logFn(`✅ Дерево потребителя ${consumerRoot} обновлено до origin/${MAIN} (ff-only).`);
     return 'updated';
