@@ -117,6 +117,10 @@ export type GateEnv = {
     ensureClean: EnsureCleanFn;
     parkOnOriginMain: ParkFn;
     updateRunnerTreeToOriginMain: UpdateTreeFn;
+    // Канон, задача 28: дерево ПОТРЕБИТЕЛЯ подтягивается тем же мерджем фазы. Тип общий с
+    // обновлением дерева раннера, а поведение обратное по контракту: этот вызов не бросает
+    // никогда — состояние дерева человека следующей фазе не мешает, и стопом быть не может.
+    updateConsumerTreeAfterMerge: UpdateTreeFn;
     syncDepsIfLockChanged: SyncDepsFn;
     buildSanitizedGateEnv: BuildGateEnvFn;
     formatExcerpt: FormatExcerptFn;
@@ -250,6 +254,7 @@ export function createGateRunner(env: GateEnv) {
         ensureClean,
         parkOnOriginMain,
         updateRunnerTreeToOriginMain,
+        updateConsumerTreeAfterMerge,
         syncDepsIfLockChanged,
         buildSanitizedGateEnv,
         formatExcerpt,
@@ -785,6 +790,14 @@ export function createGateRunner(env: GateEnv) {
         // даст ни занять его вторым worktree, ни обновить из-под чужого checkout.
         // «Обновлённый main» раннера = свежий origin/main + detach на нём: следующая
         // фаза стартует ровно от этого коммита.
+        // Задача 28: дерево ПОТРЕБИТЕЛЯ подтягиваем ЗДЕСЬ — после подтверждённого мерджа и
+        // ДО обновления дерева раннера. Порядок содержателен: своё дерево может не
+        // обновиться (транзиентный git-сбой), и тогда мы уходим в `merged-local-stale`
+        // мимо всего, что ниже. Фаза при этом влита, и дерево человека к исправности
+        // локального git раннера отношения не имеет — оставлять его старым из-за чужого
+        // сбоя значило бы вернуть ровно ту дыру, ради которой задача заводилась
+        // (ревью, 1-й проход). Бросить этот вызов не может по контракту.
+        updateConsumerTreeAfterMerge(runArgvFn);
         try {
             updateRunnerTreeToOriginMain(runArgvFn);
         } catch (e: unknown) {

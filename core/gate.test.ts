@@ -71,6 +71,7 @@ function makeEnv(over: Partial<GateEnv> = {}): GateEnv {
         ensureClean: () => true,
         parkOnOriginMain: () => {},
         updateRunnerTreeToOriginMain: () => {},
+        updateConsumerTreeAfterMerge: () => {},
         syncDepsIfLockChanged: () => {},
         buildSanitizedGateEnv: () => ({ PATH: '/x' }),
         formatExcerpt: (s: string) => s,
@@ -431,6 +432,36 @@ describe('tryMergePhase — гейт мерджа: hold/blocked/red/merged', () 
         expect(updateTree).toHaveBeenCalledTimes(1);
     });
 
+    // Канон, задача 28: дерево ПОТРЕБИТЕЛЯ подтягивается тем же мерджем. Без этой пробы
+    // строку вызова можно было бы убрать из gate.ts, и сьют остался бы зелёным: контракт
+    // самой функции проверяется у модуля, а её МЕСТО в хореографии — только здесь.
+    it('задача 28: merged тянет и дерево потребителя; на несданной фазе — не тянет', () => {
+        const updateConsumer = vi.fn();
+        const g = createGateRunner(makeEnv({ updateConsumerTreeAfterMerge: updateConsumer }));
+        expect(
+            tryMergeWith(g, phase, {
+                findOpenPrFn: () => ({ number: 9, labels: [] }),
+                checksGreenFn: () => true,
+                getVerifiedHeadFn: () => SHA,
+            }),
+        ).toBe('merged');
+        expect(updateConsumer).toHaveBeenCalledTimes(1);
+
+        // Красный гейт: фаза не сдана, тянуть в дерево человека нечего — и не тянем.
+        // Обновление, идущее «на всякий случай», приводило бы туда чужую работу тогда,
+        // когда своя ещё не влита.
+        const idle = vi.fn();
+        const g2 = createGateRunner(makeEnv({ updateConsumerTreeAfterMerge: idle }));
+        expect(
+            tryMergeWith(g2, phase, {
+                findOpenPrFn: () => ({ number: 9, labels: [] }),
+                checksGreenFn: () => false,
+                getLastRedCheckFn: () => ({ name: 'test', cmd: 'npm run test', excerpt: 'x' }),
+            }),
+        ).toBe('red-checks');
+        expect(idle).not.toHaveBeenCalled();
+    });
+
     // #49: шов чтения головы приходит из runLoop (adapters.taskSource.pullRequestHeadSha) и
     // обязан доехать до checksGreen. Без этого прокидывания подмена шва в конфиге меняла бы
     // мердж, но не прогон чеков — «тихий дефолт» ровно того класса, что и барьер #415.
@@ -538,8 +569,13 @@ describe('tryMergePhase — гейт мерджа: hold/blocked/red/merged', () 
     });
 
     it('merge прошёл, обновление дерева упало → merged-local-stale', () => {
+        // Задача 28 (ревью, 1-й проход): дерево ПОТРЕБИТЕЛЯ подтягивается и на этом пути.
+        // Фаза влита, а сбой локального git раннера к дереву человека отношения не имеет —
+        // иначе транзиентный чих возвращал бы ровно ту дыру, ради которой задача заводилась.
+        const updateConsumer = vi.fn();
         const g = createGateRunner(
             makeEnv({
+                updateConsumerTreeAfterMerge: updateConsumer,
                 updateRunnerTreeToOriginMain: () => {
                     throw new Error('detach упал');
                 },
@@ -552,6 +588,7 @@ describe('tryMergePhase — гейт мерджа: hold/blocked/red/merged', () 
             getVerifiedHeadFn: () => SHA,
         });
         expect(res).toBe('merged-local-stale');
+        expect(updateConsumer).toHaveBeenCalledTimes(1);
     });
 
     it('#387: после подтверждённого мерджа зовёт удаление локального ref ветки фазы', () => {

@@ -3065,6 +3065,34 @@ describe('preflight — валидация конфига/среды и подг
             expect(logs.join('\n')).toContain('/app/scripts/journal.mjs');
         });
 
+        it('задача 28: при заданных roots предупреждение обещает обновление, а не ручной pull', () => {
+            // Формулировка — часть контракта, а не украшение: прежняя («это дерево раннер
+            // не обновляет») была верна до задачи 28 и сегодня отправила бы человека делать
+            // руками то, что раннер делает сам. Оговорка про чистое дерево на main тоже
+            // обязана звучать: без неё обещание становится неправдой ровно там, где человек
+            // оставил свои правки.
+            const logs: string[] = [];
+            preflight(
+                withScripts(
+                    { projectSync: '/app/scripts/sync.mjs', reviewFindingsJournal: null },
+                    {
+                        rootsResolved: { consumerRoot: '/app' },
+                        consumerScripts: { projectSync: 'scripts/sync.mjs' },
+                    },
+                ),
+                okDeps({
+                    loadStateFn: fakeState,
+                    logFn: (m: string) => logs.push(m),
+                    existsFn: () => false,
+                }),
+            );
+            const warn = logs.join('\n');
+            expect(warn).toContain('consumerScripts.projectSync');
+            expect(warn).toContain('после мерджа фазы');
+            expect(warn).toMatch(/чистое и на main/);
+            expect(warn).not.toMatch(/раннер не обновляет/);
+        });
+
         it('старт при этом НЕ падает: фаза может сама заводить этот скрипт', () => {
             // Ревью Codex (!22): дерево перед стартом стоит на origin/main, и фаза, которая
             // добавляет скрипт, при отказе не смогла бы стартовать вовсе — AFK до утра.
@@ -4413,6 +4441,93 @@ describe('runLoop — основной while-цикл: итерации коде
         expect(shCmds).not.toContain('git pull --ff-only');
         expect(advancePhaseFn).toHaveBeenCalledTimes(1);
         expect(logs.join('\n')).toMatch(/уже смерджена/);
+    });
+
+    // Канон, задача 28 (ревью, 1-й проход): у мерджа ДВА пути, и второй — вот этот («фаза
+    // смерджена человеком либо прошлым прогоном»). Без пробы строку обновления дерева
+    // потребителя можно было бы отсюда убрать, и сьют остался бы зелёным: тест гейта
+    // сторожит только СВОЙ путь.
+    it('задача 28: на пути «фаза уже смерджена» тянется и дерево потребителя', () => {
+        const logs: string[] = [];
+        const shCmds: string[] = [];
+        runLoop(
+            validCfg({
+                rootsResolved: {
+                    consumerRoot: '/path/to/app',
+                    executionRoot: '/path/to/app-ralph',
+                    productRoot: '/path/to/app/.claude/ralph',
+                    runtimeDir: '/path/to/app/.ralph/runtime/prod',
+                },
+            }),
+            ctx(mkState()),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => true,
+                runArgvFn: (file: string, args: string[]) => {
+                    shCmds.push(`${file} ${args.join(' ')}`);
+                    // Дерево человека на main и чистое: путь обязан дойти до слияния.
+                    // `rev-parse` обязан отдать полный object id — слияние идёт по нему.
+                    if (args.includes('symbolic-ref')) return 'main';
+                    return args.includes('rev-parse') ? 'c'.repeat(40) : '';
+                },
+            }),
+        );
+        // Адрес — из раскладки, а не из текущего каталога: обновляется именно дерево
+        // потребителя, а не то, в котором раннер работает.
+        // Префикс команд модуля — свой каталог плюс запреты хуков и рекурсии.
+        expect(
+            shCmds.some((c) => c.startsWith('git -C /path/to/app') && c.includes('status')),
+        ).toBe(true);
+        expect(
+            shCmds.some(
+                (c) => c.startsWith('git -C /path/to/app') && c.includes('merge --ff-only'),
+            ),
+        ).toBe(true);
+        // Своё дерево при этом обновляется по-прежнему и своим способом (detach).
+        expect(shCmds).toContain('git checkout --detach origin/main');
+    });
+
+    // Ревью, 2-й проход: порядок пары важен сам по себе. Регрессия, вернувшая обновление
+    // потребителя ПОСЛЕ обновления своего дерева, осталась бы зелёной в пробе выше — там
+    // оба вызова проходят, — и снова оставляла бы дерево человека старым при стопе.
+    it('задача 28: своё дерево не обновилось — дерево потребителя УЖЕ подтянуто', () => {
+        const logs: string[] = [];
+        const shCmds: string[] = [];
+        runLoop(
+            validCfg({
+                rootsResolved: {
+                    consumerRoot: '/path/to/app',
+                    executionRoot: '/path/to/app-ralph',
+                    productRoot: '/path/to/app/.claude/ralph',
+                    runtimeDir: '/path/to/app/.ralph/runtime/prod',
+                },
+            }),
+            ctx(mkState()),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => true,
+                runArgvFn: (file: string, args: string[]) => {
+                    shCmds.push(`${file} ${args.join(' ')}`);
+                    // Своё дерево не обновляется: тот самый транзиентный сбой, из-за
+                    // которого петля встаёт и разбирает человек.
+                    if (args.includes('--detach')) throw new Error('detach упал');
+                    if (args.includes('symbolic-ref')) return 'main';
+                    return args.includes('rev-parse') ? 'c'.repeat(40) : '';
+                },
+            }),
+        );
+        expect(logs.join('\n')).toMatch(/дерево раннера не обновилось/);
+        // Префикс команд модуля — свой каталог плюс запреты хуков и рекурсии.
+        expect(
+            shCmds.some((c) => c.startsWith('git -C /path/to/app') && c.includes('status')),
+        ).toBe(true);
+        expect(
+            shCmds.some(
+                (c) => c.startsWith('git -C /path/to/app') && c.includes('merge --ff-only'),
+            ),
+        ).toBe(true);
     });
 
     // #37: раньше milestone такой фазы закрывал свип на СЛЕДУЮЩЕМ старте раннера — он

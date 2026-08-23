@@ -142,6 +142,7 @@ import type {
     TaskSourceAdapter,
 } from '../adapters/adapters.ts';
 import { underRoot, type TResolvedRoots } from './roots.ts';
+import { updateConsumerTree } from './consumer-tree.ts';
 import {
     buildAdapters,
     createCoderRuntime,
@@ -3283,6 +3284,29 @@ export function createOrchestrator(env: OrchestratorEnv) {
         runArgvFn('git', ['checkout', '--detach', 'origin/main']);
     }
 
+    // Канон, задача 28: дерево ПОТРЕБИТЕЛЯ — второе дерево этой пары, и до сих пор его не
+    // обновлял никто. Пути скриптов потребителя заякорены к `consumerRoot` (задача 23),
+    // значит скрипт, приехавший фазовым PR, там не появлялся до ручного `pull` человека, а
+    // вызов оставался fail-open. Контракт и отвергнутые варианты — в `core/consumer-tree.ts`.
+    //
+    // Соседство с `updateRunnerTreeToOriginMain` не случайно: обновлять оба дерева нужно в
+    // одних и тех же двух местах (мердж гейтом и путь «фаза уже смерджена»). Но исходы у них
+    // РАЗНЫЕ и намеренно: без своего дерева раннер строил бы следующую фазу на устаревшей
+    // базе — это стоп; дерево человека следующей фазе не мешает ничем — это лог.
+    // Раскладка приходит ПАРАМЕТРОМ там, где вызывающий её знает (`runLoop` работает с
+    // конфигом-аргументом, а не с module-level `config`), и из замыкания там, где не знает
+    // (гейт: его `getConfig` типизирован узко, только составом чеков). Дефолт закрывает
+    // боевой путь, явный аргумент — тот, где конфиг цикла и есть источник правды.
+    function updateConsumerTreeAfterMerge(
+        runArgvFn: ShArgvFn = shArgv,
+        roots: TResolvedRoots | null = config?.rootsResolved ?? null,
+    ): void {
+        // `env` прокидывается НЕ ради значений, а ради снятия навязанных: `GIT_DIR` и
+        // родня сильнее ключа `-C`, и без них команда ушла бы в чужой репозиторий. Снимает
+        // их сам модуль — обещание «работаем в consumerRoot» его, ему и держать.
+        updateConsumerTree(roots, { runArgvFn, logFn: log, env: process.env });
+    }
+
     // L2 → worktree-модель (#77): после гейта не бросаем дерево раннера на PR-голове —
     // паркуем его на origin/main. Именно ДЕТАЧЕМ на origin/main, а не `git checkout main`:
     // ветку main почти всегда держит соседнее дерево человека, git не даёт занять один
@@ -3422,6 +3446,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         ensureClean,
         parkOnOriginMain,
         updateRunnerTreeToOriginMain,
+        updateConsumerTreeAfterMerge,
         syncDepsIfLockChanged,
         buildSanitizedGateEnv,
         formatExcerpt,
@@ -3788,7 +3813,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 // Судим по СЫРОМУ значению из конфига, а не по резолвнутому: при заданных
                 // `roots` резолвнутый абсолютен ВСЕГДА (path.resolve), и проверка
                 // `isAbsolute(value)` съела бы ровно ту ветку, ради которой всё написано, —
-                // предупреждение про необновляемое дерево потребителя (ревью Codex, !22).
+                // предупреждение про дерево потребителя (ревью Codex, !22; задача 28).
                 const raw = cfg.consumerScripts?.[key as keyof TConsumerScripts];
                 const rawAbsolute = typeof raw === 'string' && path.isAbsolute(raw);
                 // Абсолютный путь про базу не спрашивают: он сам себе адрес, и любая фраза
@@ -3796,8 +3821,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 const why = rawAbsolute
                     ? 'путь абсолютный, то есть от раскладки корней не зависит вовсе'
                     : anchor
-                      ? `путь якорится к consumerRoot ${anchor}, а это дерево раннер не обновляет: ` +
-                        `скрипт, добавленный фазой, приедет в дерево РАБОТЫ и здесь не появится сам`
+                      ? `путь якорится к consumerRoot ${anchor}: это дерево раннер подтягивает ` +
+                        `сам после мерджа фазы (ff-only) — но только чистое и на main; сейчас ` +
+                        `скрипта там нет, а фаза пишет в дерево РАБОТЫ`
                       : dry
                         ? 'относительный путь считается от рабочего дерева раннера, а в --dry-run ' +
                           'переезда в него могло не быть — база проверки тогда другая, чем у живого прогона'
@@ -4499,6 +4525,11 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     // (ref человека) не трогаем — git и не даст занять его вторым worktree.
                     // Fail-stop: строить следующую фазу на непонятной базе хуже, чем встать.
                     if (!dry) {
+                        // Задача 28: дерево ПОТРЕБИТЕЛЯ — до обновления своего и вне try.
+                        // Своё дерево на этом пути может не обновиться и увести в стоп; фаза
+                        // при этом влита, и дерево человека от исправности локального git
+                        // раннера не зависит (ревью, 1-й проход). Бросить не может.
+                        updateConsumerTreeAfterMerge(runArgvFn, cfg.rootsResolved ?? null);
                         try {
                             updateRunnerTreeToOriginMain(runArgvFn);
                         } catch (e) {
@@ -7110,6 +7141,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
         saveSessionOutput,
         handleCrashedCoderSession,
         parkOnOriginMain,
+        // Канон, задача 28: обновление дерева потребителя после мерджа фазы — наружу для
+        // юнитов мердж-пути (сам контракт проверяется у модуля и приёмочным сценарием).
+        updateConsumerTreeAfterMerge,
         gateChecksFor,
         checksGreen,
         findOpenPr,
