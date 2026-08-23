@@ -4483,6 +4483,44 @@ describe('runLoop — основной while-цикл: итерации коде
         expect(shCmds).toContain('git checkout --detach origin/main');
     });
 
+    // Ревью, 2-й проход: порядок пары важен сам по себе. Регрессия, вернувшая обновление
+    // потребителя ПОСЛЕ обновления своего дерева, осталась бы зелёной в пробе выше — там
+    // оба вызова проходят, — и снова оставляла бы дерево человека старым при стопе.
+    it('задача 28: своё дерево не обновилось — дерево потребителя УЖЕ подтянуто', () => {
+        const logs: string[] = [];
+        const shCmds: string[] = [];
+        runLoop(
+            validCfg({
+                rootsResolved: {
+                    consumerRoot: '/path/to/app',
+                    executionRoot: '/path/to/app-ralph',
+                    productRoot: '/path/to/app/.claude/ralph',
+                    runtimeDir: '/path/to/app/.ralph/runtime/prod',
+                },
+            }),
+            ctx(mkState()),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => true,
+                runArgvFn: (file: string, args: string[]) => {
+                    shCmds.push(`${file} ${args.join(' ')}`);
+                    // Своё дерево не обновляется: тот самый транзиентный сбой, из-за
+                    // которого петля встаёт и разбирает человек.
+                    if (args.includes('--detach')) throw new Error('detach упал');
+                    return args.includes('symbolic-ref') ? 'main' : '';
+                },
+            }),
+        );
+        expect(logs.join('\n')).toMatch(/дерево раннера не обновилось/);
+        expect(shCmds).toContain('git -C /path/to/app status --porcelain --untracked-files=no');
+        expect(
+            shCmds.some(
+                (c) => c.startsWith('git -C /path/to/app') && c.includes('merge --ff-only'),
+            ),
+        ).toBe(true);
+    });
+
     // #37: раньше milestone такой фазы закрывал свип на СЛЕДУЮЩЕМ старте раннера — он
     // ходил в форж мимо шва и на площадке без `gh` не работал вовсе. Свип убран, и его
     // единственный полезный случай закрыт здесь: фаза смерджена (человеком или прошлым

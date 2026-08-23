@@ -70,7 +70,7 @@ describe('updateConsumerTree — кто держит дерево потреби
                 'fetch',
                 '--no-recurse-submodules',
                 'origin',
-                'main',
+                '+refs/heads/main:refs/ralph/consumer-main',
             ],
             // Сливается нафетченное, а не `origin/main`: при нестандартном refspec
             // remote-tracking ref мог не обновиться, и слияние с ним повторило бы прошлое
@@ -83,7 +83,7 @@ describe('updateConsumerTree — кто держит дерево потреби
                 'submodule.recurse=false',
                 'merge',
                 '--ff-only',
-                'FETCH_HEAD',
+                'refs/ralph/consumer-main',
             ],
         ]);
         expect(w.logs.join('\n')).toContain(CONSUMER);
@@ -130,7 +130,7 @@ describe('updateConsumerTree — кто держит дерево потреби
     it('ff-only не прошёл (дерево разошлось) — best-effort: лог с причиной, без броска', () => {
         const w = world({
             'symbolic-ref --quiet --short HEAD': 'main',
-            '-c submodule.recurse=false merge --ff-only FETCH_HEAD': new Error(
+            '-c submodule.recurse=false merge --ff-only refs/ralph/consumer-main': new Error(
                 'Not possible to fast-forward',
             ),
         });

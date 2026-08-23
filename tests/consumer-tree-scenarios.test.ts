@@ -32,6 +32,13 @@ function gitEnv(home: string): NodeJS.ProcessEnv {
         GIT_AUTHOR_EMAIL: 'scenario@example.invalid',
         GIT_COMMITTER_NAME: 'scenario',
         GIT_COMMITTER_EMAIL: 'scenario@example.invalid',
+        // Подмодуль песочницы живёт локальным путём, а `git` запрещает файловый транспорт
+        // для подмодулей с CVE-2022-39253. Разрешение задано ОКРУЖЕНИЮ мира, а не коду под
+        // тестом: барьер обязан держаться на флагах команды, а не на том, что рекурсия
+        // невозможна в принципе. Проба от противного ниже это и доказывает.
+        GIT_CONFIG_COUNT: '1',
+        GIT_CONFIG_KEY_0: 'protocol.file.allow',
+        GIT_CONFIG_VALUE_0: 'always',
     };
 }
 
@@ -115,6 +122,57 @@ function mergePhase(w: World, message: string): string {
     return w.git(phase, 'rev-parse', 'HEAD');
 }
 
+const SUBMODULE = '.claude/ralph';
+
+/**
+ * Подключить к дереву потребителя подмодуль-«продукт» и двинуть его ревизию фазой:
+ * origin получает коммит с НОВЫМ gitlink, дерево потребителя об этом ещё не знает.
+ */
+function withAdvancedSubmodule(w: World): { oldSha: string; newSha: string } {
+    const productGit = path.join(w.root, 'product.git');
+    const productWork = path.join(w.root, 'product-work');
+    w.git(w.root, 'init', '--quiet', '--bare', '-b', 'main', productGit);
+    w.git(w.root, 'clone', '--quiet', productGit, productWork);
+    fs.writeFileSync(path.join(productWork, 'core.ts'), '// продукт, версия 1\n');
+    w.git(productWork, 'add', '-A');
+    w.git(productWork, 'commit', '--quiet', '-m', 'продукт v1');
+    w.git(productWork, 'push', '--quiet', 'origin', 'main');
+    const oldSha = w.git(productWork, 'rev-parse', 'HEAD');
+
+    w.git(w.consumerRoot, 'submodule', 'add', '--quiet', productGit, SUBMODULE);
+    w.git(w.consumerRoot, 'commit', '--quiet', '-m', 'подключён продукт');
+    w.git(w.consumerRoot, 'push', '--quiet', 'origin', 'main');
+
+    // Новая ревизия продукта и фазовый коммит, который двигает на неё gitlink.
+    fs.writeFileSync(path.join(productWork, 'core.ts'), '// продукт, версия 2\n');
+    w.git(productWork, 'add', '-A');
+    w.git(productWork, 'commit', '--quiet', '-m', 'продукт v2');
+    w.git(productWork, 'push', '--quiet', 'origin', 'main');
+    const newSha = w.git(productWork, 'rev-parse', 'HEAD');
+
+    const phase = path.join(w.root, 'phase-sub');
+    w.git(w.root, 'clone', '--quiet', path.join(w.root, 'origin.git'), phase);
+    // Двигаем ТОЛЬКО указатель: выкачивать подмодуль в дерево фазы незачем.
+    w.git(phase, 'update-index', '--cacheinfo', `160000,${newSha},${SUBMODULE}`);
+    w.git(phase, 'commit', '--quiet', '-m', 'продукт обновлён фазой');
+    w.git(phase, 'push', '--quiet', 'origin', 'main');
+
+    // Потребитель включает рекурсию у себя — барьер обязан выстоять ПРОТИВ его конфига.
+    w.git(w.consumerRoot, 'config', 'fetch.recurseSubmodules', 'yes');
+    w.git(w.consumerRoot, 'config', 'submodule.recurse', 'true');
+    return { oldSha, newSha };
+}
+
+/** Есть ли объект в хранилище подмодуля: он и означает «fetch туда заходил». */
+function submoduleHas(w: World, sha: string): boolean {
+    try {
+        w.git(path.join(w.consumerRoot, SUBMODULE), 'cat-file', '-e', `${sha}^{commit}`);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
 const run = (w: World) =>
     updateConsumerTree(w.roots, { runArgvFn: w.runArgvFn, logFn: (m) => w.logs.push(m) });
 
@@ -167,6 +225,37 @@ describe('дерево потребителя после мерджа фазы',
         expect(fs.readFileSync(path.join(runtime, 'ralph.state.json'), 'utf-8')).toBe(
             '{"count":3}\n',
         );
+    });
+
+    it('подмодуль продукта не тронут — даже когда рекурсию включил сам потребитель', () => {
+        // Дефолт `fetch.recurseSubmodules` — `on-demand`, а здесь у потребителя стоит `yes`
+        // и `submodule.recurse=true`: мир настроен максимально враждебно обещанию «продукт
+        // не трогаем». Держат его только флаги самой команды (ревью, 1-й и 2-й проходы).
+        const w = buildWorld();
+        const { oldSha, newSha } = withAdvancedSubmodule(w);
+
+        expect(run(w)).toBe('updated');
+
+        // Сам gitlink в индексе доехал — фаза применена…
+        expect(w.git(w.consumerRoot, 'ls-tree', 'HEAD', SUBMODULE)).toContain(newSha);
+        // …а рабочее дерево подмодуля и его хранилище остались нетронутыми.
+        expect(w.git(path.join(w.consumerRoot, SUBMODULE), 'rev-parse', 'HEAD')).toBe(oldSha);
+        expect(
+            submoduleHas(w, newSha),
+            'fetch зашёл в подмодуль: объект новой ревизии продукта оказался в его хранилище',
+        ).toBe(false);
+    });
+
+    it('от противного: с рекурсией объект в подмодуль ПРИЕЗЖАЕТ — мир на неё способен', () => {
+        // Без этой пробы предыдущая доказывала бы тождество: подмодуль, в который нельзя
+        // зайти в принципе, «не тронут» при любом коде.
+        const w = buildWorld();
+        const { newSha } = withAdvancedSubmodule(w);
+        expect(submoduleHas(w, newSha)).toBe(false);
+
+        w.git(w.consumerRoot, 'fetch', '--recurse-submodules=yes', 'origin', 'main');
+
+        expect(submoduleHas(w, newSha)).toBe(true);
     });
 
     it('разошедшийся main не сливается: локальный коммит человека на месте', () => {
