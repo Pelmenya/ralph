@@ -98,9 +98,10 @@ describe('updateConsumerTree — кто держит дерево потреби
                 `+refs/heads/main:${REF}`,
             ],
             ['git', '-C', CONSUMER, 'rev-parse', '--verify', `${REF}^{commit}`],
-            // Сверка ветки ПЕРЕД слиянием — окно между первой проверкой и командой
-            // (ревью, 3-й проход), плюс снимок HEAD: его печатает пост-сверка.
+            // Сверки ветки И ЧИСТОТЫ вплотную к слиянию — окно между первыми проверками
+            // и командой (ревью, 3-й и 5-й проходы), плюс снимок HEAD для пост-сверки.
             ['git', '-C', CONSUMER, ...BRANCH_ARGS],
+            ['git', '-C', CONSUMER, 'status', '--porcelain', '--untracked-files=no'],
             ['git', '-C', CONSUMER, 'rev-parse', 'HEAD'],
             // Сливается зафиксированный sha, а не имя ref'а: имя пришлось бы разрешать
             // повторно, а его мог переписать следующий прогон.
@@ -159,6 +160,31 @@ describe('updateConsumerTree — кто держит дерево потреби
         expect(w.mutations()).toEqual([]);
         expect(w.log()).toContain('feature/своё');
         expect(w.text()).toContain(`update-ref -d ${REF}`);
+    });
+
+    it('дерево стало грязным, пока мы фетчили, — слияния не будет', () => {
+        // Обещание «грязное не трогаю» относилось бы к состоянию минутной давности, если
+        // спрашивать статус только на входе (ревью, 5-й проход).
+        const w = world({
+            [BRANCH_KEY]: 'main',
+            'status --porcelain --untracked-files=no': ['', ' M src/app.ts'],
+            [`rev-parse --verify ${REF}^{commit}`]: SHA,
+        });
+        expect(w.run()).toBe('dirty');
+        expect(w.mutations()).toEqual([]);
+        expect(w.log()).toMatch(/пока мы фетчили/);
+        // Ref всё равно убран — он уже записан, и сдача фазы тут ни при чём.
+        expect(w.text()).toContain(`update-ref -d ${REF} ${SHA}`);
+    });
+
+    it('fetch не дошёл до записи — чужой ref не удаляем: подтвердить владение нечем', () => {
+        const w = world({
+            [BRANCH_KEY]: 'main',
+            [`-c submodule.recurse=false fetch --no-recurse-submodules --no-write-fetch-head origin +refs/heads/main:${REF}`]:
+                new Error('could not read from remote'),
+        });
+        expect(w.run()).toBe('failed');
+        expect(w.text()).not.toContain('update-ref');
     });
 
     it('после слияния дерево оказалось не на main — громко, с sha для отката', () => {
