@@ -62,6 +62,7 @@ import { createStateLock } from './state-lock.ts';
 import type { RalphState } from './state-lock.ts';
 import { createTunnelCheck } from './tunnel-check.ts';
 import { createWorktreeManager } from './worktree.ts';
+import { ensurePhaseBranch, checkOnPhaseBranch } from './phase-branch.ts';
 import { createReviewModule } from './review.ts';
 import { createGateRunner, resolveGateChecks } from './gate.ts';
 import { createDeployCheckModule } from './deploy-check.ts';
@@ -4159,6 +4160,13 @@ export function createOrchestrator(env: OrchestratorEnv) {
         waitForDeployRunFn?: typeof waitForDeployRun;
         checkProdHealthFn?: typeof checkProdHealth;
         ensureMonitorAliveFn?: typeof ensureMonitorAlive;
+        // Задача 11: постановка дерева на ветку фазы и страж после сессии — швами, как
+        // остальные побочки цикла. Тесты гоняют развилки без настоящего git.
+        ensurePhaseBranchFn?: typeof ensurePhaseBranch;
+        checkOnPhaseBranchFn?: typeof checkOnPhaseBranch;
+        // Снятие устаревших намерений при отказе стража: побочка по fs, поэтому швом.
+        readSessionRequestsFn?: typeof readSessionRequests;
+        removeSessionRequestsFn?: typeof removeSessionRequests;
         monitorConfigPath?: string;
     };
 
@@ -4261,6 +4269,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
             waitForDeployRunFn = adapters.deployCheck.waitForDeployRun,
             checkProdHealthFn = adapters.deployCheck.checkHealth,
             ensureMonitorAliveFn = ensureMonitorAlive,
+            ensurePhaseBranchFn = ensurePhaseBranch,
+            checkOnPhaseBranchFn = checkOnPhaseBranch,
+            readSessionRequestsFn = readSessionRequests,
+            removeSessionRequestsFn = removeSessionRequests,
             monitorConfigPath,
         }: RunLoopDeps = {},
     ): void {
@@ -4365,6 +4377,31 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     `🔄 ${phase.milestone} | итерация ${state.count}/${maxIterations} | Issue #${next.number}: ${next.title} | модель: ${issueModel} (${issueProvider}) | осталось: ${issues.length}`,
                 );
 
+                // Задача 11: дерево работы ставит на ветку фазы РАННЕР, до спавна сессии.
+                // Раньше это делала сессия по промпту, и слабая модель, не подобравшая
+                // идиому, коммитила на detached HEAD — коммит оставался недостижим ни из
+                // одной ветки. Fail-closed: не встали на ветку — не спавним сессию вовсе.
+                // Сессия, которой некуда коммитить, сожжёт итерацию и создаст ту самую
+                // потерю, ради которой всё это и написано.
+                if (!dry) {
+                    const branchState = ensurePhaseBranchFn(phase.branch, {
+                        runArgvFn,
+                        logFn,
+                        safeBranch: (b, opts) => safeBranch(b, { logFn, ...opts }),
+                        env: process.env,
+                    });
+                    if (branchState.sha === null || branchState.kind === 'diverged') {
+                        pushEventFn(
+                            `⛔ Ralph: дерево работы не встало на ветку фазы ${phase.branch} ` +
+                                `(${branchState.kind}${branchState.reason ? `: ${branchState.reason}` : ''}) — ` +
+                                'сессию не запускаю: коммитить ей некуда.',
+                            cfg,
+                            { logFn },
+                        );
+                        break;
+                    }
+                }
+
                 // Breaker «нет прогресса» (идея из frankbria/ralph-claude-code): фиксируем
                 // HEAD и размер очереди ДО сессии — после сравним. Итерация без единого
                 // коммита И без закрытого issue = удар об стену; maxIterations поймал бы
@@ -4422,6 +4459,105 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         },
                     },
                 );
+                // Задача 11, вторая половина: страж ПОСЛЕ сессии. Постановка до спавна
+                // снимает причину уйти в detached HEAD, но не запрещает уйти самой.
+                // Разница между этим стражем и тихой потерей ровно одна — названный SHA:
+                // коммит вне ветки достижим только по нему.
+                //
+                // Стоит ПЕРВЫМ, до намерений и до разбора падения, и порядок здесь —
+                // половина самого барьера (ревью, 1-й проход):
+                //
+                //   - до НАМЕРЕНИЙ: сессия, закоммитившая на detached HEAD, могла попросить
+                //     закрыть карточку и выйти с кодом 0. Применить это значит закрыть
+                //     задачу, работа по которой недостижима, — очередь опустеет, и фаза
+                //     уедет в PR без коммита. Потерянное намерение стоит одной итерации,
+                //     ложно закрытая карточка — целой фазы;
+                //   - до РАЗБОРА ПАДЕНИЯ: тот разбор кончается `break`, и SHA не был бы
+                //     назван вовсе. Диагностику падения при этом не теряем — зовём её
+                //     здесь же, ради вывода сессии на диск, и только потом останавливаемся.
+                //
+                // Стоп, а не предупреждение: следующая итерация встанет на ветку фазы
+                // штатно, и уехавший коммит станет недостижим уже без единой строки в логе.
+                if (!dry) {
+                    const head = checkOnPhaseBranchFn(phase.branch, {
+                        runArgvFn,
+                        logFn,
+                        safeBranch: () => true,
+                        env: process.env,
+                    });
+                    if (!head.ok) {
+                        // Разбор падения зовём ради вывода сессии на диск, но его пуш
+                        // ПЕРЕХВАТЫВАЕМ, а не глушим (ревью, 3-й проход): в нём лежат путь
+                        // к сохранённому выводу, список грязных файлов и причина вида
+                        // «рантайм недоступен» — то есть ровно то, с чего человек начнёт
+                        // разбор. Первая версия правки выбрасывала это вместе с дубликатом
+                        // и оставляла в уведомлении один голый код возврата. Текст
+                        // доезжает целиком, но ОДНИМ уведомлением.
+                        let crashNote = '';
+                        if (code !== 0) {
+                            handleCrashedCoderSessionFn(next, code, lastOutput, {
+                                shFn,
+                                logFn,
+                                pushEventFn: ((msg: string) => {
+                                    crashNote = msg;
+                                    return true;
+                                }) as typeof pushEvent,
+                                cfg,
+                            });
+                        }
+                        // Намерения не просто «не применяем» — снимаем из очереди. Файл
+                        // переживает стоп, и следующая успешная сессия применила бы старое
+                        // `close` вместе со своими: барьер откладывал бы ложное закрытие
+                        // на итерацию, а не отменял его (ревью, 2-й проход). Текст уходит
+                        // в лог целиком — это последняя воля сессии, и терять её молча
+                        // нельзя, даже когда исполнять её нельзя тоже.
+                        //
+                        // Снятие обёрнуто целиком: отказ fs здесь не должен ни убивать
+                        // петлю до уведомления, ни оставлять уведомление врущим. Не вышло —
+                        // так и говорим, с адресом файла (ревью, 3-й проход).
+                        let staleNote =
+                            'Намерения сессии сняты без применения: закрывать карточку ' +
+                            'по работе, которой нет в ветке, нельзя; их текст — в логе.';
+                        // Чтение и снятие — РАЗНЫЕ try, и это не косметика: в одном общем
+                        // отказ чтения уводил бы мимо `removeSessionRequestsFn`, то есть
+                        // файл оставался бы на месте, а уведомление говорило бы «снять не
+                        // удалось» о попытке, которой не было (ревью, 4-й проход).
+                        // Прочитать не вышло — снимаем вслепую: текст ценен, но файл, чьё
+                        // содержимое неизвестно, опаснее файла, чьё содержимое потеряно.
+                        try {
+                            const stale = readSessionRequestsFn();
+                            if (stale && stale.trim() !== '') {
+                                logFn(`Намерения сессии сняты без применения:\n${stale}`);
+                            }
+                        } catch (e) {
+                            logFn(
+                                `⚠ Намерения сессии прочитать не вышло (${(e as Error).message}) — ` +
+                                    'снимаю вслепую, текст восстановить нечем.',
+                            );
+                        }
+                        try {
+                            removeSessionRequestsFn();
+                        } catch (e) {
+                            staleNote =
+                                `⚠ Намерения сессии снять НЕ удалось (${(e as Error).message}). ` +
+                                `Файл ${RUNTIME.requests} остался — следующая сессия применит ` +
+                                'его вместе со своими. Убери руками до перезапуска.';
+                            logFn(staleNote);
+                        }
+                        pushEventFn(
+                            (crashNote ? `${crashNote}\n\n` : '') +
+                                `${head.message ?? 'дерево работы не на ветке фазы'} ` +
+                                `(Issue #${next.number}, фаза "${phase.milestone}", ` +
+                                `код сессии ${code}). ${staleNote} В SHA попало только ` +
+                                'закоммиченное — если сессия оставила правки в дереве, ' +
+                                'они остались там же.',
+                            cfg,
+                            { logFn },
+                        );
+                        break;
+                    }
+                }
+
                 // #40: намерения сессии применяются СРАЗУ после неё и ДО разбора падения:
                 // файл-запрос — это последняя воля сессии, и написать «упёрся в ручной
                 // гейт, ставь blocked» она могла ровно перед тем, как умереть по maxTurns.

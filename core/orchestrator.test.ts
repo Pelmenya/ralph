@@ -3767,6 +3767,18 @@ describe('runLoop — основной while-цикл: итерации коде
             // #193: обновление дерева раннера после мерджа идёт через argv-коллаборатор.
             runArgvFn: () => '',
             saveStateFn: () => {},
+            // Задача 11: постановка дерева на ветку фазы и страж после сессии — побочки
+            // (настоящий git), поэтому в общем деплое заглушены «всё удалось». Развилки
+            // самих функций — в core/phase-branch.test.ts, сценарии стопа — ниже.
+            ensurePhaseBranchFn: () => ({
+                kind: 'fast-forwarded',
+                branch: 'feature/m1',
+                sha: 'a'.repeat(40),
+            }),
+            checkOnPhaseBranchFn: () => ({ ok: true, sha: 'a'.repeat(40) }),
+            // Снятие устаревших намерений при отказе стража — побочка по fs.
+            readSessionRequestsFn: () => null,
+            removeSessionRequestsFn: () => {},
             openIssuesFn: () => [],
             allOpenIssuesFn: () => [],
             // #40: применение намерений сессии — побочка (fs + шов), в тестах заглушка.
@@ -4239,6 +4251,322 @@ describe('runLoop — основной while-цикл: итерации коде
         // Дошли до штатного ONCE-стопа ПОСЛЕ блока диагностики падения — значит, ранний
         // break из-за stop:true не сработал (handleCrashedCoderSessionFn сказал stop:false).
         expect(logs.join('\n')).toMatch(/HITL: одна итерация/);
+    });
+
+    // ── Задача 11: ветку фазы держит раннер, а не сессия ────────────────────
+    //
+    // Инцидент: сессия слабой модели не подобрала идиому переключения и закоммитила на
+    // detached HEAD — коммит остался недостижим ни из одной ветки. Барьер двусторонний:
+    // дерево ставится на ветку ДО спавна, и после сессии проверяется, что оно там же.
+
+    it('задача 11: дерево ставится на ветку фазы ДО спавна сессии', () => {
+        const logs: string[] = [];
+        const order: string[] = [];
+        const ensurePhaseBranchFn = vi.fn((branch: string) => {
+            order.push(`branch:${branch}`);
+            return { kind: 'created' as const, branch, sha: 'a'.repeat(40) };
+        });
+        runLoop(
+            validCfg(),
+            ctx(mkState()),
+            deps(logs, {
+                once: true,
+                phaseIndexOfFn: () => 0,
+                openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                ensurePhaseBranchFn,
+                runClaudeFn: () => {
+                    order.push('session');
+                    return 0;
+                },
+            }),
+        );
+        expect(ensurePhaseBranchFn).toHaveBeenCalledTimes(1);
+        expect(ensurePhaseBranchFn.mock.calls[0][0]).toBe('feature/m1');
+        // Порядок и есть весь смысл правки: после сессии переключать уже поздно.
+        expect(order).toEqual(['branch:feature/m1', 'session']);
+    });
+
+    it('задача 11: не встали на ветку → сессия НЕ спавнится, стоп с пушем', () => {
+        const logs: string[] = [];
+        const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+        const pushEventFn = vi.fn();
+        runLoop(
+            validCfg(),
+            ctx(mkState()),
+            deps(logs, {
+                phaseIndexOfFn: () => 0,
+                openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                ensurePhaseBranchFn: () => ({
+                    kind: 'failed' as const,
+                    branch: 'feature/m1',
+                    sha: null,
+                    reason: 'origin недоступен',
+                }),
+                runClaudeFn,
+                pushEventFn,
+            }),
+        );
+        // Сессия, которой некуда коммитить, сожгла бы итерацию и создала ту самую потерю.
+        expect(runClaudeFn).not.toHaveBeenCalled();
+        expect(pushEventFn).toHaveBeenCalledTimes(1);
+        expect(pushEventFn.mock.calls[0][0]).toMatch(/не встало на ветку фазы feature\/m1/);
+    });
+
+    it('задача 11: расхождение с origin — тоже стоп, а не попытка починить силой', () => {
+        const logs: string[] = [];
+        const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+        const pushEventFn = vi.fn();
+        runLoop(
+            validCfg(),
+            ctx(mkState()),
+            deps(logs, {
+                phaseIndexOfFn: () => 0,
+                openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                // sha есть (дерево на ветке), но ff невозможен: пуш всё равно отвергнется.
+                ensurePhaseBranchFn: () => ({
+                    kind: 'diverged' as const,
+                    branch: 'feature/m1',
+                    sha: 'a'.repeat(40),
+                    reason: 'ff невозможен',
+                }),
+                runClaudeFn,
+                pushEventFn,
+            }),
+        );
+        expect(runClaudeFn).not.toHaveBeenCalled();
+        expect(pushEventFn.mock.calls[0][0]).toMatch(/diverged/);
+    });
+
+    it('задача 11: сессия оставила detached HEAD → стоп, и SHA назван в пуше', () => {
+        const logs: string[] = [];
+        const pushEventFn = vi.fn();
+        const sha = 'c'.repeat(40);
+        const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+        runLoop(
+            validCfg(),
+            ctx(mkState()),
+            deps(logs, {
+                phaseIndexOfFn: () => 0,
+                openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                checkOnPhaseBranchFn: () => ({
+                    ok: false,
+                    sha,
+                    message: `⛔ Сессия оставила дерево работы в detached HEAD, а не на ветке фазы feature/m1. Работа достижима по SHA ${sha} — спаси её: git branch feature/m1 ${sha}`,
+                }),
+                runClaudeFn,
+                pushEventFn,
+            }),
+        );
+        // Сессия отработала — проверка идёт ПОСЛЕ неё, иначе спасать было бы нечего.
+        expect(runClaudeFn).toHaveBeenCalledTimes(1);
+        expect(pushEventFn).toHaveBeenCalledTimes(1);
+        // Названный SHA — единственное, чем эта строка отличается от тихой потери.
+        expect(pushEventFn.mock.calls[0][0]).toContain(sha);
+    });
+
+    it('задача 11: страж отработал ДО намерений — карточка не закроется по работе вне ветки', () => {
+        const logs: string[] = [];
+        const applySessionRequestsFn = vi.fn(() => ({ applied: 1, failed: false }));
+        const pushEventFn = vi.fn();
+        const sha = 'd'.repeat(40);
+        runLoop(
+            validCfg(),
+            ctx(mkState()),
+            deps(logs, {
+                phaseIndexOfFn: () => 0,
+                openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                // Сессия вышла с кодом 0 и попросила закрыть карточку, но коммит лёг мимо
+                // ветки. Применить намерение значит закрыть задачу, работы по которой нет.
+                checkOnPhaseBranchFn: () => ({ ok: false, sha, message: `SHA ${sha}` }),
+                applySessionRequestsFn,
+                runClaudeFn: () => 0,
+                pushEventFn,
+            }),
+        );
+        expect(applySessionRequestsFn).not.toHaveBeenCalled();
+        expect(pushEventFn.mock.calls[0][0]).toContain(sha);
+    });
+
+    it('задача 11: сессия упала И ушла с ветки → диагностика падения не потеряна, стоп общий', () => {
+        const logs: string[] = [];
+        const handleCrashedCoderSessionFn = vi.fn<HandleCrashedCoderSessionFake>(() => ({
+            stop: false,
+        }));
+        const applySessionRequestsFn = vi.fn(() => ({ applied: 0, failed: false }));
+        const pushEventFn = vi.fn();
+        runLoop(
+            validCfg(),
+            ctx(mkState()),
+            deps(logs, {
+                phaseIndexOfFn: () => 0,
+                openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                checkOnPhaseBranchFn: () => ({
+                    ok: false,
+                    sha: 'e'.repeat(40),
+                    message: 'вне ветки',
+                }),
+                handleCrashedCoderSessionFn,
+                applySessionRequestsFn,
+                runClaudeFn: () => 1,
+                pushEventFn,
+            }),
+        );
+        // Разбор падения пишет вывод сессии на диск — без него диагноз потерян навсегда.
+        expect(handleCrashedCoderSessionFn).toHaveBeenCalledTimes(1);
+        // Но решение о стопе принимает страж: код сессии на него не влияет.
+        expect(applySessionRequestsFn).not.toHaveBeenCalled();
+    });
+
+    it('задача 11: падение плюс уход с ветки — ОДИН пуш, а не два', () => {
+        const logs: string[] = [];
+        const pushEventFn = vi.fn();
+        // Реалистичный разбор падения: он и сам умеет пушить (код 126/127, грязное дерево).
+        const handleCrashedCoderSessionFn = vi.fn<HandleCrashedCoderSessionFake>(
+            (_issue, _code, _out, o) => {
+                (o as { pushEventFn?: (m: string) => void }).pushEventFn?.('падение сессии');
+                return { stop: true };
+            },
+        );
+        runLoop(
+            validCfg(),
+            ctx(mkState()),
+            deps(logs, {
+                phaseIndexOfFn: () => 0,
+                openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                checkOnPhaseBranchFn: () => ({
+                    ok: false,
+                    sha: 'f'.repeat(40),
+                    message: 'вне ветки',
+                }),
+                handleCrashedCoderSessionFn,
+                runClaudeFn: () => 1,
+                pushEventFn,
+            }),
+        );
+        // Одно уведомление вместо двух — и разбор падения в нём НЕ потерян: его текст
+        // (путь к выводу сессии, грязное дерево, причина) перехвачен и вклеен.
+        //
+        // Барьер узкий и назван честно: он про пуш РАЗБОРА ПАДЕНИЯ. Сам рантайм кодера
+        // умеет пушить раньше — про недоступность, — и это отдельный инцидент, а не
+        // дубликат этого (ревью, 3-й проход).
+        expect(pushEventFn).toHaveBeenCalledTimes(1);
+        expect(pushEventFn.mock.calls[0][0]).toContain('падение сессии');
+        expect(pushEventFn.mock.calls[0][0]).toMatch(/код сессии 1/);
+        expect(handleCrashedCoderSessionFn).toHaveBeenCalledTimes(1);
+    });
+
+    it('задача 11: устаревшие намерения снимаются, а не ждут следующей сессии', () => {
+        const logs: string[] = [];
+        const removeSessionRequestsFn = vi.fn();
+        runLoop(
+            validCfg(),
+            ctx(mkState()),
+            deps(logs, {
+                phaseIndexOfFn: () => 0,
+                openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                checkOnPhaseBranchFn: () => ({
+                    ok: false,
+                    sha: 'a'.repeat(40),
+                    message: 'вне ветки',
+                }),
+                readSessionRequestsFn: () => '{"kind":"close","issue":7}\n',
+                removeSessionRequestsFn,
+                runClaudeFn: () => 0,
+                pushEventFn: vi.fn(),
+            }),
+        );
+        // Иначе барьер откладывал бы ложное закрытие на итерацию, а не отменял его.
+        expect(removeSessionRequestsFn).toHaveBeenCalledTimes(1);
+        // Воля сессии не теряется молча — её текст уходит в лог.
+        expect(logs.join('\n')).toContain('"kind":"close"');
+    });
+
+    it('задача 11: снять намерения не удалось — уведомление говорит это, а не врёт', () => {
+        const logs: string[] = [];
+        const pushEventFn = vi.fn();
+        runLoop(
+            validCfg(),
+            ctx(mkState()),
+            deps(logs, {
+                once: true,
+                phaseIndexOfFn: () => 0,
+                openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                checkOnPhaseBranchFn: () => ({
+                    ok: false,
+                    sha: 'a'.repeat(40),
+                    message: 'вне ветки',
+                }),
+                readSessionRequestsFn: () => '{"kind":"close","issue":7}\n',
+                removeSessionRequestsFn: () => {
+                    throw new Error('EACCES');
+                },
+                runClaudeFn: () => 0,
+                pushEventFn,
+            }),
+        );
+        // Отказ fs не убивает петлю ДО уведомления и не оставляет его врущим.
+        expect(pushEventFn).toHaveBeenCalledTimes(1);
+        expect(pushEventFn.mock.calls[0][0]).toMatch(/снять НЕ удалось/);
+    });
+
+    it('задача 11: намерения не прочитались — снимаем вслепую, а не пропускаем', () => {
+        const logs: string[] = [];
+        const removeSessionRequestsFn = vi.fn();
+        const pushEventFn = vi.fn();
+        runLoop(
+            validCfg(),
+            ctx(mkState()),
+            deps(logs, {
+                once: true,
+                phaseIndexOfFn: () => 0,
+                openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                checkOnPhaseBranchFn: () => ({
+                    ok: false,
+                    sha: 'a'.repeat(40),
+                    message: 'вне ветки',
+                }),
+                readSessionRequestsFn: () => {
+                    throw new Error('EIO');
+                },
+                removeSessionRequestsFn,
+                runClaudeFn: () => 0,
+                pushEventFn,
+            }),
+        );
+        // Файл, чьё содержимое неизвестно, опаснее файла, чьё содержимое потеряно: отказ
+        // чтения не должен уводить мимо снятия — иначе старое `close` доживёт до запуска.
+        expect(removeSessionRequestsFn).toHaveBeenCalledTimes(1);
+        expect(pushEventFn.mock.calls[0][0]).not.toMatch(/снять НЕ удалось/);
+    });
+
+    it('задача 11: в DRY ни постановка, ни страж git не трогают', () => {
+        const logs: string[] = [];
+        const ensurePhaseBranchFn = vi.fn(() => ({
+            kind: 'created' as const,
+            branch: 'feature/m1',
+            sha: 'a'.repeat(40),
+        }));
+        const checkOnPhaseBranchFn = vi.fn(() => ({ ok: true }));
+        const removeSessionRequestsFn = vi.fn();
+        runLoop(
+            validCfg(),
+            ctx(mkState()),
+            deps(logs, {
+                dry: true,
+                once: true,
+                phaseIndexOfFn: () => 0,
+                openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                ensurePhaseBranchFn,
+                checkOnPhaseBranchFn,
+                removeSessionRequestsFn,
+                runClaudeFn: () => 0,
+            }),
+        );
+        expect(ensurePhaseBranchFn).not.toHaveBeenCalled();
+        expect(checkOnPhaseBranchFn).not.toHaveBeenCalled();
+        // Снятие намерений живёт внутри отказа стража, а стража в DRY нет вовсе:
+        // удалить файл в сухом прогоне значило бы потерять его без единой мутации.
+        expect(removeSessionRequestsFn).not.toHaveBeenCalled();
     });
 
     it('no-progress breaker (AFK): HEAD не сдвинулся и очередь та же → стоп, пуш', () => {
