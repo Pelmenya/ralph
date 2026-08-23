@@ -61,7 +61,7 @@ function world(replies: Record<string, string | Error | Array<string | Error>> =
 }
 
 /** Мир, где всё в порядке: дерево чистое, на main, fetch принёс sha. */
-const happy = () => world({ [BRANCH_KEY]: 'main', [`rev-parse --verify ${REF}`]: SHA });
+const happy = () => world({ [BRANCH_KEY]: 'main', [`rev-parse --verify ${REF}^{commit}`]: SHA });
 
 describe('updateConsumerTree — кто держит дерево потребителя актуальным', () => {
     it('раскладки корней нет — обновлять нечего, ни одной команды', () => {
@@ -93,10 +93,11 @@ describe('updateConsumerTree — кто держит дерево потреби
                 'submodule.recurse=false',
                 'fetch',
                 '--no-recurse-submodules',
+                '--no-write-fetch-head',
                 'origin',
                 `+refs/heads/main:${REF}`,
             ],
-            ['git', '-C', CONSUMER, 'rev-parse', '--verify', REF],
+            ['git', '-C', CONSUMER, 'rev-parse', '--verify', `${REF}^{commit}`],
             // Сверка ветки ПЕРЕД слиянием — окно между первой проверкой и командой
             // (ревью, 3-й проход), плюс снимок HEAD: его печатает пост-сверка.
             ['git', '-C', CONSUMER, ...BRANCH_ARGS],
@@ -105,7 +106,9 @@ describe('updateConsumerTree — кто держит дерево потреби
             // повторно, а его мог переписать следующий прогон.
             ['git', '-C', CONSUMER, '-c', 'submodule.recurse=false', 'merge', '--ff-only', SHA],
             ['git', '-C', CONSUMER, ...BRANCH_ARGS],
-            ['git', '-C', CONSUMER, 'update-ref', '-d', REF],
+            // Уборка со сверкой значения: имя ref'а одно на потребителя, экземпляров
+            // раннера может быть несколько (ревью, 4-й проход).
+            ['git', '-C', CONSUMER, 'update-ref', '-d', REF, SHA],
         ]);
         expect(w.log()).toContain(CONSUMER);
     });
@@ -150,7 +153,7 @@ describe('updateConsumerTree — кто держит дерево потреби
         // `merge --ff-only` перемотал бы ЕЁ, и молча.
         const w = world({
             [BRANCH_KEY]: ['main', 'feature/своё'],
-            [`rev-parse --verify ${REF}`]: SHA,
+            [`rev-parse --verify ${REF}^{commit}`]: SHA,
         });
         expect(w.run()).toBe('off-main');
         expect(w.mutations()).toEqual([]);
@@ -164,18 +167,21 @@ describe('updateConsumerTree — кто держит дерево потреби
         const head = 'b'.repeat(40);
         const w = world({
             [BRANCH_KEY]: ['main', 'main', 'feature/своё'],
-            [`rev-parse --verify ${REF}`]: SHA,
+            [`rev-parse --verify ${REF}^{commit}`]: SHA,
             'rev-parse HEAD': head,
         });
         expect(w.run()).toBe('failed');
+        // Факты, а не готовая команда: `reset --hard` вслепую откатил бы не ту ветку
+        // (ревью, 4-й проход). Названо, от чего ушли и что слито.
         expect(w.log()).toContain(head);
-        expect(w.log()).toMatch(/reset --hard/);
+        expect(w.log()).toContain(SHA);
+        expect(w.log()).not.toMatch(/reset --hard/);
     });
 
     it('ff-only не прошёл (дерево разошлось) — best-effort: лог с причиной, без броска', () => {
         const w = world({
             [BRANCH_KEY]: 'main',
-            [`rev-parse --verify ${REF}`]: SHA,
+            [`rev-parse --verify ${REF}^{commit}`]: SHA,
             [`-c submodule.recurse=false merge --ff-only ${SHA}`]: new Error(
                 'Not possible to fast-forward',
             ),
@@ -192,10 +198,36 @@ describe('updateConsumerTree — кто держит дерево потреби
         expect(w.text()).toContain(`update-ref -d ${REF}`);
     });
 
+    it('на месте sha пришёл мусор — сливать нечем, и это отказ, а не merge вслепую', () => {
+        // `runArgvFn` инжектируется, то есть «git вернёт полный object id» — контракт
+        // боевой реализации, а не гарантия типа. Слияние по неразобранной строке ушло бы
+        // куда угодно, включая `HEAD~1` (ревью, 4-й проход).
+        const w = world({
+            [BRANCH_KEY]: 'main',
+            [`rev-parse --verify ${REF}^{commit}`]: 'HEAD~1',
+        });
+        expect(w.run()).toBe('failed');
+        expect(w.mutations()).toEqual([]);
+        expect(w.log()).toContain('HEAD~1');
+    });
+
+    it('ref не убрался — исход прежний, но молчания нет', () => {
+        // Мусор в чужом репозитории не отменяет состоявшегося обновления, но обязан быть
+        // назван вместе с адресом: GC-корень, о котором не сказали, растёт молча.
+        const w = world({
+            [BRANCH_KEY]: 'main',
+            [`rev-parse --verify ${REF}^{commit}`]: SHA,
+            [`update-ref -d ${REF} ${SHA}`]: new Error('ref занят соседом'),
+        });
+        expect(w.run()).toBe('updated');
+        expect(w.log()).toContain(REF);
+        expect(w.log()).toContain('ref занят соседом');
+    });
+
     it('fetch не прошёл — ни слияния, ни ложного успеха', () => {
         const w = world({
             [BRANCH_KEY]: 'main',
-            [`-c submodule.recurse=false fetch --no-recurse-submodules origin +refs/heads/main:${REF}`]:
+            [`-c submodule.recurse=false fetch --no-recurse-submodules --no-write-fetch-head origin +refs/heads/main:${REF}`]:
                 new Error('could not read from remote'),
         });
         expect(w.run()).toBe('failed');

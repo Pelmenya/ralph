@@ -4467,7 +4467,9 @@ describe('runLoop — основной while-цикл: итерации коде
                 runArgvFn: (file: string, args: string[]) => {
                     shCmds.push(`${file} ${args.join(' ')}`);
                     // Дерево человека на main и чистое: путь обязан дойти до слияния.
-                    return args.includes('symbolic-ref') ? 'main' : '';
+                    // `rev-parse` обязан отдать полный object id — слияние идёт по нему.
+                    if (args.includes('symbolic-ref')) return 'main';
+                    return args.includes('rev-parse') ? 'c'.repeat(40) : '';
                 },
             }),
         );
@@ -4508,7 +4510,8 @@ describe('runLoop — основной while-цикл: итерации коде
                     // Своё дерево не обновляется: тот самый транзиентный сбой, из-за
                     // которого петля встаёт и разбирает человек.
                     if (args.includes('--detach')) throw new Error('detach упал');
-                    return args.includes('symbolic-ref') ? 'main' : '';
+                    if (args.includes('symbolic-ref')) return 'main';
+                    return args.includes('rev-parse') ? 'c'.repeat(40) : '';
                 },
             }),
         );
