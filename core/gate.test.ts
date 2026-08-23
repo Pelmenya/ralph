@@ -569,8 +569,13 @@ describe('tryMergePhase — гейт мерджа: hold/blocked/red/merged', () 
     });
 
     it('merge прошёл, обновление дерева упало → merged-local-stale', () => {
+        // Задача 28 (ревью, 1-й проход): дерево ПОТРЕБИТЕЛЯ подтягивается и на этом пути.
+        // Фаза влита, а сбой локального git раннера к дереву человека отношения не имеет —
+        // иначе транзиентный чих возвращал бы ровно ту дыру, ради которой задача заводилась.
+        const updateConsumer = vi.fn();
         const g = createGateRunner(
             makeEnv({
+                updateConsumerTreeAfterMerge: updateConsumer,
                 updateRunnerTreeToOriginMain: () => {
                     throw new Error('detach упал');
                 },
@@ -583,6 +588,7 @@ describe('tryMergePhase — гейт мерджа: hold/blocked/red/merged', () 
             getVerifiedHeadFn: () => SHA,
         });
         expect(res).toBe('merged-local-stale');
+        expect(updateConsumer).toHaveBeenCalledTimes(1);
     });
 
     it('#387: после подтверждённого мерджа зовёт удаление локального ref ветки фазы', () => {

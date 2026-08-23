@@ -4443,6 +4443,46 @@ describe('runLoop — основной while-цикл: итерации коде
         expect(logs.join('\n')).toMatch(/уже смерджена/);
     });
 
+    // Канон, задача 28 (ревью, 1-й проход): у мерджа ДВА пути, и второй — вот этот («фаза
+    // смерджена человеком либо прошлым прогоном»). Без пробы строку обновления дерева
+    // потребителя можно было бы отсюда убрать, и сьют остался бы зелёным: тест гейта
+    // сторожит только СВОЙ путь.
+    it('задача 28: на пути «фаза уже смерджена» тянется и дерево потребителя', () => {
+        const logs: string[] = [];
+        const shCmds: string[] = [];
+        runLoop(
+            validCfg({
+                rootsResolved: {
+                    consumerRoot: '/path/to/app',
+                    executionRoot: '/path/to/app-ralph',
+                    productRoot: '/path/to/app/.claude/ralph',
+                    runtimeDir: '/path/to/app/.ralph/runtime/prod',
+                },
+            }),
+            ctx(mkState()),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => true,
+                runArgvFn: (file: string, args: string[]) => {
+                    shCmds.push(`${file} ${args.join(' ')}`);
+                    // Дерево человека на main и чистое: путь обязан дойти до слияния.
+                    return args.includes('symbolic-ref') ? 'main' : '';
+                },
+            }),
+        );
+        // Адрес — из раскладки, а не из текущего каталога: обновляется именно дерево
+        // потребителя, а не то, в котором раннер работает.
+        expect(shCmds).toContain('git -C /path/to/app status --porcelain --untracked-files=no');
+        expect(
+            shCmds.some(
+                (c) => c.startsWith('git -C /path/to/app') && c.includes('merge --ff-only'),
+            ),
+        ).toBe(true);
+        // Своё дерево при этом обновляется по-прежнему и своим способом (detach).
+        expect(shCmds).toContain('git checkout --detach origin/main');
+    });
+
     // #37: раньше milestone такой фазы закрывал свип на СЛЕДУЮЩЕМ старте раннера — он
     // ходил в форж мимо шва и на площадке без `gh` не работал вовсе. Свип убран, и его
     // единственный полезный случай закрыт здесь: фаза смерджена (человеком или прошлым

@@ -61,8 +61,30 @@ describe('updateConsumerTree — кто держит дерево потреби
         expect(w.calls).toEqual([
             ['git', '-C', CONSUMER, 'status', '--porcelain', '--untracked-files=no'],
             ['git', '-C', CONSUMER, 'symbolic-ref', '--quiet', '--short', 'HEAD'],
-            ['git', '-C', CONSUMER, 'fetch', 'origin', 'main'],
-            ['git', '-C', CONSUMER, 'merge', '--ff-only', 'origin/main'],
+            [
+                'git',
+                '-C',
+                CONSUMER,
+                '-c',
+                'submodule.recurse=false',
+                'fetch',
+                '--no-recurse-submodules',
+                'origin',
+                'main',
+            ],
+            // Сливается нафетченное, а не `origin/main`: при нестандартном refspec
+            // remote-tracking ref мог не обновиться, и слияние с ним повторило бы прошлое
+            // состояние, отчитавшись «обновлено» (ревью, 1-й проход).
+            [
+                'git',
+                '-C',
+                CONSUMER,
+                '-c',
+                'submodule.recurse=false',
+                'merge',
+                '--ff-only',
+                'FETCH_HEAD',
+            ],
         ]);
         expect(w.logs.join('\n')).toContain(CONSUMER);
     });
@@ -108,7 +130,9 @@ describe('updateConsumerTree — кто держит дерево потреби
     it('ff-only не прошёл (дерево разошлось) — best-effort: лог с причиной, без броска', () => {
         const w = world({
             'symbolic-ref --quiet --short HEAD': 'main',
-            'merge --ff-only origin/main': new Error('Not possible to fast-forward'),
+            '-c submodule.recurse=false merge --ff-only FETCH_HEAD': new Error(
+                'Not possible to fast-forward',
+            ),
         });
         let kind: TConsumerTreeKind | null = null;
         expect(() => {
@@ -128,12 +152,19 @@ describe('updateConsumerTree — кто держит дерево потреби
         expect(w.mutations()).toEqual([]);
     });
 
-    it('в подмодули не рекурсирует ни на одной ветке — ревизия продукта не побочка pull', () => {
-        // Каталог продукта у потребителя — подмодуль внутри `consumerRoot`. `pull
-        // --recurse-submodules` подменил бы код продукта ПОД работающей петлёй; ревизия
-        // продукта меняется lifecycle-операцией launcher'а, а не мимоходом.
+    it('в подмодули не рекурсирует — и запрет ЯВНЫЙ, а не «мы не просили»', () => {
+        // Каталог продукта у потребителя — подмодуль внутри `consumerRoot`, и его код
+        // подменяет lifecycle-операция launcher'а, а не побочка соседнего обновления.
+        // Проба сторожит ЗАПРЕТ, а не отсутствие слова: дефолт `fetch.recurseSubmodules`
+        // — `on-demand`, то есть молчание здесь означало бы «рекурсируем» (ревью, 1-й
+        // проход). Вторая половина — `submodule.recurse` потребителя: его в конфиге может
+        // включить он сам, и тогда в подмодуль полез бы ещё и merge.
         const w = world({ 'symbolic-ref --quiet --short HEAD': 'main' });
         w.run();
-        expect(w.calls.flat().join(' ')).not.toContain('recurse-submodules');
+        const fetch = w.calls.find((c) => c.includes('fetch'));
+        expect(fetch).toContain('--no-recurse-submodules');
+        for (const call of w.calls.filter((c) => c.includes('fetch') || c.includes('merge'))) {
+            expect(call.join(' ')).toContain('-c submodule.recurse=false');
+        }
     });
 });

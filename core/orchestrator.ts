@@ -3293,8 +3293,15 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // одних и тех же двух местах (мердж гейтом и путь «фаза уже смерджена»). Но исходы у них
     // РАЗНЫЕ и намеренно: без своего дерева раннер строил бы следующую фазу на устаревшей
     // базе — это стоп; дерево человека следующей фазе не мешает ничем — это лог.
-    function updateConsumerTreeAfterMerge(runArgvFn: ShArgvFn = shArgv): void {
-        updateConsumerTree(config?.rootsResolved ?? null, { runArgvFn, logFn: log });
+    // Раскладка приходит ПАРАМЕТРОМ там, где вызывающий её знает (`runLoop` работает с
+    // конфигом-аргументом, а не с module-level `config`), и из замыкания там, где не знает
+    // (гейт: его `getConfig` типизирован узко, только составом чеков). Дефолт закрывает
+    // боевой путь, явный аргумент — тот, где конфиг цикла и есть источник правды.
+    function updateConsumerTreeAfterMerge(
+        runArgvFn: ShArgvFn = shArgv,
+        roots: TResolvedRoots | null = config?.rootsResolved ?? null,
+    ): void {
+        updateConsumerTree(roots, { runArgvFn, logFn: log });
     }
 
     // L2 → worktree-модель (#77): после гейта не бросаем дерево раннера на PR-голове —
@@ -4515,11 +4522,13 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     // (ref человека) не трогаем — git и не даст занять его вторым worktree.
                     // Fail-stop: строить следующую фазу на непонятной базе хуже, чем встать.
                     if (!dry) {
+                        // Задача 28: дерево ПОТРЕБИТЕЛЯ — до обновления своего и вне try.
+                        // Своё дерево на этом пути может не обновиться и увести в стоп; фаза
+                        // при этом влита, и дерево человека от исправности локального git
+                        // раннера не зависит (ревью, 1-й проход). Бросить не может.
+                        updateConsumerTreeAfterMerge(runArgvFn, cfg.rootsResolved ?? null);
                         try {
                             updateRunnerTreeToOriginMain(runArgvFn);
-                            // Задача 28: дерево человека — best-effort, поэтому ВНУТРИ try,
-                            // но своим исходом: бросить оно не может по контракту.
-                            updateConsumerTreeAfterMerge(runArgvFn);
                         } catch (e) {
                             logFn(
                                 `⛔ Фаза "${phase.milestone}" смерджена, но дерево раннера не обновилось (${(e as Error).message}). ` +
