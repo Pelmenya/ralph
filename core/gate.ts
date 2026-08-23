@@ -117,6 +117,10 @@ export type GateEnv = {
     ensureClean: EnsureCleanFn;
     parkOnOriginMain: ParkFn;
     updateRunnerTreeToOriginMain: UpdateTreeFn;
+    // Канон, задача 28: дерево ПОТРЕБИТЕЛЯ подтягивается тем же мерджем фазы. Тип общий с
+    // обновлением дерева раннера, а поведение обратное по контракту: этот вызов не бросает
+    // никогда — состояние дерева человека следующей фазе не мешает, и стопом быть не может.
+    updateConsumerTreeAfterMerge: UpdateTreeFn;
     syncDepsIfLockChanged: SyncDepsFn;
     buildSanitizedGateEnv: BuildGateEnvFn;
     formatExcerpt: FormatExcerptFn;
@@ -250,6 +254,7 @@ export function createGateRunner(env: GateEnv) {
         ensureClean,
         parkOnOriginMain,
         updateRunnerTreeToOriginMain,
+        updateConsumerTreeAfterMerge,
         syncDepsIfLockChanged,
         buildSanitizedGateEnv,
         formatExcerpt,
@@ -796,6 +801,10 @@ export function createGateRunner(env: GateEnv) {
             return 'merged-local-stale';
         }
         logFn(`✅ PR #${pr.number} смерджен (squash), дерево раннера на свежем origin/main.`);
+        // Задача 28: и дерево ПОТРЕБИТЕЛЯ — после мерджа, а не «когда-нибудь руками».
+        // Строго ПОСЛЕ строки успеха: исход здесь — лог, а не решение о сдаче фазы, и
+        // читаться он должен как продолжение мерджа, а не как его условие.
+        updateConsumerTreeAfterMerge(runArgvFn);
         return 'merged';
     }
 

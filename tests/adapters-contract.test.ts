@@ -98,6 +98,7 @@ function makeGateEnv(over: Partial<GateEnv> = {}): GateEnv {
         ensureClean: () => true,
         parkOnOriginMain: () => {},
         updateRunnerTreeToOriginMain: () => {},
+        updateConsumerTreeAfterMerge: () => {},
         syncDepsIfLockChanged: () => {},
         buildSanitizedGateEnv: () => ({}),
         formatExcerpt: (s: string) => s,

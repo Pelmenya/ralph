@@ -3065,6 +3065,34 @@ describe('preflight — валидация конфига/среды и подг
             expect(logs.join('\n')).toContain('/app/scripts/journal.mjs');
         });
 
+        it('задача 28: при заданных roots предупреждение обещает обновление, а не ручной pull', () => {
+            // Формулировка — часть контракта, а не украшение: прежняя («это дерево раннер
+            // не обновляет») была верна до задачи 28 и сегодня отправила бы человека делать
+            // руками то, что раннер делает сам. Оговорка про чистое дерево на main тоже
+            // обязана звучать: без неё обещание становится неправдой ровно там, где человек
+            // оставил свои правки.
+            const logs: string[] = [];
+            preflight(
+                withScripts(
+                    { projectSync: '/app/scripts/sync.mjs', reviewFindingsJournal: null },
+                    {
+                        rootsResolved: { consumerRoot: '/app' },
+                        consumerScripts: { projectSync: 'scripts/sync.mjs' },
+                    },
+                ),
+                okDeps({
+                    loadStateFn: fakeState,
+                    logFn: (m: string) => logs.push(m),
+                    existsFn: () => false,
+                }),
+            );
+            const warn = logs.join('\n');
+            expect(warn).toContain('consumerScripts.projectSync');
+            expect(warn).toContain('после мерджа фазы');
+            expect(warn).toMatch(/чистое и на main/);
+            expect(warn).not.toMatch(/раннер не обновляет/);
+        });
+
         it('старт при этом НЕ падает: фаза может сама заводить этот скрипт', () => {
             // Ревью Codex (!22): дерево перед стартом стоит на origin/main, и фаза, которая
             // добавляет скрипт, при отказе не смогла бы стартовать вовсе — AFK до утра.
