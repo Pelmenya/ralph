@@ -73,10 +73,26 @@ describe('parseSessionRequests — разбор намерений кодер-с
         ).toThrow(/пар/i);
     });
 
+    // Динамические маршруты Next: скобки в имени сегмента — штатная форма, и без них
+    // замечание ревью на такой файл уносило ВЕСЬ батч намерений (потребитель medods-bridge,
+    // 25.08.2026 — две остановки сдачи фазы подряд).
+    it.each([
+        ['apps/web/app/[slug]/page.tsx', 'динамический сегмент'],
+        ['app/[...rest]/page.tsx', 'catch-all сегмент'],
+        ['app/[[...opt]]/page.tsx', 'необязательный catch-all'],
+        ['app/(group)/[id]/route.ts', 'скобки рядом с группой маршрутов'],
+    ])('путь %s принимается (%s)', (path) => {
+        expect(() =>
+            parseSessionRequests(line({ kind: 'pr-comment', comment: 'x', path, line: 1 }), opts),
+        ).not.toThrow();
+    });
+
     it.each([
         ['/etc/passwd', 'абсолютный путь'],
         ['../../secrets.env', 'выход за корень репозитория'],
         ['-rf', 'ведущий дефис — argument injection'],
+        ['[slug]/page.tsx', 'скобка первым символом — сужаем вход, реальным путям не нужно'],
+        ['app/[slug]/../../etc/passwd', 'скобки не открывают выход за дерево'],
     ])('НЕГАТИВНЫЙ: путь %s отвергается (%s)', (path) => {
         expect(() =>
             parseSessionRequests(line({ kind: 'pr-comment', comment: 'x', path, line: 1 }), opts),
