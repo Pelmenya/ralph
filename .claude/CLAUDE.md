@@ -16,10 +16,11 @@
 | `hooks/guard-process-kill.cjs`  | `kill` — только свой процесс и только по литеральному pid                    |
 | `hooks/guard-wiring.ts`         | сверка проводки: guard подключён и накрывает Bash, файловые инструменты, MCP |
 | `hooks/skill-barrier.cjs`       | правка теста в сессии петли — только после вызова `Skill(vitest)`            |
-| `hooks/load-context.cjs`        | SessionStart: подгружает handoff                                             |
+| `hooks/load-context.cjs`        | SessionStart: подгружает `local/HANDOFF.md`                                  |
 | `hooks/sync-docs.cjs`           | PostToolUse: пересобирает `AGENTS.md` после правки `CLAUDE.md`               |
 | `skills/vitest/`                | скилл vitest (сгенерирован в antfu/skills), правится только регенерацией     |
-| `state/HANDOFF.md`              | передача между сессиями                                                      |
+| `local/HANDOFF.md`              | передача между сессиями; локальный, под `.gitignore`                         |
+| `ralph/ralph.project.md`        | проектная половина промпта петли на каноне (конфиг рядом — локальный)        |
 
 ## Местные правила
 

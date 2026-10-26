@@ -14,7 +14,13 @@ import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
-import { TRACE_CLASSES, denyNamePattern, traceFindings, explain } from './project-traces.ts';
+import {
+    HISTORY_EXEMPT,
+    TRACE_CLASSES,
+    denyNamePattern,
+    traceFindings,
+    explain,
+} from './project-traces.ts';
 
 // Отсчёт от каталога МОДУЛЯ, а не от cwd: ядро гоняется и из своего корня, и из каталога
 // внутри проекта-потребителя, а CWD в этих раскладках разный. `import.meta.dirname` здесь
@@ -200,9 +206,12 @@ describe('сообщения коммитов', () => {
         expect(commits?.length ?? 0).toBeGreaterThan(0);
     });
 
+    const exempt = new Set(HISTORY_EXEMPT.map((e) => e.sha));
+
     it('ни одно сообщение не несёт следов проектов-потребителей', () => {
         const deny = denyNamePattern();
         const bad = (commits ?? []).flatMap(({ sha, body }) => {
+            if (exempt.has(sha)) return [];
             const findings = traceFindings(body, { deny });
             return findings.length === 0
                 ? []
@@ -212,5 +221,30 @@ describe('сообщения коммитов', () => {
             bad.join('\n'),
             'След в сообщении коммита правкой файла не убирается — историю придётся переписывать',
         ).toBe('');
+    });
+
+    // Исключение живёт ровно столько, сколько его причина. Иначе список копился бы молча:
+    // запись по SHA, которого нет в истории (опечатка, другая ветка), гасит пустоту и
+    // выглядит как работающее прощение.
+    it('каждое исключение истории указывает на коммит, который в ней есть', () => {
+        const known = new Set((commits ?? []).map((c) => c.sha));
+        const stale = HISTORY_EXEMPT.filter((e) => !known.has(e.sha)).map(
+            (e) => `${e.sha} — ${e.reason}`,
+        );
+        expect(stale.join('\n'), 'Исключение без коммита в истории — вычеркни').toBe('');
+    });
+
+    // Второй класс протухания: коммит есть, а скан на нём больше ничего не находит —
+    // значит запись прощает уже не след, а что угодно, что туда допишут. Проверить это
+    // можно только со словарём: следы в исключённых сообщениях — имена, а не форма.
+    it('каждое исключение истории всё ещё гасит настоящий след', () => {
+        const deny = denyNamePattern();
+        if (deny === null) return;
+        const bodies = new Map((commits ?? []).map((c) => [c.sha, c.body]));
+        const idle = HISTORY_EXEMPT.filter((e) => {
+            const body = bodies.get(e.sha);
+            return body !== undefined && traceFindings(body, { deny }).length === 0;
+        }).map((e) => `${e.sha} — ${e.reason}`);
+        expect(idle.join('\n'), 'Исключение, на котором скан чист, — вычеркни').toBe('');
     });
 });

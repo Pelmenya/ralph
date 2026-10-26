@@ -3,7 +3,10 @@
  * SessionStart hook — load handoff context + git state at session start.
  *
  * Reads:
- *   - .claude/state/HANDOFF.md (если есть)
+ *   - .claude/local/HANDOFF.md (если есть) — локальный, под .gitignore: handoff пишется
+ *     с путями машины и именами потребителей, а репозиторий публичный. Прежний
+ *     `.claude/state/HANDOFF.md` лежал в git и потому был вынужденно обезличен до
+ *     бесполезности — следующей сессии он не говорил, где и над чем идёт работа.
  *   - git status --short
  *   - git log --oneline -5
  *
@@ -18,7 +21,7 @@ const path = require('node:path');
 const { execSync } = require('node:child_process');
 
 function readHandoff() {
-    const handoffPath = path.join('.claude', 'state', 'HANDOFF.md');
+    const handoffPath = path.join('.claude', 'local', 'HANDOFF.md');
     try {
         if (fs.existsSync(handoffPath)) {
             return fs.readFileSync(handoffPath, 'utf-8').trim();
