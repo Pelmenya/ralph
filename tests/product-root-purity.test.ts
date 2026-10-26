@@ -30,7 +30,7 @@ import path from 'node:path';
 import {
     buildFixtureRuntime,
     diffSnapshots,
-    loadFixtureConfig,
+    loadConfigForLoop,
     runFixtureLoop,
     snapshotTree,
 } from './test-helpers.ts';
@@ -41,7 +41,7 @@ describe('прогон не пишет в каталог продукта', () =
     it('снимок дерева до и после полного фикстурного цикла совпадает', () => {
         const before = snapshotTree(PRODUCT_ROOT);
         const runtime = buildFixtureRuntime();
-        const cfg = loadFixtureConfig(runtime);
+        const cfg = loadConfigForLoop(runtime);
         runFixtureLoop(runtime, cfg);
         const diff = diffSnapshots(before, snapshotTree(PRODUCT_ROOT));
         expect(

@@ -336,12 +336,17 @@ export function createNoDeployCheck(): DeployCheckAdapter {
 // (`{ claude, kimi, openai }` в composition root orchestrator.ts) + говорящее имя переданной
 // функции, а не имя конструктора — поэтому три байт-в-байт копии не нужны (research:
 // `docs/…/research.md`). Claude-путь не трогается.
+//
+// `checkAvailable` (#44) обязателен, а не опционален: реализация без проверки готовности
+// пропустила бы сломанный рантайм на старте молча — ровно тот исход, ради которого метод
+// заведён.
 export type CoderRuntimeFns = {
     run: (prompt: string, options: RunOptions) => RunResult;
+    checkAvailable: () => void;
 };
 
 export function createCoderRuntime(fns: CoderRuntimeFns): CoderRuntimeAdapter {
-    return { run: fns.run };
+    return { run: fns.run, checkAvailable: fns.checkAvailable };
 }
 
 // ── Сборка набора швов по выбору из конфига (fail-closed) ─────────────────────

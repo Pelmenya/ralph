@@ -22,7 +22,7 @@ import fs from 'node:fs';
 import {
     FIXTURE_CONFIG_PATH,
     buildFixtureRuntime,
-    loadFixtureConfig,
+    loadConfigForLoop,
     runFixtureLoop,
 } from './test-helpers.ts';
 
@@ -124,7 +124,7 @@ describe('gateChecksFor на конфиге ЧУЖОГО проекта — со
 describe('dry-run переносимости ядра на чужом конфиге (#371)', () => {
     it('resolveProfile инициализирует фикстуру без ошибок и без подмешивания боевых значений', () => {
         const runtime = buildFixtureRuntime();
-        const cfg: Record<string, unknown> = loadFixtureConfig(runtime);
+        const cfg: Record<string, unknown> = loadConfigForLoop(runtime);
 
         expect(cfg.profileName).toBe('playground');
         expect((cfg.consumerScriptsResolved as { projectSync: string }).projectSync).toBe(
@@ -146,7 +146,7 @@ describe('dry-run переносимости ядра на чужом конфи
         // стояла копией в обоих, копии разъехались, и один из барьеров проверял меньше,
         // чем обещал его же название (ревью !21).
         const runtime = buildFixtureRuntime();
-        const cfg = loadFixtureConfig(runtime);
+        const cfg = loadConfigForLoop(runtime);
         const { shCalls, runClaudeCalls, openIssuesCalls, authChecked, savedStates, ctx } =
             runFixtureLoop(runtime, cfg);
 

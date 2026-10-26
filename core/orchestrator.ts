@@ -68,7 +68,11 @@ import {
     rollbackRuntime,
     type TMigrationDeps,
 } from './runtime-migration.ts';
-import type { TConsumerScripts, TConsumerScriptsResolved } from './config-profile.ts';
+import type {
+    TConsumerScripts,
+    TConsumerScriptsResolved,
+    TPermissionMode,
+} from './config-profile.ts';
 import { createStateLock } from './state-lock.ts';
 import type { RalphState } from './state-lock.ts';
 import { createTunnelCheck } from './tunnel-check.ts';
@@ -318,7 +322,7 @@ export type RalphConfig = {
     prompt?: string;
     model?: string;
     fallbackModel?: string;
-    permissionMode?: string;
+    permissionMode?: TPermissionMode;
     // #20: сколько РАЗ повторить кодер-сессию, не уложившуюся в бюджет ходов
     // (--max-turns). Целое ≥ 0, дефолт CODER_TURN_RETRIES; 0 — повторов нет (прежнее
     // поведение: исчерпание ходов на грязном дереве = стоп). Парный ключ к
@@ -1413,6 +1417,65 @@ export function createOrchestrator(env: OrchestratorEnv) {
         if (model) cmdArgs.push('-m', model);
         cmdArgs.push('--', prompt);
         return cmdArgs;
+    }
+
+    // #44: проба готовности рантайма — запускается ли его бинарь вообще. Реализация
+    // метода шва `checkAvailable` для всех трёх провайдеров (у kimi бинарь тот же `claude`,
+    // у openai — `codex`). Сломанный рантайм (бинаря нет, нет прав, оборванное
+    // автообновление удалило файл посреди прогона) раньше всплывал только первой кодер-
+    // сессией — после монитора, worktree и установки зависимостей.
+    //
+    // `--version` выбран как вызов, который не пишет ничего: ни сессии, ни конфига, ни сети
+    // — поэтому проба идёт и в `--dry-run`. Ключи kimi/openai проверяет не она, а резолв
+    // рантаймов в preflight: отказ ключа и отказ бинаря чинятся по-разному, и смешивать их
+    // в одну пробу значило бы назвать человеку не ту причину. Доступность API не
+    // проверяется сознательно: сетевой сбой на старте — транзиент, и стоп по нему ронял бы
+    // петлю там, где первая сессия просто переждала бы его штатной паузой.
+    //
+    // Бросает Error с причиной — текст отказа от шва, рамку «кодер-рантайм недоступен»
+    // ставит вызывающий (checkCoderRuntimes).
+    function probeRuntimeBinary(bin: string, spawnFn: typeof spawnSync = spawnSync): void {
+        if (spawnFn === spawnSync) guardSideEffect(`probeRuntimeBinary(${bin} --version)`);
+        const res = spawnFn(bin, ['--version'], {
+            stdio: ['ignore', 'pipe', 'pipe'],
+            shell: false,
+            timeout: 30 * 1000,
+            encoding: 'utf-8',
+        });
+        // Сигнал раньше ошибки: при таймауте spawnSync отдаёт и `error=ETIMEDOUT`, и
+        // `signal=SIGTERM` (тот же разбор, что у assertCodexLoginChannel).
+        if (res.signal) {
+            throw new Error(`\`${bin} --version\` убит сигналом ${res.signal} — бинарь не ответил`);
+        }
+        if (res.error) {
+            const code = (res.error as NodeJS.ErrnoException).code;
+            const why =
+                code === 'ENOENT'
+                    ? 'бинарь не найден в PATH'
+                    : code === 'EACCES'
+                      ? 'нет прав на исполнение'
+                      : res.error.message;
+            throw new Error(`\`${bin} --version\` не запустился: ${why}`);
+        }
+        if (res.status !== 0) {
+            const tail = `${res.stderr || ''}`.trim().split('\n').slice(-3).join(' / ');
+            throw new Error(
+                `\`${bin} --version\` вернул код ${res.status}${tail ? `: ${tail}` : ''}`,
+            );
+        }
+    }
+
+    // Успешная проба запоминается по имени бинаря: у claude и kimi бинарь один, и без памяти
+    // конфиг, где достижимы оба, ждал бы один и тот же `claude --version` дважды — до
+    // таймаута каждый. Запоминается только успех: отказ и так останавливает старт.
+    const probedRuntimeBinaries = new Set<string>();
+    function probeRuntimeBinaryOnce(
+        bin: string,
+        probeFn: (bin: string) => void = probeRuntimeBinary,
+    ): void {
+        if (probedRuntimeBinaries.has(bin)) return;
+        probeFn(bin);
+        probedRuntimeBinaries.add(bin);
     }
 
     // Тонкая обвязка над spawnSync для бинаря `codex` — сиблинг spawnClaude, НЕ рефактор его
@@ -3675,15 +3738,24 @@ export function createOrchestrator(env: OrchestratorEnv) {
             none: createNoDeployCheck(),
         },
         coderRuntime: {
-            claude: createCoderRuntime({ run: runClaudeOnce }),
+            claude: createCoderRuntime({
+                run: runClaudeOnce,
+                checkAvailable: () => probeRuntimeBinaryOnce('claude'),
+            }),
             // #373 (фаза 6): Kimi через тот же `claude` + endpoint Moonshot (env-своп в
             // runKimiOnce). Ключ выбирается конфигом (`adapters.coderRuntime: 'kimi'`);
             // дефолт остаётся `claude` (ADAPTER_DEFAULTS) — Claude-путь не меняется.
-            kimi: createCoderRuntime({ run: runKimiOnce }),
+            kimi: createCoderRuntime({
+                run: runKimiOnce,
+                checkAvailable: () => probeRuntimeBinaryOnce('claude'),
+            }),
             // #374 (фаза 6): OpenAI через ОТДЕЛЬНЫЙ `codex exec` (не поверх claude). Ключ
             // выбирается конфигом (`adapters.coderRuntime: 'openai'`); дефолт остаётся
             // `claude` (ADAPTER_DEFAULTS) — Claude-путь не меняется.
-            openai: createCoderRuntime({ run: runOpenAIOnce }),
+            openai: createCoderRuntime({
+                run: runOpenAIOnce,
+                checkAvailable: () => probeRuntimeBinaryOnce('codex'),
+            }),
         },
     };
 
@@ -3808,6 +3880,74 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     `(${b.reason}) — следующая фаза не начинается (#165). Почини прод/деплой и запусти с ` +
                     `--deploy-resolved, либо очисти state.deployBlock в ${RUNTIME.state}.`,
             );
+        }
+    }
+
+    // Рантаймы, достижимые из конфига: статический `adapters.coderRuntime` плюс провайдеры
+    // маршрутов modelRouting (labels/default/apiLimitFallback/healEscalation.route). Один
+    // набор на две проверки старта — резолв ключей в preflight и пробу готовности (#44):
+    // разъехавшись, они проверяли бы разные рантаймы, и фолбэк на непроверенный всплыл бы
+    // посреди ночи.
+    function reachableRuntimes(cfg: RalphConfig): {
+        providers: Set<string>;
+        routes: { provider: string; model?: string }[];
+    } {
+        const fallbackProvider = adapterSelection.coderRuntime;
+        const routing = cfg.modelRouting;
+        const entries: (ModelRouteEntry | undefined)[] = [];
+        if (routing) {
+            if (routing.labels) entries.push(...Object.values(routing.labels));
+            entries.push(routing.default, routing.apiLimitFallback, routing.healEscalation?.route);
+        }
+        const routes = entries
+            .map((e) => resolveModelRoute(e, fallbackProvider))
+            .filter((r): r is { provider: string; model?: string } => r !== null);
+        const providers = new Set<string>([fallbackProvider, ...routes.map((r) => r.provider)]);
+        return { providers, routes };
+    }
+
+    // #44: готовность кодер-рантайма проверяется ДО всего, что стоит времени, — worktree,
+    // установки зависимостей, монитора, первой итерации. Раньше сломанный рантайм (бинарь
+    // пропал посреди автообновления CLI) всплывал только первой кодер-сессией, и диагноз
+    // человек доставал из её лога.
+    //
+    // Отдельный шаг, а не строка внутри preflight(): preflight в main() идёт после переезда
+    // в worktree и синка зависимостей (#181 держит синк вплотную к переезду), а проверка,
+    // поставленная после установки, опоздала бы ровно на неё. Проверка через шов
+    // (`checkAvailable`), а не по имени бинаря: ядро не знает, что рантайм называется
+    // claude, — то же правило, по которому в ядре нет `gh`.
+    //
+    // Проверяются ВСЕ достижимые рантаймы, а не только статический: фолбэк лимита или
+    // эскалация на непроверенный рантайм упали бы посреди ночи, ровно как без проверки.
+    // Текст отказа отличим от отказа форжа («Форж не авторизован…»): разные причины —
+    // разный ремонт. Read-only: шов только спрашивает, поэтому шаг идёт и в --dry-run.
+    function checkCoderRuntimes(
+        cfg: RalphConfig,
+        {
+            failFn = fail as FailFn,
+            logFn = log,
+            checkRuntimeFn = (provider: string) => {
+                const impl = adapterRegistries.coderRuntime[provider];
+                if (!impl) throw new Error('реализация не зарегистрирована в реестре coderRuntime');
+                impl.checkAvailable();
+            },
+        }: {
+            failFn?: FailFn;
+            logFn?: LogFn;
+            checkRuntimeFn?: (provider: string) => void;
+        } = {},
+    ): void {
+        for (const provider of reachableRuntimes(cfg).providers) {
+            try {
+                checkRuntimeFn(provider);
+            } catch (e) {
+                failFn(
+                    `Кодер-рантайм недоступен (${provider}): ${(e as Error).message}. ` +
+                        'Почини установку рантайма на хосте и перезапусти — форж и конфиг тут ни при чём.',
+                );
+                return;
+            }
+            logFn(`✅ Кодер-рантайм готов: ${provider}`);
         }
     }
 
@@ -4022,21 +4162,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // и в dry. Модель на провайдера берём из записи, если она его назвала (resolve*Runtime
         // требует model); статическому провайдеру модель даёт его *Runtime.model в резолвере.
         {
-            const fallbackProvider = adapterSelection.coderRuntime;
-            const routing = cfg.modelRouting;
-            const entries: (ModelRouteEntry | undefined)[] = [];
-            if (routing) {
-                if (routing.labels) entries.push(...Object.values(routing.labels));
-                entries.push(
-                    routing.default,
-                    routing.apiLimitFallback,
-                    routing.healEscalation?.route,
-                );
-            }
-            const routes = entries
-                .map((e) => resolveModelRoute(e, fallbackProvider))
-                .filter((r): r is { provider: string; model?: string } => r !== null);
-            const providers = new Set<string>([fallbackProvider, ...routes.map((r) => r.provider)]);
+            const { providers, routes } = reachableRuntimes(cfg);
             const modelFor = (provider: string): string | undefined =>
                 routes.find((r) => r.provider === provider && r.model)?.model;
             const failHard = failFn as unknown as (m: string) => never;
@@ -8086,6 +8212,13 @@ export function createOrchestrator(env: OrchestratorEnv) {
         log(`⚙️  Профиль: ${config.profileName}`);
         if (roots) log(`🗂  Состояние экземпляра: ${roots.runtimeDir}`);
 
+        // #44: рантайм кодера — до worktree и установки зависимостей (докблок
+        // checkCoderRuntimes). В --dry-run тоже: проба ничего не пишет, а ответ «запустится
+        // ли сессия» dry обязан давать тот же, что живой запуск. В --reset — нет: сброс
+        // state — инструмент восстановления, кодер ему не нужен, и хост со сломанным CLI
+        // остался бы без способа сбросить состояние.
+        if (!RESET) checkCoderRuntimes(config);
+
         // #76: раннер переезжает в выделенный worktree ДО всего остального (включая --reset —
         // state в прежней раскладке живёт в worktree — RUNTIME.state тогда CLAUDE_DIR-
         // относителен; с заданным runtimeDir он уже абсолютен и от chdir не зависит). C1: --dry-run строго read-only — worktree не
@@ -8335,6 +8468,12 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // #373 (фаза 6): рантайм Kimi (тот же `claude` + endpoint Moonshot). Экспорт —
         // для смоук-теста рантайма и юнитов чистых хелперов (env/резолв, fail-closed).
         runKimiOnce,
+        // #44: проба готовности рантайма и шаг старта, её зовущий; реестр — для
+        // контрактного теста «у каждой зарегистрированной реализации есть checkAvailable».
+        probeRuntimeBinary,
+        probeRuntimeBinaryOnce,
+        checkCoderRuntimes,
+        adapterRegistries,
         buildKimiSpawnEnv,
         resolveKimiRuntime,
         // #374 (фаза 6): рантайм OpenAI (отдельный `codex exec`). Экспорт — для смоук-теста

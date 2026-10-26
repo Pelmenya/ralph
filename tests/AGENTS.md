@@ -30,6 +30,7 @@
 | `false-stop-scenarios.test.ts`      | петля не встаёт там, где отказа нет: пустой индекс, человеческий хвост            |
 | `strip-comments.ts`                 | снятие комментариев — общая деталь обоих сканов по коду                           |
 | `porting-dry-run.test.ts`           | ядро планирует фазу на конфиге ЧУЖОГО проекта                                     |
+| `demo-dry-run.test.ts`              | шаблон демо (`examples/demo/`) проходит цикл ядра; карточки, гейт, проводка guard |
 | `blocked-` / `hold-scenarios`       | переходы петли в `blocked` и `hold` через настоящий `runLoop`                     |
 | `lock-scenarios.test.ts`            | защита от двойного запуска                                                        |
 | `deadman-scenarios.test.ts`         | пороги тишины на реальном файле лога                                              |

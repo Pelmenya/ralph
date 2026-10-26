@@ -58,6 +58,24 @@ export function isPlainObject(v: unknown): v is Record<string, unknown> {
 // повод остановиться, а не тихо нейтрализовать (fail-closed, как и вся схема профилей).
 const FORBIDDEN_KEYS = ['__proto__', 'constructor', 'prototype'];
 
+// Режимы прав сессии, которые принимает `--permission-mode` CLI кодера (канон, задача 33).
+// Список закрыт: значение уходит в CLI как есть, и незнакомое валит старт. Снят с
+// Claude Code 2.1.311: `claude --help` перечисляет acceptEdits, auto, bypassPermissions,
+// manual, dontAsk, plan; `default` в справке нет, но CLI его принимает (проверено вызовом
+// `--permission-mode default`) — старые конфиги с ним не ломаются. Новый режим CLI
+// попадает сюда правкой со сверкой по `claude --help`, иначе отказ назовёт опечаткой
+// валидное значение.
+export const PERMISSION_MODES = [
+    'default',
+    'acceptEdits',
+    'auto',
+    'bypassPermissions',
+    'manual',
+    'dontAsk',
+    'plan',
+] as const;
+export type TPermissionMode = (typeof PERMISSION_MODES)[number];
+
 // Скрипты потребителя, которые умеет звать ядро (канон, задача 23). Список закрыт: он же
 // служит проверкой опечатки в имени ключа — незнакомый ключ валит старт, а не тихо
 // выключает скрипт.
@@ -189,6 +207,36 @@ export function createConfigProfile(env: ConfigProfileEnv) {
             return failFn(
                 `ralph.config.json (профиль "${profileName}"): haltBeforeDeploy осмыслен только в профиле "prod" ` +
                     `(пост-мердж деплой фазы 5, #249). Вне prod флаг молча ничего не значит — убери его из этого профиля/common.`,
+            );
+        }
+        return true;
+    }
+
+    // Канон, задача 33: permissionMode уходит в `--permission-mode` кодер-сессии как есть
+    // (`buildClaudeArgs`). Опечатка (`bypassPermission`, `bypass-permissions`) без барьера
+    // молча уехала бы в CLI, и режим прав сессии оказался бы не тем, который заказан
+    // конфигом, — заметно это только по поведению живой сессии. Класс тот же, что у
+    // haltBeforeDeploy: сдвиг режима, который выглядит исправной конфигурацией. Список
+    // закрыт: новый режим CLI попадает сюда правкой, а не догадкой.
+    // Возврат: true — валиден; иначе результат failFn (мягкий failFn пробрасываем наверх).
+    function assertValidPermissionMode(
+        cfg: Record<string, unknown>,
+        profileName: string,
+        failFn: FailFn = fail,
+    ): unknown {
+        const v = cfg.permissionMode;
+        if (v === undefined) return true; // не задан — режим CLI по умолчанию, проверять нечего
+        const allowed = PERMISSION_MODES.join(', ');
+        if (typeof v !== 'string') {
+            return failFn(
+                `ralph.config.json (профиль "${profileName}"): permissionMode = ${JSON.stringify(v)} — ожидалась строка. ` +
+                    `Допустимые: ${allowed}. Убери ключ (режим CLI по умолчанию) либо задай одно из них.`,
+            );
+        }
+        if (!(PERMISSION_MODES as readonly string[]).includes(v)) {
+            return failFn(
+                `ralph.config.json (профиль "${profileName}"): permissionMode = ${JSON.stringify(v)} — неизвестный режим. ` +
+                    `Допустимые: ${allowed}. Значение уходит в --permission-mode как есть, и опечатка тихо сменила бы режим прав сессии.`,
             );
         }
         return true;
@@ -802,6 +850,10 @@ export function createConfigProfile(env: ConfigProfileEnv) {
         // иначе опечатка в типе тихо даёт halt-режим — см. assertValidHaltBeforeDeploy).
         const haltOk = assertValidHaltBeforeDeploy(merged, wanted, failFn);
         if (haltOk !== true) return haltOk; // мягкий failFn — наверх как есть
+        // Канон, задача 33: permissionMode уходит в --permission-mode как есть — опечатка
+        // тихо сменила бы режим прав сессии (см. assertValidPermissionMode).
+        const permOk = assertValidPermissionMode(merged, wanted, failFn);
+        if (permOk !== true) return permOk; // мягкий failFn — наверх как есть
         // #376: modelRouting провайдер-осведомлён — валидируем схему целиком (labels/
         // default/apiLimitFallback/healEscalation) до того, как раннер начнёт резолвить
         // провайдера по label'ам issue.
@@ -843,6 +895,7 @@ export function createConfigProfile(env: ConfigProfileEnv) {
         deepMerge,
         parseProfileFlag,
         assertValidHaltBeforeDeploy,
+        assertValidPermissionMode,
         assertValidModelRouting,
         assertValidPromptPlaceholders,
         assertValidReviewBacklog,

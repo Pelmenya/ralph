@@ -289,6 +289,77 @@ describe('resolveProfile — сборка итогового конфига из
         // Тот же флаг в common на prod — валиден.
         expect(resolveProfile(cfg, 'prod', boom).haltBeforeDeploy).toBe(true);
     });
+
+    // Канон, задача 33: permissionMode уходит в `--permission-mode` как есть, и опечатка
+    // тихо меняла бы режим прав сессии — ловим на старте, как haltBeforeDeploy.
+    describe('permissionMode — значение из известного списка (задача 33)', () => {
+        const withMode = (
+            common: Record<string, unknown>,
+            profile: Record<string, unknown> = {},
+        ) => ({
+            defaultProfile: 'playground',
+            common: { phases: [{ milestone: 'M', branch: 'b' }], ...common },
+            profiles: { playground: profile, prod: {} },
+        });
+
+        it('каждое известное значение проходит и доезжает до конфига как есть', () => {
+            // Список выписан руками, а не взят из PERMISSION_MODES: сверка с CLI (2.1.311),
+            // а не с самим собой — режим, выпавший из константы, здесь покраснеет.
+            for (const mode of [
+                'default',
+                'acceptEdits',
+                'auto',
+                'bypassPermissions',
+                'manual',
+                'dontAsk',
+                'plan',
+            ]) {
+                const cfg = resolveProfile(withMode({ permissionMode: mode }), null, boom);
+                expect(cfg.permissionMode).toBe(mode);
+            }
+        });
+
+        it('ключа нет — режим CLI по умолчанию, проверять нечего', () => {
+            expect(resolveProfile(withMode({}), null, boom).permissionMode).toBeUndefined();
+        });
+
+        it('опечатка → стоп с именем профиля и перечнем допустимых', () => {
+            for (const typo of [
+                'bypassPermission',
+                'bypass-permissions',
+                'BypassPermissions',
+                '',
+            ]) {
+                expect(() =>
+                    resolveProfile(withMode({ permissionMode: typo }), null, boom),
+                ).toThrow(
+                    /профиль "playground".*permissionMode.*default, acceptEdits, auto, bypassPermissions, manual, dontAsk, plan/,
+                );
+            }
+        });
+
+        it('не строка → стоп (число, null, булево, объект)', () => {
+            for (const v of [1, null, true, { mode: 'plan' }]) {
+                expect(() => resolveProfile(withMode({ permissionMode: v }), null, boom)).toThrow(
+                    /permissionMode.*ожидалась строка/,
+                );
+            }
+        });
+
+        it('опечатка в профиле ловится поверх валидного common', () => {
+            const raw = withMode(
+                { permissionMode: 'bypassPermissions' },
+                { permissionMode: 'plann' },
+            );
+            expect(() => resolveProfile(raw, 'playground', boom)).toThrow(/"plann"/);
+            expect(resolveProfile(raw, 'prod', boom).permissionMode).toBe('bypassPermissions');
+        });
+
+        it('мягкий failFn пробрасывается наверх как есть', () => {
+            const soft = () => null;
+            expect(resolveProfile(withMode({ permissionMode: 'nope' }), null, soft)).toBe(null);
+        });
+    });
 });
 
 // #16: накопительная веха карточек лестницы. Ключи валидируются на старте (инвариант №1):

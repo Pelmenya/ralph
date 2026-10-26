@@ -197,6 +197,7 @@ function makeFakeRuntime(result: { code: number; output: string }): {
             runs.push({ prompt, maxTurns: options.maxTurns, model: options.model });
             return { code: result.code, output: result.output };
         },
+        checkAvailable: () => {},
     };
     return { adapter, runs };
 }

@@ -1447,7 +1447,10 @@ registerDeployCheckContract(
 // ── CoderRuntimeAdapter ──────────────────────────────────────────────────────────────
 
 function buildFakeRuntime(result: { code: number; output: string }): CoderRuntimeAdapter {
-    return createCoderRuntime({ run: () => ({ code: result.code, output: result.output }) });
+    return createCoderRuntime({
+        run: () => ({ code: result.code, output: result.output }),
+        checkAvailable: () => {},
+    });
 }
 
 // Боевая логика: buildClaudeArgs + spawnClaude (ralph.js), spawnFn подменён — та же граница
@@ -1464,6 +1467,7 @@ function buildRealRuntime(spawnResult: {
             const argv = ralph.buildClaudeArgs(options, {});
             return ralph.spawnClaude(argv, prompt, 1000, spawnFn);
         },
+        checkAvailable: () => ralph.probeRuntimeBinary('claude', spawnFn),
     });
 }
 
@@ -1491,8 +1495,34 @@ function registerCoderRuntimeContract(
             const res = adapter.run('задача', { maxTurns: 10 });
             expect(res.code).toBe(1);
         });
+
+        // #44: проверка готовности — часть контракта, а не опция реализации.
+        it('checkAvailable есть и у готового рантайма не бросает', () => {
+            const adapter = buildOk();
+            expect(typeof adapter.checkAvailable).toBe('function');
+            expect(() => adapter.checkAvailable()).not.toThrow();
+        });
     });
 }
+
+// #44: боевая проба готовности обязана БРОСАТЬ на сломанном рантайме — иначе preflight
+// пропустит его молча. Фейку тут проверять нечего: он ничего не запускает.
+describe('CoderRuntimeAdapter.checkAvailable — боевая проба (spawnFn подменён)', () => {
+    it('НЕГАТИВНЫЙ: ненулевой код пробы → бросает', () => {
+        const adapter = buildRealRuntime({ status: 2, stdout: '', stderr: 'boom' });
+        expect(() => adapter.checkAvailable()).toThrow(/код 2/);
+    });
+
+    it('НЕГАТИВНЫЙ: проба убита сигналом → бросает', () => {
+        const adapter = buildRealRuntime({
+            status: null,
+            stdout: '',
+            stderr: '',
+            signal: 'SIGTERM',
+        });
+        expect(() => adapter.checkAvailable()).toThrow(/SIGTERM/);
+    });
+});
 
 registerCoderRuntimeContract(
     'фейк (in-memory)',

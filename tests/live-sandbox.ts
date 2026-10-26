@@ -143,7 +143,7 @@ function sandboxConfig(sb: LiveSandbox): unknown {
             authorAllowlist: ['sandbox-bot'],
             model: 'sandbox-coder-model',
             fallbackModel: 'none',
-            permissionMode: 'sandbox-permission-mode',
+            permissionMode: 'bypassPermissions',
             installCmd: 'true',
             adapters: { deployCheck: 'none' },
             gate: { checks: [['test', 'true']], prodChecks: [], prodDropChecks: [] },
@@ -231,9 +231,15 @@ esac
  * (`runtimeDir` — её же конфиг) и вшивает его в шим при сборке, а не выкусывает из текста
  * промпта: переформулировка промпта оставила бы сводку незаписанной, и живой цикл встал бы
  * на `review-no-verdict` — стопом, который выглядит дефектом ядра, а не песочницы.
+ *
+ * На `--version` шим отвечает версией и выходит, ничего не трогая: этим вызовом раннер
+ * проверяет готовность рантайма на старте (#44), ДО пробы барьера. Без ответа проба
+ * исполняла бы сценарий кодера — писала промпт и подсунутые файлы, — и барьеры «кодер не
+ * запускался» и «запись поймана ровно один раз» краснели бы на самой пробе.
  */
 function coderShim(sb: LiveSandbox, extra: string): string {
     return `#!/bin/sh
+if [ "$1" = "--version" ]; then echo "0.0.0 (sandbox)"; exit 0; fi
 SANDBOX_PRODUCT_ROOT="${sb.productRoot}"
 cat > "${sb.root}/coder-prompt.txt"
 ${extra}

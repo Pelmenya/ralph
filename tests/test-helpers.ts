@@ -324,10 +324,19 @@ export function buildFixtureRuntime() {
     });
 }
 
-/** Резолвнутый конфиг фикстуры + установка его как фабричного (боевой путь делает main()). */
-export function loadFixtureConfig(runtime: ReturnType<typeof buildFixtureRuntime>) {
-    const raw = JSON.parse(fs.readFileSync(FIXTURE_CONFIG_PATH, 'utf-8')) as unknown;
-    const cfg = runtime.resolveProfile(raw, 'playground', (msg: string) => {
+/**
+ * Резолвнутый конфиг для цикла + установка его как фабричного (боевой путь делает main()).
+ * По умолчанию — конфиг фикстуры; путь и профиль — параметрами: тем же циклом проверяется
+ * конфиг демо-проекта (`demo-dry-run.test.ts`), и вторая копия обвязки разъехалась бы с
+ * этой (ревью !21).
+ */
+export function loadConfigForLoop(
+    runtime: ReturnType<typeof buildFixtureRuntime>,
+    configPath: string = FIXTURE_CONFIG_PATH,
+    profile: string = 'playground',
+) {
+    const raw = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as unknown;
+    const cfg = runtime.resolveProfile(raw, profile, (msg: string) => {
         throw new Error(msg);
     }) as Parameters<typeof runtime.preflight>[0];
     runtime.setConfigForTests(cfg);

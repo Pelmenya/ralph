@@ -279,11 +279,16 @@ describe('мапперы гейта / нотификатора / рантайм�
     // #373/#374: один конструктор на все провайдеры кодер-рантайма (claude/kimi/openai) —
     // контракт шва идентичен, провайдер-специфика живёт в боевой функции `run`, а читаемость
     // намерения даёт КЛЮЧ реестра, не имя конструктора.
-    it('createCoderRuntime раскладывает run (общий на claude/kimi/openai)', () => {
+    it('createCoderRuntime раскладывает run и checkAvailable (общий на claude/kimi/openai)', () => {
         const run = vi.fn(() => ({ code: 0, output: 'diff' }));
-        const r: CoderRuntimeAdapter = createCoderRuntime({ run });
+        const checkAvailable = vi.fn(() => {
+            throw new Error('бинарь не найден');
+        });
+        const r: CoderRuntimeAdapter = createCoderRuntime({ run, checkAvailable });
         expect(r.run('промпт', { maxTurns: 10 })).toEqual({ code: 0, output: 'diff' });
         expect(run).toHaveBeenCalledWith('промпт', { maxTurns: 10 });
+        // #44: отказ проверки доходит до ядра исключением, а не проглатывается маппером.
+        expect(() => r.checkAvailable()).toThrow(/бинарь не найден/);
     });
 });
 
@@ -333,6 +338,7 @@ function fakeRegistries(): AdapterRegistries {
     });
     const coderRuntime: CoderRuntimeAdapter = createCoderRuntime({
         run: () => ({ code: 0, output: '' }),
+        checkAvailable: () => {},
     });
     return {
         taskSource: { github: ts },
@@ -361,6 +367,7 @@ describe('buildAdapters — сборка набора швов по выбору
         const reg = fakeRegistries();
         const secondRuntime: CoderRuntimeAdapter = createCoderRuntime({
             run: () => ({ code: 7, output: 'kimi' }),
+            checkAvailable: () => {},
         });
         reg.coderRuntime.kimi = secondRuntime;
         const sel = resolveAdapterSelection({ coderRuntime: 'kimi' }, throwingFail);

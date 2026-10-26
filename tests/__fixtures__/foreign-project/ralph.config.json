@@ -8,7 +8,7 @@
         "authorAllowlist": ["orbital-bot"],
         "model": "fixture-coder-model-default",
         "fallbackModel": "fixture-coder-model-default",
-        "permissionMode": "fixture-permission-mode",
+        "permissionMode": "bypassPermissions",
         "installCmd": "pnpm install --frozen-lockfile",
         "runnerWorktreeDirname": "sputnik-tracker-ralph",
         "gate": {
