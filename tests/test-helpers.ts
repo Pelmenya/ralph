@@ -225,6 +225,9 @@ export function makeRunLoopScenario(
                 // см. докблок noSessionRequests выше.
                 applySessionRequestsFn: sessionRequests,
                 ensureCleanFn: () => true,
+                // #85: пуш коммитов сессии разбора blocked — настоящий git push. Заглушено «пушить
+                // нечего»; сценарии пуша и отказа переопределяют, модуль — core/session-push.test.ts.
+                pushSessionCommitsFn: () => ({ kind: 'in-sync' as const }),
                 // #134: проводка на ветку фазы — настоящий git в дереве тестов;
                 // сценарии самой проводки живут в core/phase-branch.test.ts.
                 ensurePhaseBranchFn: (branch: string) => {

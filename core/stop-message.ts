@@ -20,6 +20,9 @@ export type TStopReason =
     | 'review-no-verdict'
     | 'blocked-unconfirmed'
     | 'main-conflict'
+    | 'main-sync-failed'
+    | 'head-diverged'
+    | 'session-unpushed'
     | 'tree-dirty'
     | 'breaker'
     | 'deadman'
@@ -49,6 +52,13 @@ export const REASON_TITLES: Record<TStopReason, string> = {
     'review-no-verdict': 'ревью без вердикта',
     'blocked-unconfirmed': 'метка blocked не подтверждена',
     'main-conflict': 'конфликт веток',
+    // fetch, identity, пуш или `--abort` упали. Заголовок нейтральный в обе стороны:
+    // «конфликт веток» отправил бы человека искать конфликт, которого нет, а «не конфликт»
+    // отрицал бы настоящий конфликт, после которого упал `--abort`, — что именно было,
+    // говорит диагноз (ревью #66).
+    'main-sync-failed': 'ветка не подтянута к main',
+    'head-diverged': 'локальный ref ветки разошёлся с головой PR',
+    'session-unpushed': 'незапушенный коммит сессии разбора',
     'tree-dirty': 'дерево не на нужной ветке',
     breaker: 'circuit breaker',
     deadman: 'тишина лога (deadman)',

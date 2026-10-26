@@ -113,6 +113,9 @@ function runPhase({
     // #115-ревью: код возврата сессии АРБИТРА. Ненулевой — падение его сессии, а не
     // отказ по существу: состояние «арбитр отработал» при этом фиксироваться не должно.
     arbiterCode = 0,
+    // Задача 40: код возврата остальных сессий по промпту и номеру вызова такого же
+    // промпта (с нуля). `undefined` — штатный ноль.
+    sessionCode = (() => undefined) as (prompt: string, nth: number) => number | undefined,
     // #16: сколько НЕЗАКРЫТЫХ карточек уже лежит в каждой накопительной вехе. Через тот же
     // шов, которым петля считает очередь фазы: потолок вехи считается её содержимым, а не
     // числом, которое тест мог бы подсунуть мимо форжа.
@@ -247,7 +250,9 @@ function runPhase({
             runClaudeFn: (prompt: string, opts?: { model?: string }) => {
                 prompts.push(prompt);
                 models.push(opts?.model ?? '');
-                return isArbiterPrompt(prompt) ? arbiterCode : 0;
+                if (isArbiterPrompt(prompt)) return arbiterCode;
+                const nth = prompts.filter((p) => p === prompt).length - 1;
+                return sessionCode(prompt, nth) ?? 0;
             },
             // Намерения применяет петля; здесь фейк отдаёт то, что «оставила» сессия.
             applySessionRequestsFn: (args: { currentMilestone?: string }) => {
@@ -290,6 +295,8 @@ function runPhase({
                 };
             },
             ensureCleanFn: () => true,
+            // #85: см. тот же дефолт в tests/test-helpers.ts.
+            pushSessionCommitsFn: () => ({ kind: 'in-sync' as const }),
             // #134: см. тот же дефолт в tests/test-helpers.ts.
             ensurePhaseBranchFn: (branch: string) => {
                 placements.push(prompts.length);
@@ -1338,5 +1345,30 @@ describe('задача 73: сессии правок стартуют на ве�
         expect(s.fixPrompts()).toHaveLength(c.nth);
         expect(s.pushTexts().some((t) => t.includes(c.where))).toBe(true);
         expect(s.merged()).toBe(false);
+    });
+});
+
+// Задача 40: падение сессии лестницы останавливает сдачу — и об этом человек узнаёт пушем,
+// а не из лога утром. Ровно одним: второй пуш о том же стопе читался бы вторым событием.
+describe('задача 40: стоп лестницы ревью правок — ровно один пуш', () => {
+    it('проход ревью правок упал → один пуш, мерджа нет', () => {
+        const run = runPhase({
+            sessionCode: (p) => (isFixReviewPrompt(p) ? 1 : undefined),
+        });
+        expect(run.pushTexts()).toHaveLength(1);
+        expect(run.pushTexts()[0]).toMatch(/проход ревью правок фазы "M1" упал \(код 1\)/);
+        expect(run.merged()).toBe(false);
+    });
+
+    it('повторные правки по находкам прохода упали → один пуш, мерджа нет', () => {
+        const run = runPhase({
+            passes: [{ findings: [blocker('теряется отказ', 10)] }],
+            // Первая сессия правок — штатная; падает вторая, по находкам прохода.
+            sessionCode: (p, nth) => (isFixPrompt(p) && nth >= 1 ? 1 : undefined),
+        });
+        expect(run.fixPrompts().length).toBeGreaterThanOrEqual(2);
+        expect(run.pushTexts()).toHaveLength(1);
+        expect(run.pushTexts()[0]).toMatch(/правки по ревью правок фазы "M1" упали \(код 1\)/);
+        expect(run.merged()).toBe(false);
     });
 });

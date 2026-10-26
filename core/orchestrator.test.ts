@@ -117,6 +117,7 @@ const {
     runLoop,
     loadState,
     ensureClean,
+    commitLeftovers,
     handleCrashedCoderSession,
     parkOnOriginMain,
     gateChecksFor,
@@ -3843,6 +3844,9 @@ describe('runLoop — основной while-цикл: итерации коде
             prHasBlockedLabelFn: () => true,
             runClaudeFn: () => 0,
             ensureCleanFn: () => true,
+            // #85: пуш коммитов сессии разбора blocked — настоящий git push. Заглушено «пушить
+            // нечего»; сценарии пуша и отказа переопределяют, модуль — core/session-push.test.ts.
+            pushSessionCommitsFn: () => ({ kind: 'in-sync' as const }),
             phaseMergedFn: () => false,
             // #237: тот же безопасный дефолт — настоящий mergedPhasePr зовёт ghJson → sh,
             // и тест на пути «фаза уже смерджена» ловил бы предохранитель #138.
@@ -3870,8 +3874,13 @@ describe('runLoop — основной while-цикл: итерации коде
             // #86: безопасный дефолт-заглушка — без него тест, не переопределивший
             // pushEventFn явно, звал бы НАСТОЯЩИЙ pushEvent (реальный log() + попытка
             // sendTelegramMessage в prod-сценариях). Сценарии, проверяющие сам пуш,
-            // подменяют его явно.
-            pushEventFn: () => false,
+            // подменяют его явно. Строку в лог дефолт пишет так же, как боевой pushEvent
+            // (`🔔 PUSH: …` через прокинутый logFn): стоп, переехавший из лога в пуш
+            // (задача 40), не должен пропадать из лога сценария.
+            pushEventFn: (msg: string, _cfg?: unknown, o?: { logFn?: (m: string) => void }) => {
+                o?.logFn?.(`🔔 PUSH: ${msg}`);
+                return false;
+            },
             // #151: тот же безопасный дефолт-заглушка, что у pushEventFn/syncProjectBoardFn
             // выше — без него тест, не переопределивший ensureMonitorAliveFn явно, звал бы
             // НАСТОЯЩИЙ ensureMonitorAlive (реальные fs.readFileSync/spawn монитора).
@@ -4018,6 +4027,51 @@ describe('runLoop — основной while-цикл: итерации коде
         expect(commitLeftoversFn).toHaveBeenCalled();
         // Цикл НЕ встал: сессия по карточке запустилась.
         expect(runClaudeFn).toHaveBeenCalledTimes(1);
+    });
+
+    // #13: строка «⛔ … — стоп, разбери руками» шла в лог за 0.2 с до «📦 Остаток
+    // закоммичен», после чего петля спокойно продолжала. Разбор прогона человеком ушёл
+    // по ложному следу — искал стоп, которого не было. Про стоп говорит тот, кто его
+    // принимает: здесь склеены НАСТОЯЩИЕ ensureClean и commitLeftovers на одном логе.
+    it('#13 авто-коммит остатка удался → в логе нет слова «стоп»', () => {
+        const logs: string[] = [];
+        const logFn = (m: string) => logs.push(m);
+        let committed = false;
+        const shFn = (c: string) => {
+            if (c === 'git status --porcelain') return committed ? '' : ' M core/a.ts';
+            if (c === 'git diff --cached --name-only') return 'core/a.ts';
+            return '';
+        };
+        const shArgvFn = (_cmd: string, args: string[]) => {
+            if (args[0] === 'commit') committed = true;
+            return '';
+        };
+        const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+        runLoop(
+            validCfg(),
+            ctx(mkState()),
+            deps(logs, {
+                once: true,
+                phaseIndexOfFn: () => 0,
+                ensureCleanFn: (c: string) => ensureClean(c, { shFn, logFn }),
+                commitLeftoversFn: (c: string) => commitLeftovers(c, { shFn, shArgvFn, logFn }),
+                openIssuesFn: () => [{ number: 5, title: 'задача', labels: [] }],
+                runClaudeFn,
+            }),
+        );
+        expect(committed).toBe(true);
+        expect(runClaudeFn).toHaveBeenCalledTimes(1);
+        // Смотрим ветку авто-коммита — строки ДО запуска сессии: `once` дальше честно
+        // пишет свой HITL-стоп, и он к ветке остатка отношения не имеет.
+        const upToCommit = logs.slice(
+            0,
+            logs.findIndex((m) => /Остаток сессии закоммичен/.test(m)) + 1,
+        );
+        const text = upToCommit.join('\n');
+        expect(text).toMatch(/Грязное рабочее дерево/);
+        expect(text).toMatch(/Остаток сессии закоммичен/);
+        expect(text).not.toMatch(/стоп/i);
+        expect(text).not.toMatch(/разбери руками/);
     });
 
     it('#66 чистое дерево → коммита не случается вовсе', () => {
@@ -6123,7 +6177,7 @@ describe('runLoop — основной while-цикл: итерации коде
         );
         expect(runClaudeFn).toHaveBeenCalledTimes(1);
         expect(state.submitted).toBeFalsy();
-        expect(logs.join('\n')).toMatch(/Шаг правок по ревью упал \(код 1\)/);
+        expect(logs.join('\n')).toMatch(/шаг правок по ревью фазы "M1" упал \(код 1\)/);
     });
 
     it('#594 НЕГАТИВНЫЙ: ходы кончаются каждый раз → повторы не бесконечны, стоп fail-closed', () => {
@@ -6200,6 +6254,147 @@ describe('runLoop — основной while-цикл: итерации коде
         expect(runClaudeFn).toHaveBeenCalledTimes(1);
         expect(state.submitted).toBeFalsy();
         expect(logs.join('\n')).toMatch(/Намерения сессии \(правки по ревью\) не применились/);
+    });
+
+    // #85: сессия разбора закоммитила и не запушила — гейт после merge-вердикта отказал на
+    // расхождении ref с головой PR, и вахта пушила руками. Пушит раннер, до повторного ревью.
+    it('#85: незапушенный коммит сессии разбора → раннер пушит его до повторного ревью, фаза идёт дальше', () => {
+        const logs: string[] = [];
+        const order: string[] = [];
+        const state = mkState({
+            submitted: true,
+            blockedHeals: 0,
+            lastReviewModel: 'claude-opus-4-8',
+        });
+        const runClaudeFn = vi.fn<RunClaudeFake>(() => {
+            order.push('session');
+            return 0;
+        });
+        const pushSessionCommitsFn = vi.fn((branch: string) => {
+            order.push(`push:${branch}`);
+            return { kind: 'pushed' as const, local: 'b'.repeat(40), remote: 'a'.repeat(40) };
+        });
+        const pushEventFn = vi.fn((msg: string) => msg.length > 0);
+        runLoop(
+            validCfg({ blockedHealAttempts: 3 }),
+            ctx(state),
+            deps(logs, {
+                tryMergePhaseFn: () => 'blocked',
+                pickReviewModelFn: () => 'claude-opus-4-8',
+                runClaudeFn,
+                pushSessionCommitsFn,
+                pushEventFn,
+            }),
+        );
+        // Разбор → пуш раннером → повторное ревью: ревью и гейт судят то, что в PR.
+        expect(order).toEqual(['session', 'push:feature/m1', 'session']);
+        expect(pushEventFn.mock.calls.some((c) => /оставлен человеку/.test(String(c[0])))).toBe(
+            false,
+        );
+        expect(state.blockedHeals).toBe(1);
+    });
+
+    it('#85: остаток сессии разбора в дереве → сначала коммит остатка, потом пуш', () => {
+        const order: string[] = [];
+        runLoop(
+            validCfg({ blockedHealAttempts: 3 }),
+            ctx(mkState({ submitted: true, lastReviewModel: 'claude-opus-4-8' })),
+            deps([], {
+                tryMergePhaseFn: () => 'blocked',
+                pickReviewModelFn: () => 'claude-opus-4-8',
+                // Грязное дерево — только после сессии разбора, а не на границе итерации.
+                ensureCleanFn: (ctx: string) => ctx !== 'разбор blocked',
+                commitLeftoversFn: (ctx: string) => {
+                    order.push(`commit:${ctx}`);
+                    return true;
+                },
+                pushSessionCommitsFn: () => {
+                    order.push('push');
+                    return { kind: 'in-sync' as const };
+                },
+            }),
+        );
+        expect(order).toEqual(['commit:разбор blocked', 'push']);
+    });
+
+    it('#85: пуш коммитов сессии разбора отвергнут → стоп с причиной session-unpushed, без повторного ревью', () => {
+        const logs: string[] = [];
+        const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+        const removeBlockedLabelFn = vi.fn();
+        const pushEventFn = vi.fn((msg: string) => msg.length > 0);
+        runLoop(
+            validCfg({ blockedHealAttempts: 3 }),
+            ctx(mkState({ submitted: true, lastReviewModel: 'claude-opus-4-8' })),
+            deps(logs, {
+                tryMergePhaseFn: () => 'blocked',
+                pickReviewModelFn: () => 'claude-opus-4-8',
+                runClaudeFn,
+                removeBlockedLabelFn,
+                pushSessionCommitsFn: () => ({
+                    kind: 'failed' as const,
+                    why: 'git push отвергнут — ! [rejected] (non-fast-forward)',
+                    local: 'b'.repeat(40),
+                    remote: 'a'.repeat(40),
+                }),
+                pushEventFn,
+            }),
+        );
+        // Повторного ревью нет: судить пришлось бы то, чего нет в PR.
+        expect(runClaudeFn).toHaveBeenCalledTimes(1);
+        expect(removeBlockedLabelFn).not.toHaveBeenCalled();
+        const stops = pushEventFn.mock.calls.map((c) => String(c[0]));
+        expect(stops).toHaveLength(1);
+        expect(stops[0]).toContain('(session-unpushed)');
+        expect(stops[0]).toContain('незапушенный коммит сессии разбора');
+        expect(stops[0]).toContain('non-fast-forward');
+        expect(stops[0]).toContain('bbbbbbbb');
+        expect(stops[0]).not.toContain('(unknown)');
+    });
+
+    it('#85: локальный ref отстал от origin (behind) → без стопа, повторное ревью идёт дальше', () => {
+        const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+        const pushEventFn = vi.fn((msg: string) => msg.length > 0);
+        const state = mkState({
+            submitted: true,
+            blockedHeals: 0,
+            lastReviewModel: 'claude-opus-4-8',
+        });
+        runLoop(
+            validCfg({ blockedHealAttempts: 3 }),
+            ctx(state),
+            deps([], {
+                tryMergePhaseFn: () => 'blocked',
+                pickReviewModelFn: () => 'claude-opus-4-8',
+                runClaudeFn,
+                pushSessionCommitsFn: () => ({
+                    kind: 'behind' as const,
+                    local: 'a'.repeat(40),
+                    remote: 'b'.repeat(40),
+                }),
+                pushEventFn,
+            }),
+        );
+        // Разбор и повторное ревью — как при in-sync: отставание гейт подтянет сам.
+        expect(runClaudeFn).toHaveBeenCalledTimes(2);
+        expect(pushEventFn.mock.calls.some((c) => /session-unpushed/.test(String(c[0])))).toBe(
+            false,
+        );
+        expect(state.blockedHeals).toBe(1);
+    });
+
+    it('#85: dry-прогон разбора blocked не пушит', () => {
+        const pushSessionCommitsFn = vi.fn(() => ({ kind: 'in-sync' as const }));
+        runLoop(
+            validCfg({ blockedHealAttempts: 3 }),
+            ctx(mkState({ submitted: true, lastReviewModel: 'claude-opus-4-8' })),
+            deps([], {
+                dry: true,
+                tryMergePhaseFn: () => 'blocked',
+                pickReviewModelFn: () => 'claude-opus-4-8',
+                pushSessionCommitsFn,
+            }),
+        );
+        expect(pushSessionCommitsFn).not.toHaveBeenCalled();
     });
 
     it('#217: гейт blocked → чини-сессия + повторное ревью раннером, снятие метки раннером, инкремент', () => {
@@ -6299,8 +6494,10 @@ describe('runLoop — основной while-цикл: итерации коде
         expect(runClaudeFn).toHaveBeenCalledTimes(2);
         // Совет человеку — про объём блокеров, а не «перезапусти loop»: рестарт прогнал бы
         // тот же разбор с тем же потолком.
-        expect(logs.join('\n')).toMatch(/Разбор blocked не уложился в бюджет ходов за 2 попыток/);
-        expect(logs.join('\n')).not.toMatch(/Сессия разбора blocked упала/);
+        expect(logs.join('\n')).toMatch(
+            /разбор blocked фазы "M1" не уложился в бюджет ходов за 2 попыток/,
+        );
+        expect(logs.join('\n')).not.toMatch(/сессия разбора blocked.*упала/i);
     });
 
     it('гейт blocked, бюджет исчерпан → стоп без чини-сессии, сброс счётчика, пуш человеку', () => {
@@ -7637,6 +7834,7 @@ describe('runLoop — основной while-цикл: итерации коде
     it('#269: упавшая чини-сессия НЕ помечает прогон пролеченным — право лечить остаётся', () => {
         const logs: string[] = [];
         const state = mkState({ submitted: true, gateHeals: 0 });
+        const pushEventFn = vi.fn((msg: string) => msg.length > 0);
         runLoop(
             validCfg({ gateHealAttempts: 2 }),
             ctx(state),
@@ -7655,13 +7853,15 @@ describe('runLoop — основной while-цикл: итерации коде
                 }),
                 // Сессия упала: код не ноль, пуша не было, нового прогона у форжа не будет.
                 runClaudeFn: vi.fn<RunClaudeFake>(() => 1),
-                pushEventFn: vi.fn((msg: string) => msg.length > 0),
+                pushEventFn,
             }),
         );
         expect(state.forgeHealedRunId).toBe(null);
         // Попытка при этом потрачена — рестарт продолжит со второй, а не с первой.
         expect(state.gateHeals).toBe(1);
-        expect(logs.join('\n')).toContain('Чини-сессия упала');
+        expect(pushEventFn.mock.calls.map((c) => String(c[0])).join('\n')).toContain(
+            'чини-сессия гейта фазы "M1" упала',
+        );
     });
 
     // Второй слой той же правки: стоп `forge-unknown` отдан человеку, и следующий заход
@@ -7863,6 +8063,129 @@ describe('runLoop — основной while-цикл: итерации коде
         expect(state.gateHeals).toBe(0);
     });
 
+    // #66: ветка фазы отстала от main и конфликтует с ним — стоп пушем, называющий файл и
+    // причину. Раньше человек видел только неудавшийся мердж и сам искал встречную правку.
+    it('#66: main-conflict — стоп пушем с файлом встречной правки, без чини-сессии', () => {
+        const logs: string[] = [];
+        const state = mkState({ submitted: true, gateHeals: 1 });
+        const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+        const pushEventFn = vi.fn((msg: string) => msg.length > 0);
+        runLoop(
+            validCfg({ gateHealAttempts: 2 }),
+            ctx(state),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => false,
+                tryMergePhaseFn: () => 'main-conflict',
+                getLastRedCheck: () => null,
+                getLastForgeRedCheck: () => null,
+                getLastMainSyncStop: () => ({
+                    kind: 'conflict',
+                    main: 'd'.repeat(40),
+                    files: ['docs/core-journal.md'],
+                }),
+                runClaudeFn,
+                pushEventFn,
+            }),
+        );
+        expect(runClaudeFn).not.toHaveBeenCalled();
+        expect(pushEventFn).toHaveBeenCalledTimes(1);
+        const stopText = String(pushEventFn.mock.calls[0][0]);
+        expect(stopText).toContain('(main-conflict)');
+        expect(stopText).toContain('docs/core-journal.md');
+        expect(stopText).toContain('отстала от main');
+        expect(stopText).not.toContain('(unknown)');
+        expect(state.gateHeals).toBe(0);
+    });
+
+    it('#66: сбой влития без конфликта — причина main-sync-failed, а не «конфликт веток»', () => {
+        const logs: string[] = [];
+        const pushEventFn = vi.fn((msg: string) => msg.length > 0);
+        runLoop(
+            validCfg(),
+            ctx(mkState({ submitted: true })),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => false,
+                tryMergePhaseFn: () => 'main-conflict',
+                getLastRedCheck: () => null,
+                getLastForgeRedCheck: () => null,
+                getLastMainSyncStop: () => ({ kind: 'failed', why: 'пуш отвергнут non-ff' }),
+                pushEventFn,
+            }),
+        );
+        const stopText = String(pushEventFn.mock.calls[0][0]);
+        expect(stopText).toContain('пуш отвергнут non-ff');
+        expect(stopText).toContain('гейт повторит влитие');
+        // Конфликта не было — заголовок его и не утверждает.
+        expect(stopText).toContain('(main-sync-failed)');
+        expect(stopText).not.toContain('конфликт веток');
+    });
+
+    // Конфликт, после которого упал `--abort`, тоже уходит в `failed` — заголовок не должен
+    // отрицать конфликт, который назван в диагнозе.
+    it('#66: конфликт с упавшим --abort — заголовок не спорит с диагнозом', () => {
+        const pushEventFn = vi.fn((msg: string) => msg.length > 0);
+        runLoop(
+            validCfg(),
+            ctx(mkState({ submitted: true })),
+            deps([], {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => false,
+                tryMergePhaseFn: () => 'main-conflict',
+                getLastRedCheck: () => null,
+                getLastForgeRedCheck: () => null,
+                getLastMainSyncStop: () => ({
+                    kind: 'failed',
+                    why: 'конфликт в a.ts; git merge --abort тоже упал (lock) — дерево раннера грязное',
+                }),
+                pushEventFn,
+            }),
+        );
+        const stopText = String(pushEventFn.mock.calls[0][0]);
+        expect(stopText).toContain('(main-sync-failed)');
+        expect(stopText).toContain('конфликт в a.ts');
+        expect(stopText).not.toContain('не конфликт');
+    });
+
+    // #85: локальный ref разошёлся с головой PR. Раньше гейт называл причину строкой, а пуш
+    // человеку уходил катч-оллом «причина не установлена (unknown)».
+    it('#85: head-diverged — стоп пушем со строкой гейта, а не unknown', () => {
+        const logs: string[] = [];
+        const state = mkState({ submitted: true, gateHeals: 1 });
+        const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+        const pushEventFn = vi.fn((msg: string) => msg.length > 0);
+        const line =
+            'Локальный ref feature/m1 (bbbbbbbb) разошёлся с головой PR #7 (aaaaaaaa): локально есть коммиты, которых нет в PR';
+        runLoop(
+            validCfg({ gateHealAttempts: 2 }),
+            ctx(state),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => false,
+                tryMergePhaseFn: () => 'head-diverged',
+                getLastHeadDivergence: () => ({
+                    local: 'b'.repeat(40),
+                    remote: 'a'.repeat(40),
+                    line,
+                }),
+                runClaudeFn,
+                pushEventFn,
+            }),
+        );
+        expect(runClaudeFn).not.toHaveBeenCalled();
+        expect(pushEventFn).toHaveBeenCalledTimes(1);
+        const stopText = String(pushEventFn.mock.calls[0][0]);
+        expect(stopText).toContain('(head-diverged)');
+        expect(stopText).toContain(line);
+        expect(stopText).not.toContain('(unknown)');
+        expect(state.gateHeals).toBe(0);
+    });
+
     // #269-ревью: соседний стоп «бюджет исчерпан» сбрасывает счётчик и прямо обещает это
     // в логе, а `forge-env` не сбрасывал. Сценарий: forge-red → одна чини-сессия → OOM
     // на следующем круге, и человеку, починившему память контейнера, остаётся одна попытка
@@ -7952,6 +8275,212 @@ describe('runLoop — основной while-цикл: итерации коде
         expect(state.gateHeals).toBe(0);
         expect(state.forgeHealedRunId).toBe(null);
     });
+
+    // Задача 40: класс стопа определяется тем, ВЫХОДИТ ли петля. Вышла — дальше её ведёт
+    // только человек, и узнать он обязан пушем: `deadman` на `stopped` тишину не сторожит,
+    // так что стоп одной строкой лога означал ночь тишины. Пошла дальше — только лог, иначе
+    // каждый сетевой чих обесценил бы канал. «Ровно один» — потому что два пуша на одно
+    // событие читаются как два события.
+    describe('задача 40: выход из цикла по стопу — ровно один пуш', () => {
+        const openIssue = { number: 7, title: 't', labels: [] };
+        const outsider = { number: 9, title: 'чужая', labels: [], author: { login: 'stranger' } };
+        const failing = (msg: string) => () => {
+            throw new Error(msg);
+        };
+        const cases: Array<{
+            name: string;
+            state?: Partial<FakeState>;
+            overrides: () => Record<string, unknown>;
+            text: RegExp;
+        }> = [
+            {
+                name: 'остаток сессии не закоммитился',
+                overrides: () => ({ ensureCleanFn: () => false, commitLeftoversFn: () => false }),
+                text: /остаток.*не закоммичен/i,
+            },
+            {
+                name: 'C2: не прочитались открытые issues фазы',
+                overrides: () => ({ allOpenIssuesFn: failing('форж молчит') }),
+                text: /открытые issues фазы.*форж молчит/,
+            },
+            {
+                name: 'C2: в milestone открыты issues вне очереди',
+                overrides: () => ({ allOpenIssuesFn: () => [outsider] }),
+                text: /вне очереди.*#9/,
+            },
+            {
+                name: 'не прочитался мердж-статус фазы',
+                overrides: () => ({ phaseMergedFn: failing('форж молчит') }),
+                text: /мердж-статус.*форж молчит/,
+            },
+            {
+                name: 'фаза смерджена, но дерево раннера не обновилось',
+                overrides: () => ({
+                    phaseMergedFn: () => true,
+                    runArgvFn: (_f: string, args: string[]) => {
+                        if (args.includes('--detach')) throw new Error('detach упал');
+                        return '';
+                    },
+                }),
+                text: /дерево раннера не обновилось.*detach упал/,
+            },
+            {
+                name: 'ревью-сессия упала',
+                overrides: () => ({ pickReviewModelFn: () => 'claude-rev', runClaudeFn: () => 1 }),
+                text: /ревью-сессия фазы "M1" упала \(код 1\)/,
+            },
+            {
+                name: 'шаг правок по ревью упал',
+                overrides: () => ({ runClaudeFn: () => 1 }),
+                text: /шаг правок по ревью фазы "M1" упал \(код 1\)/,
+            },
+            {
+                name: 'гейт: PR смерджен, локальное состояние требует починки',
+                state: { submitted: true },
+                overrides: () => ({ tryMergePhaseFn: () => 'merged-local-stale' }),
+                text: /PR смерджен, но локальное состояние/,
+            },
+            {
+                name: 'сессия разбора blocked упала',
+                state: { submitted: true, lastReviewModel: 'claude-rev' },
+                overrides: () => ({
+                    tryMergePhaseFn: () => 'blocked',
+                    pickReviewModelFn: () => 'claude-rev',
+                    runClaudeFn: () => 1,
+                }),
+                text: /сессия разбора blocked фазы "M1" упала \(код 1\)/,
+            },
+            {
+                name: 'повторное ревью после разбора blocked упало',
+                state: { submitted: true, lastReviewModel: 'claude-rev' },
+                overrides: () => {
+                    let calls = 0;
+                    return {
+                        tryMergePhaseFn: () => 'blocked',
+                        pickReviewModelFn: () => 'claude-rev',
+                        runClaudeFn: () => (++calls === 1 ? 0 : 1),
+                    };
+                },
+                text: /повторное ревью blocked фазы "M1" упало \(код 1\)/,
+            },
+            {
+                name: 'чини-сессия гейта упала',
+                state: { submitted: true },
+                overrides: () => ({
+                    tryMergePhaseFn: () => 'red-checks',
+                    getLastRedCheck: () => ({ name: 'test', cmd: 'npm run test', excerpt: 'boom' }),
+                    runClaudeFn: () => 1,
+                }),
+                text: /чини-сессия гейта фазы "M1" упала \(код 1\)/,
+            },
+        ];
+
+        it.each(cases)('$name', ({ state, overrides, text }) => {
+            const logs: string[] = [];
+            const pushEventFn = vi.fn();
+            const advancePhaseFn = vi.fn();
+            const tryMergePhaseFn = vi.fn(() => 'not-merged');
+            runLoop(
+                validCfg(),
+                ctx(mkState(state)),
+                deps(logs, { pushEventFn, advancePhaseFn, tryMergePhaseFn, ...overrides() }),
+            );
+            expect(pushEventFn).toHaveBeenCalledTimes(1);
+            expect(String(pushEventFn.mock.calls[0][0])).toMatch(text);
+            // Пуш — тот же канал, что лог (боевой pushEvent печатает 🔔 PUSH), поэтому
+            // логгер прокинут: иначе строка ушла бы мимо инжектированного лога.
+            expect(pushEventFn.mock.calls[0][2]).toEqual(
+                expect.objectContaining({ logFn: expect.any(Function) }),
+            );
+            // Стоп — а не «пошли дальше»: фаза не продвинута.
+            expect(advancePhaseFn).not.toHaveBeenCalled();
+        });
+
+        // От противного: «пуш на каждый break» сломал бы и эти ветки — петля в них идёт
+        // дальше, и человек ей не нужен.
+        it('сбой чтения на пути, где петля продолжает, пуша не даёт', () => {
+            const logs: string[] = [];
+            const pushEventFn = vi.fn();
+            const advancePhaseFn = vi.fn();
+            runLoop(
+                validCfg(),
+                ctx(mkState()),
+                deps(logs, {
+                    pushEventFn,
+                    advancePhaseFn,
+                    phaseMergedFn: () => true,
+                    // Номер смердженного PR не прочитался — журнал находок теряет запись,
+                    // переход к следующей фазе от этого не зависит.
+                    mergedPhasePrFn: failing('форж молчит'),
+                    closeMilestoneByTitleFn: () => {},
+                }),
+            );
+            expect(advancePhaseFn).toHaveBeenCalledTimes(1);
+            expect(logs.join('\n')).toMatch(/номер смердженного PR.*форж молчит/);
+            expect(pushEventFn).not.toHaveBeenCalled();
+        });
+
+        it('сбой чтения очереди после сессии (оценка прогресса) пуша не даёт', () => {
+            const logs: string[] = [];
+            const pushEventFn = vi.fn();
+            let reads = 0;
+            const runClaudeFn = vi.fn(() => 0);
+            runLoop(
+                validCfg(),
+                ctx(mkState()),
+                deps(logs, {
+                    pushEventFn,
+                    runClaudeFn,
+                    openIssuesFn: () => {
+                        if (++reads === 1) return [openIssue];
+                        throw new Error('форж молчит');
+                    },
+                }),
+            );
+            // Сессия была, сбой оценки прогресса принят за прогресс (fail-open), петля
+            // пошла на следующий проход — и тот кончился штатно.
+            expect(runClaudeFn).toHaveBeenCalledTimes(1);
+            expect(logs.join('\n')).toMatch(/Все фазы завершены/);
+            expect(pushEventFn).not.toHaveBeenCalled();
+        });
+
+        it('комментарии PR для промпта правок не прочитались — пуша об этом нет', () => {
+            const logs: string[] = [];
+            const pushEventFn = vi.fn();
+            runLoop(
+                validCfg(),
+                ctx(mkState()),
+                deps(logs, {
+                    pushEventFn,
+                    findOpenPrFn: () => ({ number: 5, labels: [] }),
+                    prCommentsFn: failing('форж молчит'),
+                    tryMergePhaseFn: () => 'merged',
+                }),
+            );
+            expect(logs.join('\n')).toMatch(/Не смог прочитать комментарии PR #5/);
+            // Единственный пуш — о мердже: сдача прошла, сбой чтения её не остановил.
+            expect(pushEventFn).toHaveBeenCalledTimes(1);
+            expect(String(pushEventFn.mock.calls[0][0])).toMatch(/смерджена в main/);
+        });
+
+        it('штатное завершение и HITL-стоп пуша не дают — их просил сам человек', () => {
+            const pushEventFn = vi.fn();
+            const logs: string[] = [];
+            runLoop(
+                validCfg(),
+                ctx(mkState()),
+                deps(logs, { pushEventFn, phaseIndexOfFn: () => 99 }),
+            );
+            runLoop(
+                validCfg(),
+                ctx(mkState()),
+                deps(logs, { pushEventFn, once: true, openIssuesFn: () => [openIssue] }),
+            );
+            expect(logs.join('\n')).toMatch(/Все фазы завершены/);
+            expect(logs.join('\n')).toMatch(/HITL/);
+            expect(pushEventFn).not.toHaveBeenCalled();
+        });
+    });
 });
 
 describe('ensureClean — чистота дерева раннера, изолированная от дерева человека (#78)', () => {
@@ -7972,6 +8501,8 @@ describe('ensureClean — чистота дерева раннера, изоли
         expect(ok).toBe(false);
         expect(logs.join('\n')).toMatch(/Грязное рабочее дерево \(гейт мерджа\)/);
         expect(logs.join('\n')).toMatch(/src\/a\.ts/);
+        // #13: ensureClean сообщает наблюдаемое; стоп решает вызывающий, и говорит о нём он.
+        expect(logs.join('\n')).not.toMatch(/стоп|разбери руками/i);
     });
 
     it('git status упал (не git-репо/сломан) → false (fail-closed), лог об ошибке', () => {
@@ -8476,7 +9007,9 @@ describe('ветковая хореография в worktree раннера (#7
         it('локальной ветки нет (rev-parse падает) — не фатально: чеки идут на PR-голове', () => {
             const { shCmds, deps } = mkDeps({
                 shImpl: (cmd: string) => {
-                    if (cmd.startsWith('git rev-parse --verify'))
+                    // Только чтение ЛОКАЛЬНОГО ref ветки: `origin/main` гейт читает тоже
+                    // через `rev-parse --verify` (#66), и его отсутствие — уже другой кейс.
+                    if (cmd.startsWith('git rev-parse --verify --quiet'))
                         throw new Error('unknown revision');
                     return '';
                 },
@@ -9915,7 +10448,10 @@ describe('Изоляция раннера в worktree — сценарии и м
         // checkout НЕ через --detach = занятие именованной ветки (в т.ч. `git checkout main`).
         /^git checkout (?!--detach\b)/,
         /^git pull\b/,
-        /^git merge\b/,
+        // `merge-base` — чтение (#66: «отстала ли ветка от main»), под запрет не попадает.
+        // Само влитие main в отставшую ветку здесь не встречается: голова PR в этих
+        // сценариях уже содержит origin/main; его границы — в `main-sync` тестах.
+        /^git merge(?!-base\b)\b/,
         /^git reset\b/,
         // `git branch` разрешён ТОЛЬКО в форме `-D <ветка>` (#387, удаление своего же ref
         // после мерджа) — любая другая форма (создание, -f, list с флагами) запрещена.

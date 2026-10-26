@@ -50,7 +50,7 @@
  * TS-модуль без билд-шага: исполняется нативным type stripping Node 24 (erasable-only).
  */
 
-import { gitNetworkEnv } from '../shared/ralph-util.ts';
+import { gitErrorText, gitExitStatus, gitNetworkEnv } from '../shared/ralph-util.ts';
 
 /** Чем кончилась постановка дерева на ветку. Каждый исход — свой факт, не оттенок общего. */
 export type TPhaseBranchKind =
@@ -108,17 +108,6 @@ function networkEnv(env: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv | und
     return env === undefined ? undefined : gitNetworkEnv(env);
 }
 
-/** Код возврата git из отказа `execFileSync`: по нему отличают «нет» от «не смог». */
-function statusOf(e: unknown): number | null {
-    const status = (e as { status?: unknown }).status;
-    return typeof status === 'number' ? status : null;
-}
-
-/** Первая строка ошибки: в лог идёт причина, а не стек на пол-экрана. */
-function firstLine(e: unknown): string {
-    return String((e as Error).message ?? e).split('\n')[0] ?? '';
-}
-
 /**
  * Поставить дерево работы на ветку фазы.
  *
@@ -145,7 +134,7 @@ export function ensurePhaseBranch(branch: string, deps: TPhaseBranchDeps): TPhas
     try {
         gitNet(['fetch', 'origin', 'main', '--quiet']);
     } catch (e) {
-        return fail(`не смог обновить origin/main — ${firstLine(e)}`);
+        return fail(`не смог обновить origin/main — ${gitErrorText(e)}`);
     }
 
     // Есть ли ветка на origin. `--exit-code` отвечает кодом 2 на «совпадений нет» — и это
@@ -157,7 +146,8 @@ export function ensurePhaseBranch(branch: string, deps: TPhaseBranchDeps): TPhas
         gitNet(['ls-remote', '--exit-code', '--heads', 'origin', branch]);
         onOrigin = true;
     } catch (e) {
-        if (statusOf(e) !== 2) return fail(`не смог спросить origin о ветке — ${firstLine(e)}`);
+        if (gitExitStatus(e) !== 2)
+            return fail(`не смог спросить origin о ветке — ${gitErrorText(e)}`);
         onOrigin = false;
     }
 
@@ -171,7 +161,8 @@ export function ensurePhaseBranch(branch: string, deps: TPhaseBranchDeps): TPhas
         git(['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`]);
         hasLocal = true;
     } catch (e) {
-        if (statusOf(e) !== 1) return fail(`не смог прочитать локальный ref — ${firstLine(e)}`);
+        if (gitExitStatus(e) !== 1)
+            return fail(`не смог прочитать локальный ref — ${gitErrorText(e)}`);
         hasLocal = false;
     }
 
@@ -213,7 +204,7 @@ export function ensurePhaseBranch(branch: string, deps: TPhaseBranchDeps): TPhas
         try {
             gitNet(['fetch', 'origin', branch, '--quiet']);
         } catch (e) {
-            return fail(`не смог подтянуть origin/${branch} — ${firstLine(e)}`);
+            return fail(`не смог подтянуть origin/${branch} — ${gitErrorText(e)}`);
         }
     }
 
@@ -235,7 +226,7 @@ export function ensurePhaseBranch(branch: string, deps: TPhaseBranchDeps): TPhas
             10,
         );
     } catch (e) {
-        return fail(`не смог посчитать коммиты HEAD вне веток — ${firstLine(e)}`);
+        return fail(`не смог посчитать коммиты HEAD вне веток — ${gitErrorText(e)}`);
     }
     if (!Number.isFinite(orphans)) {
         return fail('счёт коммитов HEAD вне веток нечитаем — переключаться вслепую нельзя');
@@ -248,7 +239,7 @@ export function ensurePhaseBranch(branch: string, deps: TPhaseBranchDeps): TPhas
             try {
                 git(['switch', '--create', branch]);
             } catch (e) {
-                return fail(`не смог завести ветку на detached HEAD — ${firstLine(e)}`);
+                return fail(`не смог завести ветку на detached HEAD — ${gitErrorText(e)}`);
             }
             return done('adopted-detached', `взята работа с detached HEAD (${orphans} коммит(ов))`);
         }
@@ -280,7 +271,7 @@ export function ensurePhaseBranch(branch: string, deps: TPhaseBranchDeps): TPhas
                 // уже лежит чужая работа, раннеру нечем — и незачем.
                 const reason =
                     `локальная ветка разошлась с origin/${branch}, ff невозможен — ` +
-                    `${firstLine(e)}. Разбери руками: git log --oneline --graph ` +
+                    `${gitErrorText(e)}. Разбери руками: git log --oneline --graph ` +
                     `${branch} origin/${branch}`;
                 logFn(`⛔ Ветка фазы ${branch}: ${reason}`);
                 return { kind: 'diverged', branch, sha: head(), reason };
@@ -296,7 +287,7 @@ export function ensurePhaseBranch(branch: string, deps: TPhaseBranchDeps): TPhas
         git(['switch', '--create', branch, 'origin/main']);
         return done('created', 'создана от свежего origin/main');
     } catch (e) {
-        return fail(`не смог поставить дерево на ветку — ${firstLine(e)}`);
+        return fail(`не смог поставить дерево на ветку — ${gitErrorText(e)}`);
     }
 }
 
@@ -321,7 +312,7 @@ export function checkOnPhaseBranch(branch: string, deps: TPhaseBranchDeps): TBra
     try {
         sha = git(['rev-parse', 'HEAD']).trim();
     } catch (e) {
-        return { ok: false, message: `не смог прочитать HEAD дерева работы — ${firstLine(e)}` };
+        return { ok: false, message: `не смог прочитать HEAD дерева работы — ${gitErrorText(e)}` };
     }
 
     // `symbolic-ref` отказом отвечает на detached HEAD: это не сбой, а ответ «ветки нет».

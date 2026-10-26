@@ -37,7 +37,16 @@ import type {
     ForgeFailureKind,
 } from './forge-checks.ts';
 import { classifyForgeFailure, waitForForgeChecks } from './forge-checks.ts';
+import {
+    MERGE_RETRY_BASE_MS,
+    classifyMergeFailure,
+    mergeFailureLine,
+    mergeRetryPauseMs,
+    resolveMergeRetryMaxMs,
+} from './merge-retry.ts';
 import { errorText, gitNetworkEnv } from '../shared/ralph-util.ts';
+import { syncPhaseBranchWithMain } from './main-sync.ts';
+import type { MainSyncResult } from './main-sync.ts';
 
 type ExecOpts = { env?: NodeJS.ProcessEnv };
 type ShFn = (cmd: string, opts?: ExecOpts) => string;
@@ -113,6 +122,7 @@ type GateConfigRaw = {
         externalCi?: unknown;
         onToolFailure?: unknown;
     };
+    mergeRetryMaxMs?: unknown;
 };
 
 // ── Политика гейта (задача 81) ───────────────────────────────────────────────
@@ -435,6 +445,13 @@ export function createGateRunner(env: GateEnv) {
     // либо его не спрашивали). Отдаётся геттером тем же приёмом, что lastRedCheck: значение
     // ставится побочкой ВНУТРИ tryMergePhase и читается циклом уже после её возврата.
     let lastForgeRedCheck: ForgeRedCheck | null = null;
+    // #66: последний прогон гейта встал на подтяжке main (конфликт или сбой влития).
+    // Геттер тем же приёмом, что lastRedCheck: ставится внутри checksGreen, читается после.
+    let lastMainSyncStop: Exclude<MainSyncResult, { kind: 'current' | 'updated' }> | null = null;
+    // #85: локальный ref ветки разошёлся с головой PR — строка, которую гейт напечатал. Раньше
+    // этот отказ уходил безымянным 'not-merged', и пуш человеку нёс «причина не установлена»,
+    // хотя гейт назвал её точно. Геттер тем же приёмом, что lastMainSyncStop.
+    let lastHeadDivergence: { local: string; remote: string; line: string } | null = null;
     // #269-ревью: причина стопа на чеке форжа БЕЗ вердикта (потолок ожидания, устойчивый
     // сбой чтения, красный прогон без названного куба). Отдаётся тем же геттер-приёмом,
     // что lastForgeRedCheck: цикл читает её ПОСЛЕ возврата статуса `forge-unknown` и
@@ -516,6 +533,9 @@ export function createGateRunner(env: GateEnv) {
             // Задача 81: что делать с чеком, упавшим на инструменте. Дефолт — из конфига
             // тем же ленивым приёмом, что `checks`; tryMergePhase прокидывает явно.
             onToolFailure = resolveGatePolicy(getConfig(), fail).onToolFailure,
+            // #66: подтяжка `origin/main` в отставшую ветку фазы. DI — ради юнитов гейта:
+            // настоящий git этого шага проверяет `tests/main-sync-scenarios.test.ts`.
+            mainSyncFn = syncPhaseBranchWithMain,
         }: {
             shFn?: ShFn;
             runArgvFn?: ShArgvFn;
@@ -526,6 +546,7 @@ export function createGateRunner(env: GateEnv) {
             buildGateEnvFn?: BuildGateEnvFn;
             checks?: GateCheck[];
             onToolFailure?: ToolFailurePolicy;
+            mainSyncFn?: typeof syncPhaseBranchWithMain;
         } = {},
     ): boolean {
         // Сброс СРАЗУ: любой выход из этого раунда до чеков не должен носить red-check
@@ -536,6 +557,8 @@ export function createGateRunner(env: GateEnv) {
         lastVerifiedHead = null;
         lastToolFailure = null;
         lastToolSkips = [];
+        lastMainSyncStop = null;
+        lastHeadDivergence = null;
         // #204-ревью: пустой список чеков не имеет права привести к мерджу. Цикл ниже с
         // пустым `checks` не сделал бы ни одной итерации, lastVerifiedHead записался бы и
         // фаза уехала в main без единой проверки. Сегодня этот путь прикрыт тем, что боевой
@@ -644,9 +667,9 @@ export function createGateRunner(env: GateEnv) {
                 // нужен человек — но подсказка обязана быть выполнимой. Дерево раннера
                 // detached, а ref общий для всех worktree, поэтому ни push, ни pull не
                 // помогают: лечится только принудительным переводом ref.
-                logFn(
-                    `⛔ Локальный ref ${branch} (${localHead.slice(0, 8)}) разошёлся с головой PR #${prNumber} (${remoteHead.slice(0, 8)}): локально есть коммиты, которых нет в PR — в main уехал бы не тот код. Разбери руками, затем: git branch -f ${branch} origin/${branch}`,
-                );
+                const line = `Локальный ref ${branch} (${localHead.slice(0, 8)}) разошёлся с головой PR #${prNumber} (${remoteHead.slice(0, 8)}): локально есть коммиты, которых нет в PR — в main уехал бы не тот код. Разбери руками, затем: git branch -f ${branch} origin/${branch}`;
+                lastHeadDivergence = { local: localHead, remote: remoteHead, line };
+                logFn(`⛔ ${line}`);
                 parkFn();
                 return false;
             }
@@ -660,6 +683,27 @@ export function createGateRunner(env: GateEnv) {
             parkFn();
             return false;
         }
+        // #66: ветка фазы живёт часами, а `main` за это время уходит вперёд чужими мерджами.
+        // Подтягиваем его ДО чеков: чеки обязаны проверять то, что уедет в main, а встречная
+        // правка того же файла иначе всплывала безымянным отказом мерджа уже после гейта.
+        // Конфликт петля не разбирает — стоп с именами файлов (`main-sync.ts`).
+        const synced = mainSyncFn(branch, remoteHead, { runArgvFn, logFn });
+        if (synced.kind === 'conflict' || synced.kind === 'failed') {
+            lastMainSyncStop = synced;
+            logFn(
+                synced.kind === 'conflict'
+                    ? `⛔ Ветка ${branch} отстала от main (${synced.main.slice(0, 8)}) и конфликтует с ним в: ${synced.files.join(', ')} — влитие отменено, авто-мердж отменён.`
+                    : `⛔ Ветка ${branch}: не смог подтянуть origin/main (${synced.why}) — авто-мердж отменён.`,
+            );
+            parkFn();
+            return false;
+        }
+        // Чеки, санация и `--match-head-commit` — уже на голове с влитым main. Форж узнаёт о
+        // ней из пуша, и между пушем и мерджем идут чеки и ожидание его CI, так что окно
+        // мало. Не успел — отказ «голова не та» (`Head branch was modified`, `head sha …`)
+        // merge-retry.ts считает отказом по существу: это стоп петли с текстом форжа, а
+        // не повтор. Не та голова в main при этом не уходит: привязку держит сам флаг.
+        if (synced.kind === 'updated') remoteHead = synced.head;
         // env-санация (#189): чеки и `npm ci` ниже исполняют код проверяемого PR в дереве
         // раннера, где в окружении лежат секреты петли. Строим санированный env по allowlist
         // ОДИН раз на прогон и прокидываем его и в syncDeps (npm ci), и в каждый чек. Fail-closed:
@@ -846,6 +890,12 @@ export function createGateRunner(env: GateEnv) {
      *                          достижим штатно — один чужой прогон в очереди съедает
      *                          бюджет, — и ночью такая остановка иначе выясняется утром.
      *                          Причина текстом лежит в `lastForgeStop` (геттер ниже);
+     *   'main-conflict'      — ветка фазы отстала от main, и подтянуть его не вышло (#66):
+     *                          встречная правка тех же файлов либо сбой влития/пуша. Файлы
+     *                          и причина — в `getLastMainSyncStop()`; стоп человеку пушем;
+     *   'head-diverged'      — локальный ref ветки разошёлся с головой PR (#85): локально
+     *                          есть коммиты, которых нет в PR. Строка гейта — в
+     *                          `getLastHeadDivergence()`; стоп человеку пушем с ней же;
      *   'not-merged'         — не мерджили по нечинимой причине (нет PR / blocked /
      *                          сеть-git проблемы / merge упал).
      *
@@ -889,6 +939,9 @@ export function createGateRunner(env: GateEnv) {
             // обязаны проходить без реальных пауз (правило «время — параметр»).
             mergeConfirmAttempts = 6,
             mergeConfirmDelayMs = 5_000,
+            // #47: предел по времени на повторы мерджа при транзиентных отказах форжа.
+            // Дефолт — из конфига (`mergeRetryMaxMs`), его отсутствие — дефолт модуля.
+            mergeRetryMaxMs = resolveMergeRetryMaxMs(getConfig(), fail),
             // #269: шов «чек PR у форжа». Приходит из runLoop вместе с остальными
             // примитивами мердж-пути; undefined = у реализации шва такого метода нет,
             // и тогда шаг пропускается целиком (прежнее поведение).
@@ -913,6 +966,8 @@ export function createGateRunner(env: GateEnv) {
             gatePolicy = resolveGatePolicy(getConfig(), fail),
             getLastToolFailureFn = () => lastToolFailure,
             getToolFailureSkipsFn = () => lastToolSkips,
+            getLastMainSyncStopFn = () => lastMainSyncStop,
+            getLastHeadDivergenceFn = () => lastHeadDivergence,
         }: {
             dry?: boolean;
             shFn?: ShFn;
@@ -932,6 +987,7 @@ export function createGateRunner(env: GateEnv) {
             profileName?: string;
             mergeConfirmAttempts?: number;
             mergeConfirmDelayMs?: number;
+            mergeRetryMaxMs?: number;
             forgeChecksFn?: ForgeChecksFn;
             forgeDiagnosisFn?: ForgeDiagnosisFn;
             healedForgeRunId?: string;
@@ -942,6 +998,8 @@ export function createGateRunner(env: GateEnv) {
             gatePolicy?: GatePolicy;
             getLastToolFailureFn?: () => ToolFailure | null;
             getToolFailureSkipsFn?: () => ToolFailureSkip[];
+            getLastMainSyncStopFn?: () => typeof lastMainSyncStop;
+            getLastHeadDivergenceFn?: () => typeof lastHeadDivergence;
         } = {},
     ):
         | 'merged'
@@ -954,6 +1012,8 @@ export function createGateRunner(env: GateEnv) {
         | 'forge-env'
         | 'forge-unknown'
         | 'gate-tool-failure'
+        | 'main-conflict'
+        | 'head-diverged'
         | 'not-merged' {
         // #218: сброс СРАЗУ, тем же приёмом, что checksGreen сбрасывает lastRedCheck/
         // lastVerifiedHead — раунд, упавший ДО findOpenPr (dry/грязное дерево), не должен
@@ -972,7 +1032,11 @@ export function createGateRunner(env: GateEnv) {
             return 'not-merged';
         }
         // M2: checkout с грязью либо упадёт, либо утащит полу-работу между коммитами.
-        if (!ensureCleanFn('гейт мерджа')) return 'not-merged';
+        // #13: ensureClean сообщает только наблюдаемое — об отказе мерджить говорит гейт.
+        if (!ensureCleanFn('гейт мерджа')) {
+            logFn(`⛔ Гейт: дерево раннера грязное — мердж не выполняется.`);
+            return 'not-merged';
+        }
         const pr = findOpenPrFn(phase.branch);
         if (!pr) {
             logFn(
@@ -1003,6 +1067,22 @@ export function createGateRunner(env: GateEnv) {
                 onToolFailure: gatePolicy.onToolFailure,
             })
         ) {
+            // #66: ветка отстала от main и не подтянулась — свой исход, а не безымянный
+            // 'not-merged': человеку нужны файлы встречной правки, а не «мердж не удался».
+            // Чини-сессии нет и здесь: конфликт по смыслу петля не разрешает.
+            if (getLastMainSyncStopFn()) {
+                logFn(
+                    `⛔ Гейт: ветка PR #${pr.number} не подтянута к main — мердж не выполняется.`,
+                );
+                return 'main-conflict';
+            }
+            // #85: расхождение HEAD — тоже известная причина, а не катч-олл `unknown`.
+            if (getLastHeadDivergenceFn()) {
+                logFn(
+                    `⛔ Гейт: локальный ref ветки PR #${pr.number} разошёлся с головой PR — мердж не выполняется.`,
+                );
+                return 'head-diverged';
+            }
             const redCheck = getLastRedCheckFn();
             if (redCheck) {
                 logFn(`⛔ Гейт: чек ${redCheck.name} красный на PR #${pr.number}.`);
@@ -1217,8 +1297,17 @@ export function createGateRunner(env: GateEnv) {
             return false;
         };
 
+        // #47: повтор зависит от КЛАССА отказа (merge-retry.ts). Транзиент форжа (5xx,
+        // таймаут, обрыв) — растущая пауза до предела по времени; отказ по существу —
+        // стоп сразу, повторять нечего; нераспознанный — один повтор, как до #47. Отсчёт
+        // предела — от первого отказа: он меряет терпение к сбою площадки, а не длину гейта.
         let mergedOk = false;
-        for (let attempt = 1; attempt <= 2 && !mergedOk; attempt++) {
+        let failedSinceMs: number | null = null;
+        // Один повтор нераспознанного — по ЧИСЛУ его повторов, а не по номеру попытки:
+        // transient → unknown иначе встал бы стопом «не распознан и после повтора», хотя
+        // нераспознанный отказ не повторялся ни разу.
+        let unknownRetried = false;
+        for (let attempt = 1; !mergedOk; attempt++) {
             try {
                 mergePrFn(pr.number, verifiedHead, { runArgvFn });
                 mergedOk = true;
@@ -1238,18 +1327,41 @@ export function createGateRunner(env: GateEnv) {
                         break;
                     }
                 } catch {}
-                if (attempt < 2) {
+                const message = String((e as Error).message);
+                const why = mergeFailureLine(message);
+                const kind = classifyMergeFailure(message);
+                failedSinceMs ??= nowFn();
+                const leftMs = mergeRetryMaxMs - (nowFn() - failedSinceMs);
+                const pauseMs =
+                    kind === 'transient'
+                        ? Math.min(mergeRetryPauseMs(attempt), leftMs)
+                        : kind === 'unknown' && !unknownRetried
+                          ? MERGE_RETRY_BASE_MS
+                          : 0;
+                if (pauseMs > 0) {
+                    if (kind === 'unknown') unknownRetried = true;
                     logFn(
-                        `⚠ Мердж PR #${pr.number} не удался (${String((e as Error).message).split('\n')[0]}) — повтор через 30с.`,
+                        `⚠ Мердж PR #${pr.number} не удался (${why}) — ` +
+                            (kind === 'transient'
+                                ? `транзиентный отказ форжа, повтор через ${Math.round(pauseMs / 1000)}с ` +
+                                  `(попытка ${attempt}, до предела ${Math.round(Math.max(leftMs, 0) / 1000)}с).`
+                                : `отказ не распознан, единственный повтор через ${Math.round(pauseMs / 1000)}с.`),
                     );
-                    sleepFn(30_000);
-                } else {
-                    logFn(
-                        `⛔ Гейт: мердж PR #${pr.number} не удался (${(e as Error).message}) — оставлен человеку.`,
-                    );
-                    parkFn();
-                    return 'not-merged';
+                    sleepFn(pauseMs);
+                    continue;
                 }
+                logFn(
+                    `⛔ Гейт: мердж PR #${pr.number} не удался (${message}) — ` +
+                        (kind === 'refusal'
+                            ? 'отказ форжа по существу, повтором не лечится'
+                            : kind === 'transient'
+                              ? `транзиентные отказы форжа дольше предела ${Math.round(mergeRetryMaxMs / 60000)} мин ` +
+                                `(${attempt} попыток), стоп fail-closed`
+                              : 'отказ не распознан и после повтора') +
+                        ' — оставлен человеку.',
+                );
+                parkFn();
+                return 'not-merged';
             }
         }
         // #53: форж ПРИНЯЛ мердж — это ещё не «смерджено». У площадки операция асинхронная
@@ -1327,5 +1439,7 @@ export function createGateRunner(env: GateEnv) {
         getLastToolFailure: (): ToolFailure | null => lastToolFailure,
         getToolFailureSkips: (): ToolFailureSkip[] => lastToolSkips,
         getLastMergeProof: (): string | null => lastMergeProof,
+        getLastMainSyncStop: (): typeof lastMainSyncStop => lastMainSyncStop,
+        getLastHeadDivergence: (): typeof lastHeadDivergence => lastHeadDivergence,
     };
 }

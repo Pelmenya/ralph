@@ -90,6 +90,14 @@ export const STOP_ROLES: Record<TStopReason, 'barrier' | 'paired' | 'loop'> = {
     'review-no-verdict': 'barrier',
     'blocked-unconfirmed': 'barrier',
     'main-conflict': 'loop',
+    'main-sync-failed': 'loop',
+    // Коммиты сессии разбора пушит сам раннер (#85), так что расхождение, дошедшее до
+    // гейта, — коллизия историй (ветку допушили снаружи, пуш сессии не доехал), а не
+    // пойманное плохое изменение: стоп петли того же рода, что `session-unpushed`.
+    'head-diverged': 'loop',
+    // Пуш коммитов сессии разбора отвергнут ДО гейта: работа не потеряна и не плоха — стоп
+    // петли, а не пойманное изменение.
+    'session-unpushed': 'loop',
     'tree-dirty': 'loop',
     breaker: 'loop',
     deadman: 'loop',

@@ -296,6 +296,50 @@ describe('checksGreen — прогон шагов на голове PR (#77)', (
         expect(park).toHaveBeenCalledTimes(1);
     });
 
+    // #85: строка расхождения — диагноз стопа. Раньше гейт печатал её и возвращал безымянный
+    // отказ, а пуш человеку нёс «причина не установлена».
+    it('#85 расхождение записано: sha обеих сторон и та же строка, что в логе', () => {
+        const logs: string[] = [];
+        const g = createGateRunner(makeEnv({ log: (m) => logs.push(m) }));
+        const ok = g.checksGreen('feature/x', 7, {
+            shFn: (cmd: string) => (cmd.includes('rev-parse') ? OTHER_SHA : ''),
+            runArgvFn: (_file: string, args: string[]) => {
+                if (args[0] === 'merge-base') throw new Error('not an ancestor');
+                return '';
+            },
+            prHeadShaFn: () => SHA,
+            syncDepsFn: () => {},
+            checks: [['lint', 'npm run lint']],
+        });
+        expect(ok).toBe(false);
+        const div = g.getLastHeadDivergence();
+        expect(div).toMatchObject({ local: OTHER_SHA, remote: SHA });
+        expect(div?.line).toContain('разошёлся с головой PR #7');
+        expect(logs).toContain(`⛔ ${div?.line}`);
+        expect(g.getLastRedCheck()).toBeNull();
+    });
+
+    it('#85 следующий раунд без расхождения сбрасывает запись', () => {
+        const g = createGateRunner(makeEnv());
+        const diverged = {
+            shFn: (cmd: string) => (cmd.includes('rev-parse') ? OTHER_SHA : ''),
+            runArgvFn: (_file: string, args: string[]) => {
+                if (args[0] === 'merge-base') throw new Error('not an ancestor');
+                return '';
+            },
+            prHeadShaFn: () => SHA,
+            syncDepsFn: () => {},
+            checks: [['lint', 'npm run lint']] as [string, string][],
+        };
+        g.checksGreen('feature/x', 7, diverged);
+        expect(g.getLastHeadDivergence()).not.toBeNull();
+        g.checksGreen('feature/x', 7, {
+            ...diverged,
+            shFn: (cmd: string) => (cmd.includes('rev-parse') ? SHA : ''),
+        });
+        expect(g.getLastHeadDivergence()).toBeNull();
+    });
+
     it('#466 ref отстал (предок головы PR) → ff-подтяжка, чеки идут дальше', () => {
         const park = vi.fn();
         const g = createGateRunner(makeEnv({ parkOnOriginMain: park }));
@@ -705,6 +749,186 @@ describe('tryMergePhase — гейт мерджа: hold/blocked/red/merged', () 
             },
         });
         expect(res).toBe('merged');
+    });
+});
+
+// #47: повтор мерджа зависит от класса отказа. Часы — фейковые: sleepFn двигает nowFn,
+// так что предел в десять минут проходится без единой реальной паузы.
+describe('tryMergePhase — повтор мерджа по классу отказа (#47)', () => {
+    const phase = { branch: 'feature/x', milestone: 'M' };
+
+    function run(
+        failures: string[],
+        {
+            mergeRetryMaxMs,
+            alwaysFail = false,
+        }: { mergeRetryMaxMs?: number; alwaysFail?: boolean } = {},
+    ) {
+        let clock = 0;
+        let merged = false;
+        const pauses: number[] = [];
+        const logs: string[] = [];
+        const park = vi.fn();
+        const mergePrFn = vi.fn((_n: number, head?: string | null) => {
+            const i = mergePrFn.mock.calls.length - 1;
+            if (alwaysFail || i < failures.length) {
+                throw new Error(
+                    `Command failed: gh pr merge 9 --match-head-commit ${String(head)}\n` +
+                        (failures[i] ?? failures[failures.length - 1]),
+                );
+            }
+            merged = true;
+        });
+        const g = createGateRunner(makeEnv());
+        const res = tryMergeWith(g, phase, {
+            findOpenPrFn: () => ({ number: 9, labels: [] }),
+            checksGreenFn: () => true,
+            getVerifiedHeadFn: () => SHA,
+            mergePrFn,
+            phaseMergedFn: () => merged,
+            mergeConfirmAttempts: 1,
+            nowFn: () => clock,
+            sleepFn: (ms: number) => {
+                pauses.push(ms);
+                clock += ms;
+            },
+            logFn: (m: string) => logs.push(m),
+            parkFn: park,
+            ...(mergeRetryMaxMs === undefined ? {} : { mergeRetryMaxMs }),
+        });
+        return { res, mergePrFn, pauses, logs, park };
+    }
+
+    it('транзиент 503 → повторы с растущей паузой, успех на 4-й попытке = мердж', () => {
+        const { res, mergePrFn, pauses } = run([
+            'GraphQL: Something went wrong (HTTP 503)',
+            'HTTP 502: Bad Gateway',
+            'read ECONNRESET',
+        ]);
+        expect(res).toBe('merged');
+        expect(mergePrFn).toHaveBeenCalledTimes(4);
+        expect(pauses).toHaveLength(3);
+        expect(pauses[1]).toBeGreaterThan(pauses[0]);
+        expect(pauses[2]).toBeGreaterThan(pauses[1]);
+        // Барьер не ослаблен: каждая попытка несёт проверенную голову.
+        for (const call of mergePrFn.mock.calls) expect(call[1]).toBe(SHA);
+    });
+
+    it.each([
+        'Pull request #9 is not mergeable: the merge commit cannot be cleanly created.',
+        '{"mergeable": false}',
+        'merge conflict between base and head',
+        'Head branch was modified. Review and try the merge again. (HTTP 409)',
+    ])('отказ по существу (%s) → стоп сразу, повторов ноль', (stderr) => {
+        const { res, mergePrFn, pauses, logs, park } = run([stderr]);
+        expect(res).toBe('not-merged');
+        expect(mergePrFn).toHaveBeenCalledTimes(1);
+        expect(pauses).toEqual([]);
+        expect(park).toHaveBeenCalledTimes(1);
+        expect(logs.join('\n')).toContain('по существу');
+    });
+
+    it('предел по времени исчерпан → fail-closed стоп, ни одной паузы за предел', () => {
+        const limit = 10 * 60 * 1000;
+        const { res, mergePrFn, pauses, logs, park } = run(['HTTP 503'], {
+            alwaysFail: true,
+            mergeRetryMaxMs: limit,
+        });
+        expect(res).toBe('not-merged');
+        expect(park).toHaveBeenCalledTimes(1);
+        // Десять минут дают заметно больше прежних двух попыток…
+        expect(mergePrFn.mock.calls.length).toBeGreaterThan(4);
+        // …и ни миллисекунды сверх предела.
+        expect(pauses.reduce((a, b) => a + b, 0)).toBe(limit);
+        const stop = logs.find((l) => l.startsWith('⛔')) ?? '';
+        expect(stop).toContain('дольше предела 10 мин');
+        expect(stop).toContain('оставлен человеку');
+    });
+
+    it('предел берётся из конфига (mergeRetryMaxMs)', () => {
+        let clock = 0;
+        const pauses: number[] = [];
+        const g = createGateRunner(
+            makeEnv({ getConfig: () => ({ ...SYNTH_GATE, mergeRetryMaxMs: 45_000 }) }),
+        );
+        const res = tryMergeWith(g, phase, {
+            findOpenPrFn: () => ({ number: 9, labels: [] }),
+            checksGreenFn: () => true,
+            getVerifiedHeadFn: () => SHA,
+            mergePrFn: () => {
+                throw new Error('HTTP 503');
+            },
+            phaseMergedFn: () => false,
+            mergeConfirmAttempts: 1,
+            nowFn: () => clock,
+            sleepFn: (ms: number) => {
+                pauses.push(ms);
+                clock += ms;
+            },
+        });
+        expect(res).toBe('not-merged');
+        expect(pauses).toEqual([30_000, 15_000]);
+    });
+
+    it('нераспознанный отказ → один повтор, как до #47', () => {
+        const { res, mergePrFn, pauses } = run(['something odd happened'], { alwaysFail: true });
+        expect(res).toBe('not-merged');
+        expect(mergePrFn).toHaveBeenCalledTimes(2);
+        expect(pauses).toEqual([30_000]);
+    });
+
+    // Смешанная последовательность: единственный повтор нераспознанного считается по ЕГО
+    // повторам, а не по номеру попытки — transient → unknown обязан получить свой повтор.
+    it('transient → unknown → unknown: нераспознанный повторён ровно один раз', () => {
+        const { res, mergePrFn, pauses, logs } = run(
+            ['HTTP 503', 'something odd happened', 'something odd happened'],
+            { alwaysFail: true },
+        );
+        expect(res).toBe('not-merged');
+        expect(mergePrFn).toHaveBeenCalledTimes(3);
+        expect(pauses).toEqual([30_000, 30_000]);
+        expect(logs.find((l) => l.startsWith('⛔'))).toContain('не распознан и после повтора');
+    });
+
+    it('unknown → transient → unknown: транзиент между ними повтор нераспознанного не возвращает', () => {
+        const { res, mergePrFn } = run(['odd', 'HTTP 503', 'odd'], { alwaysFail: true });
+        expect(res).toBe('not-merged');
+        expect(mergePrFn).toHaveBeenCalledTimes(3);
+    });
+
+    it('429 лимита API → повтор, а не стоп по существу', () => {
+        const { res, mergePrFn } = run([
+            'GraphQL: API rate limit exceeded for installation (HTTP 429)',
+            'HTTP 408: Request Timeout',
+        ]);
+        expect(res).toBe('merged');
+        expect(mergePrFn).toHaveBeenCalledTimes(3);
+    });
+
+    it('строка повтора называет ответ форжа, а не команду', () => {
+        const { logs } = run(['GraphQL: Something went wrong (HTTP 503)']);
+        const warn = logs.find((l) => l.startsWith('⚠ Мердж')) ?? '';
+        expect(warn).toContain('(GraphQL: Something went wrong (HTTP 503))');
+        expect(warn).not.toContain('Command failed');
+    });
+
+    // merge-unconfirmed остаётся отдельным исходом: успех после транзиентов не отменяет
+    // обязательного подтверждения.
+    it('успех после транзиента без подтверждения → merge-unconfirmed', () => {
+        let calls = 0;
+        const g = createGateRunner(makeEnv());
+        const res = tryMergeWith(g, phase, {
+            findOpenPrFn: () => ({ number: 9, labels: [] }),
+            checksGreenFn: () => true,
+            getVerifiedHeadFn: () => SHA,
+            mergePrFn: () => {
+                if (++calls === 1) throw new Error('HTTP 503');
+            },
+            phaseMergedFn: () => false,
+            mergeConfirmAttempts: 1,
+        });
+        expect(res).toBe('merge-unconfirmed');
+        expect(calls).toBe(2);
     });
 });
 
@@ -1545,5 +1769,93 @@ describe('tryMergePhase — три исхода гейта и политика �
         // При пропусках «зелёный» — неправда: чек не прошёл, его не дозапустили.
         expect(g.getLastMergeProof()).not.toContain('зелёный');
         expect(g.getLastMergeProof()).toMatch(/прошли \d+ из \d+/);
+    });
+});
+
+describe('checksGreen/tryMergePhase — ветка фазы, отставшая от main (#66)', () => {
+    const MERGED = 'c'.repeat(40);
+    const MAIN = 'd'.repeat(40);
+
+    function run(g: ReturnType<typeof createGateRunner>, mainSyncFn: unknown) {
+        const sh = vi.fn(() => '');
+        const ok = g.checksGreen('feature/x', 7, {
+            shFn: sh,
+            runArgvFn: () => '',
+            prHeadShaFn: () => SHA,
+            syncDepsFn: () => {},
+            checks: [['lint', 'npm run lint']],
+            mainSyncFn: mainSyncFn as never,
+        });
+        return { ok, sh };
+    }
+
+    it('влитие прошло → чеки и --match-head-commit на НОВОЙ голове, а не на отставшей', () => {
+        const g = createGateRunner(makeEnv());
+        const mainSync = vi.fn(() => ({ kind: 'updated', head: MERGED, main: MAIN }));
+        const { ok, sh } = run(g, mainSync);
+        expect(ok).toBe(true);
+        expect(mainSync).toHaveBeenCalledWith('feature/x', SHA, expect.anything());
+        expect(sh).toHaveBeenCalledWith('npm run lint', expect.anything());
+        expect(g.getVerifiedHead()).toBe(MERGED);
+        expect(g.getLastMainSyncStop()).toBeNull();
+    });
+
+    it('конфликт → false до чеков, файлы в записи, red-check пуст (лечить нечего)', () => {
+        const park = vi.fn();
+        const logs: string[] = [];
+        const g = createGateRunner(makeEnv({ parkOnOriginMain: park, log: (m) => logs.push(m) }));
+        const conflict = { kind: 'conflict', main: MAIN, files: ['docs/core-journal.md'] };
+        const { ok, sh } = run(g, () => conflict);
+        expect(ok).toBe(false);
+        expect(sh).not.toHaveBeenCalledWith('npm run lint', expect.anything());
+        expect(g.getLastMainSyncStop()).toEqual(conflict);
+        expect(g.getLastRedCheck()).toBeNull();
+        expect(g.getVerifiedHead()).toBeNull();
+        expect(park).toHaveBeenCalledTimes(1);
+        expect(logs.some((l) => l.includes('docs/core-journal.md'))).toBe(true);
+    });
+
+    it('следующий раунд сбрасывает запись: устаревший конфликт не доезжает до исхода', () => {
+        const g = createGateRunner(makeEnv());
+        run(g, () => ({ kind: 'failed', why: 'сеть' }));
+        expect(g.getLastMainSyncStop()).not.toBeNull();
+        run(g, () => ({ kind: 'current' }));
+        expect(g.getLastMainSyncStop()).toBeNull();
+    });
+
+    it('tryMergePhase: запись о влитии → main-conflict, мерджа нет', () => {
+        const g = createGateRunner(makeEnv());
+        const mergePrFn = vi.fn();
+        const res = tryMergeWith(
+            g,
+            { branch: 'feature/x', milestone: 'M' },
+            {
+                findOpenPrFn: () => ({ number: 7, labels: [] }),
+                checksGreenFn: () => false,
+                getLastMainSyncStopFn: () => ({ kind: 'conflict', main: MAIN, files: ['a'] }),
+                // Сбой влития важнее любого прошлого red-check: проверяется первым.
+                getLastRedCheckFn: () => ({ name: 'lint', cmd: 'x', excerpt: '' }),
+                mergePrFn,
+            },
+        );
+        expect(res).toBe('main-conflict');
+        expect(mergePrFn).not.toHaveBeenCalled();
+    });
+
+    it('#85 tryMergePhase: запись о расхождении HEAD → head-diverged, а не not-merged', () => {
+        const g = createGateRunner(makeEnv());
+        const mergePrFn = vi.fn();
+        const res = tryMergeWith(
+            g,
+            { branch: 'feature/x', milestone: 'M' },
+            {
+                findOpenPrFn: () => ({ number: 7, labels: [] }),
+                checksGreenFn: () => false,
+                getLastHeadDivergenceFn: () => ({ local: OTHER_SHA, remote: SHA, line: 'x' }),
+                mergePrFn,
+            },
+        );
+        expect(res).toBe('head-diverged');
+        expect(mergePrFn).not.toHaveBeenCalled();
     });
 });

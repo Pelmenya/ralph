@@ -28,6 +28,8 @@
 | `deadman-scenarios.test.ts`         | пороги тишины на реальном файле лога                                      |
 | `review-of-fixes-scenarios.test.ts` | лестница «ревью правок» целиком                                           |
 | `phase-branch-scenarios.test.ts`    | ветка фазы на НАСТОЯЩЕМ git: достижимость коммита, non-ff, совет спасения |
+| `main-sync-scenarios.test.ts`       | отставшая от main ветка фазы: конфликт с именем файла, влитие до чеков    |
+| `session-push-scenarios.test.ts`    | незапушенный коммит сессии разбора: пуш раннером, non-ff не перезаписан   |
 | `coder-prompt-branch.test.ts`       | промпт не велит сессии переключать ветку — это работа раннера             |
 | `delivery-sessions-branch.test.ts`  | разбор blocked и чини-сессия гейта стартуют на ветке фазы                 |
 | `adapters-contract.test.ts`         | реализации швов соответствуют интерфейсам                                 |

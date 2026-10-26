@@ -73,11 +73,13 @@ import { createTunnelCheck } from './tunnel-check.ts';
 import { createWorktreeManager } from './worktree.ts';
 import { ensurePhaseBranch, checkOnPhaseBranch, type TPhaseBranchResult } from './phase-branch.ts';
 import { formatStopMessage, type TStopReason } from './stop-message.ts';
+import { pushSessionCommits, type SessionPushResult } from './session-push.ts';
 // Подмножество причин стопа, которыми кончается проводка на ветку фазы: `switch` по нему
 // закрывается `never`-веткой, и новая природа отказа падает на компиляции.
 type TPhaseBranchStopKind = Extract<TStopReason, 'tree-dirty' | 'main-conflict' | 'unknown'>;
 import { createReviewModule, reviewVerdict } from './review.ts';
 import { createGateRunner, resolveGateChecks, resolveGatePolicy } from './gate.ts';
+import { resolveMergeRetryMaxMs } from './merge-retry.ts';
 import { createDeployCheckModule } from './deploy-check.ts';
 // #82: классификация отказа запуска рантайма (E2BIG, ENOENT, таймаут) — чистые функции
 // без замыканий на config/DRY/adapters, общие для обоих spawn-путей.
@@ -419,6 +421,9 @@ export type RalphConfig = {
     // blockedHealAttempts).
     fixReviewAttempts?: number;
     apiLimitMaxWaits?: number;
+    // #47: предел по времени на повторы мерджа при транзиентных отказах форжа (мс).
+    // Дефолт — DEFAULT_MERGE_RETRY_MAX_MS (merge-retry.ts).
+    mergeRetryMaxMs?: number;
     waitOnApiLimit?: boolean;
     apiLimitGraceMin?: number;
     apiLimitFallbackWaitMin?: number;
@@ -2885,6 +2890,12 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // Раньше (общее дерево) ручная правка посреди AFK-прогона ложно роняла ensureClean и
     // стопила всю ночь. shFn/logFn инжектируемы — как у сиблингов гейта из #77 (для тестов
     // изоляции и единообразия); по умолчанию это боевые sh/log, работающие в cwd раннера.
+    //
+    // #13: функция сообщает НАБЛЮДАЕМОЕ, а не решение. Решение о стопе принимает
+    // вызывающий: цикл итераций на `false` коммитит остаток (#66) и встаёт, только если
+    // коммит не удался, гейт мерджа отказывается мерджить. Прежний текст «— стоп, разбери
+    // руками» остался от поведения до #66 и шёл в лог за доли секунды до «📦 Остаток
+    // закоммичен»: разбор прогона человеком ушёл искать стоп, которого не было.
     function ensureClean(
         context: string,
         { shFn = sh, logFn = log }: { shFn?: ShFn; logFn?: LogFn } = {},
@@ -2897,7 +2908,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             return false;
         }
         if (dirtyNow) {
-            logFn(`⛔ Грязное рабочее дерево (${context}) — стоп, разбери руками:\n${dirtyNow}`);
+            logFn(`🧹 Грязное рабочее дерево (${context}):\n${dirtyNow}`);
             return false;
         }
         return true;
@@ -3325,6 +3336,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
         getLastForgeRedCheck: gateGetLastForgeRedCheck,
         getLastForgeStop: gateGetLastForgeStop,
         getLastToolFailure: gateGetLastToolFailure,
+        getLastMainSyncStop: gateGetLastMainSyncStop,
+        getLastHeadDivergence: gateGetLastHeadDivergence,
     } = createGateRunner({
         mergePr,
         phaseMerged,
@@ -3694,6 +3707,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // Задача 81: политика внешнего CI и сбоев инструмента — тем же ранним отказом.
         // Опечатка в `gate.externalCi` всплыла бы иначе только на гейте, через часы работы.
         resolveGatePolicy(cfg, failFn);
+        // #47: предел повторов мерджа — тем же ранним отказом: битое значение иначе
+        // всплыло бы на мердже, то есть после всего гейта.
+        resolveMergeRetryMaxMs(cfg, failFn);
 
         // Канон, задача 27: заданный скрипт потребителя ищется на диске ДО первой итерации.
         // Форму пути закрыл валидатор конфига (задача 23), но опечатка в САМОМ пути формы не
@@ -4075,6 +4091,13 @@ export function createOrchestrator(env: OrchestratorEnv) {
         getLastForgeStop?: typeof gateGetLastForgeStop;
         // Задача 81: чек, упавший на ИНСТРУМЕНТЕ, — тем же геттер-приёмом.
         getLastToolFailure?: typeof gateGetLastToolFailure;
+        // #66: ветка фазы не подтянута к main — файлы конфликта или причина сбоя.
+        getLastMainSyncStop?: typeof gateGetLastMainSyncStop;
+        // #85: локальный ref ветки разошёлся с головой PR — строка гейта.
+        getLastHeadDivergence?: typeof gateGetLastHeadDivergence;
+        // #85: незапушенные коммиты сессии разбора blocked пушит раннер. DI — дерево тестов
+        // настоящего origin не держит; живой git модуля проверяет core/session-push.test.ts.
+        pushSessionCommitsFn?: (branch: string, logFn: LogFn) => SessionPushResult;
         pushEventFn?: typeof pushEvent;
         deployPhaseFn?: typeof deployPhasePlaceholder;
         deployEnabledFn?: () => boolean;
@@ -4188,6 +4211,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
             getLastForgeRedCheck = gateGetLastForgeRedCheck,
             getLastForgeStop = gateGetLastForgeStop,
             getLastToolFailure = gateGetLastToolFailure,
+            getLastMainSyncStop = gateGetLastMainSyncStop,
+            getLastHeadDivergence = gateGetLastHeadDivergence,
+            pushSessionCommitsFn = (branch: string, logFn: LogFn) =>
+                pushSessionCommits(branch, { runArgvFn: shArgv, logFn }),
             pushEventFn = pushEvent,
             deployPhaseFn = deployPhasePlaceholder,
             // #51: «есть ли деплой» — вопрос к шву, и он задаётся ПЕРЕД всеми остальными
@@ -4308,7 +4335,17 @@ export function createOrchestrator(env: OrchestratorEnv) {
             // Коммитим его и идём дальше; стоп остаётся только если сам коммит не удался
             // (тогда состояние дерева неизвестно — fail-closed).
             if (!dry && !ensureCleanFn(`итерация фазы "${phase.milestone}"`)) {
-                if (!commitLeftoversFn(`итерация фазы "${phase.milestone}"`)) break;
+                if (!commitLeftoversFn(`итерация фазы "${phase.milestone}"`)) {
+                    // Задача 40: подробности (что грязное, почему коммит не лёг) уже в логе
+                    // от commitLeftovers; пуш — о самом стопе, без которого ночь тишины.
+                    pushEventFn(
+                        `⛔ Ralph: остаток сессии на фазе "${phase.milestone}" не закоммичен — стоп, состояние дерева неизвестно. ` +
+                            'Разбери дерево раннера руками (git status, причина — в логе) и перезапусти loop.',
+                        cfg,
+                        { logFn },
+                    );
+                    break;
+                }
             }
 
             // #134: на ветку фазы дерево ставит ПЕТЛЯ. Раньше это оставалось кодер-сессии
@@ -4730,18 +4767,26 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 try {
                     rawOpen = allOpenIssuesFn(phase.milestone);
                 } catch (e) {
-                    logFn(
-                        `⚠ Не смог проверить открытые issues фазы перед сдачей: ${(e as Error).message} — стоп.`,
+                    // Задача 40: здесь петля ВЫХОДИТ — значит пуш. Сбой чтения, на котором
+                    // она идёт дальше (оценка прогресса, комментарии PR), остаётся логом:
+                    // пуш на каждый сетевой чих обесценил бы канал.
+                    pushEventFn(
+                        `⛔ Ralph: не смог проверить открытые issues фазы "${phase.milestone}" перед сдачей: ${(e as Error).message} — стоп. ` +
+                            'Проверь доступность форжа и перезапусти loop — состояние фазы не тронуто, повтор безопасен.',
+                        cfg,
+                        { logFn },
                     );
                     break;
                 }
                 if (rawOpen.length > 0) {
-                    logFn(
-                        `⛔ Фаза "${phase.milestone}": рабочая очередь пуста, но в milestone открыты issues вне очереди (blocked/чужие): ` +
+                    pushEventFn(
+                        `⛔ Ralph: фаза "${phase.milestone}": рабочая очередь пуста, но в milestone открыты issues вне очереди (blocked/чужие): ` +
                             rawOpen
                                 .map((i) => `#${i.number} (${(i.author && i.author.login) || '?'})`)
                                 .join(', ') +
                             '. Сдача фазы отложена — разбери их (сними blocked / закрой / триажни) и перезапусти.',
+                        cfg,
+                        { logFn },
                     );
                     break;
                 }
@@ -4752,8 +4797,11 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 try {
                     merged = phaseMergedFn(phase);
                 } catch (e) {
-                    logFn(
-                        `⚠ Не смог проверить мердж-статус фазы "${phase.milestone}": ${(e as Error).message} — стоп.`,
+                    pushEventFn(
+                        `⛔ Ralph: не смог проверить мердж-статус фазы "${phase.milestone}": ${(e as Error).message} — стоп. ` +
+                            'Проверь доступность форжа и перезапусти loop — состояние фазы не тронуто, повтор безопасен.',
+                        cfg,
+                        { logFn },
                     );
                     break;
                 }
@@ -4773,9 +4821,11 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         try {
                             updateRunnerTreeToOriginMain(runArgvFn);
                         } catch (e) {
-                            logFn(
-                                `⛔ Фаза "${phase.milestone}" смерджена, но дерево раннера не обновилось (${(e as Error).message}). ` +
+                            pushEventFn(
+                                `⛔ Ralph: фаза "${phase.milestone}" смерджена, но дерево раннера не обновилось (${(e as Error).message}). ` +
                                     `Почини руками в дереве раннера: ${RUNNER_TREE_FIX_HINT} — затем перезапусти loop.`,
+                                cfg,
+                                { logFn },
                             );
                             break;
                         }
@@ -4831,8 +4881,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     phaseHadIssues = hasAnyIssuesFn(phase.milestone);
                 } catch (e) {
                     // Пушем, как и ветка «не начата» ниже: остановка законна, но человек о
-                    // ней узнать обязан. Соседние стопы по сбою чтения (C2, мердж-статус)
-                    // пока молчат — это отдельный класс, вынесен в issue.
+                    // ней узнать обязан — как и у соседних стопов по сбою чтения (задача 40).
                     pushEventFn(
                         `⚠ Ralph: не смог проверить, были ли у фазы "${phase.milestone}" задачи: ${(e as Error).message} — стоп. ` +
                             `Проверь доступность форжа и перезапусти loop — состояние фазы не тронуто, повтор безопасен.`,
@@ -5133,8 +5182,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         }
                         if (!reviewIntentsApplied) break;
                         if (reviewCode !== 0) {
-                            logFn(
-                                `⛔ Ревью-сессия упала (код ${reviewCode}) — БЕЗ ревью фазу не мерджим (fail-closed). Перезапусти loop или проведи ревью руками.`,
+                            pushEventFn(
+                                `⛔ Ralph: ревью-сессия фазы "${phase.milestone}" упала (код ${reviewCode}) — БЕЗ ревью фазу не мерджим (fail-closed). Перезапусти loop или проведи ревью руками.`,
+                                cfg,
+                                { logFn },
                             );
                             break;
                         }
@@ -5207,10 +5258,12 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     const fix = runFixSession('правки по ревью');
                     if (fix.branchLost || fix.intentsBroken) break;
                     if (fix.code !== 0) {
-                        logFn(
+                        pushEventFn(
                             TURN_LIMIT_RE.test(fix.output)
-                                ? `⛔ Шаг правок по ревью не уложился в бюджет ходов за ${fixTurnRetries + 1} попыток — сдача фазы остановлена (fail-closed). Похоже, фаза великовата: разбери остаток руками или разрежь milestone.`
-                                : `⛔ Шаг правок по ревью упал (код ${fix.code}) — сдача фазы остановлена (fail-closed).`,
+                                ? `⛔ Ralph: шаг правок по ревью фазы "${phase.milestone}" не уложился в бюджет ходов за ${fixTurnRetries + 1} попыток — сдача фазы остановлена (fail-closed). Похоже, фаза великовата: разбери остаток руками или разрежь milestone.`
+                                : `⛔ Ralph: шаг правок по ревью фазы "${phase.milestone}" упал (код ${fix.code}) — сдача фазы остановлена (fail-closed). Перезапусти loop.`,
+                            cfg,
+                            { logFn },
                         );
                         break;
                     }
@@ -5656,8 +5709,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
                             if (fixReviewCode !== 0) {
                                 // Тот же fail-closed, что у ревью фазы: без вердикта прохода
                                 // мерджить нельзя — иначе правки снова уедут непрочитанными.
-                                logFn(
-                                    `⛔ Проход ревью правок упал (код ${fixReviewCode}) — сдача фазы остановлена (fail-closed). Перезапусти loop.`,
+                                pushEventFn(
+                                    `⛔ Ralph: проход ревью правок фазы "${phase.milestone}" упал (код ${fixReviewCode}) — сдача фазы остановлена (fail-closed). Перезапусти loop.`,
+                                    cfg,
+                                    { logFn },
                                 );
                                 ladderStop = true;
                                 break;
@@ -5746,11 +5801,21 @@ export function createOrchestrator(env: OrchestratorEnv) {
                                 ladderStop = true;
                                 break;
                             }
-                            if (again.intentsBroken || again.code !== 0) {
-                                logFn(
+                            // Задача 40: несработавшие намерения уже отпушило их применение
+                            // (applySessionRequests) — второй пуш о том же событии читался бы
+                            // как второе событие. Раньше эта ветка заодно печатала «упали (код
+                            // 0)» о сессии, которая отработала штатно.
+                            if (again.intentsBroken) {
+                                ladderStop = true;
+                                break;
+                            }
+                            if (again.code !== 0) {
+                                pushEventFn(
                                     TURN_LIMIT_RE.test(again.output)
-                                        ? `⛔ Правки по ревью правок не уложились в бюджет ходов за ${fixTurnRetries + 1} попыток — сдача остановлена (fail-closed).`
-                                        : `⛔ Правки по ревью правок упали (код ${again.code}) — сдача остановлена (fail-closed).`,
+                                        ? `⛔ Ralph: правки по ревью правок фазы "${phase.milestone}" не уложились в бюджет ходов за ${fixTurnRetries + 1} попыток — сдача остановлена (fail-closed).`
+                                        : `⛔ Ralph: правки по ревью правок фазы "${phase.milestone}" упали (код ${again.code}) — сдача остановлена (fail-closed). Перезапусти loop.`,
+                                    cfg,
+                                    { logFn },
                                 );
                                 ladderStop = true;
                                 break;
@@ -6218,8 +6283,12 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 if (gate === 'merged-local-stale') {
                     // H4: PR влит, но advancePhase НЕ делаем — локалка не готова строить
                     // следующую фазу; рестарт после ручной починки пройдёт веткой phaseMerged.
-                    logFn(
-                        '⛔ Стоп: PR смерджен, но локальное состояние требует ручной починки (см. выше).',
+                    // Задача 40: гейт назвал причину только логом — пуш о стопе даёт петля.
+                    pushEventFn(
+                        `⛔ Ralph: фаза "${phase.milestone}" — PR смерджен, но локальное состояние требует ручной починки (см. ralph.log). ` +
+                            'Почини дерево раннера и перезапусти loop — рестарт увидит фазу смердженной и продолжит.',
+                        cfg,
+                        { logFn },
                     );
                     break;
                 }
@@ -6352,12 +6421,57 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         // #594: два разных стопа — два разных совета человеку. «Упала» лечится
                         // перезапуском, «не уложилась в бюджет» — нет: рестарт прогонит тот же
                         // разбор с тем же потолком, дело в объёме блокеров, а не в сбое.
-                        logFn(
+                        pushEventFn(
                             TURN_LIMIT_RE.test(blocked.output)
-                                ? `⛔ Разбор blocked не уложился в бюджет ходов за ${fixTurnRetries + 1} попыток — стоп (fail-closed). Похоже, блокеров больше, чем влезает в бюджет: разбери руками или разрежь milestone.`
-                                : `⛔ Сессия разбора blocked упала (код ${blocked.code}) — стоп, перезапусти loop.`,
+                                ? `⛔ Ralph: разбор blocked фазы "${phase.milestone}" не уложился в бюджет ходов за ${fixTurnRetries + 1} попыток — стоп (fail-closed). Похоже, блокеров больше, чем влезает в бюджет: разбери руками или разрежь milestone.`
+                                : `⛔ Ralph: сессия разбора blocked фазы "${phase.milestone}" упала (код ${blocked.code}) — стоп, перезапусти loop.`,
+                            cfg,
+                            { logFn },
                         );
                         break;
+                    }
+                    // #85: сессия разбора закоммитила и не запушила — повторное ревью дало
+                    // merge, а гейт отказал на расхождении локального ref с головой PR, и
+                    // вахта пушила руками. Пуш — работа раннера, как и коммит остатка: тот же
+                    // довод «действие всегда одно». Пушим ДО повторного ревью — оно и гейт
+                    // обязаны судить то, что лежит в PR, а не локальную копию.
+                    if (!dry) {
+                        if (
+                            !ensureCleanFn('разбор blocked') &&
+                            !commitLeftoversFn('разбор blocked')
+                        ) {
+                            pushEventFn(
+                                `⛔ Ralph: остаток сессии разбора blocked фазы "${phase.milestone}" не закоммичен — стоп, состояние дерева неизвестно. ` +
+                                    'Разбери дерево раннера руками (git status, причина — в логе) и перезапусти loop.',
+                                cfg,
+                                { logFn },
+                            );
+                            break;
+                        }
+                        const pushed = pushSessionCommitsFn(phase.branch, logFn);
+                        if (pushed.kind === 'failed') {
+                            pushEventFn(
+                                `⛔ Ralph: фаза "${phase.milestone}" — коммиты сессии разбора blocked не доехали до origin, PR оставлен человеку. ` +
+                                    formatStopMessage({
+                                        reason: 'session-unpushed',
+                                        diagnosis:
+                                            `ветка ${phase.branch}` +
+                                            (pushed.local
+                                                ? ` локально на ${pushed.local.slice(0, 8)}`
+                                                : '') +
+                                            (pushed.remote
+                                                ? `, на origin ${pushed.remote.slice(0, 8)}`
+                                                : '') +
+                                            `: ${pushed.why}`,
+                                        question:
+                                            `сверь git log ${phase.branch} с origin/${phase.branch}, сведи их без --force, ` +
+                                            'запушь и перезапусти loop — сдача не повторится, пойдёт сразу гейт',
+                                    }),
+                                cfg,
+                                { logFn },
+                            );
+                            break;
+                        }
                     }
 
                     // #217: повторное ревью проводит РАННЕР (не кодер-сессия), моделью НЕ
@@ -6493,12 +6607,14 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         // ревью (обход барьера #217). Детерминированно возвращаем метку и
                         // снимаем флаг — гейт следующего прохода перечитает blocked.
                         const labelBack = restoreBlockedLabel(phase.branch);
-                        logFn(
-                            `⛔ Повторное ревью blocked упало (код ${rCode}) — БЕЗ ревью фазу не мерджим (fail-closed), ` +
+                        pushEventFn(
+                            `⛔ Ralph: повторное ревью blocked фазы "${phase.milestone}" упало (код ${rCode}) — БЕЗ ревью фазу не мерджим (fail-closed), ` +
                                 (labelBack
                                     ? 'label blocked возвращён'
                                     : 'label blocked не подтверждён, восстановится перед гейтом') +
                                 '. Перезапусти loop.',
+                            cfg,
+                            { logFn },
                         );
                         break;
                     }
@@ -6666,6 +6782,60 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     saveStateFn(state);
                     break;
                 }
+                // #66: ветка фазы отстала от main и не подтянулась. Раньше это был безымянный
+                // отказ мерджа уже после гейта; теперь стоп называет файлы встречной правки
+                // (причина `main-conflict`) или сбой влития, уже переживший повторы сети
+                // (`main-sync-failed`), и человек начинает с причины, а не с поиска.
+                // Чини-сессии нет: разрешать встречную правку по смыслу — не механика гейта.
+                if (gate === 'main-conflict') {
+                    const sync = getLastMainSyncStop();
+                    const stopMsg =
+                        `⛔ Ralph: ветка фазы "${phase.milestone}" не подтянута к main — PR оставлен человеку. ` +
+                        formatStopMessage({
+                            // Сбой влития без конфликта — своя причина: заголовок «конфликт
+                            // веток» о моргнувшей сети увёл бы человека искать конфликт.
+                            reason: sync?.kind === 'failed' ? 'main-sync-failed' : 'main-conflict',
+                            diagnosis: !sync
+                                ? 'гейт вернул main-conflict без записи о влитии (регресс проводки)'
+                                : sync.kind === 'conflict'
+                                  ? `ветка ${phase.branch} отстала от main (${sync.main.slice(0, 8)}), ` +
+                                    `встречная правка тех же файлов: ${sync.files.join(', ')}`
+                                  : `ветка ${phase.branch}: подтянуть origin/main не вышло — ${sync.why}`,
+                            question:
+                                sync?.kind === 'conflict'
+                                    ? `влей main в ${phase.branch}, разреши конфликт в названных файлах, ` +
+                                      'запушь и перезапусти loop — сдача не повторится, пойдёт сразу гейт'
+                                    : 'почини причину по ralph.log и перезапусти loop — гейт повторит влитие сам',
+                        });
+                    pushEventFn(stopMsg, cfg, { logFn });
+                    // Тот же сброс, что у остальных стопов, отдающих PR человеку.
+                    state.gateHeals = 0;
+                    state.forgeHealedRunId = null;
+                    saveStateFn(state);
+                    break;
+                }
+                // #85: локальный ref ветки разошёлся с головой PR. Раньше это был безымянный
+                // `not-merged`, и катч-олл ниже писал «причина не установлена», хотя гейт
+                // назвал её точно. Диагноз — та самая строка гейта, с командой исправления.
+                if (gate === 'head-diverged') {
+                    const div = getLastHeadDivergence();
+                    const stopMsg =
+                        `⛔ Ralph: ветка фазы "${phase.milestone}" разошлась с PR — PR оставлен человеку. ` +
+                        formatStopMessage({
+                            reason: 'head-diverged',
+                            diagnosis:
+                                div?.line ??
+                                'гейт вернул head-diverged без записи о расхождении (регресс проводки)',
+                            question:
+                                'реши, чья история верна: локальные коммиты запушь без --force либо сбрось ref на origin, ' +
+                                'затем перезапусти loop — сдача не повторится, пойдёт сразу гейт',
+                        });
+                    pushEventFn(stopMsg, cfg, { logFn });
+                    state.gateHeals = 0;
+                    state.forgeHealedRunId = null;
+                    saveStateFn(state);
+                    break;
+                }
                 // Топливо чини-сессии приходит с одной из двух сторон: локальный красный чек
                 // либо красный куб площадки. Ветка ОДНА — бюджет попыток, эскалация модели,
                 // сброс лестницы ревью и возврат на полную сдачу у них общие; различаются
@@ -6827,7 +6997,11 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     if (healCode !== 0) {
                         // Fail-closed как у шагов сдачи (H2): упавшая чини-сессия не должна
                         // молча зациклить гейт — но счётчик уже потрачен, рестарт продолжит.
-                        logFn(`⛔ Чини-сессия упала (код ${healCode}) — стоп, перезапусти loop.`);
+                        pushEventFn(
+                            `⛔ Ralph: чини-сессия гейта фазы "${phase.milestone}" упала (код ${healCode}) — стоп, перезапусти loop.`,
+                            cfg,
+                            { logFn },
+                        );
                         break;
                     }
                     // #269, второй проход ревью: прогон помечается пролеченным ТОЛЬКО ПОСЛЕ
@@ -7920,6 +8094,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
         getLastForgeRedCheck: gateGetLastForgeRedCheck,
         getLastForgeStop: gateGetLastForgeStop,
         getLastToolFailure: gateGetLastToolFailure,
+        getLastMainSyncStop: gateGetLastMainSyncStop,
+        getLastHeadDivergence: gateGetLastHeadDivergence,
         main,
     };
 }

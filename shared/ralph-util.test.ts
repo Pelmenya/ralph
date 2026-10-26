@@ -6,6 +6,8 @@
 import { describe, expect, it } from 'vitest';
 import { execSync } from 'node:child_process';
 import {
+    gitErrorText,
+    gitExitStatus,
     nonNegativeIntOrDefault,
     positiveIntOrDefault,
     redactSecrets,
@@ -152,5 +154,45 @@ describe('redactSecrets (#390)', () => {
 
     it('текст без совпадений возвращается как есть', () => {
         expect(redactSecrets('no secrets here', ['SECRET'])).toBe('no secrets here');
+    });
+});
+
+describe('gitErrorText / gitExitStatus — разбор отказа git (ревью #66/#85)', () => {
+    const err = (fields: Record<string, unknown>) => Object.assign(new Error('x'), fields);
+
+    it('fetch: причина со следующей строки не теряется', () => {
+        const e = err({
+            message: 'Command failed: git fetch origin main',
+            stderr: "fatal: unable to access 'https://example.com/r.git/': \nCould not resolve host: example.com\n",
+        });
+        expect(gitErrorText(e)).toBe(
+            "fatal: unable to access 'https://example.com/r.git/': / Could not resolve host: example.com",
+        );
+    });
+
+    it('без stderr — ответ из текста исключения, командная строка пропущена', () => {
+        expect(gitErrorText(err({ message: 'Command failed: git push\nremote: denied' }))).toBe(
+            'remote: denied',
+        );
+    });
+
+    it('stderr Buffer читается так же, как строка', () => {
+        expect(gitErrorText(err({ stderr: Buffer.from('fatal: bad object\n') }))).toBe(
+            'fatal: bad object',
+        );
+    });
+
+    it('больше трёх строк ответа — только три', () => {
+        expect(gitErrorText(err({ stderr: 'a\nb\nc\nd' }))).toBe('a / b / c');
+    });
+
+    it('не-Error — тоже причина, а не undefined', () => {
+        expect(gitErrorText('timeout')).toBe('timeout');
+    });
+
+    it('код возврата — число либо null', () => {
+        expect(gitExitStatus(err({ status: 1 }))).toBe(1);
+        expect(gitExitStatus(err({ status: null }))).toBeNull();
+        expect(gitExitStatus('boom')).toBeNull();
     });
 });

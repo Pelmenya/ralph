@@ -89,3 +89,30 @@ export function errorText(e: unknown): string {
 export function gitNetworkEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
     return { ...env, GIT_TERMINAL_PROMPT: '0' };
 }
+
+// Разбор отказа git из `execFileSync` — один на ядро (ревью #66/#85). Три копии жили в
+// `phase-branch.ts`, `main-sync.ts`, `session-push.ts`, и правка одной (скажем, на `stderr`
+// типа Buffer) разъехалась бы с остальными молча.
+
+/** Код возврата git: по нему отличают ответ «нет» (1/2 у отдельных команд) от отказа. */
+export function gitExitStatus(e: unknown): number | null {
+    const status = (e as { status?: unknown } | null)?.status;
+    return typeof status === 'number' ? status : null;
+}
+
+/**
+ * Причина отказа git для лога и пуша человеку. Берётся stderr, иначе текст исключения;
+ * строка `Command failed: …` — это команда, а не ответ, и пропускается. Одной строки мало:
+ * у `git fetch` первая — `fatal: unable to access '…'`, а DNS/TLS/403 стоят следующей,
+ * поэтому до трёх строк ответа склеиваются через « / ». Стек на пол-экрана не нужен тоже.
+ */
+export function gitErrorText(e: unknown): string {
+    const err = (e ?? {}) as { stderr?: unknown; message?: unknown };
+    const stderr = err.stderr === undefined || err.stderr === null ? '' : String(err.stderr);
+    const raw = stderr.trim() || String(err.message ?? e).trim();
+    const lines = raw
+        .split('\n')
+        .map((l) => l.trim())
+        .filter((l) => l !== '' && !l.startsWith('Command failed:'));
+    return lines.length > 0 ? lines.slice(0, 3).join(' / ') : raw;
+}
