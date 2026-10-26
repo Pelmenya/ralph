@@ -21,6 +21,7 @@ import {
     traceFindings,
     explain,
 } from './project-traces.ts';
+import { coreIsRepoRoot } from './core-repo.ts';
 
 // Отсчёт от каталога МОДУЛЯ, а не от cwd: ядро гоняется и из своего корня, и из каталога
 // внутри проекта-потребителя, а CWD в этих раскладках разный. `import.meta.dirname` здесь
@@ -45,11 +46,7 @@ const SELF = new Set(['tests/project-traces.ts', 'tests/project-traces.test.ts']
  * гитигнорены, списка исключений не нужно.
  */
 function coreRepoFiles(): string[] | null {
-    const top = spawnSync('git', ['-C', CORE_ROOT, 'rev-parse', '--show-toplevel'], {
-        encoding: 'utf-8',
-    });
-    if (top.status !== 0) return null;
-    if (top.stdout.trim() !== CORE_ROOT) return null;
+    if (!coreIsRepoRoot()) return null;
     const ls = spawnSync('git', ['-C', CORE_ROOT, 'ls-files'], { encoding: 'utf-8' });
     if (ls.status !== 0) return null;
     return ls.stdout
@@ -176,7 +173,9 @@ describe('сплошной скан репозитория ядра', () => {
 // уезжают в публичный репозиторий сообщением коммита ровно так же, как строкой кода, и
 // правкой файла оттуда уже не убираются. Скан по дереву этого не видит вовсе — сообщения
 // в `git ls-files` не попадают, поэтому им нужен свой проход.
-describe('сообщения коммитов', () => {
+// История — свойство репозитория канона: у копии ядра в дереве потребителя `git log`
+// показал бы чужую историю (`core-repo.ts`).
+describe.skipIf(!coreIsRepoRoot())('сообщения коммитов', () => {
     function commitMessages(): Array<{ sha: string; body: string }> | null {
         // `-z` разделяет коммиты NUL-байтом — символом, которого в тексте сообщения быть
         // не может. Через сам формат его не передать: NUL в argv запрещён ядром ОС.

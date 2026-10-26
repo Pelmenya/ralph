@@ -8,6 +8,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { coreIsRepoRoot } from '../tests/core-repo.ts';
 import {
     GUARD_PROBES,
     ensureGuardHolds,
@@ -316,9 +317,13 @@ describe('живая проба: настоящие хуки процессом'
         return failed;
     };
 
-    it('настройки и хуки канона: рекурсивное удаление и чтение env-файла заблокированы', () => {
-        expect(probeTree(CANON_ROOT)).toEqual([]);
-    });
+    // Настройки и хуки из `.claude/` репозитория канона; копия у потребителя их не несёт.
+    it.skipIf(!coreIsRepoRoot())(
+        'настройки и хуки канона: рекурсивное удаление и чтение env-файла заблокированы',
+        () => {
+            expect(probeTree(CANON_ROOT)).toEqual([]);
+        },
+    );
 
     /** Дерево с одним PreToolUse-хуком — скриптом `hook.cjs` с заданным телом. */
     const treeWithHook = (body: string) => {

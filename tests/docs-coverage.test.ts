@@ -25,6 +25,7 @@ import {
     isStale,
     renderAgents,
 } from '../docs-sync.mts';
+import { coreIsRepoRoot } from './core-repo.ts';
 
 const CANON_ROOT = resolve(import.meta.dirname, '..');
 
@@ -95,7 +96,8 @@ describe('пара CLAUDE.md ↔ AGENTS.md не разъехалась', () => {
 
     // Хук и точка его подключения проверяются вместе: удали блок из настроек — и хук
     // останется в репозитории нетронутым, просто перестанет вызываться.
-    it('хук пересборки подключён и лежит на месте', () => {
+    // Хук и настройки — в `.claude/` репозитория канона, в копию у потребителя не едут.
+    it.skipIf(!coreIsRepoRoot())('хук пересборки подключён и лежит на месте', () => {
         const hook = '.claude/hooks/sync-docs.cjs';
         expect(existsSync(join(CANON_ROOT, hook)), `нет ${hook}`).toBe(true);
         const settings = JSON.parse(
@@ -181,7 +183,9 @@ describe('ссылки в доках ведут на существующие ф
         expect(DOCS).toContain('AGENTS.md');
     });
 
-    it.each(DOCS)('%s — ни одной битой относительной ссылки', (rel) => {
+    // Корневые доки ссылаются на `.claude/` и `LICENSE` репозитория канона — у копии ядра
+    // в дереве потребителя их нет по построению (`core-repo.ts`).
+    it.skipIf(!coreIsRepoRoot()).each(DOCS)('%s — ни одной битой относительной ссылки', (rel) => {
         const text = readFileSync(join(CANON_ROOT, rel), 'utf-8');
         // Только относительные ссылки на файлы дерева: внешние URL и якоря внутри страницы
         // этот барьер не проверяет — ходить в сеть тестом нельзя, а якоря живут в разметке.

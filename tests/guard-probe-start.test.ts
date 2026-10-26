@@ -15,6 +15,7 @@ import {
     type LiveSandbox,
     type LiveSandboxOptions,
 } from './live-sandbox.ts';
+import { coreIsRepoRoot } from './core-repo.ts';
 
 // Срок — как у соседнего живого набора: настоящий git и раннер в песочнице.
 vi.setConfig({ testTimeout: 30_000 });
@@ -45,10 +46,15 @@ describe('проба барьера останавливает петлю до �
         expect(run.coderRan, 'кодер-сессия успела стартовать на сломанном барьере').toBe(false);
     });
 
-    it('исправный барьер продукта пропускает старт до кодер-сессии', () => {
-        const run = startWith({});
-        expect(run.code, run.output).toBe(0);
-        expect(run.output).toContain('Проба барьера пройдена');
-        expect(run.coderRan).toBe(true);
-    });
+    // Исправный барьер — guard продукта из `.claude/hooks/` канона; у копии ядра в дереве
+    // потребителя его нет по построению (`core-repo.ts`).
+    it.skipIf(!coreIsRepoRoot())(
+        'исправный барьер продукта пропускает старт до кодер-сессии',
+        () => {
+            const run = startWith({});
+            expect(run.code, run.output).toBe(0);
+            expect(run.output).toContain('Проба барьера пройдена');
+            expect(run.coderRan).toBe(true);
+        },
+    );
 });

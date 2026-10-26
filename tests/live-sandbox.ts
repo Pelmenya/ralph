@@ -26,9 +26,17 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
+import { coreIsRepoRoot } from './core-repo.ts';
 
 /** Каталог продукта — то самое дерево, чистоту которого сторожит барьер. */
 export const PRODUCT_ROOT = path.resolve(import.meta.dirname, '..');
+
+// Барьер дерева сессий по умолчанию — guard продукта. Он живёт в `.claude/hooks/`
+// репозитория канона и в копию ядра у потребителя не едет (`core-repo.ts`); там живой цикл
+// идёт под синтетическим исправным хуком — сценарии проверяют код ядра, а не guard.
+const DEFAULT_GUARD_HOOK = coreIsRepoRoot()
+    ? 'node "${CLAUDE_PROJECT_DIR}/.claude/ralph/.claude/hooks/guard.cjs"'
+    : 'node "${CLAUDE_PROJECT_DIR}/.claude/ralph/tests/__fixtures__/stub-guard.cjs"';
 
 /** Что в песочнице лежит и куда смотреть после прогона. */
 export type LiveSandbox = {
@@ -229,7 +237,7 @@ export function buildLiveSandbox({
     ],
     coderScript = '',
     phaseBranchOnOrigin = false,
-    guardHook = 'node "${CLAUDE_PROJECT_DIR}/.claude/ralph/.claude/hooks/guard.cjs"',
+    guardHook = DEFAULT_GUARD_HOOK,
 }: LiveSandboxOptions = {}): LiveSandbox {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-live-')));
     const consumerRoot = path.join(root, 'consumer');
