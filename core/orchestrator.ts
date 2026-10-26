@@ -168,6 +168,12 @@ import { underRoot, type TResolvedRoots } from './roots.ts';
 import { updateConsumerTree } from './consumer-tree.ts';
 import { ensureGuardHolds } from './guard-probe.ts';
 import {
+    acquireRepoOwnership,
+    canonicalRepoId,
+    ownersDir,
+    releaseRepoOwnershipIfOurs,
+} from './repo-owner.ts';
+import {
     buildAdapters,
     createCoderRuntime,
     createGithubActionsDeploy,
@@ -7121,6 +7127,47 @@ export function createOrchestrator(env: OrchestratorEnv) {
         return acquireLockFn();
     }
 
+    // Канон, задача 76: владение репозиторием на хосте поверх лока дерева. Лок не пускает
+    // второй раннер на тот же runtimeDir, а это — второй КЛОН того же origin (у него свой
+    // runtimeDir и свой лок, но общие PR, ветки и карточки). Политика и граница «один
+    // хост» — в repo-owner.ts. dry не берёт, как и лок (C1: --dry-run строго read-only).
+    // Без origin стоп: репозиторий не назвать — и барьер, пропускающий такой запуск,
+    // пропускал бы его молча. Возвращает, что снимать на выходе, или null.
+    function acquireRepoOwner({
+        dry = DRY,
+        repoDir = '.',
+        lockPath,
+        readOriginFn = (dir: string) => shArgv('git', ['-C', dir, 'remote', 'get-url', 'origin']),
+        acquireFn = acquireRepoOwnership,
+        logFn = log,
+        failFn = fail,
+    }: {
+        dry?: boolean;
+        repoDir?: string;
+        lockPath: string;
+        readOriginFn?: (dir: string) => string;
+        acquireFn?: typeof acquireRepoOwnership;
+        logFn?: LogFn;
+        failFn?: FailFn;
+    }): { dir: string; repoId: string } | null {
+        if (dry) return null;
+        let repoId: string;
+        let dir: string;
+        try {
+            // Относительный origin git читал от repoDir — от него же и разрешаем.
+            repoId = canonicalRepoId(readOriginFn(repoDir), path.resolve(repoDir));
+            dir = ownersDir();
+        } catch (e: unknown) {
+            failFn(
+                `Владение репозиторием в ${repoDir} не взять (${(e as Error)?.message ?? String(e)}) ` +
+                    `— не назвать репозиторий или реестр, и второй writer не отличить. Стоп.`,
+            );
+            return null;
+        }
+        if (!acquireFn({ dir, repoId, lockPath }, { logFn, failFn })) return null;
+        return { dir, repoId };
+    }
+
     // main: тонкая оркестровка — загрузка конфига в фабричный config (его читают
     // runClaude/openIssues/pickModel и др.), обработка --reset, затем preflight → runLoop.
     function main(): void {
@@ -7209,6 +7256,16 @@ export function createOrchestrator(env: OrchestratorEnv) {
             // сразу после взятия; повторное снятие в общем хендлере идемпотентно.
             const lockToRelease = DRY ? null : path.resolve(RUNTIME.lock);
             if (lockToRelease) process.on('exit', () => releaseLockIfOurs(lockToRelease));
+            // Владение — сразу за локом и до миграции: второй клон того же origin не должен
+            // успеть ни переложить состояние, ни тронуть форж. Снятие — тем же exit-путём.
+            if (lockToRelease) {
+                const owned = acquireRepoOwner({
+                    repoDir: roots?.consumerRoot ?? '.',
+                    lockPath: lockToRelease,
+                });
+                if (!owned) return;
+                process.on('exit', () => releaseRepoOwnershipIfOurs(owned));
+            }
             if (roots) {
                 // Лог режима — в НОВЫЙ каталог: initialLogTarget фабрики захвачен до репойнта
                 // и указывает в старую раскладку, а писать туда после переезда значит заново
@@ -7465,6 +7522,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         removeLock,
         releaseLockIfOurs,
         acquireLock,
+        acquireRepoOwner,
         acquireRunnerLock,
         listMonitorPids,
         processPpid,
