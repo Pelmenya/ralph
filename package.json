@@ -10,7 +10,8 @@
         "format": "prettier --write .",
         "docs:sync": "node docs-sync.mts",
         "docs:check": "node docs-sync.mts --check",
-        "gate": "node gate.mts"
+        "gate": "node gate.mts",
+        "metric": "node runtime/metric.mts"
     },
     "devDependencies": {
         "@types/node": "^26.2.0",

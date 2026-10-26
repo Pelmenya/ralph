@@ -14,6 +14,7 @@
 //   - прогресс issues текущего milestone (gh)
 //   - открытые PR текущей фазы (gh, по ветке из конфига #214)
 //   - последние значимые строки ralph.log (маркеры фаз/итераций/ревью/мерджа)
+// и раз в сутки шлёт строку метрики продукта (maybePushDailyMetric).
 //
 // Только чтение: gh-запросы + чтение файлов. Ничего не мутирует (инвариант №12: монитор
 // не пишет в ralph.log — свежесть этого файла и есть признак жизни раннера).
@@ -61,6 +62,8 @@ const { pushEvent } = ralph;
 // (в мониторе) — импёровая половина: чтение файла, «сейчас» и сравнение с порогом.
 import { classifyActivity, silenceThresholdMs, type Activity } from './deadman.ts';
 import { formatStopMessage } from '../core/stop-message.ts';
+import { formatMetricDayLine } from './product-metric.ts';
+import { summarizeRuntime } from './metric.mts';
 
 // monitor-panel.mts живёт в .claude/ralph/runtime/ (#396), поэтому каталог раннера —
 // родитель import.meta.dirname, а не он сам. Служебные файлы (ralph.log/state/config)
@@ -399,6 +402,85 @@ export function maybePushDeadman(
     return lastMtime;
 }
 
+// Суточная строка метрики продукта (план, Фаза 4) — раз в сутки, на первом тике после
+// полуночи UTC, сводка за прошедшие календарные сутки UTC. Окно кончается полуночью, а не
+// моментом тика: тик дрейфует на минуты, и окна «24 ч до тика» соседних дней перекрывались
+// бы или оставляли щели, хотя ключ строки — календарная дата. Почему здесь, а не в цикле раннера: панель
+// живёт рядом с петлёй и уже владеет пушами наблюдения, а раннер между сессиями может
+// стоять часами — «раз в сутки» в его цикле значило бы «когда придётся».
+//
+// Ключ — дата UTC последнего решения, в памяти процесса. На старте (ключа нет) ключ
+// встаёт на сегодня без пуша: монитор перезапускается вместе с петлёй, и пуш на каждом
+// старте превратил бы «раз в сутки» в «раз на рестарт». Цена — сутки, на границе которых
+// панель не жила, строки не дают; это честнее, чем файл-отметка, которую монитор, по
+// инварианту «только читает», писать не должен.
+//
+// Fail-open, как у остальных уведомлений: ни сбой расчёта, ни сбой доставки не роняют
+// панель — исключение в тике setInterval убило бы процесс монитора, а вместе с ним и
+// deadman. Сбой расчёта уходит человеку строкой с причиной: молчание в полночь читалось
+// бы как «пуш потерялся», а не «метрика не считается». Ключ сдвигается и при неудачной
+// доставке: строка — пульс, а не алерт, и ретрай каждые пять минут при лежащем
+// Telegram был бы спамом в monitor.out.
+export function metricDayKey(now: number): string {
+    return new Date(now).toISOString().slice(0, 10);
+}
+
+export function maybePushDailyMetric(
+    now: number,
+    lastDay: string | null,
+    {
+        pushFn = pushEvent,
+        cfg,
+        computeLine,
+        logFn = console.log,
+    }: {
+        pushFn?: PushFn;
+        cfg: ResolvedConfig;
+        computeLine: (now: number) => string;
+        logFn?: (...a: unknown[]) => void;
+    },
+): string {
+    const today = metricDayKey(now);
+    if (lastDay === null || lastDay === today) return today;
+    let line: string;
+    try {
+        line = computeLine(Date.parse(`${today}T00:00:00.000Z`));
+    } catch (e) {
+        line = `📈 Метрика за сутки не посчитана: ${(e as Error).message}`;
+    }
+    try {
+        // dry: false — по той же причине, что в maybePushDeadman: argv монитора не решает.
+        pushFn(line, cfg, { logFn, dry: false });
+    } catch (e) {
+        logFn(`⚠ Суточная строка метрики не отправлена: ${(e as Error).message}`);
+    }
+    return today;
+}
+
+/**
+ * Расчёт суточной строки по каталогу состояния, который наблюдает панель. Вынесен фабрикой,
+ * чтобы проводку (какой каталог, какой конфиг, какое окно) проверял тест на фикстуре: не тот
+ * каталог дал бы в полночь «лог не читается», а гейт остался бы зелёным.
+ *
+ * Лог — боевой ralph.log каталога (как у команды сводки): dry-лог мерджей не содержит.
+ * Конфиг, который не прочитался (`resolveProfile` → null), — своя причина: без неё
+ * человек получил бы «нет metrics.taskBudgetMin» о ключе, которого никто не проверял.
+ */
+export function dailyMetricLine(
+    config: unknown,
+    runtimeDir: string,
+    readFn: (p: string) => string,
+): (until: number) => string {
+    return (until) => {
+        if (config === null || config === undefined) {
+            throw new Error('конфиг петли не прочитался — бюджет задачи взять неоткуда');
+        }
+        return formatMetricDayLine(
+            summarizeRuntime({ config, runtimeDir, readFn, now: until, hours: 24 }).summary,
+        );
+    };
+}
+
 // Значимые строки (маркеры этапов) из УЖЕ прочитанного хвоста — последние n. Своего
 // чтения файла НЕ делает: и панель значимых строк, и детект тишины идут от одного
 // readLogTail в snapshot(). Так у тика ровно одно чтение (растущий многодневный лог не
@@ -491,6 +573,9 @@ export function openPhasePRs(
 // уже фаза 2 (взаимный контроль раннер↔монитор), здесь не в скоупе.
 let lastDeadmanPushMtime: number | null = null;
 
+// Дата UTC последнего решения о суточной строке (см. maybePushDailyMetric).
+let lastMetricDay: string | null = null;
+
 // Разовое предупреждение об исчезнувшем логе (см. snapshot). Сбрасывается, когда лог
 // снова находится, — чтобы каждый эпизод отсутствия файла предупреждал ровно раз.
 let warnedNoLog = false;
@@ -542,6 +627,10 @@ function snapshot(): void {
     lastDeadmanPushMtime = maybePushDeadman(deadman, lastMtime, lastDeadmanPushMtime, {
         cfg: config,
         milestoneName,
+    });
+    lastMetricDay = maybePushDailyMetric(now, lastMetricDay, {
+        cfg: config,
+        computeLine: dailyMetricLine(config, RUNTIME_DIR, (p) => fs.readFileSync(p, 'utf8')),
     });
     const prog = issuesProgress(milestoneName);
     const prs = openPhasePRs(config, state);

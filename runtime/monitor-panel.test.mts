@@ -17,7 +17,10 @@ import {
     readLogTail,
     shouldPushDeadman,
     deadmanPushMessage,
+    dailyMetricLine,
+    maybePushDailyMetric,
     maybePushDeadman,
+    metricDayKey,
     monitorLogPath,
     openPhasePRs,
     resolveRuntimeDir,
@@ -572,5 +575,116 @@ describe('--runtime-dir: разбор флага fail-closed (ревью !19)', 
         expect(() =>
             resolveRuntimeDir(['--runtime-dir', '/a', '--runtime-dir', '/b'], '/legacy'),
         ).toThrow(/дважды/);
+    });
+});
+
+describe('maybePushDailyMetric — суточная строка метрики, fail-open', () => {
+    const DAY1 = Date.parse('2026-10-26T23:58:00.000Z');
+    const DAY2 = Date.parse('2026-10-27T00:03:00.000Z');
+    const cfg = { profileName: 'prod' };
+    const line = () => '📈 строка';
+
+    it('старт панели — ключ встаёт на сегодня без пуша: рестарт петли не шлёт строку', () => {
+        const pushFn = vi.fn(() => true);
+        expect(maybePushDailyMetric(DAY1, null, { pushFn, cfg, computeLine: line })).toBe(
+            '2026-10-26',
+        );
+        expect(pushFn).not.toHaveBeenCalled();
+    });
+
+    it('тот же день — без пуша', () => {
+        const pushFn = vi.fn(() => true);
+        maybePushDailyMetric(DAY1, '2026-10-26', { pushFn, cfg, computeLine: line });
+        expect(pushFn).not.toHaveBeenCalled();
+    });
+
+    it('первый тик новых суток — ровно один пуш строки за прошедшие сутки', () => {
+        const pushFn = vi.fn((_m: string, _c: unknown, _o: unknown) => true);
+        const computeLine = vi.fn(line);
+        let key = maybePushDailyMetric(DAY2, '2026-10-26', { pushFn, cfg, computeLine });
+        key = maybePushDailyMetric(DAY2 + 300_000, key, { pushFn, cfg, computeLine });
+        expect(key).toBe('2026-10-27');
+        // Окно — до полуночи UTC, а не до момента тика: окна соседних дней стыкуются ровно.
+        expect(computeLine).toHaveBeenCalledWith(Date.parse('2026-10-27T00:00:00.000Z'));
+        expect(pushFn).toHaveBeenCalledTimes(1);
+        expect(pushFn.mock.calls[0][0]).toBe('📈 строка');
+        expect(pushFn.mock.calls[0][1]).toBe(cfg);
+        expect(pushFn.mock.calls[0][2]).toMatchObject({ dry: false });
+    });
+
+    it('расчёт упал — человеку уходит причина, панель не падает', () => {
+        const pushFn = vi.fn((_m: string, _c: unknown, _o: unknown) => true);
+        const key = maybePushDailyMetric(DAY2, '2026-10-26', {
+            pushFn,
+            cfg,
+            computeLine: () => {
+                throw new Error('бюджет задачи не задан');
+            },
+        });
+        expect(key).toBe('2026-10-27');
+        expect(pushFn.mock.calls[0][0]).toBe(
+            '📈 Метрика за сутки не посчитана: бюджет задачи не задан',
+        );
+    });
+
+    it('доставка бросила — не ломает тик, ключ сдвинут (пульс, не алерт)', () => {
+        const logFn = vi.fn();
+        const key = maybePushDailyMetric(DAY2, '2026-10-26', {
+            pushFn: () => {
+                throw new Error('нотифаер сломан');
+            },
+            cfg,
+            computeLine: line,
+            logFn,
+        });
+        expect(key).toBe('2026-10-27');
+        expect(logFn).toHaveBeenCalledWith(expect.stringContaining('нотифаер сломан'));
+    });
+
+    it('доставка вернула false (fail-open нотифаера) — повтора в те же сутки нет', () => {
+        const pushFn = vi.fn(() => false);
+        let key = maybePushDailyMetric(DAY2, '2026-10-26', { pushFn, cfg, computeLine: line });
+        key = maybePushDailyMetric(DAY2 + 300_000, key, { pushFn, cfg, computeLine: line });
+        expect(pushFn).toHaveBeenCalledTimes(1);
+    });
+
+    it('сутки — по UTC', () => {
+        expect(metricDayKey(Date.parse('2026-10-26T23:59:59.999Z'))).toBe('2026-10-26');
+        expect(metricDayKey(Date.parse('2026-10-27T00:00:00.000Z'))).toBe('2026-10-27');
+    });
+});
+
+describe('dailyMetricLine — проводка суточной строки панели', () => {
+    const DIR = '/path/to/state';
+    const UNTIL = Date.parse('2026-10-27T00:00:00.000Z');
+    const LOG = [
+        '[2026-10-25T23:00:00.000Z] 🔄 Ф0 | итерация 1/10 | Issue #9: вне окна | модель: m (claude)',
+        '[2026-10-26T10:00:00.000Z] 🔄 Ф | итерация 1/10 | Issue #1: x | модель: m (claude)',
+        '[2026-10-26T10:05:00.000Z] ⛔ Гейт: чек test красный на PR #5.',
+        '[2026-10-26T10:20:00.000Z] 🔔 PUSH: ✅ Ralph: фаза "Ф" смерджена в main — готова к релизу.',
+    ].join('\n');
+    const files: Record<string, string> = { [`${DIR}/ralph.log`]: LOG };
+    const readFn = (p: string) => {
+        if (p in files) return files[p];
+        throw Object.assign(new Error(`ENOENT: ${p}`), { code: 'ENOENT' });
+    };
+
+    it('считает по ralph.log наблюдаемого каталога за 24 ч до полуночи', () => {
+        const line = dailyMetricLine({ metrics: { taskBudgetMin: 30 } }, DIR, readFn)(UNTIL);
+        expect(line).toBe(
+            '📈 Метрика за 24 ч до 2026-10-27T00:00Z: в бюджет 1 из 1 (100 %), пойманных отказов 1, остановок петли 0.',
+        );
+    });
+
+    it('не тот каталог — отказ «лог не читается», а не пустая строка', () => {
+        expect(() =>
+            dailyMetricLine({ metrics: { taskBudgetMin: 30 } }, '/elsewhere', readFn)(UNTIL),
+        ).toThrow('не читается');
+    });
+
+    it('конфиг не прочитался — причина про конфиг, а не про ключ бюджета', () => {
+        expect(() => dailyMetricLine(null, DIR, readFn)(UNTIL)).toThrow(
+            'конфиг петли не прочитался',
+        );
     });
 });
