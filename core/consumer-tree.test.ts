@@ -315,6 +315,18 @@ describe('updateConsumerTree — кто держит дерево потреби
         expect(w.envs[0]?.HOME).toBe('/home/dev');
     });
 
+    it('fetch — с запретом промпта кредов, остальные команды — без него (задача 71)', () => {
+        // Без кредов git открывает `/dev/tty` и ждёт логина: AFK-раннер висел бы в
+        // пост-мердж обновлении до дедмана вместо быстрого отказа с диагнозом.
+        const w = happy();
+        w.run(ROOTS, { PATH: '/usr/bin', HOME: '/home/dev' });
+        const fetchAt = w.calls.findIndex((c) => c.includes('fetch'));
+        expect(fetchAt).toBeGreaterThan(-1);
+        w.envs.forEach((env, i) =>
+            expect(env?.GIT_TERMINAL_PROMPT).toBe(i === fetchAt ? '0' : undefined),
+        );
+    });
+
     it('окружение не передали — не выдумываем своё', () => {
         const w = happy();
         w.run();

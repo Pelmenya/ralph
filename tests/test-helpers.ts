@@ -67,6 +67,21 @@ export function makeTmpLog(prefix: string): {
     return { tmpDir, writeLog, cleanupFiles, removeDir };
 }
 
+// ── Заглушка канала намерений (#144) ────────────────────────────────────────────────
+// Намерения кодер-сессии применяет петля, и по умолчанию она читает РЕАЛЬНЫЙ файл
+// `.claude/ralph/ralph.requests.jsonl` в дереве прогона. Тест без этой заглушки
+// подхватывал бы намерения ЖИВОЙ сессии (гейт мерджа гоняет тесты именно в дереве
+// раннера) и применял их через боевой шов форжа — то есть исход прогона зависел бы от
+// того, что лежит на диске рядом. Пустой результат = «сессия ничего не просила»: ветка
+// применения в сценариях гейта не проверяется вовсе, её место — orchestrator.test.ts.
+export const noSessionRequests = (): {
+    applied: number;
+    failed: boolean;
+    closedIssues: number[];
+    prFindings: never[];
+    prBlocked: boolean;
+} => ({ applied: 0, failed: false, closedIssues: [], prFindings: [], prBlocked: false });
+
 // ── Оркестратор сценарного прогона гейта (#223, было дублем в blocked-/hold-scenarios) ──
 // Модель ревью, поставившего блок (по ней встаёт планка #217), и лимит разбора blocked.
 export const SCENARIO_REVIEW_MODEL = 'claude-opus-4-8';
@@ -87,6 +102,7 @@ const scenarioState = (o: Partial<RalphState> = {}): RalphState => ({
     reReviewPending: false,
     reviewOfFixes: null,
     deployBlock: null,
+    forgeHealedRunId: null,
     ...o,
 });
 
@@ -182,7 +198,21 @@ export function makeRunLoopScenario(
                 removeBlockedLabelFn,
                 addBlockedLabelFn,
                 runClaudeFn,
+                // #144: без заглушки проход читал бы файл намерений живого прогона —
+                // см. докблок noSessionRequests выше.
+                applySessionRequestsFn: noSessionRequests,
                 ensureCleanFn: () => true,
+                // #134: проводка на ветку фазы — настоящий git в дереве тестов;
+                // сценарии самой проводки живут в core/phase-branch.test.ts.
+                ensurePhaseBranchFn: (branch: string) => ({
+                    kind: 'switched' as const,
+                    branch,
+                    sha: 'a'.repeat(40),
+                }),
+                // Страж после сессии — тем же приёмом: дерево тестов настоящий git не держит.
+                checkOnPhaseBranchFn: () => ({ ok: true, sha: 'a'.repeat(40) }),
+                // #183: ветка «запушена» — настоящая проверка читает git в дереве тестов.
+                branchPushedFn: () => true,
                 phaseMergedFn: () => false,
                 advancePhaseFn: () => {},
                 tryMergePhaseFn: () => gate,
@@ -324,6 +354,7 @@ export function runFixtureLoop(
             gateHeals: 0,
             blockedHeals: 0,
             reviewModelFloor: null,
+            forgeHealedRunId: null,
             lastReviewModel: null,
             reReviewPending: false,
             reviewOfFixes: null,
@@ -368,6 +399,11 @@ export function runFixtureLoop(
             body: 'тело карточки из фикстуры',
         }),
         prCommentsFn: () => [],
+        // #144: намерения сессии петля применяет и в dry-проходе (файл читается ДО ветки
+        // «только лог»), а боевой дефолт идёт по РЕАЛЬНОМУ пути — то есть проход зависел
+        // бы от того, что оставила живая сессия в дереве запуска. Заглушка = «сессия ничего
+        // не просила».
+        applySessionRequestsFn: noSessionRequests,
         findOpenPrFn: () => null,
         removeBlockedLabelFn: () => {},
         addBlockedLabelFn: () => {},

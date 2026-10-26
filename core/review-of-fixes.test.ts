@@ -15,9 +15,10 @@ import {
     staleLadderCards,
     FIX_REVIEW_MAX_DISPUTES,
     FIX_REVIEW_MAX_PASSES,
+    FIX_SEVERITY_LEVELS,
     isBlockingSeverity,
+    meetsSeverityFloor,
     normalizeReviewOfFixes,
-    pickBacklogMilestone,
     pingPongIssueFor,
     severityOf,
     type FixFinding,
@@ -64,6 +65,43 @@ describe('severityOf — разметка серьёзности из контр
     // отдельным значениям: появится пятый уровень — этот тест назовёт, по какую он сторону.
     it('мердж держат ровно blocker и major', () => {
         expect(SEVERITY_LEVELS.filter((s) => isBlockingSeverity(s))).toEqual(['blocker', 'major']);
+        // #110: FIX_SEVERITY_LEVELS — та же ось, экспортирована отдельно ради
+        // config-profile.ts (валидация review.backlogSeverityFloor).
+        expect([...FIX_SEVERITY_LEVELS]).toEqual([...SEVERITY_LEVELS]);
+    });
+});
+
+describe('meetsSeverityFloor — порог серьёзности карточек лестницы (#110)', () => {
+    it('порог не задан → пропускает любую находку (дефолт сохраняет прежнее поведение)', () => {
+        expect(meetsSeverityFloor('nit', undefined)).toBe(true);
+        expect(meetsSeverityFloor('nit', null)).toBe(true);
+        expect(meetsSeverityFloor('blocker', undefined)).toBe(true);
+    });
+
+    it('порог "minor": nit не проходит, minor и серьёзнее — проходят', () => {
+        expect(meetsSeverityFloor('nit', 'minor')).toBe(false);
+        expect(meetsSeverityFloor('minor', 'minor')).toBe(true);
+        expect(meetsSeverityFloor('major', 'minor')).toBe(true);
+        expect(meetsSeverityFloor('blocker', 'minor')).toBe(true);
+    });
+
+    it('порог "major": и minor, и nit не проходят', () => {
+        expect(meetsSeverityFloor('minor', 'major')).toBe(false);
+        expect(meetsSeverityFloor('nit', 'major')).toBe(false);
+        expect(meetsSeverityFloor('major', 'major')).toBe(true);
+        expect(meetsSeverityFloor('blocker', 'major')).toBe(true);
+    });
+
+    it('находка без метки (unmarked) порогом не режется — сравнивать не с чем', () => {
+        expect(meetsSeverityFloor(null, 'blocker')).toBe(true);
+    });
+
+    // Незнакомый уровень валится снаружи (config-profile.ts), но функция чистая и
+    // экспортирована сама по себе: без явной ветки indexOf('x') === -1 сделал бы
+    // сравнение `severityRank <= -1` ложным для ЛЮБОЙ находки — отфильтровало бы всё.
+    it('неизвестный уровень порога — fail-open, а не «отфильтровать всё»', () => {
+        expect(meetsSeverityFloor('nit', 'critical' as unknown as 'blocker')).toBe(true);
+        expect(meetsSeverityFloor('blocker', 'critical' as unknown as 'blocker')).toBe(true);
     });
 });
 
@@ -368,122 +406,8 @@ describe('карточки: незакрытая косметика и закр�
     });
 });
 
-describe('pickBacklogMilestone — адрес накопительной вехи для карточек лестницы', () => {
-    // countOpenFn заодно ведёт журнал вызовов: тест на «лишних запросов к форжу нет»
-    // проверяет не только выбор, но и цену выбора.
-    const counter = (counts: Record<string, number | null>) => {
-        const asked: string[] = [];
-        const countOpenFn = (m: string): number | null => {
-            asked.push(m);
-            // Именно `in`, а не `?? 0`: заданный null — это «не сосчитали», и схлопнуть
-            // его в ноль значило бы проверять не тот случай.
-            return m in counts ? counts[m] : 0;
-        };
-        return { asked, countOpenFn };
-    };
-
-    it('берёт первого кандидата, у которого есть место', () => {
-        const { countOpenFn } = counter({ 'Бэклог 1': 2 });
-        expect(
-            pickBacklogMilestone({
-                candidates: ['Бэклог 1', 'Бэклог 2'],
-                currentPhase: 'Фаза 7',
-                cap: 5,
-                countOpenFn,
-            }),
-        ).toEqual({ milestone: 'Бэклог 1', index: 0, count: 2 });
-    });
-
-    it('веху ТЕКУЩЕЙ фазы пропускает, не спрашивая её наполнения', () => {
-        // Ровно то, ради чего заводилась адресация вперёд: карточка, родившаяся во время
-        // бэклог-фазы, не имеет права попасть в её же очередь — иначе фаза не сходится.
-        const { asked, countOpenFn } = counter({});
-        expect(
-            pickBacklogMilestone({
-                candidates: ['Бэклог 1', 'Бэклог 2'],
-                currentPhase: 'Бэклог 1',
-                cap: 5,
-                countOpenFn,
-            }),
-        ).toEqual({ milestone: 'Бэклог 2', index: 1, count: 0 });
-        expect(asked).toEqual(['Бэклог 2']);
-    });
-
-    it('переполненную веху пропускает — переполнение уезжает в следующую номерную', () => {
-        const { countOpenFn } = counter({ 'Бэклог 1': 5, 'Бэклог 2': 1 });
-        expect(
-            pickBacklogMilestone({
-                candidates: ['Бэклог 1', 'Бэклог 2'],
-                currentPhase: 'Фаза 7',
-                cap: 5,
-                countOpenFn,
-            }),
-        ).toEqual({ milestone: 'Бэклог 2', index: 1, count: 1 });
-    });
-
-    it('наполнение не сосчиталось — веха ПРОПУСКАЕТСЯ, потолок не обходится', () => {
-        // null — «не сосчитали»; у площадки самая частая его причина в том, что вехи там
-        // нет вовсе (резолв имени бросает). Считать это нулём значило бы адресовать
-        // карточку несуществующей вехе, а заодно разрешить обход потолка на любом чихе
-        // форжа: у переполненной вехи одно неотвеченное чтение снова делало бы её годной.
-        const { countOpenFn } = counter({ 'Бэклог 1': null, 'Бэклог 2': 1 });
-        expect(
-            pickBacklogMilestone({
-                candidates: ['Бэклог 1', 'Бэклог 2'],
-                currentPhase: 'Фаза 7',
-                cap: 5,
-                countOpenFn,
-            }),
-        ).toEqual({ milestone: 'Бэклог 2', index: 1, count: 1 });
-    });
-
-    it('ни у одной вехи наполнение не читается — null, карточка поедет без адреса', () => {
-        const { countOpenFn } = counter({ 'Бэклог 1': null, 'Бэклог 2': null });
-        expect(
-            pickBacklogMilestone({
-                candidates: ['Бэклог 1', 'Бэклог 2'],
-                currentPhase: 'Фаза 7',
-                cap: 5,
-                countOpenFn,
-            }),
-        ).toBeNull();
-    });
-
-    it('кандидаты кончились — null, карточка заведётся без адреса', () => {
-        const { countOpenFn } = counter({ 'Бэклог 1': 5 });
-        expect(
-            pickBacklogMilestone({
-                candidates: ['Бэклог 1'],
-                currentPhase: 'Бэклог 2',
-                cap: 5,
-                countOpenFn,
-            }),
-        ).toBeNull();
-        expect(
-            pickBacklogMilestone({
-                candidates: [],
-                currentPhase: 'Фаза 7',
-                cap: 5,
-                countOpenFn,
-            }),
-        ).toBeNull();
-    });
-
-    it('from продолжает перебор с указанного места — добор внутри одного круга', () => {
-        const { asked, countOpenFn } = counter({ 'Бэклог 2': 3 });
-        expect(
-            pickBacklogMilestone({
-                candidates: ['Бэклог 1', 'Бэклог 2'],
-                currentPhase: 'Фаза 7',
-                cap: 5,
-                countOpenFn,
-                from: 1,
-            }),
-        ).toEqual({ milestone: 'Бэклог 2', index: 1, count: 3 });
-        expect(asked).toEqual(['Бэклог 2']);
-    });
-});
-
+// Срок годности карточек лестницы (#18) — рядом с заголовками, по которым чистка узнаёт
+// свою карточку. Мутирует найденное вызывающий; здесь проверяется только отбор.
 describe('срок годности карточек лестницы (#18)', () => {
     const DAY = 24 * 60 * 60 * 1000;
     const now = Date.parse('2026-08-21T00:00:00Z');
@@ -516,8 +440,16 @@ describe('срок годности карточек лестницы (#18)', ()
     });
 
     it('карточка СПОРА не трогается никогда — её решает человек, а не срок', () => {
+        // Заголовок спора проходит предфильтр лестницы (он один из её префиксов) и
+        // доходит ИМЕННО до отдельной проверки на спор — уберите её, и тест покраснеет.
+        // Прежняя фикстура до неё не доходила вовсе: `DISPUTE_TITLE_PREFIX` не начинается
+        // с `BACKLOG_TITLE_PREFIX`, и тест дублировал соседний «чужой заголовок», оставаясь
+        // зелёным при удалении ветки (ревью правок #98).
         const dispute = card({ number: 4, title: `${DISPUTE_TITLE_PREFIX}кто прав` });
-        expect(staleLadderCards({ issues: [dispute], now, staleDays: 30 })).toEqual([]);
+        // Контраст: обычная карточка лестницы того же возраста закрывается — значит, спор
+        // уцелел именно благодаря своей проверке, а не потому, что срок не наступил.
+        const plain = card({ number: 7 });
+        expect(staleLadderCards({ issues: [dispute, plain], now, staleDays: 30 })).toEqual([7]);
     });
 
     it('карточка без даты не трогается: «не знаю возраст» — не повод закрывать', () => {

@@ -57,6 +57,7 @@
  *
  * TS-модуль без билд-шага: исполняется нативным type stripping Node 24 (erasable-only).
  */
+import { gitNetworkEnv } from '../shared/ralph-util.ts';
 import type { TResolvedRoots } from './roots.ts';
 
 /** Чем кончилось обновление. Решение вызывающего по каждому исходу — только лог. */
@@ -158,6 +159,14 @@ export function updateConsumerTree(
     // негде. `undefined` означает «вызывающий окружением не распоряжается» — тогда и мы не.
     const gitEnv = env === undefined ? undefined : { env: stripGitContext(env) };
     const git = (args: string[]): string => runArgvFn('git', gitIn(consumerRoot, args), gitEnv);
+    // Сетевой вызов здесь один — fetch, и он идёт с запретом промпта кредов (задача 71):
+    // без кредов git ждёт логина на tty, и AFK-раннер висел бы в пост-мердж обновлении.
+    const gitNet = (args: string[]): string =>
+        runArgvFn(
+            'git',
+            gitIn(consumerRoot, args),
+            env === undefined ? undefined : { env: gitNetworkEnv(stripGitContext(env)) },
+        );
     // Раскладки нет — нет и понятия «дерево потребителя»: пути скриптов в этой раскладке
     // относительны дереву работы, и обновлять нечего. Молча: сообщать не о чем.
     if (!roots) return 'no-roots';
@@ -242,7 +251,7 @@ export function updateConsumerTree(
             // `--no-write-fetch-head` — про чужое: `FETCH_HEAD` один на репозиторий, и наш
             // fetch затирал бы то, что человек только что нафетчил себе. Его последующий
             // `git merge FETCH_HEAD` слил бы НАШУ цель вместо своей (ревью, 4-й проход).
-            git([
+            gitNet([
                 'fetch',
                 '--no-recurse-submodules',
                 '--no-write-fetch-head',

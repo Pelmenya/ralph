@@ -66,6 +66,61 @@ describe('фикстурный чужой проект — сама фиксту
     );
 });
 
+// #60: ядро (gateChecksFor) обязано собирать состав гейта из КОНФИГА, а не из имён,
+// прибитых в тексте. Раньше это доказывалось только косвенно — тестами на боевом
+// `ralph.config.json` этого проекта (`core/orchestrator.test.ts`), и часть их ассертов
+// пинила имена ИМЕННО этого проекта буквально. На переносе ядра в другой репозиторий
+// (обкатка на полигон, 11.08) те тесты падали при исправном коде: gate.checks там
+// назван иначе. Здесь тот же контракт проверяется НАПРЯМУЮ на фикстуре чужого проекта —
+// её `gate.checks`/`prodChecks` названы иначе умышленно (format/build/test + audit, не
+// filenames/docs:agents/…), и падение теста означало бы, что ядро снова где-то ждёт
+// конкретное имя.
+describe('gateChecksFor на конфиге ЧУЖОГО проекта — состав из фикстуры, а не из имён (#60)', () => {
+    it('база, prod и порядок совпадают с gate.checks/prodChecks фикстуры', () => {
+        const runtime = buildFixtureRuntime();
+        const raw = loadFixtureRaw();
+        const cfg = runtime.resolveProfile(raw, 'playground', (msg: string) => {
+            throw new Error(msg);
+        }) as Parameters<typeof runtime.setConfigForTests>[0];
+        runtime.setConfigForTests(cfg);
+
+        const names = (checks: Array<[string, string]>) => checks.map(([n]: [string, string]) => n);
+        const fixtureGate = raw.common.gate as {
+            checks: Array<[string, string]>;
+            prodChecks?: Array<[string, string]>;
+            prodDropChecks?: string[];
+        };
+
+        // База — состав И порядок ровно как в фикстуре (format, build, test — не
+        // боевой список этого проекта).
+        expect(names(runtime.gateChecksFor('dev'))).toEqual(names(fixtureGate.checks));
+        expect(names(runtime.gateChecksFor('dev'))).not.toContain('filenames');
+
+        // prod = снятая база (prodDropChecks фикстуры пуст, снимать нечего) + толстый
+        // чек audit — не e2e/coverage этого проекта.
+        const dropped = fixtureGate.prodDropChecks ?? [];
+        const keptBase = names(fixtureGate.checks).filter((n) => !dropped.includes(n));
+        expect(names(runtime.gateChecksFor('prod'))).toEqual([
+            ...keptBase,
+            ...names(fixtureGate.prodChecks ?? []),
+        ]);
+
+        // Неизвестный/пустой профиль → безопасный дефолт (база), как и в ядре на боевом
+        // конфиге — инвариант общий, не завязан на имена.
+        expect(names(runtime.gateChecksFor('marsian'))).toEqual(
+            names(runtime.gateChecksFor('dev')),
+        );
+
+        // Каждый чек — пара [имя, непустая команда], команды — чужого стека (pnpm, не npm).
+        for (const [name, cmd] of runtime.gateChecksFor('prod')) {
+            expect(typeof name).toBe('string');
+            expect(name.length).toBeGreaterThan(0);
+            expect(typeof cmd).toBe('string');
+            expect(cmd.startsWith('pnpm run ')).toBe(true);
+        }
+    });
+});
+
 describe('dry-run переносимости ядра на чужом конфиге (#371)', () => {
     it('resolveProfile инициализирует фикстуру без ошибок и без подмешивания боевых значений', () => {
         const runtime = buildFixtureRuntime();

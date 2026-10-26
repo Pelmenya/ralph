@@ -21,6 +21,10 @@ import {
     BOARD_SYNC_TASK_SOURCES,
     CODER_RUNTIME_PROVIDERS,
 } from '../adapters/adapters-impl.ts';
+// #110: набор уровней severity берётся из review-of-fixes.ts, второй список здесь не
+// заводим: тот модуль — лист без импортов форжа и скриптов, поэтому core импортировать
+// его можно.
+import { FIX_SEVERITY_LEVELS } from './review-of-fixes.ts';
 import { resolveRoots, type TRootsInput } from './roots.ts';
 
 // fail() боевой уходит в process.exit(1); тестовый failFn может вернуть значение или
@@ -190,7 +194,14 @@ export function createConfigProfile(env: ConfigProfileEnv) {
         return true;
     }
 
-    // #16: адрес карточек лестницы ревью. Оба ключа необязательны — не задан ни один,
+    // #16/#18/#110: схема блока `review`, отвечающего за карточки, которые петля заводит
+    // по ходу работы, — ПЯТЬ независимых ключей: `backlogMilestone`, `backlogMilestoneCap`,
+    // `backlogStaleDays`, `backlogStaleBudget` и `backlogSeverityFloor`. Имя без «вехи»
+    // намеренно (ревью правок #110): последний ключ к вехе отношения не имеет вовсе — это
+    // порог серьёзности находки, и ищущий, где он валидируется, по имени «…Milestone»
+    // сюда бы не пришёл.
+    //
+    // Оба ключа адреса необязательны — не задан ни один,
     // карточки едут как раньше, без вехи. Но ЗАДАННЫЙ мусор валит старт, а не тихо
     // превращается в «адреса нет» (инвариант №1): именно этот режим отказа задача и
     // чинила. `backlogMilestone: 42` без барьера означал бы, что человек считает бэклог
@@ -202,7 +213,7 @@ export function createConfigProfile(env: ConfigProfileEnv) {
     // которую ничего не влезает (все карточки мимо адреса), дробное — сравнение, которое
     // сработает на половине карточки.
     // Возврат: true — валиден; иначе результат failFn (мягкий failFn пробрасываем наверх).
-    function assertValidBacklogMilestone(
+    function assertValidReviewBacklog(
         cfg: Record<string, unknown>,
         profileName: string,
         failFn: FailFn = fail,
@@ -221,6 +232,33 @@ export function createConfigProfile(env: ConfigProfileEnv) {
                         `либо непустой список имён (#16). Молча принятый мусор означал бы, что карточки лестницы ` +
                         `по-прежнему ложатся в общий бэклог, тогда как конфиг говорит обратное. ` +
                         `Убери ключ (прежнее поведение — без адреса) либо задай имена вех.`,
+                );
+            }
+            // Накопитель — веха, которую петля НЕ исполняет. На этом держится всё
+            // остальное: и запрет «карточка не удлиняет фазу», и право заводить карточки
+            // без потолка. Правило без механизма — пожелание, а механизма тут не было:
+            // рантайм отвергает только веху ТЕКУЩЕЙ фазы (pickBacklogMilestone), и
+            // накопитель, названный вехой БУДУЩЕЙ фазы, проезжал молча — а когда петля до
+            // неё дойдёт, начнёт удлинять фазу ровно настолько, насколько сама находит
+            // постороннего. Fail-closed на старте: это опечатка человека, и стоит она
+            // несходящейся фазы посреди окна.
+            const phases = Array.isArray(cfg.phases) ? cfg.phases : [];
+            const phaseNames = new Set(
+                phases
+                    .map((p) =>
+                        isPlainObject(p) ? (p as Record<string, unknown>).milestone : null,
+                    )
+                    .filter((m): m is string => typeof m === 'string'),
+            );
+            const clash = list.filter(
+                (m): m is string => typeof m === 'string' && phaseNames.has(m),
+            );
+            if (clash.length > 0) {
+                return failFn(
+                    `${where}backlogMilestone = ${JSON.stringify(clash)} — эта веха стоит и в phases (#16). ` +
+                        `Накопитель по определению веха, которую петля не исполняет: карточки, найденные по ходу ` +
+                        `работы, попадая в очередь исполняемой фазы, удлиняют её ровно настолько, насколько петля ` +
+                        `находит постороннего, — и фаза перестаёт кончаться. Заведи под накопитель отдельную веху.`,
                 );
             }
         }
@@ -246,6 +284,44 @@ export function createConfigProfile(env: ConfigProfileEnv) {
                     `число дней (#18). Ноль и отрицательное означали бы «протухло всё, включая заведённое ` +
                     `минуту назад», строка и дробное — сравнение, которое сработает не там. ` +
                     `Убери ключ (чистки нет) либо задай число дней.`,
+            );
+        }
+        // Бюджет чистки за прогон. Раньше числа не было вовсе — бюджет молча брался
+        // равным `backlogMilestoneCap`, и обоснование звучало «больше, чем в веху влезает,
+        // чистить не за чем». У вехи-НАКОПИТЕЛЯ, которой потолок не нужен вовсе, это
+        // рассуждение разваливается: подняв потолок до пятисот ради вместимости, человек
+        // заодно и незаметно поднимал до пятисот число закрытий за один прогон. Два
+        // разных решения на одном числе — и второе принималось не глядя.
+        const staleBudget = review.backlogStaleBudget;
+        if (
+            staleBudget !== undefined &&
+            (typeof staleBudget !== 'number' || !Number.isInteger(staleBudget) || staleBudget < 1)
+        ) {
+            return failFn(
+                `${where}backlogStaleBudget = ${JSON.stringify(staleBudget)} — ожидалось положительное ` +
+                    `целое (#18). Ноль означал бы выключенную чистку, но выключатель у неё другой — ` +
+                    `сними backlogStaleDays; строка и дробное — сравнение, которое сработает не там. ` +
+                    `Убери ключ (дефолт) либо задай число карточек.`,
+            );
+        }
+        // #110: порог серьёзности карточек лестницы ревью правок. Не задан — карточка
+        // заводится на любую находку, включая nit: это прежнее поведение, и оно обязано
+        // остаться дефолтом — механизм РЕШАЕТ, что находка будет ПОТЕРЯНА для трекера
+        // (комментарий на PR и счёт журнала находок фильтру не подчинены), и тихо
+        // включённым ему быть нельзя, тот же принцип, что у backlogStaleDays. Заданное
+        // значение обязано быть ОДНИМ ИЗ известных уровней — набор берётся из
+        // review-of-fixes.ts (FIX_SEVERITY_LEVELS), а не заводится здесь заново.
+        const severityFloor = review.backlogSeverityFloor;
+        if (
+            severityFloor !== undefined &&
+            !(FIX_SEVERITY_LEVELS as readonly unknown[]).includes(severityFloor)
+        ) {
+            return failFn(
+                `${where}backlogSeverityFloor = ${JSON.stringify(severityFloor)} — ожидался один из уровней ` +
+                    `${FIX_SEVERITY_LEVELS.join(', ')} (#110). Неизвестный уровень выглядел бы как заполненный ` +
+                    `порог, а фильтр молча пропускал бы всё — то же самое, что и отсутствие ключа, просто без ` +
+                    `предупреждения. Убери ключ (дефолт — заводить карточку на любую находку) либо задай ` +
+                    `известный уровень.`,
             );
         }
         return true;
@@ -733,7 +809,7 @@ export function createConfigProfile(env: ConfigProfileEnv) {
         if (routingOk !== true) return routingOk; // мягкий failFn — наверх как есть
         // #16: адрес карточек лестницы — схема обоих ключей (fail-closed: заданный мусор
         // валит старт, а не превращается в тихое «адреса нет»).
-        const backlogOk = assertValidBacklogMilestone(merged, wanted, failFn);
+        const backlogOk = assertValidReviewBacklog(merged, wanted, failFn);
         if (backlogOk !== true) return backlogOk; // мягкий failFn — наверх как есть
         // #48: плейсхолдеры промпта — последняя проверка схемы: она про содержимое, а не
         // про форму, и осмысленна только на уже слитом конфиге.
@@ -769,7 +845,7 @@ export function createConfigProfile(env: ConfigProfileEnv) {
         assertValidHaltBeforeDeploy,
         assertValidModelRouting,
         assertValidPromptPlaceholders,
-        assertValidBacklogMilestone,
+        assertValidReviewBacklog,
         assertValidConsumerScripts,
         assertValidRoots,
         resolveProfile,

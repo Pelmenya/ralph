@@ -20,6 +20,9 @@
 // Транспорт синхронный. Это не выбор стиля: всё ядро синхронно (`sh`/`ghJson` поверх
 // execSync), и асинхронный клиент здесь потребовал бы переписать петлю целиком.
 import type {
+    ForgeCheckFailure,
+    ForgeCheckRun,
+    ForgeChecks,
     Issue,
     IssueDetails,
     NewPullRequest,
@@ -28,6 +31,10 @@ import type {
     ReviewComment,
     TaskSourceAdapter,
 } from './adapters.ts';
+// #269: чек PR на стороне площадки живёт отдельным модулем — у него своя тройка
+// маршрутов (`merge-checks`, `cicd/runs`, `cicd/logs`), свой словарь статусов и свой
+// режим отказа (лог куба fail-open при fail-closed прогоне). Здесь только проводка.
+import { createSourcecraftCiChecks } from './sourcecraft-ci-checks.ts';
 
 // Ответ REST API, суженный до того, что нужно адаптеру. `unknown` вместо any — данные
 // приходят из чужого JSON, форма проверяется на месте использования.
@@ -143,6 +150,7 @@ const MAX_PAGES = 50;
 export function createSourcecraftTaskSource(deps: SourcecraftTaskSourceDeps): TaskSourceAdapter {
     const { api, org, repo, authorAllowlist, log = () => {} } = deps;
     const base = `/repos/${org}/${repo}`;
+    const ciChecks = createSourcecraftCiChecks({ api, org, repo });
 
     // Обход страниц. `key` — имя массива в ответе: у issues это `issues`, у PR
     // `pull_requests`, у milestones `items` (у трёх ручек три разных ключа — это факт
@@ -578,6 +586,17 @@ export function createSourcecraftTaskSource(deps: SourcecraftTaskSourceDeps): Ta
                 }
             }
             api('POST', `${base}/pulls/${prNumber}/merge`, { squash: true, delete_branch: true });
+        },
+
+        // #269: вердикт чека PR у площадки и детали красного прогона. Реализация —
+        // в `sourcecraft-ci-checks.ts`, здесь проводка: шов обязан отдавать эти два
+        // метода, а не заставлять ядро знать про второй модуль.
+        pullRequestChecks(prNumber: number): ForgeChecks {
+            return ciChecks.pullRequestChecks(prNumber);
+        },
+
+        redCheckDiagnosis(run: ForgeCheckRun): ForgeCheckFailure | null {
+            return ciChecks.redCheckDiagnosis(run);
         },
 
         addBlockedLabel(branch: string): void {

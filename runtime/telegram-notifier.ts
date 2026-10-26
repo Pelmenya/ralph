@@ -31,7 +31,7 @@
 // синтаксис — только аннотации типов, ни enum, ни namespace, ни parameter properties).
 // Модуль самостоятелен (не require/import ядро — ralph.js/orchestrator.ts): требуется
 // одинаково через require() из CJS-entry (ralph.js) и через createRequire из
-// .mjs-скриптов гейта (security-audit.mjs, test-ratchet.mjs) — циклической
+// .mjs-скриптов гейта (security-audit.mjs) — циклической
 // зависимости на ядро тут нет, предохранитель и журнал берутся из
 // shared/side-effect-guard.ts (#145).
 

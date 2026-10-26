@@ -58,6 +58,7 @@ const { pushEvent } = ralph;
 // Пороги тишины (#147): классификация хвоста лога по режиму + порог по режиму. Здесь
 // (в мониторе) — импёровая половина: чтение файла, «сейчас» и сравнение с порогом.
 import { classifyActivity, silenceThresholdMs, type Activity } from './deadman.ts';
+import { formatStopMessage } from '../core/stop-message.ts';
 
 // monitor-panel.mts живёт в .claude/ralph/runtime/ (#396), поэтому каталог раннера —
 // родитель import.meta.dirname, а не он сам. Служебные файлы (ralph.log/state/config)
@@ -315,11 +316,22 @@ export function deadmanPushMessage(
     milestoneName: string,
 ): string {
     return (
-        // «молчит N» — длительность тишины (fmtDur, без «назад»): fmtAge добавил бы «назад»
-        // и вышло бы «молчит 5м назад» (как будто молчание было в прошлом, а оно длится).
-        `💀 Ralph: DEADMAN на фазе "${milestoneName}" — лог молчит ${fmtDur(deadman.silenceMs ?? 0)}, ` +
-        `дольше порога ${fmtDur(deadman.thresholdMs ?? 0)} (режим ${deadman.activity}). ` +
-        'Цикл продолжается без остановки — проверь вручную.'
+        // #289: DEADMAN не «стоп PR», а сигнал вахте — но той же формой (причина/диагноз/
+        // вопрос), чтобы ночью не приходилось держать в голове второй формат сообщения.
+        // Прежний хвост «Цикл продолжается без остановки — проверь вручную» снят по ревью:
+        // вопрос человеку ниже говорит то же самое дословно, а пуш от повтора вдвое длиннее.
+        // Второй проход ревью: числа тишины и порога тоже шли дважды — в заголовке и в
+        // диагнозе теми же словами. Заголовок оставлен МАРКЕРОМ, числа живут в диагнозе.
+        `💀 Ralph: DEADMAN на фазе "${milestoneName}". ` +
+        formatStopMessage({
+            reason: 'deadman',
+            // «молчит N» — длительность тишины (fmtDur, без «назад»): fmtAge добавил бы
+            // «назад» и вышло бы «молчит 5м назад» (как будто молчание было в прошлом,
+            // а оно длится).
+            diagnosis: `ralph.log молчит ${fmtDur(deadman.silenceMs ?? 0)} на фазе "${milestoneName}" (порог ${fmtDur(deadman.thresholdMs ?? 0)}, режим ${deadman.activity}).`,
+            question:
+                'проверь, жив ли процесс раннера (tmux-панель ralph, ps, хвост ralph.log) — цикл сам себя не остановил',
+        })
     );
 }
 

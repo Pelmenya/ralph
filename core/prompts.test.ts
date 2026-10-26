@@ -87,6 +87,71 @@ const ALL: Array<[string, string]> = [
     ],
 ];
 
+describe('#269: чини-сессия по красному чеку ПЛОЩАДКИ', () => {
+    const params = {
+        requestsPath: REQUESTS,
+        branch: BRANCH,
+        checkName: 'test',
+        checkCmd: 'куб «test» прогона 356 на площадке',
+        excerpt: 'AssertionError',
+        gateCmdList: GATE,
+    };
+
+    // Проектный перечень мест, где среды расходятся, живёт в конфиге, а не в ядре
+    // (правка по ревью #269): в `core/prompts.ts` он нарушал инвариант #45 и был бы
+    // ложным следом на любом другом форже.
+    const ENV_HINT = 'рабочий каталог там `/repo`, память контейнера ограничена.';
+
+    it('без флага подсказки нет — обычная чини-сессия не должна искать разницу сред', () => {
+        const prompt = buildGateHealPrompt({ ...params, forgeEnvHint: ENV_HINT });
+        expect(prompt).not.toContain('/repo');
+        expect(prompt).toContain('воспроизведи чек локально');
+    });
+
+    // Без этого абзаца сессия честно гоняет зелёный локальный набор и объявляет отказ
+    // невоспроизводимым — ровно то, на чём петля встала 05.09.2026 (прогоны 355/356).
+    it('с флагом промпт зовёт искать разницу СРЕД, а нейтральная половина — из ядра', () => {
+        const prompt = buildGateHealPrompt({ ...params, forgeOnly: true });
+        expect(prompt).toContain('ЗЕЛЁНЫЙ');
+        expect(prompt).toContain('ищи разницу СРЕД');
+    });
+
+    // Ядро говорит НАМЕРЕНИЕМ, конкретику приносит конфиг. Без подстановки промпт
+    // остаётся верным (просто менее полезным), с ней — называет места этого контура.
+    it('проектная подсказка из конфига подставляется, а без неё промпт всё равно цел', () => {
+        expect(buildGateHealPrompt({ ...params, forgeOnly: true })).not.toContain('/repo');
+        expect(
+            buildGateHealPrompt({ ...params, forgeOnly: true, forgeEnvHint: ENV_HINT }),
+        ).toContain('/repo');
+    });
+
+    // Подсказка существует, чтобы сессия НЕ искала отказ вслепую, — и ложный пункт уводит
+    // её в первую очередь. `deploy/scripts/gate-in-docker.sh` не задаёт `--network` вовсе,
+    // а куб `install` гоняет через ту же обёртку `npm ci`: сеть в контейнере есть, и писать
+    // обратное значит отправить сессию мокать сетевые вызовы (находка ревью).
+    it('НЕ обещает того, чего нет: про отсутствие сети в контейнере не говорится', () => {
+        expect(buildGateHealPrompt({ ...params, forgeOnly: true })).not.toMatch(/сет/i);
+    });
+
+    // #269-ревью: `checkCmd` при `forgeOnly` — это АДРЕС куба, а не команда, и печатать
+    // его с префиксом «команда:» рядом со списком настоящих команд значило врать сессии.
+    it('адрес куба площадки не выдаётся за команду', () => {
+        expect(buildGateHealPrompt({ ...params, forgeOnly: true })).not.toContain(
+            `команда: ${params.checkCmd}`,
+        );
+        expect(buildGateHealPrompt(params)).toContain(`команда: ${params.checkCmd}`);
+    });
+
+    // #269-ревью: собранный текст противоречил сам себе — «воспроизвести локально не
+    // выйдет» и следом «воспроизведи чек локально». Из двух указаний модель берёт
+    // последнее, то есть ровно то, от которого её отговаривают.
+    it('не отменяет собственную подсказку: локального прогона при forgeOnly не требует', () => {
+        const prompt = buildGateHealPrompt({ ...params, forgeOnly: true });
+        expect(prompt).not.toContain('воспроизведи чек локально');
+        expect(prompt).toContain('локальный прогон здесь ничего не покажет');
+    });
+});
+
 describe('промпты сессий: подстановка параметров', () => {
     it.each(ALL)('%s подставляет ветку фазы', (_name, prompt) => {
         expect(prompt).toContain(BRANCH);
@@ -367,6 +432,50 @@ describe('лестница ревью правок: предмет проход�
     it('проход объясняет цену метки severity: blocker/major держат мердж, minor/nit — нет', () => {
         expect(fixReview).toContain('🔴 [blocker]');
         expect(fixReview).toMatch(/minor и nit петля заведёт карточками/);
+    });
+
+    // #110-ревью: обещание про карточки обязано совпадать с действующим порогом
+    // `review.backlogSeverityFloor`. Пока текст был фиксированным, промпт обещал карточку
+    // за каждый ⚪ nit, а фильтр её заводить отказывался — то же враньё сессии, что и
+    // враньё в строке лога.
+    describe('обещание про карточки идёт от действующего порога (#110)', () => {
+        const withFloor = (severityFloor: 'minor' | 'nit') =>
+            buildFixReviewPrompt({
+                requestsPath: REQUESTS,
+                branch: BRANCH,
+                allowNames: 'owner',
+                fixDiffContext: '<дифф правок>',
+                pass: 1,
+                maxPasses: 3,
+                severityFloor,
+            });
+
+        it('порог задан — промпт называет ЕГО и обещает комментарий, а не карточку, для мелочи', () => {
+            const prompt = withFloor('minor');
+            expect(prompt).toContain('«minor»');
+            expect(prompt).toMatch(/останется комментарием на PR/);
+            // Прежнее безусловное обещание карточек за nit не должно оставаться в тексте.
+            expect(prompt).not.toMatch(/minor и nit петля заведёт карточками/);
+        });
+
+        it('значение подставляется, а не выписано: другой порог — другой текст', () => {
+            expect(withFloor('nit')).toContain('«nit»');
+        });
+
+        it('порог не задан — прежнее обещание слово в слово', () => {
+            expect(fixReview).toMatch(/minor и nit петля заведёт карточками/);
+        });
+
+        it('арбитр обещает ровно то же самое — он тоже размечает мелочь', () => {
+            const arbiter = buildFixArbiterPrompt({
+                requestsPath: REQUESTS,
+                branch: BRANCH,
+                fixDiffContext: '<дифф правок>',
+                severityFloor: 'minor',
+            });
+            expect(arbiter).toContain('«minor»');
+            expect(arbiter).not.toMatch(/петля заведёт их карточками/);
+        });
     });
 
     it('арбитр не получает ни комментариев, ни выводов прошлых проходов — только дифф', () => {

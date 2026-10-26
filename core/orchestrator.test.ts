@@ -2944,14 +2944,19 @@ describe('выборка карточек фазы не урезается мо�
         const blocked = many(LIMIT).map((i) => ({ ...i, labels: [{ name: 'blocked' }] }));
         const ghJsonFn = (() => blocked) as never;
         const reasons: string[] = [];
-        ralph.openIssues('M1', {
-            ghJsonFn,
-            failFn: (msg: string) => {
-                reasons.push(msg);
-                return undefined;
-            },
-        });
-        expect(reasons.join('\n')).toMatch(/предел/i);
+        // Отказ полноты идёт МИМО failFn сбоя чтения: тот подписал бы урезанную выборку
+        // диагнозом «чтение форжа упало — проверь авторизацию», а чинится она разбором
+        // вехи, а не логином (копия потребителя, #72-ревью).
+        expect(() =>
+            ralph.openIssues('M1', {
+                ghJsonFn,
+                failFn: (msg: string) => {
+                    reasons.push(msg);
+                    return undefined;
+                },
+            }),
+        ).toThrow(/предел/i);
+        expect(reasons).toEqual([]);
     });
 
     it('ответ короче предела проходит — барьер не мешает обычной фазе', () => {
@@ -3736,6 +3741,8 @@ describe('runLoop — основной while-цикл: итерации коде
         noProgress: 0,
         gateHeals: 0,
         blockedHeals: 0,
+        // #269 (копия потребителя): прогон площадки, уже пролеченный чини-сессией.
+        forgeHealedRunId: null,
         ...o,
     });
     const validCfg = (o = {}) => ({
@@ -3776,6 +3783,9 @@ describe('runLoop — основной while-цикл: итерации коде
                 sha: 'a'.repeat(40),
             }),
             checkOnPhaseBranchFn: () => ({ ok: true, sha: 'a'.repeat(40) }),
+            // #183: «ветка запушена» читает origin настоящим `git ls-remote` — в стенде
+            // заглушено «запушена»; сценарии отказа переопределяют.
+            branchPushedFn: () => true,
             // Снятие устаревших намерений при отказе стража — побочка по fs.
             readSessionRequestsFn: () => null,
             removeSessionRequestsFn: () => {},
@@ -3954,7 +3964,18 @@ describe('runLoop — основной while-цикл: итерации коде
         // #86: событие «circuit breaker открылся» уходит пушем — и pushEvent теперь
         // единственный логгер события (маркер 🔔 PUSH), парного logFn больше нет.
         expect(pushEventFn).toHaveBeenCalledTimes(1);
-        expect(pushEventFn.mock.calls[0][0]).toMatch(/Ralph: circuit breaker — лимит итераций/);
+        expect(pushEventFn.mock.calls[0][0]).toMatch(/Ralph: circuit breaker/);
+        // #289: причина «breaker» — стоп несёт диагноз и вопрос, а не только маркер.
+        // Ревью #289: проверяются КОД причины и наличие поля, а не стык «русский
+        // заголовок + код»: переформулировка заголовка (`breaker` → «предохранитель»)
+        // красила бы тест, который про код причины, а не про её название.
+        expect(pushEventFn.mock.calls[0][0]).toContain('(breaker)');
+        expect(pushEventFn.mock.calls[0][0]).toContain('причина:');
+        // Ревью #289, второй проход: числа лимита живут в ДИАГНОЗЕ, а не пересказывают
+        // заголовок — ночной пуш об одном событии не идёт в два круга.
+        expect(pushEventFn.mock.calls[0][0]).toMatch(
+            /диагноз: итераций на фазе достигло лимита 10/,
+        );
         expect(pushEventFn.mock.calls[0][2]).toMatchObject({ logFn: expect.any(Function) });
     });
 
@@ -4309,7 +4330,7 @@ describe('runLoop — основной while-цикл: итерации коде
         // Сессия, которой некуда коммитить, сожгла бы итерацию и создала ту самую потерю.
         expect(runClaudeFn).not.toHaveBeenCalled();
         expect(pushEventFn).toHaveBeenCalledTimes(1);
-        expect(pushEventFn.mock.calls[0][0]).toMatch(/не встало на ветку фазы feature\/m1/);
+        expect(pushEventFn.mock.calls[0][0]).toMatch(/не поставлено на ветку фазы feature\/m1/);
     });
 
     it('задача 11: расхождение с origin — тоже стоп, а не попытка починить силой', () => {
@@ -4587,7 +4608,13 @@ describe('runLoop — основной while-цикл: итерации коде
         expect(state.noProgress).toBe(0); // сброшен перед стопом
         // #86: событие «circuit breaker открылся» уходит пушем (единственный логгер).
         expect(pushEventFn).toHaveBeenCalledTimes(1);
-        expect(pushEventFn.mock.calls[0][0]).toMatch(/Ralph: circuit breaker.*без прогресса/s);
+        expect(pushEventFn.mock.calls[0][0]).toMatch(/Ralph: circuit breaker.*об стену/s);
+        // #289: та же причина «breaker», что у лимита итераций — оба класса circuit breaker.
+        expect(pushEventFn.mock.calls[0][0]).toContain('(breaker)');
+        // Ревью #289: от заголовка диагноз отличается номером карточки — он и остался.
+        expect(pushEventFn.mock.calls[0][0]).toMatch(
+            /диагноз: 3 итераций подряд без коммита и без закрытого issue \(Issue #7\)/,
+        );
     });
 
     it('пустая очередь, но открыты blocked/чужие issues → сдача отложена, гейт не зовётся', () => {
@@ -5114,6 +5141,12 @@ describe('runLoop — основной while-цикл: итерации коде
         // уходит на дефолт `env.prHeadSha` — GitHub-реализацию, — и на площадке
         // воспроизводится ровно баг #49, при полностью зелёном сьюте.
         expect(seen.prHeadShaFn).toBe(taskSource.pullRequestHeadSha);
+        // #269: чек PR у форжа — пятый и шестой примитивы мердж-пути, и цена потери строки
+        // здесь та же, что у #49: шов НЕОБЯЗАТЕЛЬНЫЙ, поэтому `tryMergePhase` молча
+        // пропустит шаг, набор останется зелёным, а на площадке воспроизведётся исходный
+        // отказ #269 — «мердж отказан 400» при зелёном локальном гейте (находка ревью).
+        expect(seen.forgeChecksFn).toBe(taskSource.pullRequestChecks);
+        expect(seen.forgeDiagnosisFn).toBe(taskSource.redCheckDiagnosis);
         expect(seen.phaseMergedFn).toBe(phaseMergedFn);
     });
 
@@ -5293,9 +5326,11 @@ describe('runLoop — основной while-цикл: итерации коде
         expect(advancePhaseFn).not.toHaveBeenCalled();
         // Стоп, а не следующая итерация: phaseIndexOf зовётся ровно один раз.
         expect(phaseIndexOfFn).toHaveBeenCalledTimes(1);
-        expect(pushEventFn.mock.calls.map((c) => String(c[0])).join('\n')).toMatch(
-            /принят форжем, но не подтверждён/,
-        );
+        // Ревью #289: хвост «Проверь PR — если он влит, перезапуск продолжит сам» снят
+        // из заголовка как дословный повтор вопроса человеку; факт живёт в диагнозе.
+        const mergeUnconfirmed = pushEventFn.mock.calls.map((c) => String(c[0])).join('\n');
+        expect(mergeUnconfirmed).toMatch(/мердж PR #\? не подтверждён/);
+        expect(mergeUnconfirmed).toMatch(/диагноз: форж принял мердж .* не подтвердил его/);
     });
 
     // #51-ревью: «деплоя нет» и «деплой зелёный» — разные факты, и лог обязан их различать.
@@ -6077,13 +6112,20 @@ describe('runLoop — основной while-цикл: итерации коде
         expect(state.blockedHeals).toBe(0);
         // #86: событие «blocked отдан человеку» уходит пушем (единственный логгер).
         expect(pushEventFn).toHaveBeenCalledTimes(1);
-        expect(pushEventFn.mock.calls[0][0]).toMatch(/blocked устоял/);
+        // Ревью #289: счётчик повторов живёт в диагнозе, а не пересказывает заголовок.
+        expect(pushEventFn.mock.calls[0][0]).toMatch(/label blocked оставлен человеку/);
+        expect(pushEventFn.mock.calls[0][0]).toMatch(
+            /диагноз: 3 повторных ревью подряд оставили label blocked/,
+        );
         // #218 (критерий 2): текст называет число ревью, PR и версию про зацикливание —
         // иначе человек по привычке ищет дефект в коде, хотя проблема может быть в
         // споре ревьюера с правками, а не в самом коде.
         expect(pushEventFn.mock.calls[0][0]).toContain('#555');
         expect(pushEventFn.mock.calls[0][0]).toMatch(/3 повторных ревью/);
-        expect(pushEventFn.mock.calls[0][0]).toMatch(/зациклилось/);
+        // Ревью #289 (!151): «возможно, зациклилось» ушло — тот же совет («смотри спор
+        // ревьюера и правок, а не только код») теперь несёт вопрос человеку в структуре
+        // стопа, и текст в пуше один, без дословного повтора.
+        expect(pushEventFn.mock.calls[0][0]).toMatch(/review-dispute/);
     });
 
     // #216: prod (с включённым разбором) блокер запускает чини-сессию, а не немедленный
@@ -6339,7 +6381,7 @@ describe('runLoop — основной while-цикл: итерации коде
         // пушем (единственный логгер). Сообщение говорит «выключено профилем», а не
         // «устоял после 0 разборов».
         expect(pushEventFn).toHaveBeenCalledTimes(1);
-        expect(pushEventFn.mock.calls[0][0]).toMatch(/выключен профилем "prod"/);
+        expect(pushEventFn.mock.calls[0][0]).toMatch(/выключен конфигом .* профиля "prod"/);
         expect(pushEventFn.mock.calls[0][0]).not.toMatch(/устоял после 0/);
     });
 
@@ -6634,6 +6676,7 @@ describe('runLoop — основной while-цикл: итерации коде
 
     it('гейт not-merged (нечинимая причина) → PR оставлен человеку, стоп', () => {
         const logs: string[] = [];
+        const pushEventFn = vi.fn((msg: string) => msg.length > 0);
         runLoop(
             validCfg(),
             ctx(mkState({ submitted: true })),
@@ -6643,9 +6686,864 @@ describe('runLoop — основной while-цикл: итерации коде
                 allOpenIssuesFn: () => [],
                 phaseMergedFn: () => false,
                 tryMergePhaseFn: () => 'not-merged',
+                pushEventFn,
             }),
         );
-        expect(logs.join('\n')).toMatch(/не прошла авто-мердж/);
+        // Ревью #289 (!151): стоп уходит одним каналом — пушем (pushEvent сам пишет
+        // строку в ralph.log), прямого logFn рядом нет, поэтому текст ищем в пуше.
+        expect(pushEventFn).toHaveBeenCalledTimes(1);
+        expect(String(pushEventFn.mock.calls[0][0])).toMatch(/не прошла авто-мердж/);
+    });
+
+    it('#20: бюджет повторов берётся из конфига (coderTurnRetries) и уменьшается по мере трат', () => {
+        const handleCrashedCoderSessionFn = vi.fn<HandleCrashedCoderSessionFake>(() => ({
+            stop: false,
+            turnLimitRetry: true,
+        }));
+        const runClaudeFn = vi.fn<RunClaudeFake>(() => 1);
+        runLoop(
+            { ...validCfg(), coderTurnRetries: 2 },
+            ctx(mkState()),
+            deps([], {
+                phaseIndexOfFn: () => 0,
+                // Одна и та же карточка: попытки тратятся ПОДРЯД на неё, и второй вызов
+                // обязан увидеть остаток на единицу меньше.
+                openIssuesFn: () => [{ number: 9, title: 'задача', labels: [] }],
+                maxIterations: 2,
+                runClaudeFn,
+                handleCrashedCoderSessionFn,
+            }),
+        );
+        expect(handleCrashedCoderSessionFn.mock.calls.length).toBeGreaterThanOrEqual(2);
+        expect(handleCrashedCoderSessionFn.mock.calls[0][3]).toMatchObject({ turnRetriesLeft: 2 });
+        expect(handleCrashedCoderSessionFn.mock.calls[1][3]).toMatchObject({ turnRetriesLeft: 1 });
+    });
+
+    it('#20: мусор в coderTurnRetries не читается как осознанное значение — берётся дефолт', () => {
+        const handleCrashedCoderSessionFn = vi.fn<HandleCrashedCoderSessionFake>(() => ({
+            stop: true,
+        }));
+        runLoop(
+            { ...validCfg(), coderTurnRetries: 'много' },
+            ctx(mkState()),
+            deps([], {
+                phaseIndexOfFn: () => 0,
+                openIssuesFn: () => [{ number: 9, title: 'задача', labels: [] }],
+                runClaudeFn: vi.fn<RunClaudeFake>(() => 1),
+                handleCrashedCoderSessionFn,
+            }),
+        );
+        // Тот же валидатор, что у review.fixTurnRetries: строка — не число, дефолт = 1.
+        expect(handleCrashedCoderSessionFn.mock.calls[0][3]).toMatchObject({ turnRetriesLeft: 1 });
+    });
+
+    // #16: та же проводка, но для АДРЕСА. Инвариант «карточка кодер-сессии не попадает
+    // в веху сдаваемой фазы» держится тем, что петля называет эту веху. Тип ловит
+    // забытый аргумент на компиляции, но не ловит переданный НЕ ТОТ — например, если
+    // однажды сюда приедет веха накопителя вместо вехи фазы.
+    it('#16 петля называет применению веху ТЕКУЩЕЙ фазы — иначе запрет не на что опереть', () => {
+        const logs: string[] = [];
+        const applySessionRequestsFn = vi.fn((_args: { currentMilestone?: string }) => ({
+            applied: 0,
+            failed: false,
+        }));
+        runLoop(
+            validCfg(),
+            ctx(mkState()),
+            deps(logs, {
+                phaseIndexOfFn: () => 0,
+                openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                runClaudeFn: () => 143,
+                applySessionRequestsFn,
+                handleCrashedCoderSessionFn: () => ({ stop: true }),
+            }),
+        );
+        expect(applySessionRequestsFn.mock.calls[0][0]).toMatchObject({
+            currentMilestone: 'M1',
+        });
+    });
+
+    // #134: главный барьер правки — вход в итерацию. Отказ проводки обязан ОСТАНАВЛИВАТЬ
+    // петлю до кодер-сессии: иначе сессия стартует на детаче или чужой ветке — ровно то
+    // состояние 20.08, ради которого модуль написан. Пойман шестым кругом ревью мутацией
+    // «результат проводки игнорируется» (`break` снят): все тесты оставались зелёными,
+    // то есть сам стоп не сторожил никто — трассовые тесты ниже считают только ВЫЗОВЫ.
+    it('#134: отказ проводки на входе в итерацию → кодер-сессия не запускается', () => {
+        const logs: string[] = [];
+        const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+        const pushEventFn = vi.fn();
+        runLoop(
+            validCfg(),
+            ctx(mkState()),
+            deps(logs, {
+                once: true,
+                phaseIndexOfFn: () => 0,
+                openIssuesFn: () => [{ number: 5, title: 'задача', labels: [] }],
+                ensurePhaseBranchFn: () =>
+                    ({
+                        kind: 'failed' as const,
+                        branch: 'feature/m1',
+                        sha: null,
+                        reason: 'детач с работой',
+                    }) as const,
+                runClaudeFn,
+                pushEventFn,
+            }),
+        );
+        expect(runClaudeFn).not.toHaveBeenCalled();
+        const events = pushEventFn.mock.calls.map(([m]) => String(m)).join('\n');
+        expect(events).toContain('итерация фазы');
+        expect(events).toContain('детач с работой');
+    });
+
+    // #134: порядок на входе в итерацию — сначала остаток прошлой сессии коммитится
+    // (commitLeftovers), потом проводка: `git switch` не переносит грязное дерево через
+    // ветки, и перестановка шагов роняла бы проводку на каждом остатке. Трасса, не факт
+    // вызова: оба шага и так зовутся, вопрос ровно в их взаимном порядке.
+    it('#134: проводка идёт ПОСЛЕ коммита остатков прошлой сессии', () => {
+        const logs: string[] = [];
+        const trace: string[] = [];
+        runLoop(
+            validCfg(),
+            ctx(mkState()),
+            deps(logs, {
+                once: true,
+                phaseIndexOfFn: () => 0,
+                ensureCleanFn: () => false,
+                commitLeftoversFn: () => {
+                    trace.push('leftovers');
+                    return true;
+                },
+                ensurePhaseBranchFn: () => {
+                    trace.push('branch');
+                    return { kind: 'switched' as const, branch: 'feature/m1', sha: 'a'.repeat(40) };
+                },
+                openIssuesFn: () => [{ number: 5, title: 'задача', labels: [] }],
+                runClaudeFn: () => 0,
+            }),
+        );
+        expect(trace.indexOf('leftovers')).toBeGreaterThan(-1);
+        expect(trace.indexOf('branch')).toBeGreaterThan(trace.indexOf('leftovers'));
+    });
+
+    // #134: третий пишущий путь после гейта — правки по ревью. Считаем проводки ДО первой
+    // сессии: одна на входе в итерацию, вторая — непосредственно перед сессией правок.
+    // Проверено мутацией: со снятым вызовом остаётся одна, и тест краснеет.
+    it('#134: перед правками по ревью дерево ставится на ветку ЗАНОВО', () => {
+        const logs: string[] = [];
+        const trace: string[] = [];
+        const state = mkState();
+        runLoop(
+            validCfg({ review: { fixTurnRetries: 0 } }),
+            ctx(state),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                findOpenPrFn: () => ({ number: 55, labels: [] }),
+                pickReviewModelFn: () => 'none',
+                ensurePhaseBranchFn: () => {
+                    trace.push('branch');
+                    return { kind: 'switched' as const, branch: 'feature/m1', sha: 'a'.repeat(40) };
+                },
+                runClaudeFn: () => {
+                    trace.push('session');
+                    return 0;
+                },
+                tryMergePhaseFn: () => 'merged',
+            }),
+        );
+        const session = trace.indexOf('session');
+        expect(session).toBeGreaterThan(-1);
+        expect(trace.slice(0, session).filter((x) => x === 'branch')).toHaveLength(2);
+    });
+
+    // Задача 71: сессия сдачи, ушедшая с ветки, — тот же отказ, что у кодер-итерации.
+    // Её намерения снимаются, а не применяются: файл переживает стоп, и после рестарта
+    // следующая сдача применила бы старые `pr-block`/комментарии к уже спасённому коду.
+    it('задача 71: правки по ревью ушли с ветки → стоп, намерения сняты, а не применены', () => {
+        const logs: string[] = [];
+        const pushEventFn = vi.fn();
+        const applySessionRequestsFn = vi.fn(() => ({ applied: 0, failed: false }));
+        const removeSessionRequestsFn = vi.fn();
+        const tryMergePhaseFn = vi.fn(() => 'merged');
+        const state = mkState();
+        runLoop(
+            validCfg({ review: { fixTurnRetries: 0 } }),
+            ctx(state),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                findOpenPrFn: () => ({ number: 55, labels: [] }),
+                pickReviewModelFn: () => 'none',
+                checkOnPhaseBranchFn: () => ({
+                    ok: false,
+                    sha: 'b'.repeat(40),
+                    message: 'Сессия оставила дерево работы в detached HEAD',
+                }),
+                readSessionRequestsFn: () => '{"kind":"pr-block","reason":"старое"}\n',
+                removeSessionRequestsFn,
+                applySessionRequestsFn,
+                pushEventFn,
+                tryMergePhaseFn,
+            }),
+        );
+        expect(removeSessionRequestsFn).toHaveBeenCalledTimes(1);
+        expect(applySessionRequestsFn).not.toHaveBeenCalled();
+        expect(tryMergePhaseFn).not.toHaveBeenCalled();
+        const pushed = pushEventFn.mock.calls.map(([m]) => String(m)).join('\n');
+        expect(pushed).toContain('правки по ревью');
+        expect(pushed).toContain('сняты без применения');
+        expect(logs.join('\n')).toContain('"pr-block"');
+    });
+
+    // Задача 71: повтор после исчерпания ходов — тоже пишущая сессия, и проводка стоит
+    // перед КАЖДЫМ повтором, а не один раз до первого.
+    it('задача 71: повтор сессии правок проводится на ветку заново', () => {
+        const logs: string[] = [];
+        const trace: string[] = [];
+        let sessions = 0;
+        runLoop(
+            validCfg({ review: { fixTurnRetries: 1 } }),
+            ctx(mkState()),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                findOpenPrFn: () => ({ number: 55, labels: [] }),
+                pickReviewModelFn: () => 'none',
+                ensurePhaseBranchFn: () => {
+                    trace.push('branch');
+                    return { kind: 'switched' as const, branch: 'feature/m1', sha: 'a'.repeat(40) };
+                },
+                runClaudeFn: (
+                    _p: string,
+                    _o: unknown,
+                    { onOutput }: { onOutput?: (t: string) => void } = {},
+                ) => {
+                    trace.push('session');
+                    sessions += 1;
+                    if (sessions === 1) {
+                        onOutput?.('Error: Reached max turns (80)');
+                        return 1;
+                    }
+                    return 0;
+                },
+                tryMergePhaseFn: () => 'merged',
+            }),
+        );
+        const first = trace.indexOf('session');
+        const second = trace.indexOf('session', first + 1);
+        expect(second).toBeGreaterThan(first);
+        expect(trace.slice(first + 1, second)).toContain('branch');
+    });
+
+    it('#134: отказ повторной проводки → сессия правок по ревью не запускается', () => {
+        const logs: string[] = [];
+        const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+        const pushEventFn = vi.fn();
+        let calls = 0;
+        const state = mkState();
+        runLoop(
+            validCfg({ review: { fixTurnRetries: 0 } }),
+            ctx(state),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                findOpenPrFn: () => ({ number: 55, labels: [] }),
+                pickReviewModelFn: () => 'none',
+                ensurePhaseBranchFn: () =>
+                    ++calls === 1
+                        ? { kind: 'switched' as const, branch: 'feature/m1', sha: 'a'.repeat(40) }
+                        : ({
+                              kind: 'failed' as const,
+                              branch: 'feature/m1',
+                              sha: null,
+                              reason: 'детач с работой',
+                          } as const),
+                runClaudeFn,
+                pushEventFn,
+                tryMergePhaseFn: () => 'merged',
+            }),
+        );
+        expect(calls).toBeGreaterThan(1);
+        expect(runClaudeFn).not.toHaveBeenCalled();
+        expect(pushEventFn.mock.calls.map(([m]) => String(m)).join('\n')).toContain(
+            'правки по ревью',
+        );
+    });
+
+    // #134: разбор blocked — вторая пишущая сессия после гейта, а гейт паркует дерево
+    // детачем. Тест трассовый по той же причине, что у чини-сессии: «проводку позвали»
+    // доказывает ничего, потому что она есть и в начале итерации.
+    it('#134: между гейтом blocked и разбором дерево ставится на ветку ЗАНОВО', () => {
+        const logs: string[] = [];
+        const trace: string[] = [];
+        const state = mkState({
+            submitted: true,
+            blockedHeals: 0,
+            lastReviewModel: 'claude-opus-4-8',
+        });
+        runLoop(
+            validCfg({ blockedHealAttempts: 3 }),
+            ctx(state),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => false,
+                tryMergePhaseFn: () => {
+                    trace.push('gate');
+                    return 'blocked';
+                },
+                pickReviewModelFn: () => 'claude-opus-4-8',
+                ensurePhaseBranchFn: () => {
+                    trace.push('branch');
+                    return { kind: 'switched' as const, branch: 'feature/m1', sha: 'a'.repeat(40) };
+                },
+                runClaudeFn: () => {
+                    trace.push('session');
+                    return 0;
+                },
+            }),
+        );
+        const gate = trace.indexOf('gate');
+        const session = trace.indexOf('session', gate);
+        expect(gate).toBeGreaterThan(-1);
+        expect(session).toBeGreaterThan(gate);
+        expect(trace.slice(gate, session)).toContain('branch');
+    });
+
+    it('#134: отказ повторной проводки → разбор blocked не запускается', () => {
+        const logs: string[] = [];
+        const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+        const pushEventFn = vi.fn();
+        const tryMergePhaseFn = vi.fn(() => 'blocked' as const);
+        let calls = 0;
+        const state = mkState({
+            submitted: true,
+            blockedHeals: 0,
+            lastReviewModel: 'claude-opus-4-8',
+        });
+        runLoop(
+            validCfg({ blockedHealAttempts: 3 }),
+            ctx(state),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => false,
+                tryMergePhaseFn,
+                pickReviewModelFn: () => 'claude-opus-4-8',
+                ensurePhaseBranchFn: () =>
+                    ++calls === 1
+                        ? { kind: 'switched' as const, branch: 'feature/m1', sha: 'a'.repeat(40) }
+                        : ({
+                              kind: 'failed' as const,
+                              branch: 'feature/m1',
+                              sha: null,
+                              reason: 'детач с работой',
+                          } as const),
+                runClaudeFn,
+                pushEventFn,
+            }),
+        );
+        expect(tryMergePhaseFn).toHaveBeenCalled();
+        expect(calls).toBeGreaterThan(1);
+        expect(runClaudeFn).not.toHaveBeenCalled();
+        expect(pushEventFn.mock.calls.map(([m]) => String(m)).join('\n')).toContain(
+            'разбор blocked',
+        );
+        expect(state.blockedHeals).toBe(0);
+    });
+
+    // #183: сдача фазы шла к форжу, не проверив, что ветка вообще на origin. Когда сессии
+    // не могли пушить (#181), форж отвечал 400 — код одинаков для «нет ветки», «нет прав» и
+    // «не тот репозиторий», и ночью человек разбирался с нуля.
+    it('#183: ветка не запушена → PR не заводится, причина названа', () => {
+        const logs: string[] = [];
+        const createPrFn = vi.fn(() => 7);
+        const pushEventFn = vi.fn();
+        const state = mkState();
+        runLoop(
+            validCfg(),
+            ctx(state),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                branchPushedFn: () => false,
+                findOpenPrFn: () => null,
+                createPrFn,
+                pushEventFn,
+            }),
+        );
+        expect(createPrFn).not.toHaveBeenCalled();
+        const events = pushEventFn.mock.calls.map(([m]) => String(m)).join('\n');
+        expect(events).toContain('не запушена');
+        expect(events).toContain('pre-push');
+    });
+
+    it('#183: ветка есть на origin — ls-remote полного refs/heads даёт true', () => {
+        const argv: string[][] = [];
+        const res = ralph.branchPushed('feature/x', {
+            runArgvFn: (_f: string, a: string[]) => {
+                argv.push(a);
+                return 'deadbeef\trefs/heads/feature/x';
+            },
+            logFn: () => {},
+        });
+        expect(res).toBe(true);
+        expect(argv[0]).toContain('ls-remote');
+        // Полный реф, не голое имя: паттерн ls-remote матчится по хвосту пути,
+        // и «x» совпал бы с «feature/x».
+        expect(argv[0]).toContain('refs/heads/feature/x');
+    });
+
+    // Ровно случай branch_cleanup форжа: ветка удалена НА СЕРВЕРЕ, локальный
+    // remote-tracking ref мог протухнуть. fetch --prune здесь врал (падает «couldn't find
+    // remote ref», реф не удаляя) — ls-remote спрашивает сервер и от локального состояния
+    // не зависит вовсе.
+    it('#183: сервер ответил, ветки нет (пустой вывод ls-remote) → false', () => {
+        expect(ralph.branchPushed('feature/x', { runArgvFn: () => '', logFn: () => {} })).toBe(
+            false,
+        );
+    });
+
+    it('#183: origin недоступен — «не знаю» не превращается в «нет»', () => {
+        const logs: string[] = [];
+        const res = ralph.branchPushed('feature/x', {
+            runArgvFn: () => {
+                throw new Error('could not resolve host');
+            },
+            logFn: (m: string) => logs.push(m),
+        });
+        // true: сдача идёт дальше, и сетевой отказ назовёт своим именем вызов форжа —
+        // стоп с текстом «не запушена» при живой ветке слал бы человека чинить зелёный
+        // pre-push.
+        expect(res).toBe(true);
+        expect(logs.join('\n')).toContain('не знаю');
+    });
+
+    it('#183: небезопасное имя ветки → false, git не вызывается', () => {
+        const argv: string[][] = [];
+        const res = ralph.branchPushed('feature/x; rm -rf .', {
+            runArgvFn: (_f: string, a: string[]) => {
+                argv.push(a);
+                return 'deadbeef\trefs/heads/x';
+            },
+            logFn: () => {},
+        });
+        expect(res).toBe(false);
+        expect(argv).toHaveLength(0);
+    });
+
+    // #134: гейт паркует дерево детачем на origin/main после красного чека
+    // (parkOnOriginMain), и чини-сессия стартовала бы не на ветке фазы — ровно то
+    // состояние, из-за которого 20.08 коммит остался достижим только по SHA.
+    //
+    // Тест ПОСЛЕДОВАТЕЛЬНОСТИ, а не факта вызова: проводка есть и в начале итерации, и
+    // потому «её позвали» доказывает ровно ничего — первый вариант этого теста оставался
+    // зелёным при удалённом вызове перед чини-сессией. Здесь трасса пишется всеми тремя
+    // участниками, и проверяется, что между гейтом и сессией проводка была ПОВТОРНО.
+    it('#134: между гейтом и чини-сессией дерево ставится на ветку ЗАНОВО', () => {
+        const logs: string[] = [];
+        const trace: string[] = [];
+        const state = mkState({ submitted: true });
+        runLoop(
+            validCfg({ gateHealAttempts: 2 }),
+            ctx(state),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => false,
+                tryMergePhaseFn: () => {
+                    trace.push('gate');
+                    return 'red-checks';
+                },
+                getLastGatePr: () => 909,
+                getLastRedCheck: () => ({ name: 'test', cmd: 'npm run test', excerpt: 'boom' }),
+                ensurePhaseBranchFn: () => {
+                    trace.push('branch');
+                    return { kind: 'switched' as const, branch: 'feature/m1', sha: 'a'.repeat(40) };
+                },
+                runClaudeFn: () => {
+                    trace.push('session');
+                    return 0;
+                },
+            }),
+        );
+        const gate = trace.indexOf('gate');
+        const session = trace.indexOf('session', gate);
+        expect(gate).toBeGreaterThan(-1);
+        expect(session).toBeGreaterThan(gate);
+        expect(trace.slice(gate, session)).toContain('branch');
+    });
+
+    it('#134: отказ ИМЕННО повторной проводки → чини-сессия не запускается', () => {
+        const logs: string[] = [];
+        const runClaudeFn = vi.fn(() => 0);
+        const pushEventFn = vi.fn();
+        const tryMergePhaseFn = vi.fn(() => 'red-checks' as const);
+        let calls = 0;
+        const state = mkState({ submitted: true });
+        runLoop(
+            validCfg({ gateHealAttempts: 2 }),
+            ctx(state),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => false,
+                tryMergePhaseFn,
+                getLastGatePr: () => 909,
+                getLastRedCheck: () => ({ name: 'test', cmd: 'npm run test', excerpt: 'boom' }),
+                // Первая проводка (начало итерации) проходит, вторая — перед чини-сессией —
+                // отказывает: иначе тест доказывал бы только барьер на входе в итерацию.
+                ensurePhaseBranchFn: () =>
+                    ++calls === 1
+                        ? { kind: 'switched' as const, branch: 'feature/m1', sha: 'a'.repeat(40) }
+                        : ({
+                              kind: 'failed' as const,
+                              branch: 'feature/m1',
+                              sha: null,
+                              reason: 'не смог поставить дерево на ветку — local changes would be overwritten',
+                          } as const),
+                runClaudeFn,
+                pushEventFn,
+            }),
+        );
+        expect(tryMergePhaseFn).toHaveBeenCalled();
+        expect(calls).toBeGreaterThan(1);
+        expect(runClaudeFn).not.toHaveBeenCalled();
+        const pushedText = pushEventFn.mock.calls.map(([m]) => String(m)).join('\n');
+        expect(pushedText).toContain('чини-сессия гейта');
+        // #289: kind проводки (у этого мока — отказ самого switch, то есть 'tree-dirty') доезжает до причины стопа.
+        expect(pushedText).toContain('tree-dirty');
+        expect(pushedText).toContain('вопрос человеку:');
+        // Бюджет чини-сессий тратится на ЗАПУЩЕННУЮ сессию: отказ проводки его не жжёт.
+        expect(state.gateHeals).toBe(0);
+    });
+
+    it('#269: гейт forge-red → та же чини-сессия, но с логом куба и подсказкой про среду', () => {
+        const logs: string[] = [];
+        const state = mkState({ submitted: true, gateHeals: 0 });
+        const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+        runLoop(
+            // #269-ревью: перечень мест, где среды расходятся, приходит из КОНФИГА —
+            // в переносимом ядре он был бы ложным следом на любом другом форже.
+            validCfg({ gateHealAttempts: 2, forgeEnvHint: 'рабочий каталог там `/repo`.' }),
+            ctx(state),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => false,
+                tryMergePhaseFn: () => 'forge-red',
+                // Локального красного чека НЕТ — отказ пойман только площадкой.
+                getLastRedCheck: () => null,
+                getLastForgeRedCheck: () => ({
+                    workflow: 'gate',
+                    runId: '356',
+                    cube: 'test',
+                    log: 'Tests  2 failed | 7172 passed (7174)',
+                    kind: 'code' as const,
+                }),
+                runClaudeFn,
+            }),
+        );
+        expect(state.gateHeals).toBe(1);
+        // Возврат на ПОЛНУЮ сдачу — как и после локального лечения: правки едут через ревью.
+        expect(state.submitted).toBe(false);
+        // #269-ревью: успешная сессия помечает прогон пролеченным — следующий круг обязан
+        // ждать НОВЫЙ прогон, а не лечить тот же лог второй раз, потратив последнюю попытку.
+        expect(state.forgeHealedRunId).toBe('356');
+        expect(runClaudeFn).toHaveBeenCalledTimes(1);
+        const healPrompt = runClaudeFn.mock.calls[0][0];
+        expect(healPrompt).toContain('356');
+        expect(healPrompt).toContain('2 failed');
+        // Подсказка про разницу сред — то, без чего сессия гоняет зелёный локальный набор.
+        expect(healPrompt).toContain('ищи разницу СРЕД');
+        // Проектная половина — из конфига, а не из ядра.
+        expect(healPrompt).toContain('/repo');
+    });
+
+    // #269, второй проход ревью: пометка «прогон пролечен» стояла ДО запуска сессии, и
+    // упавшая сессия (overload/лимит API — класс отказа из #223) делала вторую попытку
+    // НЕДОСТИЖИМОЙ: она ничего не запушила, нового прогона форж не завёл, а рестарт по
+    // инструкции из лога уходил ждать новый прогон 20 минут и заканчивался тем же стопом.
+    // Поле сбрасывает только `advancePhase`, то есть холостым становился КАЖДЫЙ рестарт.
+    it('#269: упавшая чини-сессия НЕ помечает прогон пролеченным — право лечить остаётся', () => {
+        const logs: string[] = [];
+        const state = mkState({ submitted: true, gateHeals: 0 });
+        runLoop(
+            validCfg({ gateHealAttempts: 2 }),
+            ctx(state),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => false,
+                tryMergePhaseFn: () => 'forge-red',
+                getLastRedCheck: () => null,
+                getLastForgeRedCheck: () => ({
+                    workflow: 'gate',
+                    runId: '356',
+                    cube: 'test',
+                    log: 'Tests  2 failed | 7172 passed (7174)',
+                    kind: 'code' as const,
+                }),
+                // Сессия упала: код не ноль, пуша не было, нового прогона у форжа не будет.
+                runClaudeFn: vi.fn<RunClaudeFake>(() => 1),
+                pushEventFn: vi.fn((msg: string) => msg.length > 0),
+            }),
+        );
+        expect(state.forgeHealedRunId).toBe(null);
+        // Попытка при этом потрачена — рестарт продолжит со второй, а не с первой.
+        expect(state.gateHeals).toBe(1);
+        expect(logs.join('\n')).toContain('Чини-сессия упала');
+    });
+
+    // Второй слой той же правки: стоп `forge-unknown` отдан человеку, и следующий заход
+    // обязан читать вердикт форжа заново. Сюда петля попадает в том числе потому, что ЖДАЛА
+    // прогон новее пролеченного и не дождалась, — рестарт с той же памятью повторил бы стоп.
+    it('#269: forge-unknown обнуляет и память о пролеченном прогоне, не только счётчик', () => {
+        const logs: string[] = [];
+        const state = mkState({ submitted: true, gateHeals: 1, forgeHealedRunId: '356' });
+        runLoop(
+            validCfg({ gateHealAttempts: 2 }),
+            ctx(state),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => false,
+                tryMergePhaseFn: () => 'forge-unknown',
+                getLastRedCheck: () => null,
+                getLastForgeRedCheck: () => null,
+                getLastForgeStop: () =>
+                    'за 20 мин форж не завёл прогон новее 356 (по нему чини-сессия уже отработала)',
+                runClaudeFn: vi.fn<RunClaudeFake>(() => 0),
+                pushEventFn: vi.fn((msg: string) => msg.length > 0),
+            }),
+        );
+        expect(state.forgeHealedRunId).toBe(null);
+        expect(state.gateHeals).toBe(0);
+    });
+
+    it('#269: forge-env (OOM) — НЕ лечим кодом: ни одной сессии, стоп с диагнозом', () => {
+        const logs: string[] = [];
+        const state = mkState({ submitted: true, gateHeals: 0 });
+        const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+        // Параметр объявлен явно: `vi.fn(() => true)` типизировал бы аргументы пустым
+        // кортежем, и `mock.calls[0][0]` не прошёл бы typecheck (куб гейта проверяет
+        // и тесты тоже).
+        const pushEventFn = vi.fn((msg: string) => msg.length > 0);
+        runLoop(
+            validCfg({ gateHealAttempts: 2 }),
+            ctx(state),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => false,
+                tryMergePhaseFn: () => 'forge-env',
+                getLastRedCheck: () => null,
+                getLastForgeRedCheck: () => ({
+                    workflow: 'gate',
+                    runId: '350',
+                    cube: 'test',
+                    log: 'Worker exited unexpectedly',
+                    kind: 'oom' as const,
+                }),
+                runClaudeFn,
+                pushEventFn,
+            }),
+        );
+        expect(runClaudeFn).not.toHaveBeenCalled();
+        // Бюджет лечения не тратится: чинить нечего, и следующий рестарт не обязан
+        // начинать с потраченной попытки.
+        expect(state.gateHeals).toBe(0);
+        // Ревью #289 (!151): канал стопа один — pushEvent сам печатает `🔔 PUSH: <msg>`
+        // в ralph.log, прямого logFn рядом больше нет; диагноз (номер прогона) ищем в пуше.
+        expect(pushEventFn).toHaveBeenCalledTimes(1);
+        expect(String(pushEventFn.mock.calls[0][0])).toContain('350');
+        expect(String(pushEventFn.mock.calls[0][0])).toMatch(/СРЕДЫ/);
+    });
+
+    it('#269: forge-env по ПРЕРВАННОМУ прогону даёт другой диагноз, чем по OOM', () => {
+        const logs: string[] = [];
+        const pushEventFn = vi.fn((msg: string) => msg.length > 0);
+        runLoop(
+            validCfg({ gateHealAttempts: 2 }),
+            ctx(mkState({ submitted: true, gateHeals: 0 })),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => false,
+                tryMergePhaseFn: () => 'forge-env',
+                getLastRedCheck: () => null,
+                getLastForgeRedCheck: () => ({
+                    workflow: 'gate',
+                    runId: '361',
+                    cube: 'install',
+                    log: 'обрывок',
+                    kind: 'aborted' as const,
+                }),
+                runClaudeFn: vi.fn<RunClaudeFake>(() => 0),
+                pushEventFn,
+            }),
+        );
+        const text = String(pushEventFn.mock.calls[0][0]);
+        // Про память контейнера тут писать нельзя — прогон отменили, память ни при чём.
+        expect(text).toMatch(/ПРЕРВАН/);
+        expect(text).not.toMatch(/OOM/);
+    });
+
+    it('#269: чини-сессия по чеку площадки шлёт пуш «лечу N/3» — иначе ночью это не видно', () => {
+        const logs: string[] = [];
+        const state = mkState({ submitted: true, gateHeals: 0 });
+        const pushEventFn = vi.fn((msg: string) => msg.length > 0);
+        runLoop(
+            validCfg({ gateHealAttempts: 3 }),
+            ctx(state),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => false,
+                tryMergePhaseFn: () => 'forge-red',
+                getLastRedCheck: () => null,
+                getLastForgeRedCheck: () => ({
+                    workflow: 'gate',
+                    runId: '356',
+                    cube: 'lint',
+                    log: 'error TS2345',
+                    kind: 'code' as const,
+                }),
+                runClaudeFn: vi.fn<RunClaudeFake>(() => 0),
+                pushEventFn,
+            }),
+        );
+        const texts = pushEventFn.mock.calls.map(([m]) => String(m));
+        expect(texts.some((t) => t.includes('lint') && t.includes('1/3'))).toBe(true);
+    });
+
+    // #269-ревью: три стопа на чеке форжа БЕЗ вердикта (потолок ожидания, устойчивый сбой
+    // чтения, красный прогон без названного куба) уходили как `not-merged` — то есть без
+    // единого пуша, только строкой в `ralph.log`. Потолок в 20 минут при `max_slots: 1`
+    // достижим штатно, deadman на штатном завершении не сработает, и ночная остановка
+    // выяснялась бы утром — ровно тот отказ, ради которого карточка и заведена.
+    it('#269: forge-unknown — стоп ПУШЕМ с причиной, а не молча в лог', () => {
+        const logs: string[] = [];
+        const state = mkState({ submitted: true, gateHeals: 1 });
+        const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+        const pushEventFn = vi.fn((msg: string) => msg.length > 0);
+        runLoop(
+            validCfg({ gateHealAttempts: 2 }),
+            ctx(state),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => false,
+                tryMergePhaseFn: () => 'forge-unknown',
+                getLastRedCheck: () => null,
+                getLastForgeRedCheck: () => null,
+                getLastForgeStop: () =>
+                    'чек PR #12 у форжа не дал вердикта (за 20 мин чек не сошёлся)',
+                runClaudeFn,
+                pushEventFn,
+            }),
+        );
+        expect(runClaudeFn).not.toHaveBeenCalled();
+        expect(pushEventFn).toHaveBeenCalledTimes(1);
+        const stopText = String(pushEventFn.mock.calls[0][0]);
+        expect(stopText).toContain('за 20 мин чек не сошёлся');
+        // #289: стоп несёт причину, диагноз и вопрос — не только маркер «оставлен человеку».
+        expect(stopText).toContain('platform-check-red');
+        expect(stopText).toContain('диагноз:');
+        expect(stopText).toContain('вопрос человеку:');
+        // Человек чинит СРЕДУ, а не код: после рестарта бюджет лечения обязан быть полным.
+        expect(state.gateHeals).toBe(0);
+    });
+
+    // #269-ревью: соседний стоп «бюджет исчерпан» сбрасывает счётчик и прямо обещает это
+    // в логе, а `forge-env` не сбрасывал. Сценарий: forge-red → одна чини-сессия → OOM
+    // на следующем круге, и человеку, починившему память контейнера, остаётся одна попытка
+    // из двух на отказ, к которому прошлая попытка отношения не имеет.
+    it('#269: forge-env сбрасывает счётчик чини-сессий, как стоп по бюджету', () => {
+        const logs: string[] = [];
+        const state = mkState({ submitted: true, gateHeals: 1 });
+        runLoop(
+            validCfg({ gateHealAttempts: 2 }),
+            ctx(state),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => false,
+                tryMergePhaseFn: () => 'forge-env',
+                getLastRedCheck: () => null,
+                getLastForgeRedCheck: () => ({
+                    workflow: 'gate',
+                    runId: '350',
+                    cube: 'test',
+                    log: 'Worker exited unexpectedly',
+                    kind: 'oom' as const,
+                }),
+                runClaudeFn: vi.fn<RunClaudeFake>(() => 0),
+                pushEventFn: vi.fn((msg: string) => msg.length > 0),
+            }),
+        );
+        expect(state.gateHeals).toBe(0);
+    });
+
+    // #269, второй проход ревью: сброс памяти о прогоне доехал до ВСЕХ трёх стопов,
+    // отдающих PR человеку, а не до одного. Сценарий на бюджете достижим: круг лечит
+    // прогон 356 и помечает его, бюджет кончается — счётчик обнулён, а память жива,
+    // и рестарт уходит ждать прогон новее 356, выжигает потолок и встаёт `forge-unknown`.
+    it('#269: стоп по исчерпанию бюджета обнуляет и память о пролеченном прогоне', () => {
+        const logs: string[] = [];
+        const state = mkState({ submitted: true, gateHeals: 2, forgeHealedRunId: '356' });
+        const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+        runLoop(
+            validCfg({ gateHealAttempts: 2 }),
+            ctx(state),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => false,
+                tryMergePhaseFn: () => 'forge-red',
+                getLastRedCheck: () => null,
+                getLastForgeRedCheck: () => ({
+                    workflow: 'gate',
+                    runId: '358',
+                    cube: 'test',
+                    log: 'Tests  1 failed',
+                    kind: 'code' as const,
+                }),
+                runClaudeFn,
+                pushEventFn: vi.fn((msg: string) => msg.length > 0),
+            }),
+        );
+        expect(runClaudeFn).not.toHaveBeenCalled();
+        expect(state.gateHeals).toBe(0);
+        expect(state.forgeHealedRunId).toBe(null);
+    });
+
+    it('#269: forge-env обнуляет память о прогоне тем же движением, что счётчик', () => {
+        const logs: string[] = [];
+        const state = mkState({ submitted: true, gateHeals: 1, forgeHealedRunId: '356' });
+        runLoop(
+            validCfg({ gateHealAttempts: 2 }),
+            ctx(state),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => false,
+                tryMergePhaseFn: () => 'forge-env',
+                getLastRedCheck: () => null,
+                getLastForgeRedCheck: () => ({
+                    workflow: 'gate',
+                    runId: '350',
+                    cube: 'test',
+                    log: 'Worker exited unexpectedly',
+                    kind: 'oom' as const,
+                }),
+                runClaudeFn: vi.fn<RunClaudeFake>(() => 0),
+                pushEventFn: vi.fn((msg: string) => msg.length > 0),
+            }),
+        );
+        expect(state.gateHeals).toBe(0);
+        expect(state.forgeHealedRunId).toBe(null);
     });
 });
 
@@ -6876,6 +7774,112 @@ describe('handleCrashedCoderSession — падение кодер-сессии: 
         expect(result).toEqual({ stop: true });
         expect(logs.join('\n')).toMatch(/Не удалось сохранить вывод/);
         expect(pushEventFn).toHaveBeenCalledTimes(1);
+    });
+
+    // #20 (инцидент 28.08.2026, первый боевой прогон, Issue #4 «Button на Gravity»):
+    // кодер-сессия упёрлась в `--max-turns 200`, вышла с кодом 1 и оставила 31 файл
+    // незакоммиченным. Петля встала «разбери руками» — хотя работа была ГОДНОЙ: гейт на
+    // том же грязном дереве прошёл целиком (build, lint, typecheck, 3246 тестов). То есть
+    // остановка стоила ручного вмешательства и не спасла ни от чего.
+    //
+    // Механизм на этот случай в ядре был с #594, но `TURN_LIMIT_RE` проверялся ТОЛЬКО в
+    // подсистеме ревью (шаги правок и разбора blocked), а ветка кодер-сессии осталась на
+    // прежнем «грязно → стоп». Здесь тот же разбор появляется и в ней.
+    it('#20: бюджет ходов исчерпан + грязное дерево + попытки есть → остаток коммитится, цикл НЕ встаёт', () => {
+        const logs: string[] = [];
+        const pushEventFn = vi.fn();
+        const commitLeftoversFn = vi.fn(() => true);
+        const result = handleCrashedCoderSession(issue, 1, 'Reached max turns (200)', {
+            shFn: () => ' M src/a.ts\n?? tmp.log',
+            logFn: (m: string) => logs.push(m),
+            pushEventFn,
+            saveSessionOutputFn: () => {},
+            cfg: {} as unknown,
+            commitLeftoversFn,
+            turnRetriesLeft: 1,
+        });
+        expect(result.stop).toBe(false);
+        // Флаг нужен вызывающему: он ведёт счётчик попыток по карточке.
+        expect(result.turnLimitRetry).toBe(true);
+        // Работа сохранена: без коммита следующая сессия стартовала бы поверх чужой
+        // полу-работы (M2), а ensureClean встал бы на грязном дереве.
+        expect(commitLeftoversFn).toHaveBeenCalledTimes(1);
+        expect(logs.join('\n')).toMatch(/бюджет ходов/);
+        // Человеку это сообщают: пуш о продолжении, а не молчаливое решение.
+        expect(pushEventFn).toHaveBeenCalledTimes(1);
+    });
+
+    it('#20: код 1 БЕЗ маркера бюджета + грязное дерево → прежний стоп (настоящее падение остаётся fail-closed)', () => {
+        const logs: string[] = [];
+        const commitLeftoversFn = vi.fn(() => true);
+        const result = handleCrashedCoderSession(issue, 1, 'TypeError: boom', {
+            shFn: () => ' M src/a.ts',
+            logFn: (m: string) => logs.push(m),
+            pushEventFn: vi.fn(),
+            saveSessionOutputFn: () => {},
+            cfg: {} as unknown,
+            commitLeftoversFn,
+            turnRetriesLeft: 5,
+        });
+        expect(result.stop).toBe(true);
+        // Повторять сессию, которая упала по-настоящему, значит жечь бюджет об ту же стену.
+        expect(commitLeftoversFn).not.toHaveBeenCalled();
+        expect(logs.join('\n')).toMatch(/незакоммиченные изменения/);
+    });
+
+    it('#20: попытки исчерпаны → стоп, и сообщение называет причиной бюджет ходов, а не отказ сессии', () => {
+        const logs: string[] = [];
+        const pushEventFn = vi.fn();
+        const commitLeftoversFn = vi.fn(() => true);
+        const result = handleCrashedCoderSession(issue, 1, 'Reached max turns (200)', {
+            shFn: () => ' M src/a.ts',
+            logFn: (m: string) => logs.push(m),
+            pushEventFn,
+            saveSessionOutputFn: () => {},
+            cfg: {} as unknown,
+            commitLeftoversFn,
+            turnRetriesLeft: 0,
+        });
+        expect(result.stop).toBe(true);
+        expect(commitLeftoversFn).not.toHaveBeenCalled();
+        // Диагноз в сообщении: не «сессия отказала», а «не влезла» — иначе человек ищет
+        // несуществующую поломку вместо того, чтобы разрезать карточку.
+        expect(logs.join('\n')).toMatch(/бюджет ходов/);
+        expect(pushEventFn).toHaveBeenCalledTimes(1);
+    });
+
+    it('#20: остаток не удалось закоммитить → стоп fail-closed (состояние дерева неизвестно)', () => {
+        const logs: string[] = [];
+        const result = handleCrashedCoderSession(issue, 1, 'Reached max turns (200)', {
+            shFn: () => ' M src/a.ts',
+            logFn: (m: string) => logs.push(m),
+            pushEventFn: vi.fn(),
+            saveSessionOutputFn: () => {},
+            cfg: {} as unknown,
+            commitLeftoversFn: () => false,
+            turnRetriesLeft: 1,
+        });
+        // Продолжать поверх неспасённой работы нельзя: следующая сессия писала бы поверх
+        // чужой полу-работы, а что именно осталось в дереве — уже неизвестно.
+        expect(result.stop).toBe(true);
+        expect(logs.join('\n')).toMatch(/Issue #42/);
+    });
+
+    it('#20: чистое дерево после исчерпания ходов → прежнее поведение (продолжаем, коммитить нечего)', () => {
+        const commitLeftoversFn = vi.fn(() => true);
+        const result = handleCrashedCoderSession(issue, 1, 'Reached max turns (200)', {
+            shFn: () => '',
+            logFn: () => {},
+            pushEventFn: vi.fn(),
+            saveSessionOutputFn: () => {},
+            cfg: {} as unknown,
+            commitLeftoversFn,
+            turnRetriesLeft: 1,
+        });
+        expect(result.stop).toBe(false);
+        // Ветка «дерево чистое» не трогается вовсе: спасать нечего, попытку не тратим.
+        expect(result.turnLimitRetry).toBeUndefined();
+        expect(commitLeftoversFn).not.toHaveBeenCalled();
     });
 });
 
@@ -7227,8 +8231,13 @@ describe('ветковая хореография в worktree раннера (#7
                     calls.find(([cmd]) => cmd === needle || cmd.startsWith(needle))?.[1];
                 // Чек — с санированным env из buildGateEnvFn.
                 expect(optsOf(FIRST_CHECK_CMD)).toEqual({ env: SANITIZED });
-                // git fetch/checkout наследуют полный env (нужны секреты для origin).
-                expect(optsOf('git fetch')).toBeUndefined();
+                // git fetch/checkout наследуют полный env (нужны секреты для origin), а
+                // сетевой fetch вдобавок запрещает промпт кредов (задача 71) — санированным
+                // он от этого не становится.
+                expect(optsOf('git fetch')).toEqual({
+                    env: expect.objectContaining({ GIT_TERMINAL_PROMPT: '0' }),
+                });
+                expect(optsOf('git fetch')).not.toEqual({ env: SANITIZED });
                 expect(optsOf('git checkout --detach')).toBeUndefined();
             });
 
@@ -9265,6 +10274,17 @@ describe('runLoop → промпт ревью получает контекст 
                 ensureMonitorAliveFn: () => null,
                 phaseDiffFilesFn: () => ['src/a.ts'],
                 reviewDiffContextFn: () => '\n\nМАРКЕР-КОНТЕКСТА-ДИФФА',
+                // Проводка, страж после сессии и «ветка запушена» — побочки git; см. общий
+                // deps выше.
+                ensurePhaseBranchFn: () => ({
+                    kind: 'switched' as const,
+                    branch: 'feature/m1',
+                    sha: 'a'.repeat(40),
+                }),
+                checkOnPhaseBranchFn: () => ({ ok: true, sha: 'a'.repeat(40) }),
+                branchPushedFn: () => true,
+                // Намерения сессии — побочка по fs (общий deps выше делает то же).
+                applySessionRequestsFn: () => ({ applied: 0, failed: false }),
                 // #625: заглушки лестницы ревью правок — см. общий deps выше.
                 branchHeadShaFn: () => 'a'.repeat(40),
                 createIssueFn: () => 1,
@@ -9419,13 +10439,13 @@ describe('syncProjectBoard', () => {
     it('зовёт скрипт синка через argv и логирует последнюю строку его вывода', () => {
         const argvCalls: Array<[string, string[]]> = [];
         const logs: string[] = [];
-        ralph.syncProjectBoard(
-            (file: string, args: string[]) => {
+        ralph.syncProjectBoard({
+            runArgvFn: (file: string, args: string[]) => {
                 argvCalls.push([file, args]);
                 return 'шум\n✅ project-sync: доска в порядке\n';
             },
-            (m: string) => logs.push(m),
-        );
+            logFn: (m: string) => logs.push(m),
+        });
         expect(argvCalls).toEqual([['node', [REAL_CONFIG.consumerScriptsResolved.projectSync]]]);
         expect(logs[0]).toContain('доска в порядке');
     });
@@ -9441,13 +10461,13 @@ describe('syncProjectBoard', () => {
                 ...REAL_CONFIG,
                 consumerScriptsResolved: { projectSync: null, reviewFindingsJournal: null },
             });
-            ralph.syncProjectBoard(
-                (file: string, args: string[]) => {
+            ralph.syncProjectBoard({
+                runArgvFn: (file: string, args: string[]) => {
                     argvCalls.push([file, ...args]);
                     return '';
                 },
-                (m: string) => logs.push(m),
-            );
+                logFn: (m: string) => logs.push(m),
+            });
         } finally {
             ralph.setConfigForTests(REAL_CONFIG);
         }
@@ -9459,12 +10479,12 @@ describe('syncProjectBoard', () => {
     it('не бросает, когда синк упал — фаза уже смерджена, ронять её нельзя', () => {
         const logs: string[] = [];
         expect(() =>
-            ralph.syncProjectBoard(
-                () => {
+            ralph.syncProjectBoard({
+                runArgvFn: () => {
                     throw new Error('HTTP 401\nвторая строка');
                 },
-                (m: string) => logs.push(m),
-            ),
+                logFn: (m: string) => logs.push(m),
+            }),
         ).not.toThrow();
         expect(logs[0]).toContain('HTTP 401');
         expect(logs[0]).not.toContain('вторая строка');
@@ -9755,13 +10775,11 @@ describe('createOrchestrator: флаги CLI', () => {
             shFn: () => '',
             logFn: () => {},
         });
-        expect(runArgv).toHaveBeenCalledWith('git', [
-            'fetch',
-            'origin',
-            'main',
-            'feature/x',
-            '--quiet',
-        ]);
+        expect(runArgv).toHaveBeenCalledWith(
+            'git',
+            ['fetch', 'origin', 'main', 'feature/x', '--quiet'],
+            { env: expect.objectContaining({ GIT_TERMINAL_PROMPT: '0' }) },
+        );
     });
 });
 
@@ -10694,6 +11712,228 @@ describe('applySessionRequests: намерения сессии применяе
         // Прочитанное всё равно видно в логе: dry-прогон для того и нужен.
         expect(logs.join('\n')).toMatch(/close/);
     });
+
+    // #16-продолжение: у карточки кодер-сессии тоже должен быть АДРЕС. Замер 01.09.2026:
+    // 16 карточек из 18 бесхозных пришли именно отсюда, и среди них были не ниты, а
+    // находки уровня «тесты бэкенда не проходят typecheck ни в одном кубе гейта».
+    // Веха текущей фазы при этом по-прежнему запрещена — карточка в ней удлинила бы фазу,
+    // которую сессия сейчас сдаёт, ровно настолько, насколько сессия находит постороннего.
+    describe('адрес карточки кодер-сессии (#16)', () => {
+        const withBacklog = (over: Record<string, unknown> = {}) => ({
+            ...CFG,
+            review: {
+                backlogMilestone: ['Ревью · Входящие', 'Ревью · Запасные'],
+                ...over,
+            },
+        });
+
+        // Фейк шва, который запоминает АДРЕС, а не только заголовок, плюс наполнение вех.
+        const addressingTaskSource = (
+            open: Record<string, unknown[]> = {},
+            over: Record<string, unknown> = {},
+        ) => {
+            const created: Array<{
+                title: string;
+                body?: string;
+                labels?: readonly string[];
+                milestone?: string;
+            }> = [];
+            const asked: string[] = [];
+            return {
+                created,
+                asked,
+                ts: {
+                    commentOnIssue: () => {},
+                    closeIssue: () => {},
+                    blockIssue: () => {},
+                    listAllOpenIssues: (milestone: string) => {
+                        asked.push(milestone);
+                        return open[milestone] ?? [];
+                    },
+                    // Пишем ВЕСЬ input: раскладка полей руками (`createIssue({title, body,
+                    // labels, milestone})` вместо `createIssue(req)`) появилась вместе
+                    // с адресом, и потерять в ней поле стало возможно впервые. Фейк,
+                    // запоминающий только заголовок, такую потерю не увидит.
+                    createIssue: (input: {
+                        title: string;
+                        body: string;
+                        labels: readonly string[];
+                        milestone?: string;
+                    }) => {
+                        created.push(input);
+                        return 77;
+                    },
+                    ...over,
+                },
+            };
+        };
+
+        const newIssue = (title: string) =>
+            line({ kind: 'new-issue', title, body: 'симптом', labels: ['complexity:low'] });
+
+        // Сверяем карточку ЦЕЛИКОМ, а не только адрес: метки решают, какой моделью
+        // карточка будет взята (без `complexity:*` её не видит роутинг вовсе), тело —
+        // единственное, по чему человек поймёт находку. Потерять их стало возможно ровно
+        // здесь: раньше намерение уезжало в шов одним объектом и терять было нечего.
+        it('карточка едет в накопитель ЦЕЛИКОМ: тело, метки и адрес', () => {
+            const { ts, created } = addressingTaskSource();
+            ralph.applySessionRequests({
+                cfg: withBacklog(),
+                currentMilestone: 'Gravity · Фаза 4',
+                dry: false,
+                readFn: () => newIssue('Течёт лимит'),
+                writeFn: () => {},
+                removeFn: () => {},
+                taskSource: ts,
+                logFn: () => {},
+                pushEventFn: () => {},
+            });
+            expect(created).toEqual([
+                {
+                    title: 'Течёт лимит',
+                    body: 'симптом',
+                    labels: ['complexity:low'],
+                    milestone: 'Ревью · Входящие',
+                },
+            ]);
+        });
+
+        // Правило сходимости, ради которого адрес вообще выбирается, а не берётся первым
+        // попавшимся: карточка в вехе текущей фазы удлиняет фазу, которую сессия сдаёт.
+        it('веха текущей фазы под адрес не берётся — карточка едет без него', () => {
+            const { ts, created } = addressingTaskSource();
+            ralph.applySessionRequests({
+                cfg: withBacklog({ backlogMilestone: ['Ревью · Входящие'] }),
+                currentMilestone: 'Ревью · Входящие',
+                dry: false,
+                readFn: () => newIssue('Течёт лимит'),
+                writeFn: () => {},
+                removeFn: () => {},
+                taskSource: ts,
+                logFn: () => {},
+                pushEventFn: () => {},
+            });
+            expect(created).toMatchObject([{ title: 'Течёт лимит', milestone: undefined }]);
+        });
+
+        // Отказ обязан быть СЛЫШНЫМ: карточка заводится, но человеку надо знать, что она
+        // без адреса, — красного чека здесь нет и не будет.
+        it('накопитель переполнен → карточка без адреса и предупреждение в логе', () => {
+            const full = Array.from({ length: 5 }, (_, i) => ({ number: i + 1, title: 'x' }));
+            const { ts, created } = addressingTaskSource({ 'Ревью · Входящие': full });
+            const logs: string[] = [];
+            ralph.applySessionRequests({
+                cfg: withBacklog({
+                    backlogMilestone: ['Ревью · Входящие'],
+                    backlogMilestoneCap: 5,
+                }),
+                currentMilestone: 'Gravity · Фаза 4',
+                dry: false,
+                readFn: () => newIssue('Течёт лимит'),
+                writeFn: () => {},
+                removeFn: () => {},
+                taskSource: ts,
+                logFn: (m: string) => logs.push(m),
+                pushEventFn: () => {},
+            });
+            expect(created).toMatchObject([{ title: 'Течёт лимит', milestone: undefined }]);
+            expect(logs.join('\n')).toMatch(/Накопительной вехи для карточек кодер-сессии/);
+        });
+
+        // Отказ ЧТЕНИЯ наполнения ≠ пустая веха. Иначе одно неотвеченное чтение делало бы
+        // годной сколь угодно переполненную веху — потолок переставал бы быть барьером.
+        it('наполнение вехи не читается → адреса нет, а не «веха пустая»', () => {
+            const { ts, created } = addressingTaskSource(
+                {},
+                {
+                    listAllOpenIssues: () => {
+                        throw new Error('вехи нет в этом репозитории');
+                    },
+                },
+            );
+            ralph.applySessionRequests({
+                cfg: withBacklog(),
+                currentMilestone: 'Gravity · Фаза 4',
+                dry: false,
+                readFn: () => newIssue('Течёт лимит'),
+                writeFn: () => {},
+                removeFn: () => {},
+                taskSource: ts,
+                logFn: () => {},
+                pushEventFn: () => {},
+            });
+            expect(created).toMatchObject([{ title: 'Течёт лимит', milestone: undefined }]);
+        });
+
+        // Адрес ищется ЛЕНИВО: батч без единой карточки (обычный случай) не платит за это
+        // ни одним запросом к форжу.
+        it('батч без новых карточек не спрашивает наполнение вех вовсе', () => {
+            const { ts, asked } = addressingTaskSource();
+            ralph.applySessionRequests({
+                cfg: withBacklog(),
+                currentMilestone: 'Gravity · Фаза 4',
+                dry: false,
+                readFn: () => line({ kind: 'close', issue: 7, comment: 'сделано' }),
+                writeFn: () => {},
+                removeFn: () => {},
+                taskSource: ts,
+                logFn: () => {},
+                pushEventFn: () => {},
+            });
+            expect(asked).toEqual([]);
+        });
+
+        // Ключ не задан — поведение прежнее, без адреса и без лишнего запроса.
+        it('ключ не задан — карточка едет как раньше, без адреса и без шума', () => {
+            const { ts, created, asked } = addressingTaskSource();
+            const logs: string[] = [];
+            ralph.applySessionRequests({
+                cfg: CFG,
+                currentMilestone: 'Gravity · Фаза 4',
+                dry: false,
+                readFn: () => newIssue('Течёт лимит'),
+                writeFn: () => {},
+                removeFn: () => {},
+                taskSource: ts,
+                logFn: (m: string) => logs.push(m),
+                pushEventFn: () => {},
+            });
+            expect(created).toMatchObject([{ title: 'Течёт лимит', milestone: undefined }]);
+            expect(asked).toEqual([]);
+            // «Прежнее поведение» — это и отсутствие новой строки в логе: предупреждение
+            // про ненайденный адрес относится к заданному ключу, а не к незаданному.
+            expect(logs.join('\n')).not.toMatch(/Накопительной вехи/);
+        });
+
+        // Замер 01.09.2026 давал 16 бесхозных карточек за период — по одной за раз их так
+        // не набирается. Батч из нескольких проверяет то, чего одиночный не может: счёт
+        // внутри батча, перелив в следующего кандидата и цену в запросах к форжу.
+        it('батч из трёх карточек: перелив по кандидатам, по одному запросу на веху', () => {
+            const { ts, created, asked } = addressingTaskSource({
+                'Ревью · Входящие': [{ number: 1, title: 'уже лежит' }],
+            });
+            ralph.applySessionRequests({
+                cfg: withBacklog({ backlogMilestoneCap: 2 }),
+                currentMilestone: 'Gravity · Фаза 4',
+                dry: false,
+                readFn: () =>
+                    [newIssue('Первая'), newIssue('Вторая'), newIssue('Третья')].join('\n'),
+                writeFn: () => {},
+                removeFn: () => {},
+                taskSource: ts,
+                logFn: () => {},
+                pushEventFn: () => {},
+            });
+            expect(created).toMatchObject([
+                { title: 'Первая', milestone: 'Ревью · Входящие' },
+                { title: 'Вторая', milestone: 'Ревью · Запасные' },
+                { title: 'Третья', milestone: 'Ревью · Запасные' },
+            ]);
+            // Наполнение спрашивается по разу на веху, а не на карточку: у площадки лимит
+            // запросов, и батч намерений не имеет права его жечь.
+            expect(asked).toEqual(['Ревью · Входящие', 'Ревью · Запасные']);
+        });
+    });
 });
 
 // ── #40: формы argv-мутаций GitHub ──────────────────────────────────────────
@@ -11112,5 +12352,29 @@ describe('main(): переезд в worktree предшествует preflight 
         // Именно ВСЕ, а не первый: ветка dry и ветка живого прогона зовут chdir порознь, и
         // проверка «первое вхождение раньше» пропустила бы перестановку во второй из них.
         expect(Math.max(...chdirAt)).toBeLessThan(preflightAt[0]);
+    });
+});
+
+// #181: синк зависимостей обязан стоять сразу за переездом в дерево раннера, а не только в
+// гейте мерджа. Проверка структурная — по исходнику main(), потому что сам main() поднимает
+// worktree, монитор и лок, и гонять его в тестах дороже, чем сторожить порядок двух строк.
+// Цена пропуска известна: 24.08 фаза встала целиком (pre-push красный на чужих зависимостях).
+describe('#181: зависимости синхронятся при переезде в дерево раннера', () => {
+    const SRC = fs.readFileSync(new URL('./orchestrator.ts', import.meta.url), 'utf-8').split('\n');
+
+    it('syncDepsIfLockChanged зовётся рядом с chdir в дерево раннера', () => {
+        const chdir = SRC.findIndex(
+            (l) => l.includes('process.chdir(worktreePath)') && !l.trim().startsWith('//'),
+        );
+        expect(chdir).toBeGreaterThan(-1);
+        const window = SRC.slice(chdir, chdir + 15).join('\n');
+        expect(window).toContain('syncDepsIfLockChanged(');
+    });
+
+    // Синк ДОБАВЛЕН на старт, а не ПЕРЕНЕСЁН со своего прежнего места: гейт гоняет чеки на
+    // голове PR, чей lock может отличаться от того, что стоял на старте прогона.
+    it('синк в гейте мерджа остался на месте', () => {
+        const gate = fs.readFileSync(new URL('./gate.ts', import.meta.url), 'utf-8');
+        expect(gate).toContain('syncDepsFn(');
     });
 });

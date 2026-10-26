@@ -270,10 +270,15 @@ describe('ядро не исполняет команд форжа (#55)', () =>
     // `deploy-check.ts` — чтение мердж-коммита и прогонов CI, в `monitor-panel.mts` —
     // счётчики доски для дашборда. Вынести их одним заходом значит переписать половину
     // ядра; это отдельная работа, а не попутная.
+    //
+    // Сведение с копией потребителя (задача 71) вынесло GitHub-реализацию швов из
+    // `orchestrator.ts` и чтения CI из `deploy-check.ts` в `adapters/github-*-commands.ts` —
+    // их долг ноль, и записей о них здесь больше нет.
+    // У `monitor-panel.mts` число выросло с 5 до 8 не от новых вызовов: строже стал
+    // паттерн слова (хвостовой дефис), и он увидел `gh-failed` и «данных gh», которые
+    // прежний пропускал.
     const DEBT: Record<string, number> = {
-        'core/orchestrator.ts': 27,
-        'core/deploy-check.ts': 3,
-        'runtime/monitor-panel.mts': 5,
+        'runtime/monitor-panel.mts': 8,
     };
 
     // `gh` как КОМАНДА: первым словом в строке-литерале (`'gh auth status'`) либо первым
@@ -297,7 +302,27 @@ describe('ядро не исполняет команд форжа (#55)', () =>
     // `const bin = 'gh'`, обёртка `env gh`. В очищенных модулях таких токенов нет вовсе
     // (проверено широкой пробой), поэтому дешёвое усиление обходится без исключений
     // и закрывает последнюю известную дыру (#55-ревью, второй круг).
-    const FORGE_WORD = /(?<![\w-])(gh|glab)(?![\w-])/;
+    //
+    // Хвост — `(?!\w)`, а не `(?![\w-])`: дефис в хвостовом классе гасил проверку словом, и
+    // `gh-чтение не удалось` прожило в `exec.ts` незамеченным (нашла мутация в копии
+    // потребителя, задача 71). Ведущий дефис по-прежнему исключён — `--gh-compat` флаг.
+    const FORGE_WORD = /(?<![\w-])(gh|glab)(?!\w)/;
+    // CLI SourceCraft (`src pr merge`, `src issue close`). Голое слово `src` в паттерн не
+    // годится — `src/a.ts`, `'src/**/*.ts'`, `join('src', …)` дали бы сплошные ложные
+    // срабатывания, поэтому форма ловли другая:
+    //   • команда — с подкомандой из ЗАКРЫТОГО перечня через пробел, и граница слова в
+    //     хвосте обязательна: без неё ловились бы 'src issues', 'src prod';
+    //   • подкоманда, собранная шаблоном (`src ${sub} merge`), ловится привязкой к НАЧАЛУ
+    //     литерала: `git add src ${file}` идёт мимо, а `` sh(`src ${sub} merge 7`) `` — нет;
+    //   • argv-вызов — `('src', [`: второй аргумент массив, а не путь.
+    const SRC_SUBCOMMANDS = 'pr|issue|repo|milestone|review|branch';
+    const FORGE_CMD_SRC = new RegExp(`\\bsrc\\s+(${SRC_SUBCOMMANDS})\\b|['"\`]src\\s+\\$`);
+    //   • argv-вызов — `('src', [` (второй аргумент массив, а не путь) ЛИБО `src` первым
+    //     аргументом функции запуска процесса (`*argv*`, `spawn*`, `exec*`): аргументы
+    //     через переменную (`runArgvFn('src', args)`) литеральным массивом не ловятся,
+    //     а `join('src', name)` — не запуск, и функция пути под этот класс не попадает.
+    const ARGV_FORGE_SRC =
+        /\(\s*['"`]src['"`]\s*,\s*\[|\b(?:\w*[Aa]rgv\w*|spawn\w*|exec\w*)\(\s*['"`]src['"`]\s*,/g;
 
     it('скан видит ядро целиком, а долг назван по существующим файлам', () => {
         // Опечатка в фильтре превратила бы `it.each` в пустой набор — сьют остался бы
@@ -323,12 +348,14 @@ describe('ядро не исполняет команд форжа (#55)', () =>
         const hits = code
             .split('\n')
             .map((line, i) => [i + 1, line] as const)
-            .filter(([, line]) => FORGE_CMD.test(line));
+            .filter(([, line]) => FORGE_CMD.test(line) || FORGE_CMD_SRC.test(line));
         // Скан ЦЕЛИКОМ — ловит argv-вызов, разорванный переносом строки.
-        const argvHits = [...code.matchAll(ARGV_FORGE)].map((m) => {
-            const lineNo = code.slice(0, m.index).split('\n').length;
-            return [lineNo, m[0].replace(/\s+/g, ' ')] as const;
-        });
+        const argvHits = [...code.matchAll(ARGV_FORGE), ...code.matchAll(ARGV_FORGE_SRC)].map(
+            (m) => {
+                const lineNo = code.slice(0, m.index).split('\n').length;
+                return [lineNo, m[0].replace(/\s+/g, ' ')] as const;
+            },
+        );
         const wordHits = code
             .split('\n')
             .map((line, i) => [i + 1, line] as const)
@@ -337,6 +364,78 @@ describe('ядро не исполняет команд форжа (#55)', () =>
             .filter(([n, line], i, arr) => arr.findIndex(([m, l]) => m === n && l === line) === i)
             .sort((a, b) => a[0] - b[0]);
     }
+
+    // Пробы-мутации из копии потребителя (задача 71): каждая обходная форма обязана
+    // краснеть, каждая безобидная — нет. Без них испорченный правкой паттерн молча
+    // перестаёт матчить, и сьют зеленеет на всём ядре сразу.
+    const CAUGHT: Array<[string, string]> = [
+        ['голая команда в литерале', "sh('gh auth status');"],
+        ['подкоманда, которой нет в перечне', "sh('gh label create foo');"],
+        ['шаблонная сборка подкоманды', 'sh(`gh ${sub} list --json number`);'],
+        ['argv-вызов', "runArgvFn('gh', ['issue', 'close', String(n)]);"],
+        ['argv-вызов, разорванный переносом строки', "runArgvFn(\n    'gh',\n    args,\n);"],
+        ['конкатенация', "const cmd = 'gh ' + sub + ' list';"],
+        ['переменная-бинарь', "const bin = 'gh';"],
+        ['обёртка env', "sh('env gh pr view 7');"],
+        ['упоминание в тексте лога', "log('⚠ gh pr merge вернул ошибку');"],
+        // Эту дыру #72 нашёл мутацией: дефис в хвостовом классе гасил проверку словом,
+        // и `gh-чтение не удалось` прожило в `exec.ts` весь #55.
+        ['упоминание через дефис', "log('⚠ gh-чтение не удалось');"],
+        ['второй форж', "sh('glab mr merge 7');"],
+        ['второй форж argv', "runArgvFn('glab', ['issue', 'close']);"],
+        // #72-ревью: форж, на котором живёт канон. Проб на него в наборе не было
+        // вовсе — то есть барьер расширялся до «ядро не исполняет команд форжа», ни разу не
+        // покраснев на форже проекта.
+        ['CLI SourceCraft', "sh('src pr merge 7 --squash');"],
+        ['CLI SourceCraft, мутация карточки', "sh('src issue close 42');"],
+        // #164: подкоманда собрана шаблоном — перечень её не знает по построению, и до
+        // этой пробы ветка `$` не краснела ни разу: откат регекса к прежнему виду
+        // оставлял сьют зелёным целиком.
+        ['CLI SourceCraft, шаблонная сборка подкоманды', 'sh(`src ${sub} merge 7`);'],
+        ['CLI SourceCraft argv', "runArgvFn('src', ['pr', 'create', '--title', t]);"],
+        ['CLI SourceCraft argv с аргументами через переменную', "runArgvFn('src', args);"],
+        ['CLI SourceCraft через spawnSync', "spawnSync('src', cmdArgs, { stdio: 'pipe' });"],
+        [
+            'CLI SourceCraft argv, разорванный переносом',
+            "runArgvFn(\n    'src',\n    ['issue', 'close'],\n);",
+        ],
+    ];
+
+    it.each(CAUGHT)('%s — ловится', (_label, snippet) => {
+        expect(forgeHits(stripComments(snippet + '\n'))).not.toEqual([]);
+    });
+
+    const ALLOWED: Array<[string, string]> = [
+        ['имя коллаборатора-чтения', 'const raw = ghJsonFn<Issue[]>(cmd);'],
+        ['слово внутри другого слова', 'const weight = highGh + 1;'],
+        ['метод шва вместо команды', 'adapters.taskSource.listReadyIssues(milestone);'],
+        ['флаг с ведущим дефисом', "args.push('--gh-compat');"],
+        ['комментарий, объясняющий, что делает адаптер', '// адаптер зовёт `gh pr merge`'],
+        // Обратная полярность для `src`: путь и глоб — самое частое, что есть в коде,
+        // и барьер, краснеющий на них, отключат первым же «поправь этот тест».
+        ['путь с каталогом src', "const files = ['src/a.ts', 'src/b.ts'];"],
+        ['глоб по каталогу src', "const glob = 'src/**/*.ts';"],
+        ['склейка пути через join', "const p = join('src', 'app', 'page.tsx');"],
+        ['склейка пути через join с переменной', "const p = path.join('src', name);"],
+        ['слово src внутри другого слова', "const dataSrc = el.getAttribute('src');"],
+        // #164: обратная полярность ветки `$`. Путь с переменной — самая частая строка,
+        // какая бывает в коде, и барьер, краснеющий на ней, отключат первым же «поправь
+        // этот тест». Отличает её от команды ровно позиция: не начало литерала.
+        ['путь с переменной в шаблоне', 'sh(`git add src ${file}`);'],
+        ['сборка пути шаблоном', 'const p = `${base}/src ${name}`;'],
+        ['строка лога с каталогом и переменной', 'log(`каталог src ${p} обновлён`);'],
+        // Слова, которым подкоманда лишь префикс: их отсекает граница слова в хвосте
+        // перечня — без неё 'src issues'/'src prod' краснели бы как команды.
+        ['слово с префиксом подкоманды', "const dirs = ['src issues', 'src prod'];"],
+    ];
+
+    it.each(ALLOWED)('%s — НЕ ложное срабатывание', (_label, snippet) => {
+        expect(forgeHits(stripComments(snippet + '\n'))).toEqual([]);
+    });
+
+    it('пустой вход даёт пустой результат — детектор не «находит» на пустоте', () => {
+        expect(forgeHits('')).toEqual([]);
+    });
 
     it.each(CORE_MODULES)('%s — команды gh/glab только в пределах известного долга', (rel) => {
         const all = forgeHits(stripComments(readFileSync(join(CANON_ROOT, rel), 'utf-8')));
@@ -672,5 +771,101 @@ describe('пути скриптов потребителя приходят из
             `Зашитый путь скрипта в ${rel} — его место в ralph.config.json ` +
                 `(consumerScripts):${detail}`,
         ).toEqual([]);
+    });
+});
+
+// Стоп человеку несёт причину, диагноз и вопрос (`core/stop-message.ts`), а не один маркер.
+// Барьер перенесён из копии потребителя при сведении (задача 71).
+describe('стоп «оставлен человеку» несёт структуру, а не один маркер (#289)', () => {
+    const SCANNED = [
+        join('core', 'orchestrator.ts'),
+        join('core', 'gate.ts'),
+        join('runtime', 'monitor-panel.mts'),
+    ];
+    // Глобальная: считаются ВХОЖДЕНИЯ маркера, а не факт его наличия в фрагменте, —
+    // см. `bareHandoffs` ниже.
+    const HANDOFF_RE = /оставлен[аоы]? человеку/gu;
+
+    // Известные места БЕЗ структуры — опись, а не индульгенция. Все три в `gate.ts` и все
+    // три — строки лога: сам `gate.ts` человеку не пушит вовсе, он возвращает исход
+    // (`forge-unknown`/`forge-env`/`not-merged`), а структурный стоп по этому исходу
+    // собирает оркестратор. Появится в `gate.ts` собственный пуш — запись здесь его
+    // не покроет: сверяется РАВЕНСТВО множеств, лишняя запись так же красная, как
+    // недостающая (тот же храповик, что у `EXPECTED` описи модулей выше).
+    const KNOWN_LOG_ONLY: Array<[string, number]> = [[join('core', 'gate.ts'), 3]];
+
+    /**
+     * Фрагменты кода со смещением начала. Разделитель — `;` в конце строки, и смещение
+     * считается по ФАКТИЧЕСКОЙ его длине (`matchAll`, а не `split`): у `split` длина
+     * разделителя терялась, смещение росло на единицу, и номер строки в сообщении об
+     * отказе уезжал на десятки строк вверх — уверенно неверное число хуже отсутствующего,
+     * потому что читающий идёт по нему первым (ревью #289, второй проход).
+     */
+    function chunksWithOffset(code: string): Array<[number, string]> {
+        const out: Array<[number, string]> = [];
+        let start = 0;
+        for (const m of code.matchAll(/;\s*\n/gu)) {
+            out.push([start, code.slice(start, m.index)]);
+            start = m.index + m[0].length;
+        }
+        out.push([start, code.slice(start)]);
+        return out;
+    }
+
+    const lineAt = (code: string, index: number): number => code.slice(0, index).split('\n').length;
+
+    /**
+     * Вхождения маркера, не покрытые вызовом `formatStopMessage` в том же фрагменте.
+     *
+     * Считаются именно ВХОЖДЕНИЯ, а не «есть ли маркер во фрагменте»: стопы `blocked`
+     * записаны одним тернарником с двумя ветками, и проверка по фрагменту зеленела,
+     * пока структурной оставалась хоть одна из них (проверено мутацией: подмена
+     * `formatStopMessage` в одной ветке барьер не красила — ревью #289, второй проход).
+     *
+     * Текст фрагмента возвращается ЦЕЛИКОМ: вызов `formatStopMessage` стоит в конце
+     * склейки, и обрезка сделала бы барьер красным на верных стопах. Обрезается только
+     * то, что попадёт в сообщение об отказе.
+     */
+    function bareHandoffs(src: string): Array<[number, string]> {
+        const code = stripComments(src);
+        const out: Array<[number, string]> = [];
+        for (const [start, chunk] of chunksWithOffset(code)) {
+            const markers = [...chunk.matchAll(HANDOFF_RE)];
+            const covered = (chunk.match(/formatStopMessage/gu) ?? []).length;
+            // Номер — НАЧАЛО фрагмента, а не найденное вхождение: покрытие считается
+            // числом, и сказать, какая именно ветка тернарника осталась без вызова,
+            // барьер не может — а указать на оператор целиком может честно.
+            const lineNo = lineAt(code, start);
+            const text = chunk.replace(/\s+/gu, ' ').trim();
+            for (let i = covered; i < markers.length; i += 1) out.push([lineNo, text]);
+        }
+        return out;
+    }
+
+    /** Сколько раз маркер вообще встречается — на этом стоит проверка «барьер не ослеп». */
+    const countHandoffs = (src: string): number =>
+        (stripComments(src).match(HANDOFF_RE) ?? []).length;
+
+    it('барьер не ослеп: маркер вообще встречается в сканируемых файлах', () => {
+        // Класс `looksBlind` (см. security-audit): скан, нашедший ноль, неотличим от
+        // сломанного скана. Если маркер переформулируют целиком — красный здесь, а не
+        // молчаливое «нарушений нет».
+        const total = SCANNED.reduce(
+            (n, rel) => n + countHandoffs(readFileSync(join(CANON_ROOT, rel), 'utf-8')),
+            0,
+        );
+        expect(total).toBeGreaterThan(5);
+    });
+
+    it.each(SCANNED)('%s: каждый стоп с маркером собран formatStopMessage', (rel) => {
+        const src = readFileSync(join(CANON_ROOT, rel), 'utf-8');
+        const bare = bareHandoffs(src);
+        const allowed = KNOWN_LOG_ONLY.find(([file]) => file === rel)?.[1] ?? 0;
+        const detail = bare.map(([n, text]) => `\n  ${String(n)}: ${text.slice(0, 120)}`).join('');
+        expect(
+            bare.length,
+            `стоп «оставлен человеку» без причины/диагноза/вопроса — собери его ` +
+                `core/stop-message.ts (formatStopMessage):${detail}`,
+        ).toBe(allowed);
     });
 });

@@ -69,3 +69,23 @@ export function redactSecrets(text: string, secrets: Array<string | undefined>):
     }
     return redacted;
 }
+
+// Первая строка причины отказа — из ЧЕГО УГОДНО, а не только из `Error` (правка по
+// ревью #269). `(e as Error).message` — приведение, а не проверка: на `throw 'timeout'`
+// из чужой реализации шва (транспорт, HTTP-клиент, чужой рантайм) оно даёт `undefined`,
+// и человек получает стоп петли без причины. Первая строка, а не весь текст: причина
+// уходит в строку лога и в `detail` исхода, а стек там только мешает.
+export function errorText(e: unknown): string {
+    return String(e instanceof Error ? e.message : e).split('\n')[0];
+}
+
+// Окружение СЕТЕВОГО вызова git: интерактивный запрос кредов запрещён (задача 71).
+//
+// Без этого git при отсутствии кредов открывает `/dev/tty` и ждёт логин — не stdin, а именно
+// tty, поэтому перенаправление ввода не спасает. В петле отвечать некому: вызов стоит до
+// дедмана, петля не падает и причины в лог не пишет. Отказ здесь дешевле молчания. Раньше
+// запрет стоял только у проводки на ветку фазы, а fetch и ls-remote остального ядра —
+// включая перенесённые из копии потребителя — шли без него.
+export function gitNetworkEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+    return { ...env, GIT_TERMINAL_PROMPT: '0' };
+}

@@ -88,8 +88,29 @@ describe('предохранитель побочек в тестах: RALPH_NO_
     it('дефолтный spawnFn (живая claude-сессия) тоже под предохранителем', () => {
         // Однажды тест уже пробился до настоящего spawnSync и запустил claude —
         // см. докблок spawnClaude. Теперь это громкая ошибка.
-        expect(() => ralph.spawnClaude(['-p', 'привет'], 1000)).toThrow(/RALPH_NO_SIDE_EFFECTS/);
+        expect(() => ralph.spawnClaude(['-p'], 'привет', 1000)).toThrow(/RALPH_NO_SIDE_EFFECTS/);
         expect(sideEffectAttempts.splice(0)).toEqual(['spawnClaude(claude)']);
+    });
+
+    // Задача 71 (поглотила задачу 7): сигнатура `(cmdArgs, prompt, timeoutMs, spawnFn)`.
+    // Прежний вызов `(cmdArgs, timeoutMs)` проходил тест выше случайно — число уезжало
+    // в `prompt`, а срок оставался неопределённым, и это ничем не краснело. Здесь каждый
+    // аргумент сверяется по месту, куда он обязан попасть: промпт — в stdin (у argv
+    // жёсткий предел MAX_ARG_STRLEN), срок — в опцию `timeout`.
+    it('spawnClaude: промпт уходит в stdin, срок — в timeout, argv без промпта', () => {
+        const calls: Array<{ file: string; args: string[]; opts: Record<string, unknown> }> = [];
+        const spawnFn = ((file: string, args: string[], opts: Record<string, unknown>) => {
+            calls.push({ file, args, opts });
+            return { status: 0, signal: null, stdout: 'ок', stderr: '', pid: 1, output: [] };
+        }) as never;
+        const res = ralph.spawnClaude(['-p', '--max-turns', '5'], 'сделай задачу', 1234, spawnFn);
+        expect(res.code).toBe(0);
+        expect(calls).toHaveLength(1);
+        expect(calls[0].file).toBe('claude');
+        expect(calls[0].args).toEqual(['-p', '--max-turns', '5']);
+        expect(calls[0].args).not.toContain('сделай задачу');
+        expect(calls[0].opts.input).toBe('сделай задачу');
+        expect(calls[0].opts.timeout).toBe(1234);
     });
 
     it('log() пишет в консоль, но не трогает файл лога', () => {

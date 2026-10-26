@@ -12,7 +12,7 @@
 // - mergedShaOf — sha squash-мерджа PR с ретраем на транзиентный mergeCommit:null;
 // - deployWaitMessage — единственный источник формата строки ожидания (контракт с
 //   deadman.ts, синхронность закреплена тестом deadman.test.ts);
-// - waitForDeployRun — поллинг gh run list до completed/timeout/not-found;
+// - waitForDeployRun — поллинг прогонов deploy-workflow до completed/timeout/not-found;
 // - probeHttpStatus / checkProdHealth — HTTP-healthcheck главной страницы прода;
 // - isWorkflowGreen / classifyDeployOutcome — единый предикат «зелёно» и fail-closed
 //   классификация итога (GREEN только при подтверждённо зелёном workflow И здоровом проде).
@@ -20,13 +20,18 @@
 // TS-модуль без билд-шага: исполняется нативным type stripping Node 24 (erasable-only
 // синтаксис — только аннотации типов, ни enum, ни namespace, ни parameter properties).
 //
+// #72 (хвост #55): команд форжа здесь БОЛЬШЕ НЕТ. Два чтения (`коммит мерджа PR` и
+// `прогоны deploy-workflow`) приходят инъекцией из `adapters/github-deploy-commands.ts` —
+// модуль знает КОНТРАКТ примитива, а не команду, которой он исполняется. Пока команды
+// лежали здесь, «пост-мердж проверка» и «GitHub CLI» читались одним модулем, и барьер
+// чистоты ядра приходилось держать списком очищенных файлов вместо сплошного скана.
+//
 // Фабрика, а не standalone-экспорты (как в ralph-util.ts/api-limit.ts): часть функций не
-// чистые — им нужен контекст ralph.js (ghJson — только ЧТЕНИЕ, #166; log; sleep; shq —
-// квотирование значений (номер PR, имя workflow) перед подстановкой в строку `gh`-команды,
-// тот же приём, что и у остальных читающих ghJson-вызовов раннера; guardSideEffect и
-// positiveIntOrDefault — тоже общие). Фабрика захватывает этот контекст один раз, а
+// чистые — им нужен контекст ralph.js (два read-примитива форжа — только ЧТЕНИЕ, #166;
+// log; sleep; guardSideEffect и positiveIntOrDefault — тоже общие). Фабрика захватывает
+// этот контекст один раз, а
 // возвращённые функции сохраняют ПОКАЗАТЕЛЬНУЮ DI: каждая
-// по-прежнему принимает свои коллабораторы (ghJsonFn/execFn/sleepFn/logFn/nowFn/…)
+// по-прежнему принимает свои коллабораторы (примитивы форжа/execFn/sleepFn/logFn/nowFn/…)
 // параметром — ровно так их зовут существующие тесты (deploy-check.test.ts) через ре-экспорт
 // из ralph.js.
 //
@@ -44,8 +49,16 @@ import { execFileSync } from 'node:child_process';
 type LogFn = (msg: string) => void;
 type SleepFn = (ms: number) => void;
 type NowFn = () => number;
-type GhJsonFn = (cmd: string, attempts?: number) => unknown;
-type ShqFn = (value: unknown) => string;
+// Примитивы форжа, приходящие инъекцией (#72). Оба — ЧТЕНИЯ, оба отдают СЫРОЙ ответ:
+// решение «пусто — это ретрай или отказ» принимает ядро, потому что оно же держит таймауты
+// и классификацию итога.
+//
+// Описан только обязательный параметр — без хвостового DI-канала самой реализации (у неё
+// он есть). Это не небрежность, а тот же приём, что в `adapters.ts`: параметры функций
+// контравариантны, и более узкое описание совместимо в обе стороны, а ядро остаётся без
+// знания о том, чем примитив исполняется.
+type MergeCommitOidFn = (prNumber: number) => unknown;
+type ListWorkflowRunsFn = (workflow: string) => unknown;
 type ExecFn = (file: string, args: string[], opts?: Record<string, unknown>) => string;
 type GuardFn = (what: string) => void;
 type PositiveIntOrDefaultFn = (value: unknown, dflt: number) => number;
@@ -89,13 +102,14 @@ export type HealthResult = { ok: boolean; status: number; url: string; reason?: 
 export type DeployVerdict = { red: boolean; reason: string };
 
 // Контекст ralph.js, захватываемый фабрикой один раз. getConfig — ленивый геттер живого
-// config (см. докблок выше); ghJson — общий коллаборатор раннера (только ЧТЕНИЕ здесь,
-// #166); log/sleep — module-level коллабораторы; guardSideEffect — общий предохранитель
-// #138 на дефолтный execFn (curl); positiveIntOrDefault — общая чистая утилита (#232).
+// config (см. докблок выше); mergeCommitOid/listWorkflowRuns — два read-примитива форжа
+// (#72, только ЧТЕНИЕ — #166), приходящие из адаптера; log/sleep — module-level
+// коллабораторы; guardSideEffect — общий предохранитель #138 на дефолтный execFn (curl);
+// positiveIntOrDefault — общая чистая утилита (#232).
 export type DeployCheckEnv = {
     getConfig: () => DeployCheckCfg;
-    ghJson: GhJsonFn;
-    shq: ShqFn;
+    mergeCommitOid: MergeCommitOidFn;
+    listWorkflowRuns: ListWorkflowRunsFn;
     log: LogFn;
     sleep: SleepFn;
     guardSideEffect: GuardFn;
@@ -104,8 +118,16 @@ export type DeployCheckEnv = {
 };
 
 export function createDeployCheckModule(env: DeployCheckEnv) {
-    const { getConfig, ghJson, shq, log, sleep, guardSideEffect, positiveIntOrDefault, SHA40_RE } =
-        env;
+    const {
+        getConfig,
+        mergeCommitOid,
+        listWorkflowRuns,
+        log,
+        sleep,
+        guardSideEffect,
+        positiveIntOrDefault,
+        SHA40_RE,
+    } = env;
 
     // Деплой фазы (#87) — явный no-op-плейсхолдер. Боевой прод уже раскатывается
     // САМ CI (.github/workflows/deploy.yml → scripts/deploy-remote.sh) по факту пуша
@@ -122,34 +144,38 @@ export function createDeployCheckModule(env: DeployCheckEnv) {
 
     // #163: sha squash-мерджа PR. Это ровно тот коммит, что уехал в main и запустил
     // deploy-workflow (headSha его run'а), — по нему пост-мердж проверка и следит.
-    // Чтение через ghJson (ретраи). Fail-closed: без валидного oid — бросаем, «не смог
-    // узнать sha» и «деплой прошёл» — разные ответы, молчаливый пропуск здесь недопустим.
+    // Чтение — примитивом форжа (ретраи внутри него). Fail-closed: без валидного oid
+    // бросаем: «не смог узнать sha» и «деплой прошёл» — разные ответы, молчаливый пропуск
+    // здесь недопустим.
     function mergedShaOf(
         prNumber: number,
         {
-            ghJsonFn = ghJson,
+            mergeCommitOidFn = mergeCommitOid,
             sleepFn = sleep,
             attempts = 3,
             retryMs = 5000,
-        }: { ghJsonFn?: GhJsonFn; sleepFn?: SleepFn; attempts?: number; retryMs?: number } = {},
+        }: {
+            mergeCommitOidFn?: MergeCommitOidFn;
+            sleepFn?: SleepFn;
+            attempts?: number;
+            retryMs?: number;
+        } = {},
     ): string {
         // fail-fast на невалидном prNumber (getLastGatePr() отдаёт null, если гейт не дошёл
-        // до findOpenPr): без гарда `gh pr view 'null'` сжёг бы attempts×ретраи ghJson с
+        // до findOpenPr): без гарда запрос по номеру 'null' сжёг бы attempts×ретраи чтения с
         // бэкофф-паузами (десятки секунд сети), прежде чем упасть. Симметрично гарду
         // recordReviewFindings (#169) — оба честно обрабатывают null (см. RunLoopDeps).
         if (!Number.isInteger(prNumber) || prNumber <= 0) {
             throw new Error(`mergedShaOf: невалидный номер PR "${prNumber}"`);
         }
-        // GitHub иногда отдаёт mergeCommit: null с лагом сразу после squash-мерджа. ghJson
-        // ретраит только exec/parse-ошибки — валидный ответ с пустым oid его не смущает.
-        // Короткая петля именно на пустой oid (attempts×retryMs) убирает самый вероятный
-        // ложный красный этого пути; исчерпав её — fail-closed бросаем (в runLoop это барьер).
+        // Форж иногда отдаёт коммит мерджа пустым с лагом сразу после squash-мерджа. Ретраи
+        // самого чтения (внутри примитива) на это не срабатывают — ответ-то валидный, просто
+        // поле пустое. Короткая петля именно на пустом oid (attempts×retryMs) убирает самый
+        // вероятный ложный красный этого пути; исчерпав её — fail-closed бросаем (в runLoop
+        // это барьер).
         let oid: unknown = null;
         for (let attempt = 1; attempt <= attempts; attempt++) {
-            const view = ghJsonFn(`gh pr view ${shq(prNumber)} --json mergeCommit`) as {
-                mergeCommit?: { oid?: string };
-            };
-            oid = view && view.mergeCommit && view.mergeCommit.oid;
+            oid = mergeCommitOidFn(prNumber);
             if (SHA40_RE.test(String(oid))) return oid as string;
             if (attempt < attempts) sleepFn(retryMs);
         }
@@ -178,18 +204,24 @@ export function createDeployCheckModule(env: DeployCheckEnv) {
     //   status='timeout'   — run найден, но не завершился за timeoutMs (итог не считаем ни
     //                        зелёным, ни красным — решение стоп+пуш за #165);
     //   status='not-found' — run на sha так и не появился за таймаут.
-    // Только ЧТЕНИЕ gh run (ретраи внутри ghJson): прод и main не трогаем (#166). Устойчивый
-    // сетевой чих (ghJson исчерпал свои ретраи) не роняет всё ожидание — впереди ещё поллы,
-    // один чих не даёт ложного красного. Часы (nowFn) инжектируемы ради детерминизма тестов.
+    // Только ЧТЕНИЕ прогонов (ретраи — внутри примитива): прод и main не трогаем (#166).
+    // Устойчивый сетевой чих (примитив исчерпал свои ретраи) не роняет всё ожидание —
+    // впереди ещё поллы, один чих не даёт ложного красного. Часы (nowFn) инжектируемы ради
+    // детерминизма тестов.
     function waitForDeployRun(
         sha: string,
         cfg: DeployCheckCfg = getConfig(),
         {
-            ghJsonFn = ghJson,
+            listWorkflowRunsFn = listWorkflowRuns,
             sleepFn = sleep,
             logFn = log,
             nowFn = Date.now,
-        }: { ghJsonFn?: GhJsonFn; sleepFn?: SleepFn; logFn?: LogFn; nowFn?: NowFn } = {},
+        }: {
+            listWorkflowRunsFn?: ListWorkflowRunsFn;
+            sleepFn?: SleepFn;
+            logFn?: LogFn;
+            nowFn?: NowFn;
+        } = {},
     ): DeployOutcome {
         // fail-closed: без валидного sha следить не за чем — это ошибка вызывающего,
         // а не повод молча вернуть «всё хорошо».
@@ -209,17 +241,14 @@ export function createDeployCheckModule(env: DeployCheckEnv) {
         while (nowFn() - start < timeoutMs) {
             let runs: RunListItem[] | null = null;
             try {
-                runs = ghJsonFn(
-                    `gh run list --workflow ${shq(workflow)} ` +
-                        `--json databaseId,headSha,status,conclusion,url --limit 30`,
-                ) as RunListItem[];
+                runs = listWorkflowRunsFn(workflow) as RunListItem[];
             } catch (e) {
-                // ghJson уже отретраил свой набор попыток; устойчивый чих не роняет всё
+                // Примитив уже отретраил свой набор попыток; устойчивый чих не роняет всё
                 // ожидание — до таймаута ещё поллы, ложного красного он не даёт. runs=null
                 // → падаем в общий sleep-or-break ниже (повтор на следующем опросе).
                 logFn(
-                    `⚠ Пост-мердж: чтение gh run не удалось (${String((e as Error).message).split('\n')[0]}) — ` +
-                        `повтор на следующем опросе.`,
+                    `⚠ Пост-мердж: чтение прогонов deploy-workflow не удалось ` +
+                        `(${String((e as Error).message).split('\n')[0]}) — повтор на следующем опросе.`,
                 );
             }
             const run = (Array.isArray(runs) ? runs : []).find((r) => r && r.headSha === sha);

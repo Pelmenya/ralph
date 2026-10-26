@@ -205,7 +205,7 @@ describe('подсунутая зависимость от файла вне р�
 
     it('контроль: модуль пробы сегодня замкнут — иначе проба ничего не значит', () => {
         expect(DEBT[CLEAN] ?? 0).toBe(0);
-        expect(outsideHits(cleanCode())).toEqual([]);
+        expect(outsideHits(cleanCode(), depthOf(CLEAN))).toEqual([]);
     });
 
     it.each([

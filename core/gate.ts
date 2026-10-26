@@ -30,6 +30,15 @@
 // ralph.js. Module-level state гейта (lastRedCheck/lastVerifiedHead/lastGatePr) живёт в
 // замыкании фабрики и читается наружу геттерами — как раньше module.exports у ralph.js.
 
+import type {
+    ForgeCheckFailure,
+    ForgeCheckRun,
+    ForgeChecks,
+    ForgeFailureKind,
+} from './forge-checks.ts';
+import { classifyForgeFailure, waitForForgeChecks } from './forge-checks.ts';
+import { errorText, gitNetworkEnv } from '../shared/ralph-util.ts';
+
 type ExecOpts = { env?: NodeJS.ProcessEnv };
 type ShFn = (cmd: string, opts?: ExecOpts) => string;
 type ShArgvFn = (file: string, args: string[], opts?: ExecOpts) => string;
@@ -65,6 +74,24 @@ type SyncDepsFn = (opts?: { env?: NodeJS.ProcessEnv }) => void;
 // Один упавший чек гейта — топливо чини-сессии (self-heal). null = гейт падал не на
 // чеках (fetch/HEAD/detach): такие причины кодом не лечатся.
 type RedCheck = { name: string; cmd: string; excerpt: string };
+
+// #269: сигнатуры шва «чек PR у форжа». Обе НЕОБЯЗАТЕЛЬНЫЕ: реализация без них означает
+// прежнее поведение — мердж сразу после локальных чеков, а красный чек форжа отвергает
+// его сам, как и до этой карточки.
+type ForgeChecksFn = (prNumber: number) => ForgeChecks;
+type ForgeDiagnosisFn = (run: ForgeCheckRun) => ForgeCheckFailure | null;
+
+// Красный чек ФОРЖА, доведённый до формы, в которой его читает цикл: тот же набор полей,
+// что у `RedCheck`, плюс `kind` — чинится ли это кодом. Отдельный тип, а не переиспользование
+// `RedCheck`: у отказа, который не воспроизводится на хосте, другая подсказка сессии и
+// другой исход при `oom`, и схлопнуть их значило бы потерять ровно эту разницу.
+type ForgeRedCheck = {
+    workflow: string;
+    runId: string;
+    cube: string;
+    log: string;
+    kind: ForgeFailureKind;
+};
 
 // Пара [имя, команда] шага гейта. Состав приезжает из ralph.config.json (#204, фаза 4):
 // ядро гейта не знает конкретных npm-скриптов проекта — только форму «список пар».
@@ -280,6 +307,15 @@ export function createGateRunner(env: GateEnv) {
     // ПОСЛЕ tryMergePhase вернул строку-статус, а не объект с PR, так что номер несём
     // тем же геттер-паттерном, что lastRedCheck/lastVerifiedHead.
     let lastGatePr: number | null = null;
+    // #269: красный чек ПЛОЩАДКИ последнего прохода гейта (null = чек площадки не краснел
+    // либо его не спрашивали). Отдаётся геттером тем же приёмом, что lastRedCheck: значение
+    // ставится побочкой ВНУТРИ tryMergePhase и читается циклом уже после её возврата.
+    let lastForgeRedCheck: ForgeRedCheck | null = null;
+    // #269-ревью: причина стопа на чеке форжа БЕЗ вердикта (потолок ожидания, устойчивый
+    // сбой чтения, красный прогон без названного куба). Отдаётся тем же геттер-приёмом,
+    // что lastForgeRedCheck: цикл читает её ПОСЛЕ возврата статуса `forge-unknown` и
+    // кладёт в пуш человеку — иначе ночная остановка выясняется только утром.
+    let lastForgeStop: string | null = null;
 
     // ── Состав шагов гейта: из конфига (#204, фаза 4) ─────────────────────────
     //
@@ -382,7 +418,7 @@ export function createGateRunner(env: GateEnv) {
             return false;
         }
         try {
-            runArgvFn('git', ['fetch', 'origin', branch]);
+            runArgvFn('git', ['fetch', 'origin', branch], { env: gitNetworkEnv() });
         } catch (e: unknown) {
             logFn(
                 `⛔ git fetch origin ${branch} упал (${(e as Error).message}) — без свежего remote нельзя убедиться, что тестируем то, что мерджим. Авто-мердж отменён.`,
@@ -433,7 +469,35 @@ export function createGateRunner(env: GateEnv) {
                 refIsBehind = true;
             } catch {}
             if (refIsBehind) {
-                runArgvFn('git', ['update-ref', `refs/heads/${branch}`, remoteHead]);
+                // #134: ДО перевода ref дерево снимается с ветки. Раньше это подразумевалось
+                // («дерево раннера detached»), и с приходом проводки на ветку перестало быть
+                // правдой: `git update-ref` двигает ref, не спрашивая, выбран ли он, — и в
+                // дереве мгновенно появляется фантомная разница (файлы головы PR числятся
+                // удалёнными). Проверено опытом: `D g` в статусе сразу после update-ref,
+                // и он переживает последующий детач. Дальше чеки шли бы по неполному дереву,
+                // а commitLeftovers следующей итерации закоммитил бы это удаление в ветку.
+                try {
+                    runArgvFn('git', ['checkout', '--detach', remoteHead]);
+                } catch (e: unknown) {
+                    logFn(
+                        `⛔ Не смог снять дерево с ветки ${branch} перед подтяжкой ref (${(e as Error).message}) — авто-мердж отменён.`,
+                    );
+                    parkFn();
+                    return false;
+                }
+                // Отказ перевода ref (ref-lock от параллельного процесса, права на .git)
+                // раньше улетал исключением мимо парковки и внятного сообщения. С детачем
+                // выше цена такого отказа выросла: дерево уже на голове PR, а ref остался
+                // старым — молчать тут нельзя.
+                try {
+                    runArgvFn('git', ['update-ref', `refs/heads/${branch}`, remoteHead]);
+                } catch (e: unknown) {
+                    logFn(
+                        `⛔ Не смог подтянуть локальный ref ${branch} к голове PR #${prNumber} (${(e as Error).message}) — авто-мердж отменён.`,
+                    );
+                    parkFn();
+                    return false;
+                }
                 logFn(
                     `↪ Локальный ref ${branch} отстал от головы PR #${prNumber} (${localHead.slice(0, 8)} → ${remoteHead.slice(0, 8)}) — подтянут fast-forward, работа не теряется.`,
                 );
@@ -540,6 +604,22 @@ export function createGateRunner(env: GateEnv) {
         }
     }
 
+    // ── Момент коммита головы PR (#278) ──────────────────────────────────────
+    // Нижняя граница свежести вердикта форжа (`sinceMs` у `waitForForgeChecks`): прогон
+    // с `createdAt` раньше этого момента физически не может отвечать за код текущей
+    // головы — форж ещё не мог его увидеть. Читаем ЛОКАЛЬНО, без похода к форжу: к
+    // этому моменту `checksGreen` уже сделал `git checkout --detach` ровно на этот sha
+    // (дерево раннера содержит коммит целиком). Sha приходит из `lastVerifiedHead`,
+    // прошедшего проверку `SHA40_RE` в checksGreen, — интерполяция в шелл безопасна.
+    function headCommittedAt(sha: string, shFn: ShFn = sh, shqFn: ShqFn = shq): number {
+        const iso = shFn(`git log -1 --format=%cI ${shqFn(sha)}`).trim();
+        const ms = Date.parse(iso);
+        if (!Number.isFinite(ms)) {
+            throw new Error(`git log -1 не вернул валидную дату коммита ${sha} ('${iso}')`);
+        }
+        return ms;
+    }
+
     // ── Гейт мерджа фазы ─────────────────────────────────────────────────────
 
     /**
@@ -566,6 +646,22 @@ export function createGateRunner(env: GateEnv) {
      *                          разбор блокеров (до blockedHealAttempts раз), потом человек;
      *   'red-checks'         — гейт упал именно на ЧЕКАХ (build/lint/.../test): это
      *                          чинится кодом → цикл запустит чини-сессию (self-heal);
+     *   'forge-red'          — ЛОКАЛЬНЫЕ чеки зелёные, а чек PR у форжа красный (#269), и
+     *                          его лог говорит про код: цикл запустит ту же чини-сессию,
+     *                          но с логом упавшего куба площадки и подсказкой «отказ
+     *                          воспроизводится только там»;
+     *   'forge-env'          — чек форжа красный по отказу СРЕДЫ (OOM контейнера гейта,
+     *                          убитый форк) без единого проваленного кейса: кодом это не
+     *                          чинится, и сессия лечения принялась бы «чинить» здоровые
+     *                          тесты. Стоп с диагнозом человеку;
+     *   'forge-unknown'      — чек форжа не дал ВЕРДИКТА (потолок ожидания, устойчивый
+     *                          сбой чтения, красный прогон без названного куба). Тоже стоп
+     *                          человеку, но отдельным статусом от 'not-merged' (правка по
+     *                          ревью #269): цикл обязан отдать его ПУШЕМ, а не только
+     *                          строкой в `ralph.log`. Потолок в 20 минут при `max_slots: 1`
+     *                          достижим штатно — один чужой прогон в очереди съедает
+     *                          бюджет, — и ночью такая остановка иначе выясняется утром.
+     *                          Причина текстом лежит в `lastForgeStop` (геттер ниже);
      *   'not-merged'         — не мерджили по нечинимой причине (нет PR / blocked /
      *                          сеть-git проблемы / merge упал).
      *
@@ -609,6 +705,25 @@ export function createGateRunner(env: GateEnv) {
             // обязаны проходить без реальных пауз (правило «время — параметр»).
             mergeConfirmAttempts = 6,
             mergeConfirmDelayMs = 5_000,
+            // #269: шов «чек PR у форжа». Приходит из runLoop вместе с остальными
+            // примитивами мердж-пути; undefined = у реализации шва такого метода нет,
+            // и тогда шаг пропускается целиком (прежнее поведение).
+            forgeChecksFn,
+            forgeDiagnosisFn,
+            // #269-ревью: прогон, по логу которого чини-сессия УЖЕ отработала. Форж отдаёт
+            // ПОСЛЕДНИЙ прогон workflow, а не прогон конкретного sha, — и после пуша правок
+            // какое-то время повторяет вердикт прошлого. Без этого номера петля тратила бы
+            // вторую (последнюю) попытку лечения на уже починенный лог.
+            healedForgeRunId,
+            // #278: момент коммита проверенной головы — нижняя граница свежести вердикта
+            // форжа (`sinceMs`). DI ради тестов: боевой дефолт зовёт `git log`, юнит-тест
+            // гейта не обязан таскать за собой настоящий git-репозиторий ради этой мелочи.
+            headCommittedAtFn = headCommittedAt,
+            // Политика ожидания — чистая функция ядра, инжектится ради тестов: иначе
+            // проверка потолка шла бы двадцать реальных минут.
+            waitForForgeChecksFn = waitForForgeChecks,
+            classifyForgeFailureFn = classifyForgeFailure,
+            nowFn = () => Date.now(),
         }: {
             dry?: boolean;
             shFn?: ShFn;
@@ -628,6 +743,13 @@ export function createGateRunner(env: GateEnv) {
             profileName?: string;
             mergeConfirmAttempts?: number;
             mergeConfirmDelayMs?: number;
+            forgeChecksFn?: ForgeChecksFn;
+            forgeDiagnosisFn?: ForgeDiagnosisFn;
+            healedForgeRunId?: string;
+            headCommittedAtFn?: (sha: string) => number;
+            waitForForgeChecksFn?: typeof waitForForgeChecks;
+            classifyForgeFailureFn?: typeof classifyForgeFailure;
+            nowFn?: () => number;
         } = {},
     ):
         | 'merged'
@@ -636,11 +758,18 @@ export function createGateRunner(env: GateEnv) {
         | 'hold'
         | 'blocked'
         | 'red-checks'
+        | 'forge-red'
+        | 'forge-env'
+        | 'forge-unknown'
         | 'not-merged' {
         // #218: сброс СРАЗУ, тем же приёмом, что checksGreen сбрасывает lastRedCheck/
         // lastVerifiedHead — раунд, упавший ДО findOpenPr (dry/грязное дерево), не должен
         // оставлять номер PR прошлого раунда для текста пуша «блокер снят автоматически».
         lastGatePr = null;
+        // #269: тем же приёмом и по той же причине — раунд, упавший до чека площадки,
+        // не должен носить красный куб прошлого раунда.
+        lastForgeRedCheck = null;
+        lastForgeStop = null;
         // C1: dry-run строго read-only. Основной guard стоит в цикле ДО вызова гейта;
         // этот — defense in depth: даже если будущая правка цикла потеряет внешний
         // guard, dry-run всё равно не смерджит и не тронет дерево раннера.
@@ -684,6 +813,94 @@ export function createGateRunner(env: GateEnv) {
             logFn(`⛔ Гейт: не прошёл до чеков (fetch/HEAD/detach) на PR #${pr.number}.`);
             return 'not-merged';
         }
+        // Голова, которую ТОЛЬКО ЧТО проверил checksGreen: один опрос шва на круг, а не
+        // два (правка по ревью #278). Нужна дважды — как нижняя граница свежести вердикта
+        // форжа (#278) и как `--match-head-commit` при мердже (#SiaTz); между этими
+        // точками значение не меняется, и читателю не приходится это доказывать.
+        const verifiedHead = getVerifiedHeadFn();
+        // #269: локальные чеки зелёные — но у площадки СВОЙ чек, и мердж она отвергает
+        // (400), пока он красный. Раньше раннер спрашивал только себя: три попытки мерджа
+        // через 30 с и стоп «PR оставлен человеку», а причина оставалась в контейнере
+        // площадки. Шаг стоит ПОСЛЕ локальных чеков нарочно — красный локальный чек
+        // чинится дешевле и не должен ждать двадцать минут; к этому моменту прогон
+        // площадки обычно уже отработал параллельно нашему гейту.
+        //
+        // Шов необязателен: без него шаг пропускается, и мердж идёт ровно как до карточки.
+        if (forgeChecksFn) {
+            // #278: свежесть вердикта — форж отдаёт ПОСЛЕДНИЙ прогон workflow, а не прогон
+            // именно этой головы, и «на практике успевает» (тайминг локального гейта)
+            // барьером не было. Нижняя граница — момент коммита проверенной головы: прогон
+            // старше него физически не может быть про этот код. Сбой чтения git — не повод
+            // ронять весь мердж-путь (та же логика, что у прочей fail-open диагностики):
+            // просто эта конкретная проверка свежести в этом круге не работает.
+            let sinceMs: number | undefined;
+            if (verifiedHead) {
+                try {
+                    sinceMs = headCommittedAtFn(verifiedHead);
+                } catch (e: unknown) {
+                    logFn(
+                        `⚠ Не удалось узнать время коммита ${verifiedHead.slice(0, 8)} (${errorText(e)}) — свежесть вердикта площадки в этом круге не проверяется.`,
+                    );
+                }
+            }
+            const forge = waitForForgeChecksFn({
+                readFn: () => forgeChecksFn(pr.number),
+                sleepFn: sleepFn,
+                nowFn,
+                logFn,
+                ...(healedForgeRunId ? { healedRunId: healedForgeRunId } : {}),
+                ...(sinceMs !== undefined ? { sinceMs } : {}),
+            });
+            if (forge.kind === 'timeout' || forge.kind === 'error') {
+                lastForgeStop = `чек PR #${String(pr.number)} у форжа не дал вердикта (${forge.detail})`;
+                logFn(`⛔ Гейт: ${lastForgeStop} — мердж отменён, PR оставлен человеку.`);
+                parkFn();
+                return 'forge-unknown';
+            }
+            if (forge.kind === 'red') {
+                // Диагноз читается ОТДЕЛЬНЫМ вызовом и его отсутствие не приговор коду:
+                // «прогон красный, а какой куб — форж не сказал» лечить вслепую нельзя,
+                // это стоп человеку, но и молчать о нём нельзя.
+                let failure: ForgeCheckFailure | null = null;
+                try {
+                    failure = forgeDiagnosisFn ? forgeDiagnosisFn(forge.run) : null;
+                } catch (e: unknown) {
+                    logFn(
+                        `⚠ Детали красного прогона ${forge.run.runId} прочитать не удалось: ${errorText(e)}`,
+                    );
+                }
+                if (!failure) {
+                    lastForgeStop =
+                        `чек PR #${String(pr.number)} красный (прогон ${forge.run.runId}), ` +
+                        'но упавший куб не назван — чинить вслепую нельзя';
+                    logFn(`⛔ Гейт: ${lastForgeStop}, PR оставлен человеку.`);
+                    parkFn();
+                    return 'forge-unknown';
+                }
+                const kind = classifyForgeFailureFn(failure.log, forge.run.rawStatus);
+                lastForgeRedCheck = { ...failure, kind };
+                if (kind !== 'code') {
+                    logFn(
+                        kind === 'aborted'
+                            ? `⛔ Гейт: прогон ${failure.runId} ПРЕРВАН (статус «${forge.run.rawStatus}») ` +
+                                  'на кубе ' +
+                                  `${failure.cube} — это не отказ кода, лечить нечего.`
+                            : `⛔ Гейт: куб ${failure.cube} прогона ${failure.runId} упал по ОТКАЗУ СРЕДЫ ` +
+                                  '(нет ни одного проваленного кейса, есть сигнатура убитого воркера/OOM). ' +
+                                  'Кодом это не чинится — сессия лечения принялась бы править здоровые тесты.',
+                    );
+                    parkFn();
+                    return 'forge-env';
+                }
+                logFn(
+                    `⛔ Гейт: куб ${failure.cube} прогона ${failure.runId} красный на площадке при зелёном локальном гейте.`,
+                );
+                parkFn();
+                return 'forge-red';
+            }
+            // 'green' и 'absent' — мердж разрешён: во втором случае у PR чеков нет вовсе,
+            // и площадке нечего отвергать.
+        }
         // H4: merge и пост-мердж шаги — РАЗНЫЕ try. Упал сам merge → PR цел, честное
         // «не удался». Merge прошёл, а обновление дерева раннера упало → это НЕ «мердж
         // не удался», а «смерджено, локалка отстала»: другой статус, другое восстановление.
@@ -697,7 +914,6 @@ export function createGateRunner(env: GateEnv) {
         // допушить (недобитая кодер-сессия, человек с другой машины) — без этой привязки gh
         // смерджил бы новую, НЕ прогнанную голову. Сервер отвергнет мердж, если голова уехала.
         // Пусто (мок checksGreen в тестах не выставил sha) → мерджим как раньше, без привязки.
-        const verifiedHead = getVerifiedHeadFn();
         // Мердж — через примитив форжа mergePr (шов TaskSourceAdapter, #369): argv (#193),
         // --match-head-commit при валидном sha (#SiaTz). Ретрай и сверку phaseMerged держит
         // ЭТА функция (оркестрация), не примитив. runArgvFn прокинут насквозь — тесты видят
@@ -817,10 +1033,17 @@ export function createGateRunner(env: GateEnv) {
         checksGreen,
         tryMergePhase,
         deleteLocalBranchRef,
+        // Наружу ради тестов ТЕЛА (правка по ревью #278): параметры `shFn`/`shqFn` заводились
+        // ради подмены, но подменить их было неоткуда — функция не отдавалась из фабрики,
+        // и тесты гейта проверяли только проводку через `headCommittedAtFn`. Тот же приём,
+        // что у соседнего `deleteLocalBranchRef`.
+        headCommittedAt,
         // Геттеры module-level state гейта — наружу для runLoop/tryMergePhase (дефолтные
         // депы) и для ассертов тестов (то же, что раньше отдавал module.exports ralph.js).
         getLastRedCheck: (): RedCheck | null => lastRedCheck,
         getVerifiedHead: (): string | null => lastVerifiedHead,
         getLastGatePr: (): number | null => lastGatePr,
+        getLastForgeRedCheck: (): ForgeRedCheck | null => lastForgeRedCheck,
+        getLastForgeStop: (): string | null => lastForgeStop,
     };
 }

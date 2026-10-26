@@ -50,9 +50,18 @@
  * TS-модуль без билд-шага: исполняется нативным type stripping Node 24 (erasable-only).
  */
 
+import { gitNetworkEnv } from '../shared/ralph-util.ts';
+
 /** Чем кончилась постановка дерева на ветку. Каждый исход — свой факт, не оттенок общего. */
 export type TPhaseBranchKind =
-    'unsafe-name' | 'created' | 'adopted' | 'fast-forwarded' | 'switched' | 'diverged' | 'failed';
+    | 'unsafe-name'
+    | 'created'
+    | 'adopted'
+    | 'adopted-detached'
+    | 'fast-forwarded'
+    | 'switched'
+    | 'diverged'
+    | 'failed';
 
 export type TPhaseBranchResult = {
     kind: TPhaseBranchKind;
@@ -96,7 +105,7 @@ const GIT_FLAGS = ['-c', 'submodule.recurse=false'];
  * стоит до дедмана, петля не падает и причины в лог не пишет. Отказ здесь дешевле молчания.
  */
 function networkEnv(env: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv | undefined {
-    return env === undefined ? undefined : { ...env, GIT_TERMINAL_PROMPT: '0' };
+    return env === undefined ? undefined : gitNetworkEnv(env);
 }
 
 /** Код возврата git из отказа `execFileSync`: по нему отличают «нет» от «не смог». */
@@ -197,9 +206,68 @@ export function ensurePhaseBranch(branch: string, deps: TPhaseBranchDeps): TPhas
         return { kind, branch, sha };
     };
 
+    // Ветку с origin подтягиваем ДО счёта работы на detached HEAD: в свежем worktree
+    // ref'а origin/<ветка> ещё нет, и коммиты, давно лежащие на origin, сосчитались бы
+    // как бесхозные — петля встала бы на ровном месте.
+    if (onOrigin) {
+        try {
+            gitNet(['fetch', 'origin', branch, '--quiet']);
+        } catch (e) {
+            return fail(`не смог подтянуть origin/${branch} — ${firstLine(e)}`);
+        }
+    }
+
+    // Работа на detached HEAD, которой нет ни в одной ветке (из копии потребителя). Такое
+    // дерево оставляет сессия, закоммитившая мимо ветки, или человек; `git switch` с него
+    // уходит молча, и коммиты остаются достижимы только по SHA — до первой чистки gc.
+    //
+    // Считаем `HEAD --not --branches --remotes`, а не `origin/main..HEAD`: гейт мерджа
+    // сам оставляет дерево на detached-голове PR, то есть впереди origin/main на весь
+    // дифф фазы, — по наивному счёту каждая итерация после гейта выглядела бы как
+    // бесхозная работа. На ветке HEAD достижим из неё же, и счёт честно даёт ноль.
+    //
+    // «Не смог посчитать» — не «работы нет»: ошибка здесь стоит ровно того коммита,
+    // ради которого модуль написан, поэтому отказ.
+    let orphans: number;
+    try {
+        orphans = Number.parseInt(
+            git(['rev-list', '--count', 'HEAD', '--not', '--branches', '--remotes']).trim(),
+            10,
+        );
+    } catch (e) {
+        return fail(`не смог посчитать коммиты HEAD вне веток — ${firstLine(e)}`);
+    }
+    if (!Number.isFinite(orphans)) {
+        return fail('счёт коммитов HEAD вне веток нечитаем — переключаться вслепую нельзя');
+    }
+    if (orphans > 0) {
+        const sha = head();
+        // Ветки фазы нет нигде — работу можно взять ею как есть: ветка заводится на HEAD,
+        // ничего не теряется и ничья история не переписывается.
+        if (!onOrigin && !hasLocal) {
+            try {
+                git(['switch', '--create', branch]);
+            } catch (e) {
+                return fail(`не смог завести ветку на detached HEAD — ${firstLine(e)}`);
+            }
+            return done('adopted-detached', `взята работа с detached HEAD (${orphans} коммит(ов))`);
+        }
+        // Ветка уже есть — слить автоматически нечем, а переключение осиротило бы работу.
+        // HEAD не прочитался — имя ref'а собирается командой, а не подставляется строкой
+        // «HEAD»: `refs/ralph/rescue-HEAD` при втором инциденте перезаписал бы первый.
+        const rescueRef = sha
+            ? `refs/ralph/rescue-${sha}`
+            : 'refs/ralph/rescue-$(git rev-parse HEAD)';
+        return fail(
+            `на detached HEAD ${sha ?? '(SHA не прочитан)'} есть ${orphans} коммит(ов) вне всех ` +
+                `веток, а ветка ${branch} уже существует (${onOrigin ? 'на origin' : 'локально'}) — ` +
+                `переключение их осиротило бы. Закрепи: git update-ref ${rescueRef} HEAD, ` +
+                `потом влей в ${branch} руками`,
+        );
+    }
+
     try {
         if (onOrigin) {
-            gitNet(['fetch', 'origin', branch, '--quiet']);
             if (!hasLocal) {
                 git(['switch', '--create', branch, '--track', `origin/${branch}`]);
                 return done('adopted', 'взята с origin');

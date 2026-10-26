@@ -114,10 +114,14 @@ function makeGateEnv(over: Partial<GateEnv> = {}): GateEnv {
 function makeDeployEnv(over: Partial<DeployCheckEnv> = {}): DeployCheckEnv {
     return {
         getConfig: () => ({}),
-        ghJson: () => {
-            throw new Error('ghJson не подменён в тесте');
+        // #72: команды форжа приходят готовыми примитивами. Дефолты громко падают —
+        // функция, дёрнувшая форж мимо подменённого канала, роняет тест, а не уходит в сеть.
+        mergeCommitOid: () => {
+            throw new Error('mergeCommitOid не подменён в тесте');
         },
-        shq,
+        listWorkflowRuns: () => {
+            throw new Error('listWorkflowRuns не подменён в тесте');
+        },
         log: () => {},
         sleep: () => {},
         guardSideEffect: (what: string) => {
@@ -468,13 +472,13 @@ function buildRealTaskSource(): { adapter: TaskSourceAdapter; gateEnv: GateEnv }
                     `${mutationArgv(file, args)}https://forge.example/org/repo/issues/101`,
             }),
         syncProjectBoard: () =>
-            ralph.syncProjectBoard(
-                (file: string, args: string[]) => {
+            ralph.syncProjectBoard({
+                runArgvFn: (file: string, args: string[]) => {
                     traceArgv(file, args);
                     return 'ok — синк доски (0 карточек)';
                 },
-                () => {},
-            ),
+                logFn: () => {},
+            }),
     });
     // Тест-хук: подменить ghJson-диспетчер сценария (разные тесты — разные фикстуры gh).
     (adapter as unknown as { __setGhJson: (fn: (cmd: string) => unknown) => void }).__setGhJson = (
@@ -697,6 +701,16 @@ function registerTaskSourceContract(
             hook.__setIssuesThrow?.(true);
             hook.__setGhJson?.(() => ({}));
             expect(() => adapter.getIssue(7)).toThrow();
+        });
+
+        // #269: шов чека PR у форжа необязателен целиком, но НЕ по половинке. Реализация
+        // с `pullRequestChecks` без `redCheckDiagnosis` дала бы худший из режимов: гейт
+        // дожидался бы красного вердикта и на каждом круге вставал с «упавший куб не
+        // назван» — то есть петля перестала бы мерджить вообще, и выглядело бы это как
+        // отказ площадки, а не как недоделанный адаптер.
+        it('#269: чек PR у форжа реализован ПАРОЙ методов или не реализован вовсе', () => {
+            const { adapter } = build();
+            expect(typeof adapter.pullRequestChecks).toBe(typeof adapter.redCheckDiagnosis);
         });
 
         it('createPullRequest заводит PR ветки и отдаёт его номер', () => {
@@ -1311,15 +1325,15 @@ function buildFakeDeployCheck(): DeployCheckAdapter {
     };
 }
 
-// Боевая логика: createDeployCheckModule(fakeEnv) — та же ghJson-фикстура и execFn-подмена,
-// что deploy-check.test.ts.
+// Боевая логика: createDeployCheckModule(fakeEnv) — те же фикстуры примитивов форжа и
+// execFn-подмена, что в deploy-check.test.ts.
 function buildRealDeployCheck(opts: { healthUrl?: string } = {}): DeployCheckAdapter {
     const cfg = { deployCheck: { healthUrl: opts.healthUrl ?? '' } };
     const dc = createDeployCheckModule(
         makeDeployEnv({
             getConfig: () => cfg,
-            ghJson: () => {
-                throw new Error('mergeCommit не резолвится (нет sha)');
+            mergeCommitOid: () => {
+                throw new Error('коммит мерджа не резолвится (нет sha)');
             },
         }),
     );

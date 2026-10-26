@@ -740,3 +740,30 @@ describe('намерения кодер-сессии: формы запросо�
         expect(adapter.createIssue({ title: 'т', body: 'б', labels: ['area:devops'] })).toBeNull();
     });
 });
+
+// #269: проводка чека PR у площадки. Отдельный модуль (`sourcecraft-ci-checks.ts`) читает
+// его сам, но координаты репозитория ему передаёт ЭТОТ адаптер — перепутанные `org`/`repo`
+// или потерянная делегация дадут 404, три «сбоя чтения» подряд и стоп петли, а набор
+// останется зелёным (находка ревью).
+describe('чек PR у площадки: путь запроса собран из тех же координат (#269)', () => {
+    it('pullRequestChecks идёт на merge-checks нужного репозитория', () => {
+        const { adapter, calls } = build({});
+        // Фейковый сервер этого маршрута не знает и отдаёт `{}` — разбор такое отвергает
+        // (форма ответа), и это ровно то, что нужно: предмет теста — путь запроса.
+        expect(() => adapter.pullRequestChecks?.(7)).toThrow(/ci_workflows/);
+        expect(calls.some((c) => c.path === `/repos/${ORG}/${REPO}/pulls/7/merge-checks`)).toBe(
+            true,
+        );
+    });
+
+    it('redCheckDiagnosis идёт на прогон нужного репозитория', () => {
+        const { adapter, calls } = build({});
+        adapter.redCheckDiagnosis?.({
+            workflow: 'gate',
+            runId: '356',
+            state: 'failed',
+            rawStatus: 'failed',
+        });
+        expect(calls.some((c) => c.path === `/repos/${ORG}/${REPO}/cicd/runs/356`)).toBe(true);
+    });
+});

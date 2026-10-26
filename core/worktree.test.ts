@@ -155,8 +155,14 @@ describe('refreshRunnerWorktree — перевод дерева раннера �
         const { refreshRunnerWorktree } = createWorktreeManager(makeEnv());
         const calls: Array<[string, string[]]> = [];
         const shFn = () => '';
-        const runArgvFn = (file: string, args: string[]) => {
+        const prompts: Array<string | undefined> = [];
+        const runArgvFn = (
+            file: string,
+            args: string[],
+            opts?: { env?: Record<string, string | undefined> },
+        ) => {
             calls.push([file, args]);
+            prompts.push(opts?.env?.GIT_TERMINAL_PROMPT);
             return '';
         };
         const ok = refreshRunnerWorktree('/tmp/wt', { shFn, runArgvFn, logFn: () => {} });
@@ -165,6 +171,8 @@ describe('refreshRunnerWorktree — перевод дерева раннера �
             ['git', ['-C', '/tmp/wt', 'fetch', 'origin', 'main', '--quiet']],
             ['git', ['-C', '/tmp/wt', 'checkout', '--detach', 'origin/main', '--quiet']],
         ]);
+        // Сетевой здесь только fetch — ему и запрет промпта кредов (задача 71).
+        expect(prompts).toEqual(['0', undefined]);
     });
 
     it('грязное дерево → НЕ трогает (fetch/checkout не зовутся), false', () => {
@@ -367,7 +375,11 @@ describe('ensureRunnerWorktree — выделенный git worktree ранне�
             repoRoot: REPO,
         });
         expect(result).toBe(WT);
-        expect(runArgvFn).toHaveBeenCalledWith('git', ['fetch', 'origin', 'main']);
+        // Сетевой вызов — с запретом промпта кредов (задача 71): без него git ждёт логина
+        // на tty, и петля молча стоит до дедмана.
+        expect(runArgvFn).toHaveBeenCalledWith('git', ['fetch', 'origin', 'main'], {
+            env: expect.objectContaining({ GIT_TERMINAL_PROMPT: '0' }),
+        });
         expect(addFn).toHaveBeenCalledWith(WT);
         expect(trustFn).toHaveBeenCalledWith(WT);
         expect(installFn).toHaveBeenCalledWith(WT, { PATH: '/sanitized' });

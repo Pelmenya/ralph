@@ -10,6 +10,8 @@ import path from 'node:path';
 // @ts-expect-error — JS-entry раннера без деклараций типов: блоки перенесены из
 // ralph.test.js как есть и ходят через его ре-экспорт (#366).
 import ralph from '../ralph.js';
+// Ось серьёзности — из ядра, а не копией: см. комментарий у теста порога.
+import { FIX_SEVERITY_LEVELS } from './review-of-fixes.ts';
 
 const { deepMerge, resolveProfile, parseProfileFlag } = ralph;
 
@@ -354,6 +356,105 @@ describe('review.backlogMilestone / backlogMilestoneCap — схема ключ�
                 boom,
             ),
         ).toThrow(/backlogMilestoneCap/);
+    });
+
+    // #18: бюджет чистки — своё число, а не потолок вехи. Ключ необязателен, но мусор в
+    // нём валит старт: механизм ЗАКРЫВАЕТ чужие карточки, и «сравнение сработает не там»
+    // здесь стоит закрытых живых замечаний.
+    // Правило «накопитель — веха, которую петля не исполняет» держало на себе оба канала
+    // адреса, а механизма у него не было: рантайм отвергает только ТЕКУЩУЮ фазу, и веха
+    // будущей проезжала молча.
+    it('накопитель, названный в phases, валит старт — иначе фаза перестанет кончаться', () => {
+        const withPhases = (review: unknown, phases: unknown) => ({
+            defaultProfile: 'prod',
+            common: { phases },
+            profiles: { prod: { review } },
+        });
+        expect(() =>
+            resolveProfile(
+                withPhases({ backlogMilestone: 'Фаза 2' }, [
+                    { milestone: 'Фаза 1', branch: 'a' },
+                    { milestone: 'Фаза 2', branch: 'b' },
+                ]),
+                'prod',
+                boom,
+            ),
+        ).toThrow(/backlogMilestone/);
+        // Совпадение ищется по ВСЕМУ списку накопителей, а не только по первому.
+        expect(() =>
+            resolveProfile(
+                withPhases({ backlogMilestone: ['Входящие', 'Фаза 1'] }, [
+                    { milestone: 'Фаза 1', branch: 'a' },
+                ]),
+                'prod',
+                boom,
+            ),
+        ).toThrow(/backlogMilestone/);
+        // Не пересекается — валиден.
+        expect(() =>
+            resolveProfile(
+                withPhases({ backlogMilestone: 'Входящие' }, [
+                    { milestone: 'Фаза 1', branch: 'a' },
+                ]),
+                'prod',
+                boom,
+            ),
+        ).not.toThrow();
+    });
+
+    it('бюджет чистки — положительное целое; ноль и дробное валят старт', () => {
+        expect(() =>
+            resolveProfile(withReview({ backlogStaleBudget: 20 }), 'prod', boom),
+        ).not.toThrow();
+        expect(() => resolveProfile(withReview({ backlogStaleBudget: 0 }), 'prod', boom)).toThrow(
+            /backlogStaleBudget/,
+        );
+        expect(() => resolveProfile(withReview({ backlogStaleBudget: 2.5 }), 'prod', boom)).toThrow(
+            /backlogStaleBudget/,
+        );
+        expect(() =>
+            resolveProfile(withReview({ backlogStaleBudget: '20' }), 'prod', boom),
+        ).toThrow(/backlogStaleBudget/);
+    });
+
+    // Ноль тут особенно легко принять за «выключить чистку» — сообщение обязано назвать
+    // настоящий выключатель, иначе человек выключит не то.
+    it('ноль в бюджете чистки объясняет, где настоящий выключатель', () => {
+        expect(() => resolveProfile(withReview({ backlogStaleBudget: 0 }), 'prod', boom)).toThrow(
+            /backlogStaleDays/,
+        );
+    });
+
+    // #110: порог серьёзности карточек лестницы ревью правок — fail-closed на неизвестном
+    // уровне, дефолт (ключ не задан) сохраняет прежнее поведение.
+    describe('backlogSeverityFloor — порог серьёзности (#110)', () => {
+        it('ключ не задан → валиден (прежнее поведение: карточка на любую находку)', () => {
+            expect(() => resolveProfile(withReview({}), 'prod', boom)).not.toThrow();
+        });
+
+        // Список берётся из `FIX_SEVERITY_LEVELS`, а не набирается руками: это уже
+        // четвёртая копия одной оси (`SEVERITY_MARKERS`, `FIX_SEVERITY_LEVELS`,
+        // `scripts/review-findings.mjs`, здесь), и первые три сторожит тест на дрейф, а
+        // эту не сторожил никто — новый уровень валидация приняла бы, а тест об этом не
+        // узнал бы (ревью правок #110). `it.each` заодно называет отвергнутый уровень
+        // в отчёте о падении: `for` внутри одного `it` показывал только «тест упал».
+        it.each([...FIX_SEVERITY_LEVELS])('известный уровень «%s» — валиден', (level) => {
+            expect(() =>
+                resolveProfile(withReview({ backlogSeverityFloor: level }), 'prod', boom),
+            ).not.toThrow();
+        });
+
+        it('неизвестный уровень валит старт, а не молча отключает фильтр', () => {
+            expect(() =>
+                resolveProfile(withReview({ backlogSeverityFloor: 'critical' }), 'prod', boom),
+            ).toThrow(/backlogSeverityFloor/);
+            expect(() =>
+                resolveProfile(withReview({ backlogSeverityFloor: '' }), 'prod', boom),
+            ).toThrow(/backlogSeverityFloor/);
+            expect(() =>
+                resolveProfile(withReview({ backlogSeverityFloor: 3 }), 'prod', boom),
+            ).toThrow(/backlogSeverityFloor/);
+        });
     });
 });
 

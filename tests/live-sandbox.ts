@@ -43,6 +43,9 @@ export type LiveSandbox = {
     runtimeDir: string;
 };
 
+/** Ветка единственной фазы песочницы. */
+const SANDBOX_BRANCH = 'feature/sandbox-phase-1';
+
 export type LiveSandboxOptions = {
     /** Ответ фейкового форжа на очередь фазы. `[]` уводит петлю в цикл сдачи фазы. */
     openIssues?: unknown[];
@@ -52,6 +55,12 @@ export type LiveSandboxOptions = {
      * дерева РАБОТЫ адресуется как `$PWD/.claude/ralph` — кодер-сессия идёт с его CWD.
      */
     coderScript?: string;
+    /**
+     * Ветка фазы уже лежит на origin — её запушили прошлые сессии. Сценарию сдачи без
+     * карточек она нужна: кодер не запускается, и без неё сдача честно встаёт на «ветка
+     * не запушена» до гейта.
+     */
+    phaseBranchOnOrigin?: boolean;
 };
 
 /**
@@ -147,7 +156,7 @@ function sandboxConfig(sb: LiveSandbox): unknown {
                 restartWaitMs: 1,
             },
             prompt: 'Возьми Issue из milestone {milestone} и сделай его в ветке {branch}.',
-            phases: [{ milestone: 'Песочница · Фаза 1', branch: 'feature/sandbox-phase-1' }],
+            phases: [{ milestone: 'Песочница · Фаза 1', branch: SANDBOX_BRANCH }],
             roots: {
                 consumerRoot: sb.consumerRoot,
                 executionRoot: sb.executionRoot,
@@ -179,12 +188,18 @@ esac
 /**
  * Фейк кодера. Промпт читается со stdin (боевой путь `claude -p` без позиционного
  * аргумента) и складывается в песочницу — иначе шим завис бы на непрочитанном канале.
+ *
+ * Ветку фазы шим пушит, как по контракту `ralph.md` делает настоящая сессия: сдача фазы
+ * начинается с проверки «ветка есть на origin», и без пуша цикл сдачи в песочнице
+ * останавливался бы на ней, не дойдя до гейта, — то есть сценарий проверял бы меньше,
+ * чем обещает его название.
  */
 function coderShim(sb: LiveSandbox, extra: string): string {
     return `#!/bin/sh
 SANDBOX_PRODUCT_ROOT="${sb.productRoot}"
 cat > "${sb.root}/coder-prompt.txt"
 ${extra}
+branch=$(git symbolic-ref --quiet --short HEAD) && git push --quiet origin "HEAD:refs/heads/$branch" >/dev/null 2>&1
 echo "кодер-сессия песочницы отработала"
 `;
 }
@@ -207,6 +222,7 @@ export function buildLiveSandbox({
         },
     ],
     coderScript = '',
+    phaseBranchOnOrigin = false,
 }: LiveSandboxOptions = {}): LiveSandbox {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-live-')));
     const consumerRoot = path.join(root, 'consumer');
@@ -249,6 +265,9 @@ export function buildLiveSandbox({
     git(consumerRoot, home, 'commit', '--quiet', '-m', 'дерево песочницы');
     git(consumerRoot, home, 'remote', 'add', 'origin', path.join(root, 'origin.git'));
     git(consumerRoot, home, 'push', '--quiet', '-u', 'origin', 'main');
+    if (phaseBranchOnOrigin) {
+        git(consumerRoot, home, 'push', '--quiet', 'origin', `main:refs/heads/${SANDBOX_BRANCH}`);
+    }
     return sb;
 }
 

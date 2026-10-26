@@ -16,20 +16,21 @@ import ralph from '../ralph.js';
 const { waitForDeployRun, mergedShaOf, checkProdHealth } = ralph;
 
 const SHA40_RE = /^[0-9a-f]{40}$/;
-const shq = (v: unknown) => `'${String(v).replace(/'/g, `'\\''`)}'`;
 
-// Синтетический env: побочки (ghJson/guardSideEffect) по умолчанию громко падают, если
-// функция под тестом дёрнет их без явного override, — забытый override становится ошибкой
-// теста, а не тихим проходом через боевой gh/curl. guardSideEffect по умолчанию throw'ит —
+// Синтетический env: побочки (примитивы форжа/guardSideEffect) по умолчанию громко падают,
+// если функция под тестом дёрнет их без явного override, — забытый override становится
+// ошибкой теста, а не тихим проходом в сеть. guardSideEffect по умолчанию throw'ит —
 // ровно то же, что и боевой предохранитель #138 делает под RALPH_NO_SIDE_EFFECTS=1: тест,
 // забывший подменить execFn, должен упасть на попытке уйти в настоящий curl.
 function makeEnv(over: Partial<DeployCheckEnv> = {}): DeployCheckEnv {
     return {
         getConfig: () => ({}),
-        ghJson: () => {
-            throw new Error('ghJson не подменён в тесте');
+        mergeCommitOid: () => {
+            throw new Error('mergeCommitOid не подменён в тесте');
         },
-        shq,
+        listWorkflowRuns: () => {
+            throw new Error('listWorkflowRuns не подменён в тесте');
+        },
         log: () => {},
         sleep: () => {},
         guardSideEffect: (what: string) => {
@@ -55,62 +56,55 @@ describe('deployPhasePlaceholder — маркер точки цикла (#87)', 
 describe('mergedShaOf — sha squash-мерджа PR (#163)', () => {
     const SHA = 'c'.repeat(40);
 
-    it('возвращает oid mergeCommit, номер PR уходит через shq', () => {
-        const ghJsonFn = vi.fn((_cmd: string) => ({ mergeCommit: { oid: SHA } }));
+    it('возвращает oid, отданный примитивом форжа, спрашивая его про ЭТОТ номер PR', () => {
+        const mergeCommitOidFn = vi.fn((_pr: number) => SHA);
         const { mergedShaOf } = createDeployCheckModule(makeEnv());
-        expect(mergedShaOf(12, { ghJsonFn })).toBe(SHA);
-        expect(ghJsonFn.mock.calls[0][0]).toContain("gh pr view '12'");
+        expect(mergedShaOf(12, { mergeCommitOidFn })).toBe(SHA);
+        // Чем именно примитив спрашивает форж — знание адаптера, и проверяется там
+        // (github-deploy-commands.test.ts). Ядру принадлежит только «спросили про 12».
+        expect(mergeCommitOidFn.mock.calls[0][0]).toBe(12);
     });
 
     it('fail-closed: mergeCommit отсутствует/невалиден → бросает после исчерпания ретраев', () => {
         const { mergedShaOf } = createDeployCheckModule(makeEnv());
         expect(() =>
-            mergedShaOf(12, { ghJsonFn: () => ({ mergeCommit: null }), sleepFn: () => {} }),
+            mergedShaOf(12, { mergeCommitOidFn: () => null, sleepFn: () => {} }),
         ).toThrow();
     });
 
     it('транзиентный mergeCommit: null → ретрай, зелёный на следующей попытке', () => {
         let call = 0;
-        const ghJsonFn = vi.fn(() => {
+        const mergeCommitOidFn = vi.fn(() => {
             call++;
-            return call === 1 ? { mergeCommit: null } : { mergeCommit: { oid: SHA } };
+            return call === 1 ? null : SHA;
         });
         const sleepFn = vi.fn();
         const { mergedShaOf } = createDeployCheckModule(makeEnv());
-        expect(mergedShaOf(12, { ghJsonFn, sleepFn })).toBe(SHA);
-        expect(ghJsonFn).toHaveBeenCalledTimes(2);
+        expect(mergedShaOf(12, { mergeCommitOidFn, sleepFn })).toBe(SHA);
+        expect(mergeCommitOidFn).toHaveBeenCalledTimes(2);
         expect(sleepFn).toHaveBeenCalledTimes(1); // пауза только между попытками
     });
 
     it('устойчивый null исчерпывает ровно attempts попыток и бросает', () => {
-        const ghJsonFn = vi.fn(() => ({ mergeCommit: null }));
+        const mergeCommitOidFn = vi.fn(() => null);
         const sleepFn = vi.fn();
         const { mergedShaOf } = createDeployCheckModule(makeEnv());
-        expect(() => mergedShaOf(12, { ghJsonFn, sleepFn, attempts: 3 })).toThrow();
-        expect(ghJsonFn).toHaveBeenCalledTimes(3);
+        expect(() => mergedShaOf(12, { mergeCommitOidFn, sleepFn, attempts: 3 })).toThrow();
+        expect(mergeCommitOidFn).toHaveBeenCalledTimes(3);
         expect(sleepFn).toHaveBeenCalledTimes(2); // паузы только МЕЖДУ попытками
     });
 
-    it('только ЧТЕНИЕ: "gh pr view", без merge/close/edit', () => {
-        const ghJsonFn = vi.fn((_cmd: string) => ({ mergeCommit: { oid: SHA } }));
-        const { mergedShaOf } = createDeployCheckModule(makeEnv());
-        mergedShaOf(1, { ghJsonFn });
-        const cmd = ghJsonFn.mock.calls[0][0] as string;
-        expect(cmd).toMatch(/^gh pr view\b/);
-        expect(cmd).not.toMatch(/\b(merge|close|edit|delete)\b/);
-    });
-
     // getLastGatePr() отдаёт null, если гейт не дошёл до findOpenPr. Без fail-fast гарда
-    // `gh pr view 'null'` сжёг бы attempts×ретраи ghJson с бэкоффом, прежде чем упасть.
-    it('невалидный prNumber (null/0/дробь) → fail-fast, ghJson не зовётся', () => {
-        const ghJsonFn = vi.fn(() => ({ mergeCommit: { oid: SHA } }));
+    // запрос по номеру 'null' сжёг бы attempts×ретраи чтения с бэкоффом, прежде чем упасть.
+    it('невалидный prNumber (null/0/дробь) → fail-fast, примитив форжа не зовётся', () => {
+        const mergeCommitOidFn = vi.fn(() => SHA);
         const { mergedShaOf } = createDeployCheckModule(makeEnv());
         for (const bad of [null, 0, -1, 1.5, undefined, '12']) {
-            expect(() => mergedShaOf(bad as unknown as number, { ghJsonFn })).toThrow(
+            expect(() => mergedShaOf(bad as unknown as number, { mergeCommitOidFn })).toThrow(
                 /невалидный номер PR/,
             );
         }
-        expect(ghJsonFn).not.toHaveBeenCalled();
+        expect(mergeCommitOidFn).not.toHaveBeenCalled();
     });
 });
 
@@ -128,7 +122,7 @@ describe('waitForDeployRun — ожидание итога deploy-workflow на 
     const SHA = 'd'.repeat(40);
 
     it('run найден в статусе completed → возвращает conclusion сразу, без сна', () => {
-        const ghJsonFn = vi.fn(() => [
+        const listWorkflowRunsFn = vi.fn(() => [
             { databaseId: 1, headSha: SHA, status: 'completed', conclusion: 'success', url: 'u' },
         ]);
         const sleepFn = vi.fn();
@@ -136,7 +130,7 @@ describe('waitForDeployRun — ожидание итога deploy-workflow на 
         const out = waitForDeployRun(
             SHA,
             { deployCheck: { workflow: 'deploy.yml', timeoutMs: 100, pollIntervalMs: 20 } },
-            { ghJsonFn, sleepFn, logFn: () => {}, nowFn: () => 0 },
+            { listWorkflowRunsFn, sleepFn, logFn: () => {}, nowFn: () => 0 },
         );
         expect(out).toEqual({
             status: 'completed',
@@ -149,7 +143,7 @@ describe('waitForDeployRun — ожидание итога deploy-workflow на 
     });
 
     it('run не найден до таймаута → not-found', () => {
-        const ghJsonFn = vi.fn(() => []);
+        const listWorkflowRunsFn = vi.fn(() => []);
         let now = 0;
         const nowFn = () => now;
         const sleepFn = vi.fn((ms: number) => {
@@ -159,13 +153,13 @@ describe('waitForDeployRun — ожидание итога deploy-workflow на 
         const out = waitForDeployRun(
             SHA,
             { deployCheck: { timeoutMs: 100, pollIntervalMs: 20 } },
-            { ghJsonFn, sleepFn, logFn: () => {}, nowFn },
+            { listWorkflowRunsFn, sleepFn, logFn: () => {}, nowFn },
         );
         expect(out.status).toBe('not-found');
     });
 
     it('run найден, но не completed до таймаута → timeout с последним статусом', () => {
-        const ghJsonFn = vi.fn(() => [
+        const listWorkflowRunsFn = vi.fn(() => [
             { databaseId: 2, headSha: SHA, status: 'in_progress', conclusion: null, url: 'u2' },
         ]);
         let now = 0;
@@ -177,7 +171,7 @@ describe('waitForDeployRun — ожидание итога deploy-workflow на 
         const out = waitForDeployRun(
             SHA,
             { deployCheck: { timeoutMs: 100, pollIntervalMs: 20 } },
-            { ghJsonFn, sleepFn, logFn: () => {}, nowFn },
+            { listWorkflowRunsFn, sleepFn, logFn: () => {}, nowFn },
         );
         expect(out).toEqual({
             status: 'timeout',
@@ -188,8 +182,8 @@ describe('waitForDeployRun — ожидание итога deploy-workflow на 
         });
     });
 
-    it('устойчивая ошибка чтения gh run не роняет ожидание — доходит до таймаута', () => {
-        const ghJsonFn = vi.fn(() => {
+    it('устойчивая ошибка чтения прогонов не роняет ожидание — доходит до таймаута', () => {
+        const listWorkflowRunsFn = vi.fn(() => {
             throw new Error('network blip');
         });
         let now = 0;
@@ -201,7 +195,7 @@ describe('waitForDeployRun — ожидание итога deploy-workflow на 
         const out = waitForDeployRun(
             SHA,
             { deployCheck: { timeoutMs: 100, pollIntervalMs: 20 } },
-            { ghJsonFn, sleepFn, logFn: () => {}, nowFn },
+            { listWorkflowRunsFn, sleepFn, logFn: () => {}, nowFn },
         );
         expect(out.status).toBe('not-found');
     });
@@ -209,36 +203,24 @@ describe('waitForDeployRun — ожидание итога deploy-workflow на 
     it('невалидный sha → бросает fail-closed, не молчит', () => {
         const { waitForDeployRun } = createDeployCheckModule(makeEnv());
         expect(() =>
-            waitForDeployRun('not-a-sha', {}, { ghJsonFn: () => [] as unknown[] }),
+            waitForDeployRun('not-a-sha', {}, { listWorkflowRunsFn: () => [] as unknown[] }),
         ).toThrow();
     });
 
-    it('имя workflow из конфига уходит через shq в gh run list', () => {
-        const ghJsonFn = vi.fn((_cmd: string) => [
+    // Имя workflow из конфига доезжает до примитива форжа. Как именно оно квотируется и в
+    // какую команду подставляется — знание адаптера (github-deploy-commands.test.ts);
+    // здесь проверяется ровно то, за что отвечает ядро: спросили про ЭТОТ workflow.
+    it('имя workflow из конфига уходит в примитив форжа', () => {
+        const listWorkflowRunsFn = vi.fn((_workflow: string) => [
             { databaseId: 5, headSha: SHA, status: 'completed', conclusion: 'success', url: 'u' },
         ]);
         const { waitForDeployRun } = createDeployCheckModule(makeEnv());
         waitForDeployRun(
             SHA,
             { deployCheck: { workflow: 'release.yml', timeoutMs: 10, pollIntervalMs: 5 } },
-            { ghJsonFn, sleepFn: () => {}, logFn: () => {}, nowFn: () => 0 },
+            { listWorkflowRunsFn, sleepFn: () => {}, logFn: () => {}, nowFn: () => 0 },
         );
-        expect(ghJsonFn.mock.calls[0][0]).toContain("--workflow 'release.yml'");
-    });
-
-    it('только ЧТЕНИЕ: "gh run list", без cancel/rerun/delete/merge/close', () => {
-        const ghJsonFn = vi.fn((_cmd: string) => [
-            { databaseId: 1, headSha: SHA, status: 'completed', conclusion: 'success', url: 'u' },
-        ]);
-        const { waitForDeployRun } = createDeployCheckModule(makeEnv());
-        waitForDeployRun(
-            SHA,
-            { deployCheck: { workflow: 'deploy.yml', timeoutMs: 100, pollIntervalMs: 20 } },
-            { ghJsonFn, sleepFn: () => {}, logFn: () => {}, nowFn: () => 0 },
-        );
-        const cmd = ghJsonFn.mock.calls[0][0] as string;
-        expect(cmd).toMatch(/^gh run list\b/);
-        expect(cmd).not.toMatch(/\b(cancel|rerun|delete|merge|close|revert)\b/);
+        expect(listWorkflowRunsFn.mock.calls[0][0]).toBe('release.yml');
     });
 });
 
@@ -515,30 +497,29 @@ const deployCfg = (o = {}) => ({
 describe('Пост-мердж проверка — только чтение, без мутаций (#166)', () => {
     const SHA = 'd'.repeat(40);
 
-    it('waitForDeployRun зовёт ТОЛЬКО "gh run list" — read-глагол, без merge/cancel/rerun/delete/close', () => {
-        // Параметр cmd объявлен явно (а не проигнорирован) — иначе mock.calls в .ts-файле
-        // типизируется пустым кортежем и ассерт на текст команды не скомпилируется.
-        const ghJsonFn = vi.fn((_cmd: string) => [
+    // #72: «только чтение» держится в ДВУХ местах, и оба обязаны проверяться. Здесь —
+    // половина ядра: за весь цикл ожидания оно трогает форж ровно одним примитивом, и
+    // примитив этот read-only по контракту. Что сама команда — read-глагол без
+    // merge/cancel/rerun, проверяет тест адаптера (github-deploy-commands.test.ts):
+    // после переезда команды сюда её текст просто не доезжает.
+    it('waitForDeployRun трогает форж ТОЛЬКО read-примитивом «прогоны workflow»', () => {
+        const listWorkflowRunsFn = vi.fn((_workflow: string) => [
             { databaseId: 1, headSha: SHA, status: 'completed', conclusion: 'success', url: 'u' },
         ]);
         waitForDeployRun(
             SHA,
             { deployCheck: { workflow: 'deploy.yml', timeoutMs: 100, pollIntervalMs: 20 } },
-            { ghJsonFn, sleepFn: () => {}, logFn: () => {}, nowFn: () => 0 },
+            { listWorkflowRunsFn, sleepFn: () => {}, logFn: () => {}, nowFn: () => 0 },
         );
-        expect(ghJsonFn).toHaveBeenCalledTimes(1);
-        const cmd = ghJsonFn.mock.calls[0][0];
-        expect(cmd).toMatch(/^gh run list\b/);
-        expect(cmd).not.toMatch(/\b(cancel|rerun|delete|merge|close|revert)\b/);
+        expect(listWorkflowRunsFn).toHaveBeenCalledTimes(1);
+        expect(listWorkflowRunsFn.mock.calls[0][0]).toBe('deploy.yml');
     });
 
-    it('mergedShaOf зовёт ТОЛЬКО "gh pr view" — read-глагол, без merge/close/edit', () => {
-        const ghJsonFn = vi.fn((_cmd: string) => ({ mergeCommit: { oid: SHA } }));
-        mergedShaOf(1, { ghJsonFn });
-        expect(ghJsonFn).toHaveBeenCalledTimes(1);
-        const cmd = ghJsonFn.mock.calls[0][0];
-        expect(cmd).toMatch(/^gh pr view\b/);
-        expect(cmd).not.toMatch(/\b(merge|close|edit|delete)\b/);
+    it('mergedShaOf трогает форж ТОЛЬКО read-примитивом «коммит мерджа»', () => {
+        const mergeCommitOidFn = vi.fn((_pr: number) => SHA);
+        mergedShaOf(1, { mergeCommitOidFn });
+        expect(mergeCommitOidFn).toHaveBeenCalledTimes(1);
+        expect(mergeCommitOidFn.mock.calls[0][0]).toBe(1);
     });
 
     it('checkProdHealth зовёт curl только на чтение (GET) — без -X/-d/--data/--upload-file', () => {
@@ -568,24 +549,29 @@ describe('#167: пост-мердж проверка — критерии гот
 
     it('зелёный workflow на первом же опросе → возврат сразу, часы не сдвинуты (петля не ждёт впустую)', () => {
         const { clock, nowFn, sleepFn } = mkClock();
-        const ghJsonFn = vi.fn(() => [
+        const listWorkflowRunsFn = vi.fn(() => [
             { databaseId: 1, headSha: SHA, status: 'completed', conclusion: 'success', url: 'u' },
         ]);
-        const out = waitForDeployRun(SHA, cfg(), { ghJsonFn, sleepFn, logFn: () => {}, nowFn });
+        const out = waitForDeployRun(SHA, cfg(), {
+            listWorkflowRunsFn,
+            sleepFn,
+            logFn: () => {},
+            nowFn,
+        });
         expect(out).toMatchObject({ status: 'completed', conclusion: 'success' });
         // Зелёный найден на первом опросе — ни одного sleep, часы стоят на нуле.
-        expect(ghJsonFn).toHaveBeenCalledTimes(1);
+        expect(listWorkflowRunsFn).toHaveBeenCalledTimes(1);
         expect(clock.t).toBe(0);
     });
 
     it('workflow тянется дольше таймаута → ожидание ограничено по времени (не вечный цикл, не ложный красный)', () => {
         const { clock, nowFn, sleepFn } = mkClock();
         // Всегда in_progress: без границы по времени это был бы бесконечный цикл.
-        const ghJsonFn = vi.fn(() => [
+        const listWorkflowRunsFn = vi.fn(() => [
             { databaseId: 2, headSha: SHA, status: 'in_progress', conclusion: null, url: 'u' },
         ]);
         const out = waitForDeployRun(SHA, cfg({ timeoutMs: 100, pollIntervalMs: 20 }), {
-            ghJsonFn,
+            listWorkflowRunsFn,
             sleepFn,
             logFn: () => {},
             nowFn,
@@ -596,19 +582,19 @@ describe('#167: пост-мердж проверка — критерии гот
         // Часы не ушли дальше таймаута больше чем на один интервал опроса.
         expect(clock.t).toBeLessThanOrEqual(100 + 20);
         // Число опросов конечно и соответствует бюджету таймаут/интервал.
-        expect(ghJsonFn.mock.calls.length).toBeLessThanOrEqual(Math.ceil(100 / 20) + 1);
+        expect(listWorkflowRunsFn.mock.calls.length).toBeLessThanOrEqual(Math.ceil(100 / 20) + 1);
     });
 
     // --- Критерий: «сетевой сбой при чтении статуса не стопит петлю без исчерпания ретраев» ---
 
-    it('gh падает на КАЖДОМ опросе → ожидание не роняет петлю, исчерпывает опросы до таймаута, возвращает not-found', () => {
+    it('чтение падает на КАЖДОМ опросе → ожидание не роняет петлю, исчерпывает опросы до таймаута, возвращает not-found', () => {
         const { clock, nowFn, sleepFn } = mkClock();
-        const ghJsonFn = vi.fn(() => {
-            throw new Error('gh: connection reset by peer');
+        const listWorkflowRunsFn = vi.fn(() => {
+            throw new Error('connection reset by peer');
         });
         // Не бросает наружу — устойчивый сетевой сбой не стопит петлю.
         const out = waitForDeployRun(SHA, cfg({ timeoutMs: 100, pollIntervalMs: 20 }), {
-            ghJsonFn,
+            listWorkflowRunsFn,
             sleepFn,
             logFn: () => {},
             nowFn,
@@ -617,7 +603,7 @@ describe('#167: пост-мердж проверка — критерии гот
         expect(out.status).toBe('not-found');
         expect(out.conclusion).toBeNull();
         // Ретраи исчерпаны по таймауту, а не по первому сбою: опросов больше одного.
-        expect(ghJsonFn.mock.calls.length).toBeGreaterThan(1);
+        expect(listWorkflowRunsFn.mock.calls.length).toBeGreaterThan(1);
         expect(clock.t).toBeLessThanOrEqual(100 + 20);
     });
 
@@ -625,10 +611,10 @@ describe('#167: пост-мердж проверка — критерии гот
         const { nowFn, sleepFn } = mkClock();
         const responses = [
             () => {
-                throw new Error('gh: timeout');
+                throw new Error('чтение прогонов: timeout');
             },
             () => {
-                throw new Error('gh: timeout');
+                throw new Error('чтение прогонов: timeout');
             },
             () => [
                 {
@@ -641,15 +627,15 @@ describe('#167: пост-мердж проверка — критерии гот
             ],
         ];
         let i = 0;
-        const ghJsonFn = vi.fn(() => responses[Math.min(i++, responses.length - 1)]());
+        const listWorkflowRunsFn = vi.fn(() => responses[Math.min(i++, responses.length - 1)]());
         const out = waitForDeployRun(SHA, cfg({ timeoutMs: 1000, pollIntervalMs: 20 }), {
-            ghJsonFn,
+            listWorkflowRunsFn,
             sleepFn,
             logFn: () => {},
             nowFn,
         });
         expect(out).toMatchObject({ status: 'completed', conclusion: 'success' });
-        expect(ghJsonFn).toHaveBeenCalledTimes(3);
+        expect(listWorkflowRunsFn).toHaveBeenCalledTimes(3);
     });
 
     it('checkProdHealth: устойчивый сетевой сбой прода → исчерпывает ретраи, {ok:false}, не бросает и не зависает', () => {
@@ -677,23 +663,33 @@ describe('#167: пост-мердж проверка — критерии гот
 
     // --- Критерий: «побочки — через DI, RALPH_NO_SIDE_EFFECTS=1, guardSideEffect» ---
 
-    it('пост-мердж проверка ничего не мутирует даже при МНОГИХ опросах — только read-глагол gh run list', () => {
+    it('пост-мердж проверка ничего не мутирует даже при МНОГИХ опросах — только read-примитив', () => {
         const { nowFn, sleepFn } = mkClock();
-        const ghJsonFn = vi.fn((_cmd: string) => [
+        const listWorkflowRunsFn = vi.fn((_workflow: string) => [
             { databaseId: 4, headSha: SHA, status: 'in_progress', conclusion: null, url: 'u' },
         ]);
-        waitForDeployRun(SHA, cfg({ timeoutMs: 100, pollIntervalMs: 20 }), {
-            ghJsonFn,
+        // #72-ревью: второй примитив подключается ЧЕРЕЗ env фабрики, а не подсовывается
+        // отдельным аргументом. `waitForDeployRun` такой опции не принимает вовсе, поэтому
+        // прежний `mergeCommitOidFn` в этом тесте не был подключён никуда и «не вызывался»
+        // при любом коде — ассерт-пустышка. Собранный из env модуль делает утверждение
+        // проверяемым: дотянись цикл ожидания до второго примитива — шпион бы это увидел.
+        const mergeCommitOid = vi.fn(() => SHA);
+        const { waitForDeployRun: waitFromEnv } = createDeployCheckModule(
+            makeEnv({ mergeCommitOid, listWorkflowRuns: listWorkflowRunsFn }),
+        );
+        waitFromEnv(SHA, cfg({ timeoutMs: 100, pollIntervalMs: 20 }), {
+            listWorkflowRunsFn,
             sleepFn,
             logFn: () => {},
             nowFn,
         });
-        // На каждом из нескольких опросов — только чтение, ни одной мутации.
-        expect(ghJsonFn.mock.calls.length).toBeGreaterThan(1);
-        for (const [cmd] of ghJsonFn.mock.calls) {
-            expect(cmd).toMatch(/^gh run list\b/);
-            expect(cmd).not.toMatch(/\b(cancel|rerun|delete|merge|close|revert|edit)\b/);
+        // На каждом из нескольких опросов — тот же единственный read-примитив, и ни разу
+        // ничего сверх него: у ядра нет другого канала к форжу, потому что команд у него нет.
+        expect(listWorkflowRunsFn.mock.calls.length).toBeGreaterThan(1);
+        for (const [workflow] of listWorkflowRunsFn.mock.calls) {
+            expect(workflow).toBe('deploy.yml');
         }
+        expect(mergeCommitOid).not.toHaveBeenCalled();
     });
 });
 
@@ -713,15 +709,15 @@ describe('waitForDeployRun — поллинг до завершения с кр�
             [{ databaseId: 7, headSha: SHA, status: 'completed', conclusion: 'failure', url: 'u' }],
         ];
         let i = 0;
-        const ghJsonFn = vi.fn(() => responses[Math.min(i++, responses.length - 1)]);
+        const listWorkflowRunsFn = vi.fn(() => responses[Math.min(i++, responses.length - 1)]);
         const out = waitForDeployRun(SHA, cfg({ timeoutMs: 1000 }), {
-            ghJsonFn,
+            listWorkflowRunsFn,
             sleepFn,
             logFn: () => {},
             nowFn,
         });
         expect(out.status).toBe('completed');
         expect(out.conclusion).toBe('failure');
-        expect(ghJsonFn).toHaveBeenCalledTimes(3);
+        expect(listWorkflowRunsFn).toHaveBeenCalledTimes(3);
     });
 });

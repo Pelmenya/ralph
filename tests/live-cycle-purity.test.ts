@@ -19,7 +19,7 @@
 // рантайм-мусор за собой. Копия продукта ВНУТРИ дерева работы — то, куда после `chdir`
 // указывают все относительные пути раннера; запись туда делает грязным само дерево фазы,
 // и петля встаёт на `ensureClean` посреди ночи.
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import path from 'node:path';
@@ -43,6 +43,13 @@ import { NO_SIDE_EFFECTS } from '../shared/side-effect-guard.ts';
 // Пробы уборки за ненормально убитым прогоном требуют своего `/proc` — см. довод у первой
 // из них. `skipIf` вместо тихого `return`: пропуск обязан быть виден в отчёте.
 const itIsolated = it.skipIf(!sandboxIsolatesProcesses());
+
+// Срок кейса — свой, а не дефолтные 5 с vitest. Каждый сценарий поднимает настоящий git,
+// раннер и монитор в песочнице: на свободной машине это 3–4 с, то есть дефолт стоял на
+// грани, и push-гейт площадки покраснел таймаутом двух сценариев (5,6 и 6,0 с), когда
+// параллельно шёл соседний workflow. Срок с запасом, но конечный: зависший прогон
+// по-прежнему краснеет, а не висит.
+vi.setConfig({ testTimeout: 30_000 });
 
 const built: LiveSandbox[] = [];
 afterEach(() => {
@@ -114,7 +121,7 @@ describe('живой цикл идёт в изоляции и не трогае�
     it('цикл сдачи фазы: PR, ревью, правки и гейт тоже не пишут в продукт', () => {
         // Пустая очередь уводит петлю в сдачу фазы — ветку с наибольшим числом побочек:
         // заведение PR, две кодер-сессии ревью, лестница правок, гейт мерджа.
-        const run = liveRun({ openIssues: [] });
+        const run = liveRun({ openIssues: [], phaseBranchOnOrigin: true });
         expect(run.output).toContain('issues закрыты');
         expect(run.output).toContain('Гейт мерджа');
         expect(run.productDiff).toEqual([]);

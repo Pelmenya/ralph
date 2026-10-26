@@ -87,6 +87,7 @@ const mkState = (o: Partial<RalphState> = {}): RalphState => ({
     reReviewPending: false,
     reviewOfFixes: null,
     deployBlock: null,
+    forgeHealedRunId: null,
     ...o,
 });
 
@@ -148,6 +149,7 @@ function runPhase({
     let headCalls = 0;
     const HEADS = ['b', 'c', 'd', 'e', 'f'].map((c) => c.repeat(40));
     const nextHead = () => HEADS[Math.min(headCalls++, HEADS.length - 1)];
+    const applyArgs: Array<{ currentMilestone?: string }> = [];
 
     runLoop(
         config,
@@ -235,7 +237,11 @@ function runPhase({
                 return isArbiterPrompt(prompt) ? arbiterCode : 0;
             },
             // Намерения применяет петля; здесь фейк отдаёт то, что «оставила» сессия.
-            applySessionRequestsFn: () => {
+            applySessionRequestsFn: (args: { currentMilestone?: string }) => {
+                // Аргументы записываем, а не только ответ подменяем: веху текущей фазы
+                // применению называет ПЕТЛЯ, и без этого журнала проводку можно выкинуть,
+                // не покраснев ни на чём (#16).
+                applyArgs.push(args);
                 const last = prompts[prompts.length - 1] ?? '';
                 if (isFixReviewPrompt(last)) {
                     const result = passes[passIdx] ?? { findings: [] };
@@ -266,6 +272,15 @@ function runPhase({
                 };
             },
             ensureCleanFn: () => true,
+            // #134: см. тот же дефолт в tests/test-helpers.ts.
+            ensurePhaseBranchFn: (branch: string) => ({
+                kind: 'switched' as const,
+                branch,
+                sha: 'a'.repeat(40),
+            }),
+            checkOnPhaseBranchFn: () => ({ ok: true, sha: 'a'.repeat(40) }),
+            // #183: ветка «запушена» — настоящая проверка читает git в дереве тестов.
+            branchPushedFn: () => true,
             phaseMergedFn: () => false,
             mergedPhasePrFn: () => null,
             advancePhaseFn: () => {},
@@ -300,6 +315,7 @@ function runPhase({
         fixPrompts: () => prompts.filter(isFixPrompt),
         arbiterPrompts: () => prompts.filter(isArbiterPrompt),
         heads: HEADS,
+        applyArgs,
         pushTexts: () => pushEventFn.mock.calls.map((c: unknown[]) => c[0] as string),
         merged: () =>
             pushEventFn.mock.calls.some((c: unknown[]) => /смерджена в main/.test(c[0] as string)),
@@ -614,6 +630,77 @@ describe('крит. 2: поток новых minor/nit не продлевает
         expect(s.logs.join('\n')).toMatch(/DRY: карточка/);
     });
 
+    // #18: бюджет чистки — СВОЁ число, а не потолок вехи. Пока они были одним ключом,
+    // человек, поднявший потолок ради вместимости накопителя, поднимал заодно и размах
+    // мутации: у безразмерной вехи «больше, чем в неё влезает, чистить не за чем»
+    // перестаёт что-либо ограничивать.
+    it('бюджет чистки не следует за потолком вехи: потолок 50, закрыто пять', () => {
+        const s = runPhase({
+            backlogIssues: {
+                'Бэклог 1': [901, 902, 903, 904, 905, 906, 907].map((n) => oldCard(n, 40)),
+            },
+            passes: [{ findings: [nit('пробел', 1)] }],
+            config: cfg({
+                review: {
+                    ...cfg().review,
+                    backlogMilestone: ['Бэклог 1', 'Бэклог 2'],
+                    backlogMilestoneCap: 50,
+                    backlogStaleDays: 30,
+                },
+            }),
+            now: NOW,
+        });
+
+        expect(s.closedIssues).toEqual([901, 902, 903, 904, 905]);
+    });
+
+    it('бюджет чистки задаётся явно и режет число закрытий за прогон', () => {
+        const s = runPhase({
+            backlogIssues: {
+                'Бэклог 1': [901, 902, 903, 904, 905].map((n) => oldCard(n, 40)),
+            },
+            passes: [{ findings: [nit('пробел', 1)] }],
+            config: cfg({
+                review: {
+                    ...cfg().review,
+                    backlogMilestone: ['Бэклог 1', 'Бэклог 2'],
+                    backlogStaleDays: 30,
+                    backlogStaleBudget: 2,
+                },
+            }),
+            now: NOW,
+        });
+
+        expect(s.closedIssues).toEqual([901, 902]);
+    });
+
+    // Бюджет объявлен «за ПРОГОН», а расходуется в чистке, которую зовут ПО ВЕХЕ.
+    // Разница видна только на двух вехах: если бы бюджет был повеховым (или не убывал
+    // вовсе), во второй закрылись бы все три, и «3» в конфиге перестало бы быть тройкой.
+    it('бюджет чистки — на прогон, а не на веху: две вехи, закрыто три ВСЕГО', () => {
+        const s = runPhase({
+            backlogIssues: {
+                // Потолок 2: после чистки одной протухшей тут остаётся две свежих, веха
+                // по-прежнему полна — и поиск адреса идёт дальше, ко второй.
+                'Бэклог 1': [oldCard(901, 40), oldCard(902, 1), oldCard(903, 1)],
+                'Бэклог 2': [oldCard(911, 40), oldCard(912, 40), oldCard(913, 40)],
+            },
+            passes: [{ findings: [nit('пробел', 1)] }],
+            config: cfg({
+                review: {
+                    ...cfg().review,
+                    backlogMilestone: ['Бэклог 1', 'Бэклог 2'],
+                    backlogMilestoneCap: 2,
+                    backlogStaleDays: 30,
+                    backlogStaleBudget: 3,
+                },
+            }),
+            now: NOW,
+        });
+
+        expect(s.closedIssues).toEqual([901, 911, 912]);
+    });
+
     it('чистка освобождает место: веха у потолка снова годится под адрес', () => {
         // Ровно ради этого срок годности и заводился: пять протухших карточек иначе
         // закрывали бы веху навсегда, и новая косметика ехала бы мимо неё.
@@ -675,7 +762,19 @@ describe('крит. 2: поток новых minor/nit не продлевает
 
         expect(s.issues).toHaveLength(1);
         expect(s.issues[0].milestone).toBeUndefined();
-        expect(s.logs.join('\n')).toMatch(/Накопительной вехи.*не нашлось/s);
+        expect(s.logs.join('\n')).toMatch(/Накопительной вехи для карточек ревью правок/);
+    });
+
+    // #16: веху ТЕКУЩЕЙ фазы применению намерений называет петля — на этом держится
+    // запрет «карточка не едет в фазу, которую сейчас сдают». Проводку легко выкинуть,
+    // не покраснев: все прочие тесты адреса зовут применение напрямую и подают её руками.
+    it('петля называет применению веху сдаваемой фазы на каждом шаге цикла сдачи', () => {
+        const s = runPhase({ passes: [{ findings: [nit('пробел', 1)] }] });
+
+        expect(s.applyArgs.length).toBeGreaterThan(0);
+        for (const args of s.applyArgs) {
+            expect(args.currentMilestone).toBe('M1');
+        }
     });
 
     it('ключ не задан — прежнее поведение: карточка без вехи и без единого предупреждения', () => {
@@ -748,6 +847,121 @@ describe('крит. 2: поток новых minor/nit не продлевает
         // не исчерпан (повтор его не двигает), арбитра звать не за чем.
         expect(s.arbiterPrompts()).toHaveLength(0);
         expect(s.ladder().passes).toBe(1);
+    });
+});
+
+// #110: порог серьёзности карточек лестницы. Накопитель растёт быстрее, чем разбирается
+// (замер 01.09.2026: 29 карточек за два дня, разобрано ноль, больше половины — minor/nit),
+// и этот порог режет заведение карточки на самую мелкую косметику. Отброшенная находка не
+// исчезает бесследно — она остаётся комментарием ревью на PR (промпт, не этот код) и учтена
+// в счёте прохода (журнал); порог не двигает ни решение о мердже, ни анти-пинг-понг.
+describe('#110: порог серьёзности режет заведение карточки, не решение о мердже', () => {
+    it('порог не задан → прежнее поведение: карточка заводится и на nit', () => {
+        const s = runPhase({ passes: [{ findings: [nit('пробел', 1)] }] });
+
+        expect(s.merged()).toBe(true);
+        expect(s.issues).toHaveLength(1);
+        expect(s.issues[0].title).toContain('пробел');
+    });
+
+    it('порог "minor": nit карточки не даёт, minor — даёт', () => {
+        const s = runPhase({
+            passes: [{ findings: [nit('пробел', 1), minor('нейминг', 2)] }],
+            config: cfg({
+                review: { ...cfg().review, backlogSeverityFloor: 'minor' },
+            }),
+        });
+
+        expect(s.merged()).toBe(true);
+        expect(s.issues).toHaveLength(1);
+        expect(s.issues[0].title).toContain('нейминг');
+        expect(s.issues.some((i) => i.title.includes('пробел'))).toBe(false);
+    });
+
+    it('отброшенная находка остаётся в счётчиках журнала прохода — она не потеряна, а не заведена карточкой', () => {
+        const s = runPhase({
+            passes: [{ findings: [nit('пробел', 1)] }],
+            config: cfg({
+                review: { ...cfg().review, backlogSeverityFloor: 'minor' },
+            }),
+        });
+
+        expect(s.issues).toHaveLength(0);
+        expect(s.journal).toHaveLength(1);
+        expect(s.journal[0].counts).toMatchObject({ nit: 1, total: 1 });
+    });
+
+    it('порог не влияет на решение о мердже: major по-прежнему держит его и требует круг правок', () => {
+        const s = runPhase({
+            // Порог задан на самом строгом уровне ('blocker') — major его формально не
+            // проходит (meetsSeverityFloor('major', 'blocker') === false). Если бы порог
+            // участвовал в decideAfterFixReview, major перестал бы держать мердж, и фаза
+            // мёржилась бы ОДНИМ проходом ревью правок вместо круга «ревью → правки → ревью».
+            passes: [{ findings: [major('убита ветка отказа', 1)] }, { findings: [] }],
+            config: cfg({
+                review: { ...cfg().review, backlogSeverityFloor: 'blocker' },
+            }),
+        });
+
+        // Потолок двинулся (классификация видит major как blocking независимо от порога),
+        // И потребовался ещё один проход ревью правок — то есть decideAfterFixReview
+        // реально вернул 'fix', а не 'merge' на первом же проходе.
+        expect(s.ladder().passes).toBe(1);
+        expect(s.fixReviewPrompts()).toHaveLength(2);
+        expect(s.merged()).toBe(true);
+    });
+
+    it('спорная карточка (анти-пинг-понг) порогом не режется, даже если находка мельче порога', () => {
+        // Дублируем ДВЕ находки в одном месте на трёх проходах: blocker держит лестницу
+        // живой (без него после первого же ответа «merge» и спорить не о чем), nit — сама
+        // проверяемая находка, СТРОЖЕ порога 'minor' (карточку косметики такая находка бы
+        // не получила). Обе оспорены дважды и обе становятся карточками спора — порог на
+        // путь анти-пинг-понга не распространяется вовсе.
+        const sameBlocker = () => blocker('спорное место', 1);
+        const sameNit = () => nit('спорный пробел', 2);
+        const s = runPhase({
+            passes: [
+                { findings: [sameBlocker(), sameNit()] },
+                { findings: [sameBlocker(), sameNit()] },
+                { findings: [sameBlocker(), sameNit()] },
+            ],
+            config: cfg({
+                review: { ...cfg().review, backlogSeverityFloor: 'minor' },
+            }),
+        });
+
+        expect(s.merged()).toBe(true);
+        const blockerDispute = s.issues.find((i) => i.title.includes('спорное место'));
+        const nitDispute = s.issues.find((i) => i.title.includes('спорный пробел'));
+        expect(blockerDispute?.title).toMatch(/^Спор ревью и правок/);
+        // Ключевая проверка #110: nit СТРОЖЕ порога 'minor' (карточку косметики не получил
+        // бы), но карточку спора всё равно получил — порог на pingPong не смотрит.
+        expect(nitDispute?.title).toMatch(/^Спор ревью и правок/);
+        expect(nitDispute?.body).toContain('Позиция ревью');
+        expect(nitDispute?.body).toContain('Позиция правок');
+    });
+
+    it('порог фильтрует и косметику независимого арбитра, не только основной лестницы', () => {
+        const threeFreshMajors = [
+            { findings: [major('раз', 1)] },
+            { findings: [major('два', 2)] },
+            { findings: [major('три', 3)] },
+        ];
+        const s = runPhase({
+            passes: threeFreshMajors,
+            // Арбитр не воспроизвёл блокер (пустой findings для решения по существу), но
+            // сам оставил косметику двух уровней — ей и проверяем фильтр на ветке арбитра
+            // (`[...pendingCosmetic, ...arbBlocking.cosmetic]`, orchestrator.ts), которая
+            // отделена от основной лестницы и своего теста без этого не имела.
+            arbiter: { findings: [minor('нейминг арбитра', 4), nit('пробел арбитра', 5)] },
+            config: cfg({
+                review: { ...cfg().review, backlogSeverityFloor: 'minor' },
+            }),
+        });
+
+        expect(s.merged()).toBe(true);
+        expect(s.issues.some((i) => i.title.includes('нейминг арбитра'))).toBe(true);
+        expect(s.issues.some((i) => i.title.includes('пробел арбитра'))).toBe(false);
     });
 });
 
@@ -888,9 +1102,8 @@ describe('#115-ревью: спорная карточка сохраняет р
         { findings: [major('второй', 20)] },
         { findings: [major('третий', 30)] },
     ];
-    // Конфиг, где модели меток РАНЖИРУЕМЫ: кодерские модели роутинга перечислены в
-    // `review.modelStrength`, и ядру есть по чему выбрать сильнейшую. Ядро такого
-    // совпадения НЕ требует — что происходит без него, проверяют два сценария ниже.
+    // Конфиг, где модели меток РАНЖИРУЕМЫ: без порядка силы ядру нечем выбрать сильнейшую,
+    // и оно честно оставляет набор как есть (проверено соседним сценарием).
     const ranked = cfg({
         modelRouting: {
             default: 'claude-coder',

@@ -84,15 +84,21 @@ describe('блокер не устраняется → три ревью под�
         expect(s.state.blockedHeals).toBe(3);
 
         // Пока ещё ни одного стоп-пуша: три ревью только-только набрали лимит.
-        expect(s.pushTexts().some((t) => /устоял/.test(t))).toBe(false);
+        // Маркер стопа — «оставлен человеку»: заголовок «label blocked устоял после N»
+        // снят по ревью #289 как дословный пересказ диагноза.
+        expect(s.pushTexts().some((t) => /оставлен человеку/.test(t))).toBe(false);
 
         s.pass('blocked'); // следующий проход видит bDone>=bMax → стоп
-        const stop = s.pushTexts().filter((t) => /устоял/.test(t));
+        const stop = s.pushTexts().filter((t) => /оставлен человеку/.test(t));
         expect(stop).toHaveLength(1);
         // Крит. 2 (#218): текст называет число ревью, PR и версию про зацикливание.
         expect(stop[0]).toContain('#777');
-        expect(stop[0]).toMatch(/3 повторных ревью/);
-        expect(stop[0]).toMatch(/оставлен человеку/);
+        expect(stop[0]).toMatch(/диагноз: 3 повторных ревью подряд оставили label blocked/);
+        // #289: стоп несёт закрытую причину «review-dispute» + диагноз + вопрос человеку,
+        // а не только маркер «устоял/оставлен человеку».
+        expect(stop[0]).toContain('review-dispute');
+        expect(stop[0]).toContain('диагноз:');
+        expect(stop[0]).toContain('вопрос человеку:');
         // Счётчик сброшен (фаза ушла человеку), мерджа не было.
         expect(s.state.blockedHeals).toBe(0);
         expect(s.pushTexts().some((t) => /смерджена в main/.test(t))).toBe(false);
@@ -142,7 +148,7 @@ describe('перезапуск раннера посреди разбора → 
 
         // «Лимит по-прежнему близок»: ещё один блок-проход уже упирается в стоп человеку.
         s.pass('blocked');
-        expect(s.pushTexts().some((t) => /устоял/.test(t))).toBe(true);
+        expect(s.pushTexts().some((t) => /оставлен человеку/.test(t))).toBe(true);
     });
 });
 

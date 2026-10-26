@@ -49,6 +49,13 @@ export type RalphState = {
     // (normalizeReviewOfFixes), а не вера в тип.
     reviewOfFixes: unknown;
     deployBlock: unknown;
+    // #269-ревью: номер прогона форжа, по логу которого чини-сессия УЖЕ отработала.
+    // Форж отдаёт ПОСЛЕДНИЙ прогон workflow, а не прогон конкретного sha, и какое-то
+    // время после пуша правок повторяет вердикт предыдущего. Гейт сверяется с этим
+    // номером и ждёт НОВЫЙ прогон вместо того, чтобы потратить последнюю попытку лечения
+    // на уже починенный лог. Переживает рестарт по той же причине, что gateHeals: бюджет
+    // лечения тоже переживает. `null` — лечения по чеку форжа в этой фазе не было.
+    forgeHealedRunId: string | null;
 };
 
 type KillFn = (pid: number, signal?: number | string) => void;
@@ -125,6 +132,8 @@ export function createStateLock(env: StateLockEnv) {
             // advancePhase его НЕ обнуляет: блок ставится уже ПОСЛЕ advancePhase и обязан
             // пережить и переход фазы, и рестарт.
             deployBlock: null,
+            // #269-ревью: прогона, по которому уже лечили, ещё нет.
+            forgeHealedRunId: null,
         };
     }
 

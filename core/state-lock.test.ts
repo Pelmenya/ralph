@@ -56,6 +56,7 @@ describe('defaultState — канонический полный state из пе
             reReviewPending: false,
             reviewOfFixes: null,
             deployBlock: null,
+            forgeHealedRunId: null,
         });
     });
 

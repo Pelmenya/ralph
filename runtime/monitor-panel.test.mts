@@ -237,7 +237,7 @@ describe('shouldPushDeadman — эпизод тишины по ключу lastMt
 });
 
 describe('deadmanPushMessage — текст пуша', () => {
-    it('содержит фазу, длительность/порог/режим тишины и явное «цикл продолжается»', () => {
+    it('содержит фазу, длительность/порог/режим тишины и явное «цикл сам себя не остановил»', () => {
         const msg = deadmanPushMessage(
             { silenceMs: 11 * 60000, thresholdMs: 10 * 60000, activity: 'gate' },
             'Наблюдаемость ralph · Фаза 1',
@@ -245,7 +245,22 @@ describe('deadmanPushMessage — текст пуша', () => {
         expect(msg).toContain('Наблюдаемость ralph · Фаза 1');
         expect(msg).toContain('DEADMAN');
         expect(msg).toContain('режим gate');
-        expect(msg).toMatch(/цикл продолжается/i);
+        // Ревью #289: прежний хвост «Цикл продолжается без остановки» снят как дословный
+        // повтор вопроса человеку — тот же смысл остался в структурной половине строки.
+        expect(msg).toMatch(/цикл сам себя не остановил/i);
+    });
+
+    // #289: та же структура (причина/диагноз/вопрос), что у стопа «PR оставлен человеку» —
+    // ночная вахта не должна держать в голове два разных формата сообщений.
+    it('несёт причину "deadman", диагноз (фаза/тишина/порог) и вопрос человеку', () => {
+        const msg = deadmanPushMessage(
+            { silenceMs: 11 * 60000, thresholdMs: 10 * 60000, activity: 'gate' },
+            'Наблюдаемость ralph · Фаза 1',
+        );
+        expect(msg).toContain('deadman');
+        expect(msg).toContain('диагноз:');
+        expect(msg).toContain('вопрос человеку:');
+        expect(msg).toMatch(/жив ли процесс раннера/);
     });
 });
 

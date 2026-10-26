@@ -112,7 +112,7 @@ type DeadmanThresholds = {
 export const DEFAULT_DEADMAN: DeadmanThresholds = {
     iterationGraceMs: 10 * 60 * 1000, // запас поверх claudeTimeoutMs для кодер-сессии
     gateSilenceMs: 10 * 60 * 1000, // тишина внутри гейта (самый долгий чек + запас)
-    defaultSilenceMs: 5 * 60 * 1000, // короткий дефолт для git/gh-шагов
+    defaultSilenceMs: 5 * 60 * 1000, // короткий дефолт для шагов git и форжа
 };
 
 export const DEFAULT_CLAUDE_TIMEOUT_MS = 2 * 60 * 60 * 1000; // как в runClaudeOnce (ralph.js)

@@ -124,6 +124,26 @@ describe('gateChecksFor — состав шагов по профилю (#80), �
         const { gateChecksFor } = createGateRunner(makeEnv({ getConfig: () => cfg }));
         expect(gateChecksFor('prod').map(([n]) => n)).toContain('test');
     });
+
+    // #60: fail-fast порядок «дешёвый → дорогой» — ответственность автора конфига (см.
+    // докблок над gateChecksFor в gate.ts), а не решение ядра о том, ЧТО именно дёшево.
+    // Ядро обязано только сохранять порядок объявления, не пересортировывать его. Синтетика
+    // здесь названа иначе, чем в любом реальном проекте, — так тест доказывает инвариант
+    // «порядок» отдельно от инварианта «состав», который проверяют соседние тесты.
+    it('порядок — как в конфиге: селектор не пересортировывает шаги', () => {
+        const { gateChecksFor } = createGateRunner(makeEnv());
+        // База — ровно в порядке объявления SYNTH_GATE.gate.checks.
+        expect(gateChecksFor().map(([n]) => n)).toEqual(['build', 'lint', 'test']);
+        // prod — снятая база (в своём порядке) + prodChecks (в своём порядке), не слияние
+        // по алфавиту и не по длине команды.
+        expect(gateChecksFor('prod').map(([n]) => n)).toEqual([
+            'build',
+            'lint',
+            'security',
+            'coverage',
+            'e2e',
+        ]);
+    });
 });
 
 describe('resolveGateChecks — fail-closed на битой схеме gate (#204)', () => {
@@ -293,6 +313,49 @@ describe('checksGreen — прогон шагов на голове PR (#77)', (
         expect(ok).toBe(true);
         expect(argv).toContainEqual(['git', ['update-ref', 'refs/heads/feature/x', SHA]]);
         expect(park).not.toHaveBeenCalled();
+    });
+
+    // #134: раньше «дерево детач» подразумевалось, и update-ref по выбранной ветке был
+    // безопасен. С проводкой на ветку (#134) дерево на ней стоит, а update-ref двигает ref
+    // молча: в дереве сразу появляется фантомное удаление файлов головы PR (проверено
+    // опытом), чеки идут по неполному дереву, а commitLeftovers следующей итерации это
+    // удаление коммитит. Отсюда порядок: детач ПЕРЕД переводом ref.
+    it('#134 отказ перевода ref → парковка и отказ мерджа, а не исключение наружу', () => {
+        const park = vi.fn();
+        const g = createGateRunner(makeEnv({ parkOnOriginMain: park }));
+        const syncDeps = vi.fn();
+        const ok = g.checksGreen('feature/x', 7, {
+            shFn: (cmd: string) => (cmd.includes('rev-parse') ? OTHER_SHA : ''),
+            runArgvFn: (_file: string, args: string[]) => {
+                if (args[0] === 'update-ref') throw new Error('ref lock');
+                return '';
+            },
+            prHeadShaFn: () => SHA,
+            syncDepsFn: syncDeps,
+            checks: [['lint', 'npm run lint']],
+        });
+        expect(ok).toBe(false);
+        expect(syncDeps).not.toHaveBeenCalled();
+        expect(park).toHaveBeenCalledTimes(1);
+    });
+
+    it('#134 ff-подтяжка снимает дерево с ветки ДО перевода ref', () => {
+        const g = createGateRunner(makeEnv({ parkOnOriginMain: vi.fn() }));
+        const argv: Array<[string, string[]]> = [];
+        g.checksGreen('feature/x', 7, {
+            shFn: (cmd: string) => (cmd.includes('rev-parse') ? OTHER_SHA : ''),
+            runArgvFn: (file: string, args: string[]) => {
+                argv.push([file, args]);
+                return '';
+            },
+            prHeadShaFn: () => SHA,
+            syncDepsFn: () => {},
+            checks: [['lint', 'npm run lint']],
+        });
+        const detach = argv.findIndex(([, a]) => a[0] === 'checkout' && a.includes('--detach'));
+        const update = argv.findIndex(([, a]) => a[0] === 'update-ref');
+        expect(detach).toBeGreaterThan(-1);
+        expect(update).toBeGreaterThan(detach);
     });
 
     it('шов отдал не-sha → fail-closed', () => {
@@ -723,3 +786,394 @@ function tryMergeWith(
         ...over,
     });
 }
+
+// ── #269: чек PR на стороне площадки, перед мерджем ─────────────────────────────
+//
+// Предмет — ПОРЯДОК и ИСХОДЫ шага, а не разбор ответа: сам вердикт приходит уже свёрнутым
+// швом, ожидание — чистая функция `core/forge-checks.ts` со своим набором.
+describe('tryMergePhase — чек PR у площадки (#269)', () => {
+    const phase = { branch: 'feature/m1', milestone: 'M1' };
+    const GREEN = { state: 'success' as const, runs: [] };
+    const RED_RUN = {
+        workflow: 'gate',
+        runId: '356',
+        state: 'failed' as const,
+        rawStatus: 'failed',
+    };
+    const RED = { state: 'failed' as const, runs: [RED_RUN] };
+
+    // Шаг спрашивает шов и пропускает мердж только на зелёном/отсутствующем чеке.
+    //
+    // Часы ТИКАЮТ (полминуты на обращение), а сон — заглушка: ожидание в тесте не должно
+    // идти реальные минуты, но и стоять на месте ему нельзя — на замерших часах цикл
+    // ожидания не дошёл бы ни до льготы, ни до потолка и крутился бы вечно.
+    function forgeMerge(
+        g: ReturnType<typeof createGateRunner>,
+        over: Record<string, unknown> = {},
+    ) {
+        let clock = 0;
+        return tryMergeWith(g, phase, {
+            findOpenPrFn: () => ({ number: 9, labels: [] }),
+            checksGreenFn: () => true,
+            getVerifiedHeadFn: () => SHA,
+            nowFn: () => (clock += 30_000),
+            ...over,
+        });
+    }
+
+    it('чек зелёный — мерджим, и голову спрашиваем ПОСЛЕ локальных чеков, а не вместо них', () => {
+        const merge = vi.fn();
+        const forgeChecksFn = vi.fn(() => GREEN);
+        const g = createGateRunner(makeEnv());
+        const res = forgeMerge(g, { forgeChecksFn, mergePrFn: merge });
+
+        expect(res).toBe('merged');
+        expect(forgeChecksFn).toHaveBeenCalledWith(9);
+        expect(merge).toHaveBeenCalledTimes(1);
+    });
+
+    it('шва нет — прежнее поведение: мердж без ожидания', () => {
+        const merge = vi.fn();
+        const g = createGateRunner(makeEnv());
+        const res = tryMergeWith(g, phase, {
+            findOpenPrFn: () => ({ number: 9, labels: [] }),
+            checksGreenFn: () => true,
+            getVerifiedHeadFn: () => SHA,
+            mergePrFn: merge,
+        });
+
+        expect(res).toBe('merged');
+        expect(merge).toHaveBeenCalledTimes(1);
+    });
+
+    it('чек красный, лог про код → forge-red, мердж НЕ зовём, диагноз доступен циклу', () => {
+        const merge = vi.fn();
+        const g = createGateRunner(makeEnv());
+        const res = forgeMerge(g, {
+            mergePrFn: merge,
+            forgeChecksFn: () => RED,
+            forgeDiagnosisFn: () => ({
+                workflow: 'gate',
+                runId: '356',
+                cube: 'test',
+                log: ' Tests  2 failed | 7172 passed (7174)',
+            }),
+        });
+
+        expect(res).toBe('forge-red');
+        expect(merge).not.toHaveBeenCalled();
+        expect(g.getLastForgeRedCheck()).toMatchObject({
+            cube: 'test',
+            runId: '356',
+            kind: 'code',
+        });
+    });
+
+    it('чек красный по отказу СРЕДЫ → forge-env: лечить кодом нечего', () => {
+        const merge = vi.fn();
+        const g = createGateRunner(makeEnv());
+        const res = forgeMerge(g, {
+            mergePrFn: merge,
+            forgeChecksFn: () => RED,
+            forgeDiagnosisFn: () => ({
+                workflow: 'gate',
+                runId: '350',
+                cube: 'test',
+                log: 'Caused by: Error: Worker exited unexpectedly\n Test Files  430 passed (432)',
+            }),
+        });
+
+        expect(res).toBe('forge-env');
+        expect(merge).not.toHaveBeenCalled();
+        expect(g.getLastForgeRedCheck()?.kind).toBe('oom');
+    });
+
+    it('красный прогон без названного куба — стоп человеку, а не лечение вслепую', () => {
+        const merge = vi.fn();
+        const g = createGateRunner(makeEnv());
+        const res = forgeMerge(g, {
+            mergePrFn: merge,
+            forgeChecksFn: () => RED,
+            forgeDiagnosisFn: () => null,
+        });
+
+        // #269-ревью: отдельный статус, а не 'not-merged'. Разница не косметическая —
+        // цикл обязан отдать такой стоп ПУШЕМ: ночью «фаза не сдалась» иначе выясняется
+        // утром, а deadman не сработает (процесс завершился штатно).
+        expect(res).toBe('forge-unknown');
+        expect(merge).not.toHaveBeenCalled();
+        expect(g.getLastForgeRedCheck()).toBeNull();
+        expect(g.getLastForgeStop()).toContain('упавший куб не назван');
+    });
+
+    it('чтение диагноза бросило — тот же стоп, петля не падает', () => {
+        const g = createGateRunner(makeEnv());
+        const res = forgeMerge(g, {
+            forgeChecksFn: () => RED,
+            forgeDiagnosisFn: () => {
+                throw new Error('площадка не ответила');
+            },
+        });
+
+        expect(res).toBe('forge-unknown');
+    });
+
+    it('потолок ожидания — стоп с причиной, а не мердж вслепую', () => {
+        const merge = vi.fn();
+        const g = createGateRunner(makeEnv());
+        const logs: string[] = [];
+        const res = forgeMerge(g, {
+            logFn: (m: string) => logs.push(m),
+            mergePrFn: merge,
+            // Вечно ждущий чек: в жизни это очередь воркера при `max_slots: 1` либо
+            // статус, требующий человека (`awaiting_approval`).
+            forgeChecksFn: () => ({
+                state: 'pending',
+                runs: [{ ...RED_RUN, state: 'pending', rawStatus: 'processing' }],
+            }),
+        });
+
+        expect(res).toBe('forge-unknown');
+        expect(merge).not.toHaveBeenCalled();
+        // Сырой статус площадки обязан доехать до лога: «всё processing» и «всё
+        // awaiting_approval» чинятся разным.
+        expect(logs.join('\n')).toContain('processing');
+        // ...и до причины стопа, которую цикл кладёт в пуш человеку (#269-ревью).
+        expect(g.getLastForgeStop()).toContain('processing');
+    });
+
+    it('чеков у PR нет вовсе — мердж идёт, площадке нечего отвергать', () => {
+        const merge = vi.fn();
+        const g = createGateRunner(makeEnv());
+        const res = forgeMerge(g, {
+            mergePrFn: merge,
+            forgeChecksFn: () => ({ state: 'none', runs: [] }),
+        });
+
+        expect(res).toBe('merged');
+        expect(merge).toHaveBeenCalledTimes(1);
+    });
+
+    it('красный чек прошлого раунда не переезжает в следующий', () => {
+        const g = createGateRunner(makeEnv());
+        forgeMerge(g, {
+            forgeChecksFn: () => RED,
+            forgeDiagnosisFn: () => ({
+                workflow: 'gate',
+                runId: '356',
+                cube: 'test',
+                log: 'FAIL x',
+            }),
+        });
+        expect(g.getLastForgeRedCheck()).not.toBeNull();
+
+        forgeMerge(g, { forgeChecksFn: () => GREEN });
+        expect(g.getLastForgeRedCheck()).toBeNull();
+    });
+
+    // Ожидание идёт СВОИМИ коллабораторами гейта. Без этого ассерта подмена `sleepFn`
+    // на заглушку внутри `tryMergePhase` оставила бы набор зелёным, а в бою дала бы
+    // двадцать минут busy-poll'а API площадки вместо опроса раз в полминуты (находка ревью).
+    it('ожидание спит и пишет в лог ТЕМИ ЖЕ коллабораторами, что и весь гейт', () => {
+        const sleepFn = vi.fn();
+        const logs: string[] = [];
+        const g = createGateRunner(makeEnv());
+        let asked = 0;
+        forgeMerge(g, {
+            sleepFn,
+            logFn: (m: string) => logs.push(m),
+            forgeChecksFn: () =>
+                ++asked < 3
+                    ? {
+                          state: 'pending',
+                          runs: [{ ...RED_RUN, state: 'pending', rawStatus: 'processing' }],
+                      }
+                    : GREEN,
+        });
+
+        expect(sleepFn).toHaveBeenCalledTimes(2);
+        expect(logs.filter((m) => m.includes('Чек площадки ждёт'))).toHaveLength(2);
+    });
+
+    // Парковка — часть восстановления: без неё дерево раннера остаётся на detach'е головы
+    // PR, и следующий шаг цикла начинает не с того места. Соседние #53-тесты ассертят её
+    // по той же причине (находка ревью).
+    it.each([
+        [
+            'forge-red',
+            {
+                forgeChecksFn: () => RED,
+                forgeDiagnosisFn: () => ({
+                    workflow: 'gate',
+                    runId: '356',
+                    cube: 'test',
+                    log: 'Tests  2 failed | 1 passed (3)',
+                }),
+            },
+        ],
+        [
+            'forge-env',
+            {
+                forgeChecksFn: () => RED,
+                forgeDiagnosisFn: () => ({
+                    workflow: 'gate',
+                    runId: '350',
+                    cube: 'test',
+                    log: 'Worker exited unexpectedly\n Test Files  430 passed (432)',
+                }),
+            },
+        ],
+        ['таймаут', { forgeChecksFn: () => ({ state: 'pending', runs: [] }) }],
+        ['красный без куба', { forgeChecksFn: () => RED, forgeDiagnosisFn: () => null }],
+    ])('стоп по чеку площадки (%s) паркует дерево раннера', (_name, over) => {
+        const park = vi.fn();
+        const g = createGateRunner(makeEnv());
+        forgeMerge(g, { parkFn: park, ...over });
+
+        expect(park).toHaveBeenCalled();
+    });
+
+    it('прогон ПРЕРВАН (canceled) → forge-env: отменённый прогон код не ломал', () => {
+        const g = createGateRunner(makeEnv());
+        const res = forgeMerge(g, {
+            forgeChecksFn: () => ({
+                state: 'failed',
+                runs: [{ ...RED_RUN, rawStatus: 'canceled' }],
+            }),
+            // Лог обрывка выглядит как обычный отказ — отличает только сырой статус.
+            forgeDiagnosisFn: () => ({
+                workflow: 'gate',
+                runId: '356',
+                cube: 'install',
+                log: 'FAIL что-то оборвалось',
+            }),
+        });
+
+        expect(res).toBe('forge-env');
+        expect(g.getLastForgeRedCheck()?.kind).toBe('aborted');
+    });
+
+    it('чек у площадки не спрашивается вовсе, если локальные чеки красные', () => {
+        const forgeChecksFn = vi.fn(() => GREEN);
+        const g = createGateRunner(makeEnv());
+        const res = tryMergeWith(g, phase, {
+            findOpenPrFn: () => ({ number: 9, labels: [] }),
+            checksGreenFn: () => false,
+            getLastRedCheckFn: () => ({ name: 'lint', cmd: 'npm run lint', excerpt: 'бух' }),
+            forgeChecksFn,
+        });
+
+        expect(res).toBe('red-checks');
+        expect(forgeChecksFn).not.toHaveBeenCalled();
+    });
+
+    // #278: свежесть вердикта форжа — гейт передаёт время коммита проверенной головы
+    // в `waitForForgeChecksFn` как нижнюю границу (`sinceMs`). Сам разбор «прогон
+    // старше/новее» — предмет `core/forge-checks.test.ts`; здесь проверяется только
+    // ПРОВОДКА: гейт узнаёт время локально (по sha, а не второй раз у форжа) и не
+    // падает, если узнать его не вышло.
+    describe('свежесть вердикта форжа: время коммита проводится в sinceMs (#278)', () => {
+        it('время коммита головы уходит в waitForForgeChecksFn как sinceMs', () => {
+            const waitForForgeChecksFn = vi.fn(() => ({ kind: 'green' as const }));
+            const headCommittedAtFn = vi.fn(() => 1_726_000_000_000);
+            const g = createGateRunner(makeEnv());
+
+            const res = forgeMerge(g, {
+                forgeChecksFn: () => GREEN,
+                waitForForgeChecksFn,
+                headCommittedAtFn,
+            });
+
+            expect(res).toBe('merged');
+            expect(headCommittedAtFn).toHaveBeenCalledWith(SHA);
+            expect(waitForForgeChecksFn).toHaveBeenCalledWith(
+                expect.objectContaining({ sinceMs: 1_726_000_000_000 }),
+            );
+        });
+
+        it('время коммита узнать не вышло — гейт не падает, просто не проверяет свежесть', () => {
+            const waitForForgeChecksFn = vi.fn((_deps: unknown) => ({ kind: 'green' as const }));
+            const headCommittedAtFn = vi.fn(() => {
+                throw new Error('git log упал');
+            });
+            const logs: string[] = [];
+            const g = createGateRunner(makeEnv());
+
+            const res = forgeMerge(g, {
+                forgeChecksFn: () => GREEN,
+                waitForForgeChecksFn,
+                headCommittedAtFn,
+                logFn: (m: string) => logs.push(m),
+            });
+
+            expect(res).toBe('merged');
+            const [call] = waitForForgeChecksFn.mock.calls;
+            expect(call?.[0]).not.toHaveProperty('sinceMs');
+            expect(logs.some((l) => l.includes('время коммита'))).toBe(true);
+        });
+
+        it('форж-шаг пропущен (нет forgeChecksFn) — время коммита никто не спрашивает', () => {
+            const headCommittedAtFn = vi.fn(() => 1_726_000_000_000);
+            const g = createGateRunner(makeEnv());
+
+            const res = tryMergeWith(g, phase, {
+                findOpenPrFn: () => ({ number: 9, labels: [] }),
+                checksGreenFn: () => true,
+                getVerifiedHeadFn: () => SHA,
+                headCommittedAtFn,
+            });
+
+            expect(res).toBe('merged');
+            expect(headCommittedAtFn).not.toHaveBeenCalled();
+        });
+    });
+});
+
+// Само ТЕЛО `headCommittedAt` (правка по ревью #278): тесты выше подменяют
+// `headCommittedAtFn` и проверяют только проводку, а `git log -1 --format=%cI` + `Date.parse`
+// не исполнялись ни разу — при том что именно они решают, будет ли `sinceMs` вообще.
+describe('headCommittedAt — время коммита проверенной головы (#278)', () => {
+    const SHA40 = 'a'.repeat(40);
+
+    it('ISO-дата от git превращается в epoch ms', () => {
+        const g = createGateRunner(makeEnv());
+        const shFn = vi.fn(() => '2026-09-06T12:00:00+03:00\n');
+
+        const ms = g.headCommittedAt(SHA40, shFn, (v: unknown) => `'${String(v)}'`);
+
+        expect(ms).toBe(Date.parse('2026-09-06T12:00:00+03:00'));
+        // Sha уходит в шелл только через квотирование (инвариант C3), а не голой строкой.
+        expect(shFn).toHaveBeenCalledWith(`git log -1 --format=%cI '${SHA40}'`);
+    });
+
+    it('мусор вместо даты — бросок, а не «эпоха» тихо', () => {
+        // `Date.parse('не дата')` даёт NaN, а NaN как `sinceMs` объявил бы устаревшим
+        // ЛЮБОЙ прогон: сравнение с NaN всегда ложно, и это молчаливый отказ, не отказ.
+        const g = createGateRunner(makeEnv());
+
+        expect(() =>
+            g.headCommittedAt(
+                SHA40,
+                () => 'не дата',
+                (v: unknown) => `'${String(v)}'`,
+            ),
+        ).toThrow(/валидную дату коммита/);
+    });
+
+    it('git упал — исключение доходит до вызывающего (там оно fail-open)', () => {
+        // Ронять весь мердж-путь из-за нечитаемой даты нельзя, но и глотать её ЗДЕСЬ тоже:
+        // решение «свежесть в этом круге не проверяем» принимает `tryMergePhase` и пишет
+        // об этом строку в лог — сьют выше это и проверяет.
+        const g = createGateRunner(makeEnv());
+
+        expect(() =>
+            g.headCommittedAt(
+                SHA40,
+                () => {
+                    throw new Error('fatal: bad object');
+                },
+                (v: unknown) => `'${String(v)}'`,
+            ),
+        ).toThrow(/bad object/);
+    });
+});

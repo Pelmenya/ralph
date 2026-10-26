@@ -20,7 +20,7 @@
 // чистые функции + загрузчик; точки перехвата (checksGreen, installFn) подключает #189.
 //
 // ── Почему .mts (а не .js/.ts), и почему import.meta.dirname (#403) ──
-// Фаза 8 переводит оболочку раннера на TypeScript (правило ralph-typescript.md). Здесь
+// Оболочка раннера переводится на TypeScript. Здесь
 // перевод упирается в модуль-специфику: TS-модуль под нативным type stripping Node
 // исполняется как ESM, где `__dirname` не существует. tsconfig ралфа — `module: nodenext`
 // без `"type":"module"` в package.json, поэтому обычный `.ts` TS компилит в CommonJS-режим,
