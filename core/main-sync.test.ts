@@ -3,6 +3,7 @@
 // доказывает настоящий git — `tests/main-sync-scenarios.test.ts`.
 import { describe, it, expect, vi } from 'vitest';
 import { NETWORK_ATTEMPTS, syncPhaseBranchWithMain } from './main-sync.ts';
+import { ExecTimeoutError } from '../shared/ralph-util.ts';
 
 const HEAD = 'a'.repeat(40);
 const MAIN = 'b'.repeat(40);
@@ -209,6 +210,35 @@ describe('syncPhaseBranchWithMain — ветка фазы против origin/ma
         if (res.kind === 'failed') expect(res.why).toContain('Failed to connect');
         expect(git.calls.filter((a) => a[0] === 'fetch')).toHaveLength(NETWORK_ATTEMPTS);
         expect(pauses).toHaveLength(NETWORK_ATTEMPTS - 1);
+    });
+
+    it('fetch упёрся в срок → failed со словом «срок», без повтора', () => {
+        const git = fakeGit({
+            fetch: () => {
+                throw new ExecTimeoutError('git', ['fetch', 'origin', 'main'], 600_000);
+            },
+        });
+        const pauses: number[] = [];
+        const res = sync(git, pauses);
+        expect(res.kind).toBe('failed');
+        if (res.kind === 'failed') expect(res.why).toMatch(/срок 600 с истёк/);
+        expect(git.calls.filter((a) => a[0] === 'fetch')).toHaveLength(1);
+        expect(pauses).toHaveLength(0);
+    });
+
+    it('срок не повторяется, даже если его текст классификатор счёл бы транзиентом', () => {
+        // От противного: без явной ветки этот отказ ушёл бы в повтор по тексту.
+        const timeout = new ExecTimeoutError('git', ['push'], 600_000);
+        timeout.message += ' (Failed to connect to example.com)';
+        const git = fakeGit({
+            fetch: () => {
+                throw timeout;
+            },
+        });
+        const pauses: number[] = [];
+        expect(sync(git, pauses).kind).toBe('failed');
+        expect(git.calls.filter((a) => a[0] === 'fetch')).toHaveLength(1);
+        expect(pauses).toHaveLength(0);
     });
 
     it('пуш отвергнут non-ff → без повтора: повтор такой отказ не лечит', () => {

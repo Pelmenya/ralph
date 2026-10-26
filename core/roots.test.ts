@@ -475,6 +475,7 @@ describe('переезд состояния в runtimeDir (канон, зада�
             'requests',
             'sessions',
             'state',
+            'stopRequest',
         ]);
     });
 

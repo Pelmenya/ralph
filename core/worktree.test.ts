@@ -8,6 +8,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { WorktreeEnv } from './worktree.ts';
 import { createWorktreeManager } from './worktree.ts';
+import { GIT_NETWORK_TIMEOUT_MS } from '../shared/ralph-util.ts';
 // @ts-expect-error — JS-entry раннера без деклараций типов; блоки в конце файла
 // перенесены из ralph.test.js как есть и ходят через его ре-экспорт (#366).
 import ralph from '../ralph.js';
@@ -375,10 +376,11 @@ describe('ensureRunnerWorktree — выделенный git worktree ранне�
             repoRoot: REPO,
         });
         expect(result).toBe(WT);
-        // Сетевой вызов — с запретом промпта кредов (задача 71): без него git ждёт логина
-        // на tty, и петля молча стоит до дедмана.
+        // Сетевой вызов — с запретом промпта кредов (задача 71) и сроком (задача 30): без
+        // них git ждёт логина на tty или ответа молчащего origin, и петля стоит до дедмана.
         expect(runArgvFn).toHaveBeenCalledWith('git', ['fetch', 'origin', 'main'], {
             env: expect.objectContaining({ GIT_TERMINAL_PROMPT: '0' }),
+            timeoutMs: GIT_NETWORK_TIMEOUT_MS,
         });
         expect(addFn).toHaveBeenCalledWith(WT);
         expect(trustFn).toHaveBeenCalledWith(WT);

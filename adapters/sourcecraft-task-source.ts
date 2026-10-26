@@ -35,6 +35,7 @@ import type {
 // маршрутов (`merge-checks`, `cicd/runs`, `cicd/logs`), свой словарь статусов и свой
 // режим отказа (лог куба fail-open при fail-closed прогоне). Здесь только проводка.
 import { createSourcecraftCiChecks } from './sourcecraft-ci-checks.ts';
+import { SOURCECRAFT_TOKEN_ENV } from './sourcecraft-api.ts';
 
 // Ответ REST API, суженный до того, что нужно адаптеру. `unknown` вместо any — данные
 // приходят из чужого JSON, форма проверяется на месте использования.
@@ -57,6 +58,10 @@ export type SourcecraftTaskSourceDeps = {
     // пустым навсегда — чужие issues перестали бы отсекаться (C3).
     authorAllowlist: () => readonly string[];
     log?: (msg: string) => void;
+    // #56: имя переменной с токеном — то же, что получил транспорт (`createSourcecraftApi`).
+    // Шов называет его ядру как свой секрет, и ядро вырезает значение из вывода упавшей
+    // сессии, лога и пуша.
+    tokenEnv?: string;
 };
 
 type ScLabel = { name?: unknown; slug?: unknown };
@@ -148,7 +153,14 @@ const PAGE_SIZE = 100;
 const MAX_PAGES = 50;
 
 export function createSourcecraftTaskSource(deps: SourcecraftTaskSourceDeps): TaskSourceAdapter {
-    const { api, org, repo, authorAllowlist, log = () => {} } = deps;
+    const {
+        api,
+        org,
+        repo,
+        authorAllowlist,
+        log = () => {},
+        tokenEnv = SOURCECRAFT_TOKEN_ENV,
+    } = deps;
     const base = `/repos/${org}/${repo}`;
     const ciChecks = createSourcecraftCiChecks({ api, org, repo });
 
@@ -344,6 +356,7 @@ export function createSourcecraftTaskSource(deps: SourcecraftTaskSourceDeps): Ta
     };
 
     return {
+        secretEnvNames: () => [tokenEnv],
         // Дешёвый авторизованный запрос: карточка самого репозитория. Отвергнутый токен
         // даёт 401 на любом маршруте, транспорт превращает ненулевой код curl в
         // исключение — а `checkAuth` его не глушит (fail-closed по контракту шва).

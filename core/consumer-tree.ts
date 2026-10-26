@@ -57,7 +57,8 @@
  *
  * TS-модуль без билд-шага: исполняется нативным type stripping Node 24 (erasable-only).
  */
-import { gitNetworkEnv } from '../shared/ralph-util.ts';
+import { gitNetworkOpts } from '../shared/ralph-util.ts';
+import type { ShArgvFn } from '../shared/ralph-util.ts';
 import type { TResolvedRoots } from './roots.ts';
 
 /** Чем кончилось обновление. Решение вызывающего по каждому исходу — только лог. */
@@ -66,7 +67,7 @@ export type TConsumerTreeKind =
 
 export type TConsumerTreeDeps = {
     /** Тот же контракт, что у `shArgv` ядра: argv плюс опции запуска (нам нужен `env`). */
-    runArgvFn: (file: string, args: string[], opts?: { env?: NodeJS.ProcessEnv }) => string;
+    runArgvFn: ShArgvFn;
     logFn: (msg: string) => void;
     /** Окружение вызывающего. Навязывающие репозиторий переменные снимаются здесь же. */
     env?: NodeJS.ProcessEnv;
@@ -159,13 +160,14 @@ export function updateConsumerTree(
     // негде. `undefined` означает «вызывающий окружением не распоряжается» — тогда и мы не.
     const gitEnv = env === undefined ? undefined : { env: stripGitContext(env) };
     const git = (args: string[]): string => runArgvFn('git', gitIn(consumerRoot, args), gitEnv);
-    // Сетевой вызов здесь один — fetch, и он идёт с запретом промпта кредов (задача 71):
-    // без кредов git ждёт логина на tty, и AFK-раннер висел бы в пост-мердж обновлении.
+    // Сетевой вызов здесь один — fetch, и он идёт с запретом промпта кредов (задача 71) и
+    // сроком (задача 30): без кредов git ждёт логина на tty, без срока молчащий origin держит
+    // вызов вечно — и AFK-раннер висел бы в пост-мердж обновлении.
     const gitNet = (args: string[]): string =>
         runArgvFn(
             'git',
             gitIn(consumerRoot, args),
-            env === undefined ? undefined : { env: gitNetworkEnv(stripGitContext(env)) },
+            gitNetworkOpts(env === undefined ? undefined : stripGitContext(env)),
         );
     // Раскладки нет — нет и понятия «дерево потребителя»: пути скриптов в этой раскладке
     // относительны дереву работы, и обновлять нечего. Молча: сообщать не о чем.

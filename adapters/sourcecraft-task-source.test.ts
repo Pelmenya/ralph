@@ -19,6 +19,7 @@
 import { describe, expect, it } from 'vitest';
 import { createSourcecraftTaskSource } from './sourcecraft-task-source.ts';
 import type { SourcecraftApi } from './sourcecraft-task-source.ts';
+import { SOURCECRAFT_TOKEN_ENV } from './sourcecraft-api.ts';
 
 const ORG = 'org';
 const REPO = 'repo';
@@ -765,5 +766,26 @@ describe('чек PR у площадки: путь запроса собран и
             rawStatus: 'failed',
         });
         expect(calls.some((c) => c.path === `/repos/${ORG}/${REPO}/cicd/runs/356`)).toBe(true);
+    });
+});
+
+// #56: токен площадки обязан попасть в редакцию вывода упавшей сессии. Ядро имён площадок
+// не перечисляет — оно спрашивает шов, и шов называет ту же переменную, из которой
+// транспорт берёт токен.
+describe('secretEnvNames: секрет площадки объявляет сам шов (#56)', () => {
+    it('по умолчанию — переменная, из которой транспорт берёт токен', () => {
+        const { adapter } = build({});
+        expect(adapter.secretEnvNames()).toEqual([SOURCECRAFT_TOKEN_ENV]);
+    });
+
+    it('переопределённое имя переменной объявляется вместо дефолтного', () => {
+        const adapter = createSourcecraftTaskSource({
+            api: () => ({}),
+            org: ORG,
+            repo: REPO,
+            authorAllowlist: () => [],
+            tokenEnv: 'MY_SC_TOKEN',
+        });
+        expect(adapter.secretEnvNames()).toEqual(['MY_SC_TOKEN']);
     });
 });

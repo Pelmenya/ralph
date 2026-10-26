@@ -22,10 +22,10 @@ import path from 'node:path';
 import { execFileSync, execSync } from 'node:child_process';
 import { ensureWorkspaceTrusted } from './workspace-trust.ts';
 import type { TrustOutcome } from './workspace-trust.ts';
-import { gitNetworkEnv } from '../shared/ralph-util.ts';
+import { gitNetworkOpts } from '../shared/ralph-util.ts';
+import type { ShArgvFn } from '../shared/ralph-util.ts';
 
 type ShFn = (cmd: string) => string;
-type ShArgvFn = (file: string, args: string[], opts?: { env?: NodeJS.ProcessEnv }) => string;
 type ShqFn = (s: string) => string;
 type LogFn = (msg: string) => void;
 type FailFn = (msg: string) => unknown;
@@ -181,9 +181,11 @@ export function createWorktreeManager(env: WorktreeEnv) {
             return false;
         }
         try {
-            runArgvFn('git', ['-C', worktreePath, 'fetch', 'origin', 'main', '--quiet'], {
-                env: gitNetworkEnv(),
-            });
+            runArgvFn(
+                'git',
+                ['-C', worktreePath, 'fetch', 'origin', 'main', '--quiet'],
+                gitNetworkOpts(),
+            );
             runArgvFn('git', [
                 '-C',
                 worktreePath,
@@ -341,7 +343,7 @@ export function createWorktreeManager(env: WorktreeEnv) {
         // первого запуска может стоять где угодно (древняя ветка, детач посреди ручной
         // археологии), и npm ci ниже поставил бы зависимости случайного коммита.
         try {
-            runArgvFn('git', ['fetch', 'origin', 'main'], { env: gitNetworkEnv() });
+            runArgvFn('git', ['fetch', 'origin', 'main'], gitNetworkOpts());
         } catch (e: unknown) {
             return failFn(
                 `git fetch origin main перед созданием worktree упал: ${(e as Error).message}`,

@@ -4137,6 +4137,162 @@ describe('runLoop — основной while-цикл: итерации коде
         expect(openIssuesFn).not.toHaveBeenCalled();
     });
 
+    // #88: мягкая остановка. Запрос приходит посреди шага — во время сессии, — а петля
+    // слышит его только на границе: шаг доводится целиком (намерения сессии применены,
+    // счётчик записан), state сохраняется, и в чат уходит строка об остановке.
+    describe('#88 мягкая остановка на границе шага', () => {
+        it('запрос посреди сессии → шаг доведён, state сохранён, строка в чат, запрос снят', () => {
+            const logs: string[] = [];
+            const state = mkState();
+            let requested = false;
+            const order: string[] = [];
+            const saved: FakeState[] = [];
+            const pushes: string[] = [];
+            const clearStopRequestFn = vi.fn(() => {
+                order.push('clear');
+                requested = false;
+            });
+            const runClaudeFn = vi.fn<RunClaudeFake>(() => {
+                order.push('session');
+                // Сигнал остановки посреди сессии: петля сейчас внутри spawnSync и
+                // услышать его не может — только на границе шага.
+                requested = true;
+                return 0;
+            });
+            const applySessionRequestsFn = vi.fn(() => {
+                order.push('apply');
+                return { applied: 1, failed: false, closedIssues: [5] };
+            });
+            const openIssuesFn = vi.fn(() => [{ number: 5, title: 'задача', labels: [] }]);
+            runLoop(
+                validCfg(),
+                ctx(state),
+                deps(logs, {
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn,
+                    runClaudeFn,
+                    applySessionRequestsFn,
+                    saveStateFn: (s: FakeState) => {
+                        order.push('save');
+                        saved.push({ ...s });
+                    },
+                    pushEventFn: (m: string) => {
+                        order.push('push');
+                        pushes.push(m);
+                    },
+                    stopRequestedFn: () => requested,
+                    clearStopRequestFn,
+                }),
+            );
+            // Шаг доведён: сессия одна, её намерения применены — и второй шаг не начат.
+            expect(runClaudeFn).toHaveBeenCalledTimes(1);
+            expect(applySessionRequestsFn).toHaveBeenCalledTimes(1);
+            expect(openIssuesFn).toHaveBeenCalledTimes(1);
+            // State сохранён с доведённым шагом, и это последняя запись перед стопом.
+            expect(saved.at(-1)?.count).toBe(1);
+            expect(order.slice(-3)).toEqual(['save', 'clear', 'push']);
+            // Приёмка — строка в чат.
+            expect(pushes.at(-1)).toMatch(
+                /^⏸ Ralph: мягкая остановка по запросу — фаза "M1", итерация 1: начатый шаг доведён, state сохранён\./,
+            );
+            expect(clearStopRequestFn).toHaveBeenCalledTimes(1);
+        });
+
+        it('запрос до первого шага → ни одной сессии, state сохранён, строка в чат', () => {
+            const logs: string[] = [];
+            const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+            const saveStateFn = vi.fn();
+            const pushes: string[] = [];
+            runLoop(
+                validCfg(),
+                ctx(mkState()),
+                deps(logs, {
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn: () => [{ number: 5, title: 'задача', labels: [] }],
+                    runClaudeFn,
+                    saveStateFn,
+                    pushEventFn: (m: string) => pushes.push(m),
+                    stopRequestedFn: () => true,
+                }),
+            );
+            expect(runClaudeFn).not.toHaveBeenCalled();
+            expect(saveStateFn).toHaveBeenCalledTimes(1);
+            expect(pushes).toEqual([expect.stringMatching(/^⏸ Ralph: мягкая остановка/)]);
+        });
+
+        it('запрос не снялся → стоп всё равно, а строка называет, что убрать руками', () => {
+            const pushes: string[] = [];
+            runLoop(
+                validCfg(),
+                ctx(mkState()),
+                deps([], {
+                    phaseIndexOfFn: () => 0,
+                    pushEventFn: (m: string) => pushes.push(m),
+                    stopRequestedFn: () => true,
+                    clearStopRequestFn: () => {
+                        throw new Error('EACCES');
+                    },
+                }),
+            );
+            expect(pushes).toHaveLength(1);
+            expect(pushes[0]).toMatch(/снять не удалось \(EACCES\).*руками/);
+        });
+
+        it('dry-run при запросе встаёт, но ни запрос, ни state не трогает', () => {
+            // C1: каталог состояния у dry тот же, лока он не берёт. Снятый им запрос
+            // не увидела бы живая петля рядом — и пошла бы дальше.
+            const logs: string[] = [];
+            const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+            const saveStateFn = vi.fn();
+            const clearStopRequestFn = vi.fn();
+            const pushEventFn = vi.fn();
+            runLoop(
+                validCfg(),
+                ctx(mkState()),
+                deps(logs, {
+                    dry: true,
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn: () => [{ number: 5, title: 'задача', labels: [] }],
+                    runClaudeFn,
+                    saveStateFn,
+                    pushEventFn,
+                    stopRequestedFn: () => true,
+                    clearStopRequestFn,
+                }),
+            );
+            expect(clearStopRequestFn).not.toHaveBeenCalled();
+            expect(saveStateFn).not.toHaveBeenCalled();
+            expect(pushEventFn).not.toHaveBeenCalled();
+            expect(runClaudeFn).not.toHaveBeenCalled();
+            expect(logs.join('\n')).toMatch(/💤 DRY: запрос мягкой остановки на месте/);
+        });
+
+        it('боевое снятие запроса в DRY — no-op, как запись state', () => {
+            // Второй рубеж за веткой в runLoop: снятие зовут и мимо петли, а C1 держит
+            // единственная точка мутации, как `if (DRY) return` у saveState.
+            const src = stripComments(
+                fs.readFileSync(path.join(import.meta.dirname, 'orchestrator.ts'), 'utf8'),
+            );
+            const fn = src.slice(src.indexOf('function clearStopRequest(): void {'));
+            const body = fn.slice(0, fn.indexOf('fs.rmSync'));
+            expect(body).toMatch(/if \(DRY\) return;/);
+        });
+
+        it('main() передаёт петле боевое чтение запроса: без него остановка не слышна', () => {
+            // Дефолт `runLoop` — «запроса нет» (полторы сотни тестов зовут петлю без этих
+            // двух), поэтому применение держит только проводка в main. Удали её — запрос
+            // остановки молча перестанет работать при зелёном сьюте; этот тест и краснеет.
+            const src = stripComments(
+                fs.readFileSync(path.join(import.meta.dirname, 'orchestrator.ts'), 'utf8'),
+            );
+            const call = src.slice(src.indexOf('runLoop(config, ctx, {'));
+            const body = call.slice(0, call.indexOf('});'));
+            expect(body).toMatch(/stopRequestedFn: stopRequested\b/);
+            expect(body).toMatch(/clearStopRequestFn: clearStopRequest\b/);
+            expect(src).toMatch(/fs\.existsSync\(RUNTIME\.stopRequest\)/);
+        });
+    });
+
     // #65: форж отдаёт список issue с задержкой — карточка, закрытая намерением секунду
     // назад, ещё числится открытой. Петля брала её повторно и жгла целую сессию на уже
     // сделанной работе (поймано здесь трижды: после #423, #424 и #425). Здесь шов
@@ -8694,6 +8850,66 @@ describe('handleCrashedCoderSession — падение кодер-сессии: 
         }
     });
 
+    // #56: токен площадки задач — боевой секрет с правом мерджа в main, а в списке редакции
+    // его не было: список знал только секреты петли и рантайма. Имя переменной ядро берёт
+    // у АКТИВНОГО шва taskSource (secretEnvNames), а не перечислением площадок — поэтому
+    // тест подставляет шов с выдуманным именем, которого ядро знать не может.
+    describe('#56: секрет активного шва taskSource редактируется в выводе, логе и пуше', () => {
+        const FORGE_ENV = 'SOME_FORGE_TOKEN_56';
+        const FORGE_SECRET = 'forge-secret-56-value';
+        beforeEach(() => {
+            process.env[FORGE_ENV] = FORGE_SECRET;
+        });
+        afterEach(() => {
+            delete process.env[FORGE_ENV];
+        });
+
+        function crashWith(secretEnvNames: string[]) {
+            let saved = '';
+            const logs: string[] = [];
+            const pushes: string[] = [];
+            handleCrashedCoderSession(issue, 1, `curl: Authorization: Bearer ${FORGE_SECRET}`, {
+                // Хвост ошибки с токеном: git status упал и процитировал его — этот текст
+                // уходит в лог и в пуш.
+                shFn: () => {
+                    throw new Error(`fatal: https://x:${FORGE_SECRET}@example.com refused`);
+                },
+                logFn: (m: string) => logs.push(m),
+                pushEventFn: (m: string) => {
+                    pushes.push(m);
+                    return true;
+                },
+                saveSessionOutputFn: (
+                    _p: string,
+                    out: string,
+                    secrets?: Array<string | undefined>,
+                ) => {
+                    saved = util.redactSecrets(out, secrets ?? []);
+                },
+                cfg: {} as unknown,
+                secretEnvNamesFn: () => secretEnvNames,
+            });
+            return { saved, log: logs.join('\n'), push: pushes.join('\n') };
+        }
+
+        it('значение токена площадки заменено в выводе сессии, логе и пуше', () => {
+            const { saved, log, push } = crashWith([FORGE_ENV]);
+            expect(saved).not.toContain(FORGE_SECRET);
+            expect(saved).toContain('***');
+            expect(log).not.toContain(FORGE_SECRET);
+            expect(push).not.toContain(FORGE_SECRET);
+            // Сообщение при этом осталось на месте — вырезан только секрет.
+            expect(log).toMatch(/git status после падения тоже упал/);
+        });
+
+        it('от противного: шов, не объявивший секрет, оставляет его видимым — редакцию даёт именно объявление', () => {
+            const { saved, log, push } = crashWith([]);
+            expect(saved).toContain(FORGE_SECRET);
+            expect(log).toContain(FORGE_SECRET);
+            expect(push).toContain(FORGE_SECRET);
+        });
+    });
+
     it('сбой записи вывода (ENOSPC/EACCES) НЕ роняет раннер — диагностика продолжается по git status', () => {
         // Запись вывода — вежливая диагностика, а не инвариант: необёрнутое исключение
         // пролетело бы сквозь runLoop наверх и убило раннер вместо честного git-разбора.
@@ -9172,10 +9388,11 @@ describe('ветковая хореография в worktree раннера (#7
                 // Чек — с санированным env из buildGateEnvFn.
                 expect(optsOf(FIRST_CHECK_CMD)).toEqual({ env: SANITIZED });
                 // git fetch/checkout наследуют полный env (нужны секреты для origin), а
-                // сетевой fetch вдобавок запрещает промпт кредов (задача 71) — санированным
-                // он от этого не становится.
+                // сетевой fetch вдобавок запрещает промпт кредов (задача 71) и идёт со сроком
+                // (задача 30) — санированным он от этого не становится.
                 expect(optsOf('git fetch')).toEqual({
                     env: expect.objectContaining({ GIT_TERMINAL_PROMPT: '0' }),
+                    timeoutMs: util.GIT_NETWORK_TIMEOUT_MS,
                 });
                 expect(optsOf('git fetch')).not.toEqual({ env: SANITIZED });
                 expect(optsOf('git checkout --detach')).toBeUndefined();
@@ -11727,7 +11944,10 @@ describe('createOrchestrator: флаги CLI', () => {
         expect(runArgv).toHaveBeenCalledWith(
             'git',
             ['fetch', 'origin', 'main', 'feature/x', '--quiet'],
-            { env: expect.objectContaining({ GIT_TERMINAL_PROMPT: '0' }) },
+            {
+                env: expect.objectContaining({ GIT_TERMINAL_PROMPT: '0' }),
+                timeoutMs: util.GIT_NETWORK_TIMEOUT_MS,
+            },
         );
     });
 });
@@ -12082,7 +12302,9 @@ describe('applySessionRequests: намерения сессии применяе
         expect(res.applied).toBe(1);
     });
 
-    it('#45 pr-block: комментарий с причиной, метка и СВЕРКА, что она встала', () => {
+    // #87: метка — ПЕРВОЙ, до комментария: убитый между ними раннер не должен оставить
+    // человеку развилку, на которой метка теряется (tests/pr-crash-windows.test.ts).
+    it('#45 pr-block: метка, СВЕРКА, что она встала, затем комментарий с причиной', () => {
         const { ts, calls } = prTaskSource();
         ralph.applySessionRequests({
             cfg: CFG,
@@ -12095,7 +12317,7 @@ describe('applySessionRequests: намерения сессии применяе
             logFn: () => {},
             pushEventFn: () => {},
         });
-        expect(calls).toEqual(['pr-comment:55:null:сборка красная', 'pr-block-label']);
+        expect(calls).toEqual(['pr-block-label', 'pr-comment:55:null:сборка красная']);
     });
 
     it('#45 НЕГАТИВНЫЙ: метка blocked не встала → отказ, а не тихий пропуск', () => {
@@ -12394,7 +12616,8 @@ describe('applySessionRequests: намерения сессии применяе
             logFn: () => {},
             pushEventFn: () => {},
         });
-        const tail = JSON.parse(written.join('').trim());
+        // Последняя запись — то, что осталось на диске (до неё — метка начатого, #86).
+        const tail = JSON.parse(String(written.at(-1)).trim());
         expect(tail).toMatchObject({ kind: 'pr-comment', path: 'src/a.ts', line: 42 });
         expect(tail.anchor).toBeUndefined();
     });
@@ -12443,8 +12666,9 @@ describe('applySessionRequests: намерения сессии применяе
         // #62: файл УДАЛЯЕТСЯ, а не опустошается. Пустой остаток — untracked-файл в дереве
         // раннера, и он валит следующий запуск проверкой чистоты, а однажды остановил и
         // сам гейт мерджа. `.gitignore` этот класс не закрывает: ветка фазы отрезана ДО
-        // правки игнор-листа, и в её дереве строки ещё нет.
-        expect(written).toEqual([]);
+        // правки игнор-листа, и в её дереве строки ещё нет. Записи до удаления — журнал
+        // «начато / применено» (#86); последняя из них снимает всё применённое.
+        expect(written.at(-1)?.trim()).toBe('');
         expect(removed).toBe(1);
     });
 
@@ -12603,9 +12827,9 @@ describe('applySessionRequests: намерения сессии применяе
         expect(calls).toEqual(['comment:7:первое', 'comment:7:второе']);
         expect(res.failed).toBe(true);
         // В файле — ровно неприменённый хвост: повтор всего батча продублировал бы
-        // уже поставленный комментарий, а пустой файл потерял бы остаток.
-        expect(written).toHaveLength(1);
-        const tail = written[0]
+        // уже поставленный комментарий, а пустой файл потерял бы остаток. Последняя
+        // запись — то, что осталось на диске; до неё шёл журнал «начато / применено» (#86).
+        const tail = String(written.at(-1))
             .trim()
             .split('\n')
             .map((l) => JSON.parse(l));

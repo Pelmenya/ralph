@@ -22,6 +22,7 @@ export type TRuntimePaths = {
     lockMarker: string;
     sessions: string;
     requests: string;
+    stopRequest: string;
 };
 
 export function runtimePathsIn(runtimeDir: string): TRuntimePaths {
@@ -35,5 +36,7 @@ export function runtimePathsIn(runtimeDir: string): TRuntimePaths {
         lockMarker: path.join(runtimeDir, '.deps-lock.sha'),
         sessions: path.join(runtimeDir, 'sessions'),
         requests: path.join(runtimeDir, 'ralph.requests.jsonl'),
+        // #88: запрос мягкой остановки — его кладёт человек, снимает раннер на границе шага.
+        stopRequest: path.join(runtimeDir, 'ralph.stop'),
     };
 }

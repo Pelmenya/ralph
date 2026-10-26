@@ -229,9 +229,14 @@ export type GithubTaskSourceFns = {
     }) => number | null;
 };
 
+// #56: переменные, из которых GitHub CLI берёт токен (`GH_TOKEN` важнее, `GITHUB_TOKEN` —
+// запасной). Обе — секрет этой площадки, и редакции нужны обе.
+export const GITHUB_SECRET_ENV_NAMES = ['GH_TOKEN', 'GITHUB_TOKEN'] as const;
+
 export function createGithubTaskSource(fns: GithubTaskSourceFns): TaskSourceAdapter {
     return {
         checkAuth: fns.checkAuth,
+        secretEnvNames: () => GITHUB_SECRET_ENV_NAMES,
         listReadyIssues: fns.openIssues,
         listAllOpenIssues: fns.allOpenIssues,
         hasAnyIssues: fns.hasAnyIssues,

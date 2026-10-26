@@ -48,6 +48,7 @@ function makeFakeTaskSource(seed: {
         // checkAuth (#35) и listMilestoneLabels (#37) — часть контракта шва: фейк обязан
         // их реализовывать, иначе интерфейс «реализуем» только на бумаге.
         checkAuth: () => {},
+        secretEnvNames: () => ['FAKE_FORGE_TOKEN'],
         listMilestoneLabels: (milestone) =>
             (seed.issues?.[milestone] ?? []).flatMap((i) => (i.labels ?? []).map((l) => l.name)),
         // #37: комментарии PR — тоже часть контракта шва. Фейку хватает одной ленты:

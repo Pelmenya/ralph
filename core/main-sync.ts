@@ -35,10 +35,16 @@
 // Модуль знает только git — команд форжа здесь нет, голову PR после пуша форж узнаёт сам,
 // а привязку мерджа к проверенной голове держит `--match-head-commit` в гейте.
 
-import { gitErrorText, gitExitStatus, gitNetworkEnv, sleep } from '../shared/ralph-util.ts';
+import {
+    gitErrorText,
+    gitExitStatus,
+    gitNetworkOpts,
+    isExecTimeout,
+    sleep,
+} from '../shared/ralph-util.ts';
+import type { ShArgvFn } from '../shared/ralph-util.ts';
 import { classifyMergeFailure } from './merge-retry.ts';
 
-type ShArgvFn = (file: string, args: string[], opts?: { env?: NodeJS.ProcessEnv }) => string;
 type LogFn = (msg: string) => void;
 
 /** Попыток сетевого шага (первая + повторы) и пауза перед повтором N — 15 с, 30 с. */
@@ -74,9 +80,13 @@ export function syncPhaseBranchWithMain(
     const network = (what: string, args: string[]): void => {
         for (let attempt = 1; ; attempt++) {
             try {
-                runArgvFn('git', args, { env: gitNetworkEnv() });
+                runArgvFn('git', args, gitNetworkOpts());
                 return;
             } catch (e: unknown) {
+                // Срок не повторяется: он сам уже был ожиданием, и повтор растянул бы стоп
+                // втрое. Держит это явная ветка, а не то, что текст отказа по сроку сегодня
+                // не похож на транзиент: слово «сеть» в классификаторе молча включило бы повтор.
+                if (isExecTimeout(e)) throw e;
                 const why = gitErrorText(e);
                 if (attempt >= NETWORK_ATTEMPTS || classifyMergeFailure(why) !== 'transient') {
                     throw e;

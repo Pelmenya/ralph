@@ -35,8 +35,10 @@ import {
     nonNegativeIntOrDefault,
     sleep,
     resolveInstallCmd,
-    gitNetworkEnv,
+    gitNetworkOpts,
+    redactSecrets,
 } from '../shared/ralph-util.ts';
+import type { ExecOpts, ShArgvFn } from '../shared/ralph-util.ts';
 import {
     sideEffectAttempts,
     guardSideEffect as sharedGuardSideEffect,
@@ -87,7 +89,10 @@ import { isArgvTooLong, argvTooLongMessage, resolveSpawnResult } from './spawn-f
 import {
     classifySessionRequests,
     COMMENT_NOTICE_THRESHOLD,
+    inFlightRequest,
+    inFlightStopMessage,
     parseSessionRequests,
+    serializeInFlight,
     serializeSessionRequest,
 } from './session-requests.ts';
 // #45: тексты промптов сессий — отдельным модулем, чтобы барьер чистоты мог их грепать
@@ -170,7 +175,7 @@ import type {
     RunResult,
     TaskSourceAdapter,
 } from '../adapters/adapters.ts';
-import { underRoot, type TResolvedRoots } from './roots.ts';
+import { underRoot, writeFileAtomic, type TResolvedRoots } from './roots.ts';
 import { updateConsumerTree } from './consumer-tree.ts';
 import { ensureGuardHolds } from './guard-probe.ts';
 import {
@@ -585,13 +590,11 @@ type DeployBlock = {
     reason?: string;
 };
 
-type ExecOpts = { env?: NodeJS.ProcessEnv };
 type LogFn = (msg: string) => void;
 // fail() боевой уходит в process.exit(1); тестовый failFn может вернуть значение или
 // бросить — поэтому возврат unknown, а не never (мягкий результат пробрасывается наверх).
 type FailFn = (msg: string) => unknown;
 type ShFn = (cmd: string, opts?: ExecOpts) => string;
-type ShArgvFn = (file: string, args: string[], opts?: ExecOpts) => string;
 type ExecFn = (file: string, args: string[], opts?: Record<string, unknown>) => string;
 type KillFn = (pid: number, signal?: number | string) => unknown;
 type ReadFileFn = typeof fs.readFileSync;
@@ -2033,6 +2036,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // деградация способа доставки не отменяет самого замечания.
         prFindings: TFixFinding[];
         prBlocked: boolean;
+        // #86: в файле стоит метка начатого намерения — исход эффекта неизвестен, не
+        // применено ничего. Необязательное, как и поля #625: подменённые реализации шва
+        // о нём не знают, и их отсутствие означает «метки не было».
+        outcomeUnknown?: boolean;
     } {
         const raw = readFn();
         if (!raw || raw.trim() === '')
@@ -2043,6 +2050,24 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 prFindings: [],
                 prBlocked: false,
             };
+
+        // #86: метка начатого намерения — раннер убит между эффектом и записью «применено».
+        // Проверяется ДО разбора: парсер отверг бы метку как битую строку, и человек
+        // читал бы «запрос не разобрался» вместо «исход неизвестен».
+        const started = inFlightRequest(raw);
+        if (started !== null) {
+            pushEventFn(`⛔ Ralph: ${inFlightStopMessage(started, RUNTIME.requests)}`, cfg, {
+                logFn,
+            });
+            return {
+                applied: 0,
+                failed: true,
+                closedIssues: [],
+                prFindings: [],
+                prBlocked: false,
+                outcomeUnknown: true,
+            };
+        }
 
         let requests: TSessionRequest[];
         try {
@@ -2152,6 +2177,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
             const req = requests[i];
             if (paced && i > 0) sleepFn(FORGE_PACE_MS);
             try {
+                // #86: «начато» ложится на диск ДО эффекта. Отказ этой записи — обычный
+                // пойманный отказ ниже: эффекта ещё не было, хвост с этим намерением честен.
+                writeFn(serializeInFlight(requests.slice(i)));
                 if (req.kind === 'new-issue') {
                     const num = taskSource.createIssue({
                         title: req.title,
@@ -2177,6 +2205,30 @@ export function createOrchestrator(env: OrchestratorEnv) {
                             `намерение ${req.kind}: открытого PR ветки ${phase.branch} не найдено ` +
                                 '(либо его нет, либо их несколько — петля не гадает, в какой писать)',
                         );
+                    }
+                    // #87: у pr-block метка ложится ПЕРВОЙ, до комментария. Убитый между
+                    // двумя эффектами раннер останавливается на метке начатого, и человек
+                    // решает по форжу, «лёг ли эффект». Ляг первым комментарий, человек,
+                    // увидевший его, снял бы намерение целиком — и метку вместе с ним, а гейт
+                    // смерджил бы фазу с блокером. Метка первой — обе развилки кончаются
+                    // меткой на PR, теряется в худшем случае текст (tests/pr-crash-windows).
+                    if (req.kind === 'pr-block') {
+                        // Метку ставит РАННЕР, снимает тоже он и только по итогу повторного
+                        // ревью (#217): сессия просит блок, но снять его сама не может —
+                        // такого намерения нет и быть не может.
+                        taskSource.addBlockedLabel(phase.branch);
+                        // СВЕРКА, а не доверие: сам метод fail-open по контракту (метки —
+                        // косметика цикла разбора), но здесь метка несёт вердикт ревью. Не
+                        // легшая молча метка означает, что гейт не увидит блокера и фаза
+                        // уедет в main с известным дефектом — тут fail-open неуместен.
+                        const after = taskSource.findOpenPullRequest(phase.branch);
+                        if (!(after?.labels ?? []).some((l) => l.name === 'blocked')) {
+                            throw new Error(
+                                `метка blocked на PR #${String(pr.number)} не встала — блокер ревью ` +
+                                    'остался бы невидимым для гейта, и фаза уехала бы в main',
+                            );
+                        }
+                        logFn(`⛔ PR #${String(pr.number)} помечен blocked по просьбе сессии.`);
                     }
                     const anchor = req.kind === 'pr-comment' ? req.anchor : undefined;
                     if (anchor) {
@@ -2268,24 +2320,6 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     } else {
                         taskSource.commentOnPullRequest(pr.number, { body: req.comment });
                     }
-                    if (req.kind === 'pr-block') {
-                        // Метку ставит РАННЕР, снимает тоже он и только по итогу повторного
-                        // ревью (#217): сессия просит блок, но снять его сама не может —
-                        // такого намерения нет и быть не может.
-                        taskSource.addBlockedLabel(phase.branch);
-                        // СВЕРКА, а не доверие: сам метод fail-open по контракту (метки —
-                        // косметика цикла разбора), но здесь метка несёт вердикт ревью. Не
-                        // легшая молча метка означает, что гейт не увидит блокера и фаза
-                        // уедет в main с известным дефектом — тут fail-open неуместен.
-                        const after = taskSource.findOpenPullRequest(phase.branch);
-                        if (!(after?.labels ?? []).some((l) => l.name === 'blocked')) {
-                            throw new Error(
-                                `метка blocked на PR #${String(pr.number)} не встала — блокер ревью ` +
-                                    'остался бы невидимым для гейта, и фаза уехала бы в main',
-                            );
-                        }
-                        logFn(`⛔ PR #${String(pr.number)} помечен blocked по просьбе сессии.`);
-                    }
                 } else {
                     // Комментарий несут все три вида: и «закрой», и «заблокируй» обязаны
                     // объяснить человеку, что произошло.
@@ -2334,22 +2368,52 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 );
                 return { applied: i, failed: true, closedIssues, prFindings, prBlocked };
             }
+            // #86: «применено» — снятием метки вместе с намерением. Стоит ВНЕ try намеренно:
+            // эффект уже лёг, и пойманный отказ выше вернул бы это намерение в хвост, то
+            // есть повторил бы его. Не записалось — метка остаётся на диске, и следующее
+            // применение остановится на ней с вопросом человеку, а не задвоит эффект.
+            try {
+                writeFn(
+                    `${requests
+                        .slice(i + 1)
+                        .map(serializeSessionRequest)
+                        .join('\n')}\n`,
+                );
+            } catch (e) {
+                pushEventFn(
+                    `⛔ Ralph: намерение сессии (${req.kind}) применено, но отметить это в ` +
+                        `${RUNTIME.requests} не удалось — ${(e as Error).message}. Применено ` +
+                        `${String(i + 1)} из ${String(requests.length)}; метка начатого намерения ` +
+                        'осталась в файле, и петля остановится на ней, пока человек не уберёт её ' +
+                        'вместе с этим намерением.',
+                    cfg,
+                    { logFn },
+                );
+                return {
+                    applied: i + 1,
+                    failed: true,
+                    closedIssues,
+                    prFindings,
+                    prBlocked,
+                    outcomeUnknown: true,
+                };
+            }
         }
         // #62: файл УДАЛЯЕТСЯ, а не опустошается. Пустой остаток остаётся untracked-файлом
         // в дереве раннера и валит СЛЕДУЮЩИЙ запуск проверкой чистоты дерева — а однажды
         // остановил и сам гейт мерджа. Держать чистоту дерева `.gitignore`'ом нельзя: ветка
         // фазы живёт всю фазу и отрезана ДО правки игнор-листа, значит в её дереве строки
         // ещё нет (поймано на полигоне трижды подряд).
-        // Тот же класс отказа, что ниже по стеку: не удалившийся файл применится повторно
-        // следующей итерацией и продублирует комментарии. Стоп петли из-за этого не нужен
-        // — нужен сигнал человеку, пока дублей ещё немного.
+        // Повтора не будет и при отказе удаления: после #86 каждое применённое намерение
+        // уже снято из файла, и остаётся пустой файл. Он по-прежнему пачкает дерево, поэтому
+        // нужен сигнал человеку, а не стоп петли.
         try {
             removeFn();
         } catch (e) {
             pushEventFn(
                 `⚠ Ralph: намерения применены (${String(requests.length)}), но файл ${RUNTIME.requests} не удалился — ` +
-                    `${(e as Error).message}. Убери его руками, иначе следующая итерация применит их повторно ` +
-                    'и остановится на грязном дереве.',
+                    `${(e as Error).message}. Повтора не будет (применённое из файла снято), но убери его руками: ` +
+                    'иначе следующий запуск остановится на грязном дереве.',
                 cfg,
                 { logFn },
             );
@@ -2383,9 +2447,55 @@ export function createOrchestrator(env: OrchestratorEnv) {
         }
     }
 
+    // #86: метка начатого намерения на старте — раннер убит между эффектом на форже и
+    // записью «применено». Проверка стоит ДО первой сессии, а не только в применении:
+    // иначе после рестарта отработала бы целая сессия (кодер или ревью), чтобы на её
+    // намерениях упереться в ту же метку. Отдаёт `true`, если петлю запускать нельзя.
+    function stopOnInFlightIntent({
+        cfg,
+        readFn = readSessionRequests,
+        pushEventFn = pushEvent,
+        logFn = log,
+    }: {
+        cfg: RalphConfig;
+        readFn?: () => string | null;
+        pushEventFn?: typeof pushEvent;
+        logFn?: typeof log;
+    }): boolean {
+        const started = inFlightRequest(readFn());
+        if (started === null) return false;
+        pushEventFn(`⛔ Ralph: ${inFlightStopMessage(started, RUNTIME.requests)}`, cfg, { logFn });
+        return true;
+    }
+
+    // Запись журнала «начато / применено» — целиком или никак. `writeFileSync` сначала
+    // усекает файл: раннер, убитый между усечением и записью, оставил бы пустой файл, а
+    // пустой читается как «намерений нет» — неприменённый хвост пропал бы молча, то есть
+    // ровно то окно, которое журнал закрывает.
     function writeSessionRequests(text: string): void {
         guardSideEffect(`writeSessionRequests(${RUNTIME.requests})`);
-        fs.writeFileSync(RUNTIME.requests, text);
+        writeFileAtomic(RUNTIME.requests, text);
+    }
+
+    // #88: мягкая остановка — запрос файлом в каталоге состояния, а не обработчиком
+    // сигнала. Обработчик здесь не сработал бы никогда: `runLoop` синхронен, spawnSync
+    // сессии держит поток часами, и колбэк сигнала ждал бы свободного event loop, которого
+    // у петли нет (см. комментарий у 'exit' в main). Файл же читается на границе шага тем
+    // самым потоком, что шаг исполняет: начатое доводится целиком, без дедлайна, и только
+    // потом петля встаёт. По образцу derbush/all-together: мягкая остановка воркера и
+    // финализация без дедлайна. Жёсткая остановка остаётся за kill — для неё и матрица
+    // «убить до / после».
+    function stopRequested(): boolean {
+        guardSideEffect(`stopRequested(${RUNTIME.stopRequest})`);
+        return fs.existsSync(RUNTIME.stopRequest);
+    }
+
+    // C1: dry-run не снимает запрос. Каталог состояния у него тот же, а лока он не берёт:
+    // снятый им файл уже не увидела бы живая петля рядом, и запрос человека пропал бы.
+    function clearStopRequest(): void {
+        if (DRY) return;
+        guardSideEffect(`clearStopRequest(${RUNTIME.stopRequest})`);
+        fs.rmSync(RUNTIME.stopRequest, { force: true });
     }
 
     // #62: удаление применённого запроса. `force: true` — отсутствие файла не ошибка:
@@ -2630,9 +2740,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             // ходил бы в сеть. В DRY фетч пропускаем: дифф считается по уже имеющимся
             // origin-ссылкам — для предпросмотра «что будет сделано» этого достаточно.
             if (!DRY) {
-                runArgvFn('git', ['fetch', 'origin', 'main', branch, '--quiet'], {
-                    env: gitNetworkEnv(),
-                });
+                runArgvFn('git', ['fetch', 'origin', 'main', branch, '--quiet'], gitNetworkOpts());
             } else {
                 logFn(
                     '💤 DRY: git fetch пропущен (C1 read-only) — дифф по текущим origin-ссылкам.',
@@ -2785,9 +2893,11 @@ export function createOrchestrator(env: OrchestratorEnv) {
         if (!safeBranch(branch, { logFn, where: 'проверка пуша ветки' })) return false;
         let out: string;
         try {
-            out = runArgvFn('git', ['ls-remote', 'origin', `refs/heads/${branch}`], {
-                env: gitNetworkEnv(),
-            });
+            out = runArgvFn(
+                'git',
+                ['ls-remote', 'origin', `refs/heads/${branch}`],
+                gitNetworkOpts(),
+            );
         } catch (e) {
             logFn(
                 `⚠ origin не ответил на вопрос о ветке ${branch} (${(e as Error).message}) — ` +
@@ -2810,7 +2920,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         try {
             // C1 (инвариант №8): --dry-run строго read-only, фетч — мутация ссылок .git.
             if (!DRY) {
-                runArgvFn('git', ['fetch', 'origin', branch, '--quiet'], { env: gitNetworkEnv() });
+                runArgvFn('git', ['fetch', 'origin', branch, '--quiet'], gitNetworkOpts());
             }
             const out = shFn(`git rev-parse ${shq(`origin/${branch}`)}`).trim();
             // Форма ответа проверяется, а не предполагается: строка отсюда уходит обратно
@@ -3008,7 +3118,15 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // из конфига рантаймов (фактический authTokenEnv: кастомный, если задан, иначе дефолт —
     // ровно как resolveKimiRuntime/resolveOpenAIRuntime), значение берём из process.env;
     // руками имена не перечисляем, иначе кастомный authTokenEnv утёк бы мимо списка.
-    function collectSessionSecrets(cfg: RalphConfig): Array<string | undefined> {
+    //
+    // #56: тем же приёмом — токен АКТИВНОГО шва задач. Его в списке не было вовсе, хотя это
+    // самый дорогой секрет петли: запись в репозиторий и мердж в `main`. Имена называет сам
+    // шов (`secretEnvNames`), а не перечисление площадок здесь: список площадок в ядре
+    // пропустил бы следующий шов ровно так, как пропускал SourceCraft.
+    function collectSessionSecrets(
+        cfg: RalphConfig,
+        secretEnvNamesFn: () => readonly string[] = () => adapters.taskSource.secretEnvNames(),
+    ): Array<string | undefined> {
         const kimiEnv =
             typeof cfg.kimiRuntime?.authTokenEnv === 'string' &&
             cfg.kimiRuntime.authTokenEnv.trim() !== ''
@@ -3026,6 +3144,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             process.env.RALPH_TG_CHAT_ID,
             process.env[kimiEnv],
             process.env[openaiEnv],
+            ...secretEnvNamesFn().map((name) => process.env[name]),
         ];
     }
 
@@ -3041,12 +3160,16 @@ export function createOrchestrator(env: OrchestratorEnv) {
             cfg = config,
             commitLeftoversFn = commitLeftovers,
             turnRetriesLeft = 0,
+            secretEnvNamesFn = () => adapters.taskSource.secretEnvNames(),
         }: {
             shFn?: ShFn;
             logFn?: LogFn;
             pushEventFn?: typeof pushEvent;
             saveSessionOutputFn?: typeof saveSessionOutput;
             cfg?: RalphConfig;
+            // #56: чей секрет площадки вырезать. Боевой — активный шов; параметр нужен тесту,
+            // чтобы подставить шов с именем переменной, которого ядро знать не может.
+            secretEnvNamesFn?: () => readonly string[];
             commitLeftoversFn?: typeof commitLeftovers;
             // #20: сколько повторов по бюджету ходов ещё разрешено этой карточке. Счётчик
             // ведёт вызывающий (runLoop): попытки тратятся ПОДРЯД на одну карточку, а
@@ -3055,6 +3178,16 @@ export function createOrchestrator(env: OrchestratorEnv) {
         } = {},
     ): { stop: boolean; turnLimitRetry?: boolean } {
         const sessionPath = path.join(RUNTIME.sessions, `${issue.number}-${Date.now()}.log`);
+        // #56: список собирается один раз и режет не только файл вывода, но и строки, которые
+        // отсюда уходят в лог и в пуш: в них попадает хвост ошибки (`git status` цитирует
+        // URL remote вместе с токеном), а пуш читают вне машины. Остальные места лога тем же
+        // списком не прикрыты — здесь редакция стоит там, где сессия уже упала и текст
+        // заведомо не тот, что мы ждали.
+        const secrets = collectSessionSecrets(cfg, secretEnvNamesFn);
+        const rawLogFn = logFn;
+        const rawPushEventFn = pushEventFn;
+        logFn = (msg: string) => rawLogFn(redactSecrets(msg, secrets));
+        pushEventFn = (msg, ...rest) => rawPushEventFn(redactSecrets(msg, secrets), ...rest);
         // #390: секреты (петля + ключ активного рантайма, инвариант №11) редактируются ДО
         // записи на диск — тот же приём, что telegram-notifier.ts применяет к TG-токену.
         // Запись — вежливая диагностика, а НЕ инвариант: mkdir/writeFile могут бросить
@@ -3062,7 +3195,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // убило раннер вместо честного git-status-разбора ниже. Ловим и логируем; решение
         // о стопе принимает только блок `git status`.
         try {
-            saveSessionOutputFn(sessionPath, output, collectSessionSecrets(cfg));
+            saveSessionOutputFn(sessionPath, output, secrets);
         } catch (e) {
             logFn(
                 `⚠ Не удалось сохранить вывод упавшей сессии Issue #${issue.number} в ${sessionPath} ` +
@@ -3177,7 +3310,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // Значений здесь нет (константные ref'ы origin/main), но это git-мутация в tryMergePhase/
     // runLoop, и уход на argv держит направление единообразным. runArgvFn инжектируется в тестах.
     function updateRunnerTreeToOriginMain(runArgvFn: ShArgvFn = shArgv): void {
-        runArgvFn('git', ['fetch', 'origin', 'main'], { env: gitNetworkEnv() });
+        runArgvFn('git', ['fetch', 'origin', 'main'], gitNetworkOpts());
         runArgvFn('git', ['checkout', '--detach', 'origin/main']);
     }
 
@@ -3604,7 +3737,78 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // #269-ревью: прогон форжа, по которому лечили, относится к PR ПРОШЛОЙ фазы —
         // на новой он не должен превращать первый же красный чек в бесконечное ожидание.
         st.forgeHealedRunId = null;
+        // #88: метка начатого мерджа относится к PR фазы, которую переход закрывает. Снята она
+        // той же записью, что и переход: переживи она его — следующая фаза встала бы у гейта
+        // на `merge-unknown` с номером чужого PR.
+        st.mergeInFlight = null;
         saveState(st);
+    }
+
+    // #165: барьер красного пост-мердж деплоя. Отдельной функцией (#88), а не телом
+    // preflight: матрица «убить до / после» поднимает рестарт с тем же барьером на старте,
+    // что у боевого запуска, — копия барьера в тесте разошлась бы с ним молча.
+    function stopOnDeployBlock({
+        state,
+        deployResolved,
+        saveStateFn = saveState,
+        logFn = log,
+        pushEventFn = pushEvent,
+        failFn = fail,
+        cfg = config,
+    }: {
+        state: RalphState;
+        deployResolved: boolean;
+        saveStateFn?: typeof saveState;
+        logFn?: LogFn;
+        pushEventFn?: typeof pushEvent;
+        failFn?: FailFn;
+        cfg?: RalphConfig;
+    }): void {
+        // #165: барьер красного пост-мердж деплоя. Прошлый прогон смерджил фазу, но
+        // deploy-workflow упал / прод не ответил / итог не досмотрен → в state.deployBlock
+        // лежит блок. Не строим следующую фазу поверх недоехавшего до прода main.
+        // Снять может ТОЛЬКО человек флагом --deploy-resolved (тот же принцип владения, что
+        // и у hold: снятие блока — не решение раннера). Клир идёт ДО проверки барьера, чтобы
+        // флаг гарантированно снимал активный блок.
+        if (deployResolved) {
+            if (state.deployBlock) {
+                logFn(
+                    `🔧 --deploy-resolved: снят барьер красного деплоя фазы "${(state.deployBlock as DeployBlock).milestone}" — продолжаю.`,
+                );
+                state.deployBlock = null;
+                saveStateFn(state);
+            } else {
+                logFn('🔧 --deploy-resolved: активного барьера деплоя нет — флаг проигнорирован.');
+            }
+        }
+        if (state.deployBlock) {
+            const b = state.deployBlock as DeployBlock;
+            const shaStr = b.sha ? String(b.sha).slice(0, 8) : '—';
+            // #TFO8_: pending — прошлый прогон умер в окне ожидания деплоя, итог не досмотрен.
+            // Формулировка честнее «красного»: деплой мог и доехать, но раннер это не
+            // подтвердил, поэтому fail-closed (не строим следующую фазу поверх непроверенного
+            // main). Разбор — тот же: человек проверяет итог деплоя и запускает --deploy-resolved.
+            const pending = b.status === 'pending';
+            const head = pending
+                ? `пост-мердж проверка деплоя фазы "${b.milestone}" не завершена (процесс мог умереть в окне ожидания)`
+                : `деплой фазы "${b.milestone}" красный`;
+            // Допушиваем на старте — если прошлый прогон умер между saveState и пушем, это
+            // единственный шанс не оставить красный/недосмотренный деплой немой тишиной
+            // (fail-closed, alert-first). failFn ниже — стоп до разбора человеком; откат за
+            // deploy-workflow.
+            pushEventFn(
+                `⛔ Ralph: старт заблокирован — ${head} (${b.reason}, ` +
+                    `sha ${shaStr}${b.url ? `, ${b.url}` : ''}). Следующая фаза НЕ начнётся. Разберись с ` +
+                    `деплоем (откат за deploy-workflow, main раннер не трогает) и запусти loop с --deploy-resolved.`,
+                cfg,
+                { logFn },
+            );
+            failFn(
+                `Пост-мердж деплой фазы "${b.milestone}" ${pending ? 'не досмотрен' : 'был красным'} ` +
+                    `(${b.reason}) — следующая фаза не начинается (#165). Почини прод/деплой и запусти с ` +
+                    `--deploy-resolved, либо очисти state.deployBlock в ${RUNTIME.state}.`,
+            );
+        }
     }
 
     // ── Preflight ────────────────────────────────────────────────────────────
@@ -3880,55 +4084,14 @@ export function createOrchestrator(env: OrchestratorEnv) {
             // #115-ревью: полный повтор сдачи начинает лестницу заново — см. сброс после
             // чини-сессии выше. Состояние прошлого круга здесь не наследуется.
             state.reviewOfFixes = null;
+            // #88: метку начатого мерджа снимает решение человека «PR не влит, операции нет» —
+            // ровно этот флаг называет стоп с неизвестным исходом мерджа.
+            state.mergeInFlight = null;
             saveStateFn(state);
             logFn('🔁 --resubmit: цикл сдачи фазы (PR/ревью/правки) будет выполнен заново.');
         }
 
-        // #165: барьер красного пост-мердж деплоя. Прошлый прогон смерджил фазу, но
-        // deploy-workflow упал / прод не ответил / итог не досмотрен → в state.deployBlock
-        // лежит блок. Не строим следующую фазу поверх недоехавшего до прода main.
-        // Снять может ТОЛЬКО человек флагом --deploy-resolved (тот же принцип владения, что
-        // и у hold: снятие блока — не решение раннера). Клир идёт ДО проверки барьера, чтобы
-        // флаг гарантированно снимал активный блок.
-        if (deployResolved) {
-            if (state.deployBlock) {
-                logFn(
-                    `🔧 --deploy-resolved: снят барьер красного деплоя фазы "${(state.deployBlock as DeployBlock).milestone}" — продолжаю.`,
-                );
-                state.deployBlock = null;
-                saveStateFn(state);
-            } else {
-                logFn('🔧 --deploy-resolved: активного барьера деплоя нет — флаг проигнорирован.');
-            }
-        }
-        if (state.deployBlock) {
-            const b = state.deployBlock as DeployBlock;
-            const shaStr = b.sha ? String(b.sha).slice(0, 8) : '—';
-            // #TFO8_: pending — прошлый прогон умер в окне ожидания деплоя, итог не досмотрен.
-            // Формулировка честнее «красного»: деплой мог и доехать, но раннер это не
-            // подтвердил, поэтому fail-closed (не строим следующую фазу поверх непроверенного
-            // main). Разбор — тот же: человек проверяет итог деплоя и запускает --deploy-resolved.
-            const pending = b.status === 'pending';
-            const head = pending
-                ? `пост-мердж проверка деплоя фазы "${b.milestone}" не завершена (процесс мог умереть в окне ожидания)`
-                : `деплой фазы "${b.milestone}" красный`;
-            // Допушиваем на старте — если прошлый прогон умер между saveState и пушем, это
-            // единственный шанс не оставить красный/недосмотренный деплой немой тишиной
-            // (fail-closed, alert-first). failFn ниже — стоп до разбора человеком; откат за
-            // deploy-workflow.
-            pushEventFn(
-                `⛔ Ralph: старт заблокирован — ${head} (${b.reason}, ` +
-                    `sha ${shaStr}${b.url ? `, ${b.url}` : ''}). Следующая фаза НЕ начнётся. Разберись с ` +
-                    `деплоем (откат за deploy-workflow, main раннер не трогает) и запусти loop с --deploy-resolved.`,
-                cfg,
-                { logFn },
-            );
-            failFn(
-                `Пост-мердж деплой фазы "${b.milestone}" ${pending ? 'не досмотрен' : 'был красным'} ` +
-                    `(${b.reason}) — следующая фаза не начинается (#165). Почини прод/деплой и запусти с ` +
-                    `--deploy-resolved, либо очисти state.deployBlock в ${RUNTIME.state}.`,
-            );
-        }
+        stopOnDeployBlock({ state, deployResolved, saveStateFn, logFn, pushEventFn, failFn, cfg });
 
         // C4: инвариант зависимых фаз — ВСЕ фазы до текущей обязаны быть реально смерджены.
         // Иначе текущая строится на main без предыдущей (ровно тот баг, ради которого
@@ -4112,6 +4275,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // Снятие устаревших намерений при отказе стража: побочка по fs, поэтому швом.
         readSessionRequestsFn?: typeof readSessionRequests;
         removeSessionRequestsFn?: typeof removeSessionRequests;
+        stopRequestedFn?: () => boolean;
+        clearStopRequestFn?: () => void;
         monitorConfigPath?: string;
     };
 
@@ -4229,6 +4394,12 @@ export function createOrchestrator(env: OrchestratorEnv) {
             checkOnPhaseBranchFn = checkOnPhaseBranch,
             readSessionRequestsFn = readSessionRequests,
             removeSessionRequestsFn = removeSessionRequests,
+            // #88: запрос мягкой остановки. Дефолт «запроса нет», а боевое чтение файла
+            // main() передаёт явно (как monitorConfigPath): чтение боевого файла в тесте —
+            // побочка, а `runLoop` без этих двух зовут полторы сотни тестов. Что main их
+            // передаёт, сторожит структурный тест в core/orchestrator.test.ts (#88).
+            stopRequestedFn = () => false,
+            clearStopRequestFn = () => {},
             monitorConfigPath,
         }: RunLoopDeps = {},
     ): void {
@@ -4280,11 +4451,232 @@ export function createOrchestrator(env: OrchestratorEnv) {
             return false;
         };
 
+        // #88: вопрос человеку при неизвестном исходе мерджа — один на оба стопа (форж не
+        // подтвердил; процесс умер посреди), потому что и развилка у них одна.
+        const MERGE_UNKNOWN_QUESTION =
+            'проверь PR руками — если он влит, перезапусти loop (продолжит сам); если не влит и операции мерджа на площадке нет, ' +
+            'перезапусти с --resubmit — сдача пойдёт заново, мердж не повторится вслепую';
+
+        // #88: шаги после подтверждённого мерджа — пуш, веха, журнал находок, переход фазы и
+        // пост-мердж проверка деплоя. Функцией, а не телом ветки гейта: тот же путь нужен
+        // рестарту, чей прошлый процесс смерджил фазу и умер раньше этих шагов (метка
+        // начатого мерджа на диске). Без него рестарт шёл бы веткой «уже смерджена», где нет
+        // ни строки о мердже, ни проверки деплоя, — фаза уходила в прод молча и непроверенной.
+        // Отдаёт, что делать циклу: остановиться или идти к следующей фазе.
+        const finishMergedPhase = (
+            phase: { milestone: string; branch: string },
+            idx: number,
+            prNumber: number | null,
+        ): 'break' | 'continue' => {
+            const mergedMsg = `✅ Ralph: фаза "${phase.milestone}" смерджена в main — готова к релизу.`;
+            pushEventFn(mergedMsg, cfg, { logFn });
+            closeMilestoneByTitleFn(phase.milestone); // закрыть milestone сразу, не ждать свипа
+            syncProjectBoardFn(); // #199: закрытые issues фазы → Done на доске
+            recordReviewFindingsFn(phase, prNumber, cfg.authorAllowlist); // #169: счёт находок ревью в журнал
+            // #88: барьер деплоя и снятие метки начатого мерджа ложатся ОДНОЙ записью с
+            // переходом фазы. Раньше pending-маркер писался следующей записью после
+            // advancePhase, и раннер, убитый между ними, вставал на СЛЕДУЮЩЕЙ фазе без
+            // барьера — и строил её поверх недосмотренного деплоя без единой строки в чат.
+            const deployOn = cfg.profileName === 'prod' && deployEnabledFn();
+            let mergedSha: string | null = null;
+            let mergedShaError: unknown = null;
+            if (deployOn) {
+                try {
+                    mergedSha = mergedShaOfFn(prNumber);
+                } catch (e) {
+                    // Разбирается ниже тем же catch, что и ожидание деплоя: «не знаю sha» —
+                    // такой же недосмотренный итог, а барьер уже стоит.
+                    mergedShaError = e;
+                }
+                // #TFO8_ (major): pending-маркер ДО ожидания. Вердикт деплоя приходит через
+                // ~21 мин (ожидание + healthcheck); умри процесс в этом окне (kill, OOM,
+                // ребут VDS) — без маркера рестарт построил бы следующую фазу поверх
+                // непроверенного main без пуша. preflight на pending — fail-closed стоп+пуш
+                // (снимает --deploy-resolved).
+                state.deployBlock = {
+                    status: 'pending',
+                    milestone: phase.milestone,
+                    sha: mergedSha,
+                    conclusion: null,
+                    url: null,
+                    reason: 'пост-мердж проверка не завершена (процесс мог умереть в окне ожидания)',
+                };
+            }
+            state.mergeInFlight = null;
+            advancePhaseFn(state, idx);
+            // #87: prod — стоп перед деплоем. Деплой уже в руках CI (мердж его и
+            // запустил), но loop не должен тут же хвататься за следующую фазу без
+            // паузы на релиз человеком. Пауза теперь под флагом haltBeforeDeploy
+            // (#249, см. ниже): дефолт сохраняет этот стоп, `false` включает
+            // непрерывный prod на зелёном деплое. playground: мердж остаётся финалом —
+            // continue как раньше, следующая фаза стартует с обновлённого main.
+            if (cfg.profileName === 'prod') {
+                // #51: деплоя может не быть вовсе. Тогда пост-мердж проверка не
+                // «падает fail-closed», а НЕ ПРОВОДИТСЯ: fail-closed отвечает на
+                // вопрос «релиз зелёный?», а здесь такого вопроса нет — и красный
+                // ответ на несуществующий вопрос стопорил трек после каждого мерджа.
+                // Пауза prod перед релизом (#87) при этом ОСТАЁТСЯ: она про «человек
+                // решает, что дальше», и от наличия деплоя не зависит.
+                if (deployOn) {
+                    deployPhaseFn(phase, { logFn });
+                } else {
+                    logFn(
+                        `▫ Пост-мердж: деплоя нет (adapters.deployCheck: none) — проверка релиза фазы ` +
+                            `"${phase.milestone}" не проводится.`,
+                    );
+                }
+                // #163/#165: дождаться итога deploy-workflow на смердженном sha прежде
+                // чем отдать фазу релизу — иначе откат раскатки остаётся в main и
+                // следующий мердж передеплоит битый коммит. Только ЧТЕНИЕ gh run
+                // (ретраи внутри, прод/main не трогаем — #166).
+                // block !== null → красный/недосмотренный итог: alert-first (пуш + барьер
+                // в state), main раннер НЕ трогает — откат за deploy-workflow.
+                let block: DeployBlock | null = null;
+                // #51: без деплоя тело не исполняется вовсе — ни одного обращения к механике
+                // проверки, каждое из которых на площадке было бы походом в отсутствующий `gh`.
+                if (deployOn) {
+                    try {
+                        if (mergedShaError) throw mergedShaError;
+                        const outcome = waitForDeployRunFn(mergedSha as string, cfg, { logFn });
+                        logFn(
+                            `🚀 Пост-мердж деплой фазы "${phase.milestone}": итог workflow — ` +
+                                `${outcome.status}${outcome.conclusion ? ` (${outcome.conclusion})` : ''}.`,
+                        );
+                        // #164: MVP-определение «живо» — workflow success + HTTP 200 главной
+                        // страницы. Healthcheck зовём только после зелёного workflow (#THS8S:
+                        // isWorkflowGreen — тот же предикат, что в classifyDeployOutcome):
+                        // красный/недосмотренный итог сам по себе уже сигнал, здоровье прода
+                        // на нём не проверить.
+                        let health: ReturnType<typeof checkProdHealth> | null = null;
+                        if (isWorkflowGreen(outcome)) {
+                            health = checkProdHealthFn(cfg, { logFn });
+                        }
+                        // #369: классификация — через шов деплой-проверки (та же функция).
+                        const verdict = adapters.deployCheck.classifyOutcome(outcome, health);
+                        if (verdict.red) {
+                            block = {
+                                milestone: phase.milestone,
+                                sha: outcome.sha ?? null,
+                                status: outcome.status ?? null,
+                                conclusion: outcome.conclusion ?? null,
+                                url: outcome.url ?? null,
+                                reason: verdict.reason,
+                            };
+                        }
+                    } catch (e) {
+                        // fail-closed: не смогли ПОДТВЕРДИТЬ зелёный деплой = красный, а не
+                        // тихий пропуск (иначе рестарт построил бы фазу поверх неизвестного
+                        // исхода). Сама ошибка чтения — это тоже «не знаю» = блок.
+                        const msg = String((e as Error).message).split('\n')[0];
+                        logFn(
+                            `⚠ Пост-мердж: не удалось дождаться итога деплоя фазы ` +
+                                `"${phase.milestone}" (${msg}).`,
+                        );
+                        block = {
+                            milestone: phase.milestone,
+                            sha: null,
+                            status: 'error',
+                            conclusion: null,
+                            url: null,
+                            reason: `ошибка проверки деплоя: ${msg}`,
+                        };
+                    }
+                }
+                if (block) {
+                    // #165: сначала персистим барьер, потом пушим — если процесс умрёт
+                    // между ними, блок в state переживёт рестарт и preflight допушит
+                    // (иначе класс «пуш потерян, деплой красный, тишина» из брифа).
+                    state.deployBlock = block;
+                    saveStateFn(state);
+                    const shaStr = block.sha ? String(block.sha).slice(0, 8) : '—';
+                    pushEventFn(
+                        `⛔ Ralph: фаза "${phase.milestone}" смерджена, но деплой красный — ` +
+                            `${block.reason} (sha ${shaStr}${block.url ? `, ${block.url}` : ''}). ` +
+                            `Следующая фаза НЕ начнётся, пока не разберёшь: почини прод/деплой и ` +
+                            `запусти loop с --deploy-resolved. Откат релиза — за deploy-workflow, main раннер не трогает.`,
+                        cfg,
+                        { logFn },
+                    );
+                } else {
+                    // #TFO8_: зелёный подтверждён — снимаем pending-маркер, поставленный
+                    // перед ожиданием. Иначе следующий старт увидел бы «висящий» pending
+                    // и ложно упёрся бы в барьер.
+                    state.deployBlock = null;
+                    saveStateFn(state);
+                }
+                // #249: непрерывный prod — красный пост-мердж деплой стопорит трек ВСЕГДА,
+                // независимо от haltBeforeDeploy (fail-closed: следующая фаза не должна
+                // катиться поверх непроверенного релиза). Флаг решает судьбу только
+                // зелёного исхода. Дефолт (не задан либо true) сохраняет #87 — стоп после
+                // каждой фазы, деплой и следующий шаг остаются за человеком.
+                if (block) {
+                    // Красный/недосмотренный деплой: деплой УЖЕ случился и он красный,
+                    // а не «пауза перед деплоем». Следующий запуск упрётся в барьер
+                    // state.deployBlock в preflight — продолжение только после разбора
+                    // и явного --deploy-resolved. Маркер ⏸ сохранён — на нём режим
+                    // stopped deadman'а (#10).
+                    logFn(
+                        `⏸ Ralph: фаза "${phase.milestone}" — стоп: деплой красный, продолжение только после разбора и запуска loop с --deploy-resolved.`,
+                    );
+                    return 'break';
+                }
+                if (cfg.haltBeforeDeploy !== false) {
+                    logFn(
+                        `⏸ Ralph: фаза "${phase.milestone}" — loop остановлен перед деплоем (prod). Следующая фаза начнётся со следующего запуска.`,
+                    );
+                    return 'break';
+                }
+                // #51-ревью: текст разведён по deployOn. «Деплой зелёный» при
+                // ВЫКЛЮЧЕННОМ деплое — ровно та ложь, против которой затевался #51:
+                // утренний разбор ralph.log прочитал бы её как подтверждённый релиз,
+                // хотя не проверялось ничего. Комбинация «деплоя нет + непрерывный
+                // режим» легальна, и лог обязан называть вещи своими именами.
+                logFn(
+                    deployOn
+                        ? `▶ Ralph: фаза "${phase.milestone}" — деплой зелёный, haltBeforeDeploy=false — продолжаю без остановки, следующая фаза уже поднята.`
+                        : `▶ Ralph: фаза "${phase.milestone}" — деплоя нет (проверять нечего), haltBeforeDeploy=false — продолжаю без остановки, следующая фаза уже поднята.`,
+                );
+                return 'continue';
+            }
+            return 'continue';
+        };
+
         while (true) {
             const idx = phaseIndexOfFn(state);
             const phase = cfg.phases[idx];
             if (!phase) {
                 logFn('🎉 Все фазы завершены!');
+                break;
+            }
+
+            // #88: граница шага — единственное место, где петля слушает запрос мягкой
+            // остановки. Шаг (итерация кодера, круг сдачи) к этому моменту доведён
+            // целиком, без дедлайна; state пишется ещё раз явно — стоп не должен зависеть
+            // от того, записал ли его последний шаг. Запрос снимается ДО пуша: иначе
+            // следующий запуск встал бы на том же файле, не сделав ни шага.
+            if (stopRequestedFn()) {
+                // C1: dry-run только называет запрос и встаёт. Ни state, ни сам запрос он не
+                // трогает: файл адресован живой петле, и снятый здесь он до неё не дошёл бы.
+                if (dry) {
+                    logFn(
+                        `💤 DRY: запрос мягкой остановки на месте (${RUNTIME.stopRequest}) — ` +
+                            'dry-run встаёт, запрос оставлен живой петле.',
+                    );
+                    break;
+                }
+                saveStateFn(state);
+                let clearNote = '';
+                try {
+                    clearStopRequestFn();
+                } catch (e) {
+                    clearNote = ` Запрос остановки снять не удалось (${(e as Error).message}) — убери его руками, иначе следующий запуск встанет сразу.`;
+                }
+                pushEventFn(
+                    `⏸ Ralph: мягкая остановка по запросу — фаза "${phase.milestone}", итерация ${state.count}: ` +
+                        `начатый шаг доведён, state сохранён. Продолжение — обычный запуск loop.${clearNote}`,
+                    cfg,
+                    { logFn },
+                );
                 break;
             }
 
@@ -4681,6 +5073,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 // (тест, чужой taskSource) может не знать про поле. Потеря фильтра здесь
                 // возвращает прежнее поведение — лишнюю сессию, — но не неверный мердж.
                 for (const n of intents.closedIssues ?? []) closedThisRun.add(n);
+                // #86: исход намерения неизвестен — стоп, пуш уже ушёл изнутри. Следующая
+                // сессия дописала бы свои намерения в файл, который не применится никогда,
+                // и закрытая по существу карточка крутилась бы до брейкера.
+                if (intents.outcomeUnknown === true) break;
 
                 // Кодер-итерация: ненулевой код САМ ПО СЕБЕ не фатален — issue остался
                 // открытым, его возьмёт следующая чистая сессия, а breaker ограничит
@@ -4829,6 +5225,22 @@ export function createOrchestrator(env: OrchestratorEnv) {
                             );
                             break;
                         }
+                    }
+                    // #88: метка начатого мерджа — фазу смерджил ПРОШЛЫЙ процесс этого раннера и
+                    // умер раньше пост-мердж шагов (строка о мердже, переход, проверка деплоя).
+                    // Это не мердж человеком, и молчаливый переход ниже был бы неправдой дважды:
+                    // в чате ни строки о мердже, а prod-деплой ушёл бы непроверенным. Доводим
+                    // те же шаги, что после мерджа гейтом.
+                    const ourMerge = state.mergeInFlight;
+                    if (!dry && ourMerge && ourMerge.milestone === phase.milestone) {
+                        logFn(
+                            `♻️ Фаза "${phase.milestone}" смерджена прерванным процессом (PR #${ourMerge.pr}) — довожу шаги после мерджа.`,
+                        );
+                        if (finishMergedPhase(phase, idx, ourMerge.pr) === 'break') break;
+                        // --once — как в ветке «уже смерджена» ниже: HITL-прогон доводит
+                        // пост-мердж шаги и встаёт, а не берёт кодер следующей фазы.
+                        if (once) break;
+                        continue;
                     }
                     logFn(
                         `✅ Фаза "${phase.milestone}" уже смерджена — дерево раннера на свежем origin/main, переход к следующей.`,
@@ -5892,20 +6304,27 @@ export function createOrchestrator(env: OrchestratorEnv) {
                             // отработал», и после рестарта любая блокирующая находка уходила
                             // в безусловный мердж. Цена нового порядка — повторный вызов
                             // арбитра после падения, и он ограничен теми же потолками.
-                            ladder = { ...ladder, arbitrated: true };
-                            state.reviewOfFixes = ladder;
-                            saveStateFn(state);
                             const arbBlocking = classifyFixReview(
                                 lastPrFindings,
                                 emptyReviewOfFixes(),
                             );
-                            if (lastPrBlocked || arbBlocking.freshBlocking.length > 0) {
+                            const arbConfirmed =
+                                lastPrBlocked || arbBlocking.freshBlocking.length > 0;
+                            ladder = { ...ladder, arbitrated: true };
+                            state.reviewOfFixes = ladder;
+                            // #87: подтверждённый блокер без pr-block держит только метка,
+                            // которую ставит раннер, а после рестарта лестница с `arbitrated`
+                            // решает «мердж». Флаг восстановления метки поэтому ложится на
+                            // диск ТОЙ ЖЕ записью, что и `arbitrated`: раньше его ставил
+                            // restoreBlockedLabel следующей записью, и раннер, убитый между
+                            // ними, после рестарта мерджил фазу с подтверждённым блокером
+                            // (tests/pr-crash-windows.test.ts).
+                            if (arbConfirmed && !lastPrBlocked) state.reReviewPending = true;
+                            saveStateFn(state);
+                            if (arbConfirmed) {
                                 // Воспроизвёл: метку уже поставило намерение pr-block (либо
                                 // ставим её сами по severity находок) — дальше штатный
                                 // разбор blocked, а не стоп.
-                                // Задача 79: `arbitrated` уже на диске, и после рестарта
-                                // лестница решит «мердж» — не подтверждённую метку держит
-                                // только флаг восстановления, который ставит restoreBlockedLabel.
                                 if (!lastPrBlocked) restoreBlockedLabel(phase.branch);
                                 pushEventFn(
                                     `⛔ Ralph: фаза "${phase.milestone}" — независимый арбитр подтвердил блокирующий дефект в правках (PR #${String(prNow ?? '?')}), фаза ушла в разбор blocked.`,
@@ -6033,6 +6452,38 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     }
                 }
 
+                // #88: метка начатого мерджа на диске — прошлый процесс отправил (или собирался
+                // отправить) POST мерджа и умер раньше исхода. Фаза здесь НЕ видна смердженной
+                // (ветку phaseMerged выше она уже прошла), но у асинхронного форжа это ещё не
+                // «не смерджена»: операция может стоять в очереди. Повтор POST задвоил бы
+                // принятую операцию, продолжение счёл бы её успехом — поэтому стоп с вопросом.
+                // Выход из «не влит» — --resubmit: он снимает метку осознанно, рукой человека.
+                // Метка ЧУЖОЙ фазы (ручная правка state, смена списка фаз) о мердже этого PR
+                // не говорит ничего: стоп на ней задал бы человеку вопрос не про тот PR. Она
+                // снимается вслух, и гейт идёт штатно.
+                const inFlight = state.mergeInFlight;
+                if (inFlight && inFlight.milestone !== phase.milestone) {
+                    logFn(
+                        `⚠ Метка начатого мерджа относится к фазе "${inFlight.milestone}" (PR #${inFlight.pr}), а не к "${phase.milestone}" — снимаю её.`,
+                    );
+                    state.mergeInFlight = null;
+                    saveStateFn(state);
+                } else if (inFlight) {
+                    pushEventFn(
+                        `⛔ Ralph: фаза "${phase.milestone}" — мердж PR #${inFlight.pr} начат прерванным процессом, исход неизвестен. ` +
+                            formatStopMessage({
+                                reason: 'merge-unknown',
+                                diagnosis:
+                                    `метка начатого мерджа на диске (голова ${inFlight.sha ? inFlight.sha.slice(0, 8) : 'не зафиксирована'}), ` +
+                                    'а форж фазу смердженной не показывает — операция могла не дойти или стоять в очереди.',
+                                question: MERGE_UNKNOWN_QUESTION,
+                            }),
+                        cfg,
+                        { logFn },
+                    );
+                    break;
+                }
+
                 // 4. Детерминированный гейт: раннер сам проверяет hold + blocked + HEAD==PR + чеки.
                 logFn(
                     '🚦 Гейт мерджа: проверка label hold/blocked + сверка HEAD + прогон чеков...',
@@ -6065,6 +6516,22 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     // и подмена в тесте влияла бы на проверку «фаза уже смерджена», но не
                     // на сверку идемпотентности внутри ретрая мерджа. Один канал, не два.
                     phaseMergedFn,
+                    // #88: метку снимает только ОПРЕДЕЛЁННЫЙ исход. Смерджено — снимет переход
+                    // фазы той же записью; отказ форжа по существу с первой попытки — гейт
+                    // (мерджа нет точно). Не подтверждено, транзиент за пределом, «влито, дерево
+                    // отстало» — для рестарта исход неизвестен или нужны пост-мердж шаги.
+                    onMergeSettledFn: () => {
+                        state.mergeInFlight = null;
+                        saveStateFn(state);
+                    },
+                    onMergeStartFn: (prNumber: number, head: string | null) => {
+                        state.mergeInFlight = {
+                            milestone: phase.milestone,
+                            pr: prNumber,
+                            sha: head,
+                        };
+                        saveStateFn(state);
+                    },
                 });
                 // #218: гейт дошёл сюда БЕЗ label blocked, а счётчик разбора > 0 → прошлый
                 // проход сняла метку (removeBlockedLabel) и повторное ревью раннера её не
@@ -6096,165 +6563,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     saveStateFn(state);
                 }
                 if (gate === 'merged') {
-                    const mergedMsg = `✅ Ralph: фаза "${phase.milestone}" смерджена в main — готова к релизу.`;
-                    pushEventFn(mergedMsg, cfg, { logFn });
-                    closeMilestoneByTitleFn(phase.milestone); // закрыть milestone сразу, не ждать свипа
-                    syncProjectBoardFn(); // #199: закрытые issues фазы → Done на доске
-                    recordReviewFindingsFn(phase, getLastGatePr(), cfg.authorAllowlist); // #169: счёт находок ревью в журнал
-                    advancePhaseFn(state, idx);
-                    // #87: prod — стоп перед деплоем. Деплой уже в руках CI (мердж его и
-                    // запустил), но loop не должен тут же хвататься за следующую фазу без
-                    // паузы на релиз человеком. Пауза теперь под флагом haltBeforeDeploy
-                    // (#249, см. ниже): дефолт сохраняет этот стоп, `false` включает
-                    // непрерывный prod на зелёном деплое. playground: мердж остаётся финалом —
-                    // continue как раньше, следующая фаза стартует с обновлённого main.
-                    if (cfg.profileName === 'prod') {
-                        // #51: деплоя может не быть вовсе. Тогда пост-мердж проверка не
-                        // «падает fail-closed», а НЕ ПРОВОДИТСЯ: fail-closed отвечает на
-                        // вопрос «релиз зелёный?», а здесь такого вопроса нет — и красный
-                        // ответ на несуществующий вопрос стопорил трек после каждого мерджа.
-                        // Пауза prod перед релизом (#87) при этом ОСТАЁТСЯ: она про «человек
-                        // решает, что дальше», и от наличия деплоя не зависит.
-                        const deployOn = deployEnabledFn();
-                        if (deployOn) {
-                            deployPhaseFn(phase, { logFn });
-                        } else {
-                            logFn(
-                                `▫ Пост-мердж: деплоя нет (adapters.deployCheck: none) — проверка релиза фазы ` +
-                                    `"${phase.milestone}" не проводится.`,
-                            );
-                        }
-                        // #163/#165: дождаться итога deploy-workflow на смердженном sha прежде
-                        // чем отдать фазу релизу — иначе откат раскатки остаётся в main и
-                        // следующий мердж передеплоит битый коммит. Только ЧТЕНИЕ gh run
-                        // (ретраи внутри, прод/main не трогаем — #166).
-                        // block !== null → красный/недосмотренный итог: alert-first (пуш + барьер
-                        // в state), main раннер НЕ трогает — откат за deploy-workflow.
-                        let block: DeployBlock | null = null;
-                        // #51: без деплоя тело не исполняется вовсе — ни одного обращения к механике
-                        // проверки, каждое из которых на площадке было бы походом в отсутствующий `gh`.
-                        if (deployOn) {
-                            try {
-                                const mergedSha = mergedShaOfFn(getLastGatePr());
-                                // #TFO8_ (major): персистим pending-маркер ДО ожидания. advancePhase
-                                // выше уже сохранил СЛЕДУЮЩУЮ фазу, а вердикт деплоя приходит через
-                                // ~21 мин (ожидание + healthcheck). Умри процесс в этом окне (kill,
-                                // OOM, ребут VDS) — без маркера рестарт увидел бы следующую фазу без
-                                // deployBlock и построил её поверх непроверенного main без пуша.
-                                // preflight на pending — fail-closed стоп+пуш (снимает --deploy-resolved).
-                                state.deployBlock = {
-                                    status: 'pending',
-                                    milestone: phase.milestone,
-                                    sha: mergedSha,
-                                    conclusion: null,
-                                    url: null,
-                                    reason: 'пост-мердж проверка не завершена (процесс мог умереть в окне ожидания)',
-                                };
-                                saveStateFn(state);
-                                const outcome = waitForDeployRunFn(mergedSha, cfg, { logFn });
-                                logFn(
-                                    `🚀 Пост-мердж деплой фазы "${phase.milestone}": итог workflow — ` +
-                                        `${outcome.status}${outcome.conclusion ? ` (${outcome.conclusion})` : ''}.`,
-                                );
-                                // #164: MVP-определение «живо» — workflow success + HTTP 200 главной
-                                // страницы. Healthcheck зовём только после зелёного workflow (#THS8S:
-                                // isWorkflowGreen — тот же предикат, что в classifyDeployOutcome):
-                                // красный/недосмотренный итог сам по себе уже сигнал, здоровье прода
-                                // на нём не проверить.
-                                let health: ReturnType<typeof checkProdHealth> | null = null;
-                                if (isWorkflowGreen(outcome)) {
-                                    health = checkProdHealthFn(cfg, { logFn });
-                                }
-                                // #369: классификация — через шов деплой-проверки (та же функция).
-                                const verdict = adapters.deployCheck.classifyOutcome(
-                                    outcome,
-                                    health,
-                                );
-                                if (verdict.red) {
-                                    block = {
-                                        milestone: phase.milestone,
-                                        sha: outcome.sha ?? null,
-                                        status: outcome.status ?? null,
-                                        conclusion: outcome.conclusion ?? null,
-                                        url: outcome.url ?? null,
-                                        reason: verdict.reason,
-                                    };
-                                }
-                            } catch (e) {
-                                // fail-closed: не смогли ПОДТВЕРДИТЬ зелёный деплой = красный, а не
-                                // тихий пропуск (иначе рестарт построил бы фазу поверх неизвестного
-                                // исхода). Сама ошибка чтения — это тоже «не знаю» = блок.
-                                const msg = String((e as Error).message).split('\n')[0];
-                                logFn(
-                                    `⚠ Пост-мердж: не удалось дождаться итога деплоя фазы ` +
-                                        `"${phase.milestone}" (${msg}).`,
-                                );
-                                block = {
-                                    milestone: phase.milestone,
-                                    sha: null,
-                                    status: 'error',
-                                    conclusion: null,
-                                    url: null,
-                                    reason: `ошибка проверки деплоя: ${msg}`,
-                                };
-                            }
-                        }
-                        if (block) {
-                            // #165: сначала персистим барьер, потом пушим — если процесс умрёт
-                            // между ними, блок в state переживёт рестарт и preflight допушит
-                            // (иначе класс «пуш потерян, деплой красный, тишина» из брифа).
-                            state.deployBlock = block;
-                            saveStateFn(state);
-                            const shaStr = block.sha ? String(block.sha).slice(0, 8) : '—';
-                            pushEventFn(
-                                `⛔ Ralph: фаза "${phase.milestone}" смерджена, но деплой красный — ` +
-                                    `${block.reason} (sha ${shaStr}${block.url ? `, ${block.url}` : ''}). ` +
-                                    `Следующая фаза НЕ начнётся, пока не разберёшь: почини прод/деплой и ` +
-                                    `запусти loop с --deploy-resolved. Откат релиза — за deploy-workflow, main раннер не трогает.`,
-                                cfg,
-                                { logFn },
-                            );
-                        } else {
-                            // #TFO8_: зелёный подтверждён — снимаем pending-маркер, поставленный
-                            // перед ожиданием. Иначе следующий старт увидел бы «висящий» pending
-                            // и ложно упёрся бы в барьер.
-                            state.deployBlock = null;
-                            saveStateFn(state);
-                        }
-                        // #249: непрерывный prod — красный пост-мердж деплой стопорит трек ВСЕГДА,
-                        // независимо от haltBeforeDeploy (fail-closed: следующая фаза не должна
-                        // катиться поверх непроверенного релиза). Флаг решает судьбу только
-                        // зелёного исхода. Дефолт (не задан либо true) сохраняет #87 — стоп после
-                        // каждой фазы, деплой и следующий шаг остаются за человеком.
-                        if (block) {
-                            // Красный/недосмотренный деплой: деплой УЖЕ случился и он красный,
-                            // а не «пауза перед деплоем». Следующий запуск упрётся в барьер
-                            // state.deployBlock в preflight — продолжение только после разбора
-                            // и явного --deploy-resolved. Маркер ⏸ сохранён — на нём режим
-                            // stopped deadman'а (#10).
-                            logFn(
-                                `⏸ Ralph: фаза "${phase.milestone}" — стоп: деплой красный, продолжение только после разбора и запуска loop с --deploy-resolved.`,
-                            );
-                            break;
-                        }
-                        if (cfg.haltBeforeDeploy !== false) {
-                            logFn(
-                                `⏸ Ralph: фаза "${phase.milestone}" — loop остановлен перед деплоем (prod). Следующая фаза начнётся со следующего запуска.`,
-                            );
-                            break;
-                        }
-                        // #51-ревью: текст разведён по deployOn. «Деплой зелёный» при
-                        // ВЫКЛЮЧЕННОМ деплое — ровно та ложь, против которой затевался #51:
-                        // утренний разбор ralph.log прочитал бы её как подтверждённый релиз,
-                        // хотя не проверялось ничего. Комбинация «деплоя нет + непрерывный
-                        // режим» легальна, и лог обязан называть вещи своими именами.
-                        logFn(
-                            deployOn
-                                ? `▶ Ralph: фаза "${phase.milestone}" — деплой зелёный, haltBeforeDeploy=false — продолжаю без остановки, следующая фаза уже поднята.`
-                                : `▶ Ralph: фаза "${phase.milestone}" — деплоя нет (проверять нечего), haltBeforeDeploy=false — продолжаю без остановки, следующая фаза уже поднята.`,
-                        );
-                        continue;
-                    }
+                    if (finishMergedPhase(phase, idx, getLastGatePr()) === 'break') break;
                     continue;
                 }
                 if (gate === 'merge-unconfirmed') {
@@ -6262,18 +6571,17 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     // фетча main: «не подтверждён» — это неизвестность, а не факт. Повторять
                     // мердж петля тоже не будет (задвоение принятой операции), поэтому
                     // честный стоп с пушем. Рестарт разведёт исходы сам: операция дошла —
-                    // фаза видна смердженной (ветка phaseMerged); не дошла — цикл сдачи
-                    // начнётся заново с тем же PR.
+                    // фаза видна смердженной (ветка phaseMerged); не дошла — метка начатого
+                    // мерджа (#88) остановит его снова, пока человек не скажет --resubmit.
                     pushEventFn(
                         // Ревью #289: хвост «Проверь PR — если он влит, перезапуск
                         // продолжит сам» дословно повторял вопрос человеку ниже.
                         `⛔ Ralph: фаза "${phase.milestone}" — мердж PR #${getLastGatePr() ?? '?'} не подтверждён. ` +
                             `Loop остановлен: следующая фаза не строится поверх неизвестного main. ` +
                             formatStopMessage({
-                                reason: 'unknown',
+                                reason: 'merge-unknown',
                                 diagnosis: `форж принял мердж PR #${getLastGatePr() ?? '?'}, но не подтвердил его за отведённые попытки.`,
-                                question:
-                                    'проверь PR руками — если он влит, перезапусти loop (продолжит сам); если нет, разберись с площадкой',
+                                question: MERGE_UNKNOWN_QUESTION,
                             }),
                         cfg,
                         { logFn },
@@ -7883,8 +8191,15 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // мёртвым pid → isMonitorProcess=false → ветка rmPidFn удаляет pid-файл, где уже
         // записан pid НОВОГО монитора: новый не получает SIGTERM и остаётся вечным сиротой,
         // а без pid-файла его не подберёт и adoptMonitor следующего прогона.
+        // #86: после переезда в дерево работы и preflight — отвергнутый preflight-ом
+        // запуск остановится по своей причине, а не по метке, и путь файла намерений к
+        // этому моменту тот же, по которому его потом читает применение.
+        if (stopOnInFlightIntent({ cfg: config })) return;
+
         runLoop(config, ctx, {
             monitorConfigPath: runnerConfigPath,
+            stopRequestedFn: stopRequested,
+            clearStopRequestFn: clearStopRequest,
             ensureMonitorAliveFn: (o) => {
                 const fresh = ensureMonitorAlive(o);
                 if (fresh) monitor = fresh;
@@ -7983,6 +8298,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
         phasePrBody,
         // #40: то же — у всех четырёх свой DI-хук на argv, контракт проверяет боевые.
         applySessionRequests,
+        stopOnInFlightIntent,
+        // #88: барьер деплоя на старте — его зовёт и рестарт матрицы «убить до / после».
+        stopOnDeployBlock,
         commentOnIssue,
         closeIssue,
         blockIssue,

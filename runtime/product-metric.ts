@@ -99,6 +99,10 @@ export const STOP_ROLES: Record<TStopReason, 'barrier' | 'paired' | 'loop'> = {
     // петли, а не пойманное изменение.
     'session-unpushed': 'loop',
     'tree-dirty': 'loop',
+    // Раннер убит посреди применения намерения (#86): стоп петли, изменение тут ни при чём.
+    'intent-unknown': 'loop',
+    // Исход мерджа неизвестен (#53, #88): стоп петли на неподтверждённой операции форжа.
+    'merge-unknown': 'loop',
     breaker: 'loop',
     deadman: 'loop',
     unknown: 'loop',

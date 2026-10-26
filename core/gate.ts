@@ -44,13 +44,12 @@ import {
     mergeRetryPauseMs,
     resolveMergeRetryMaxMs,
 } from './merge-retry.ts';
-import { errorText, gitNetworkEnv } from '../shared/ralph-util.ts';
+import { errorText, gitNetworkOpts } from '../shared/ralph-util.ts';
+import type { ExecOpts, ShArgvFn } from '../shared/ralph-util.ts';
 import { syncPhaseBranchWithMain } from './main-sync.ts';
 import type { MainSyncResult } from './main-sync.ts';
 
-type ExecOpts = { env?: NodeJS.ProcessEnv };
 type ShFn = (cmd: string, opts?: ExecOpts) => string;
-type ShArgvFn = (file: string, args: string[], opts?: ExecOpts) => string;
 type ShqFn = (value: unknown) => string;
 type LogFn = (msg: string) => void;
 // fail() боевой уходит в process.exit(1); тестовый может бросить/вернуть — потому unknown.
@@ -579,7 +578,7 @@ export function createGateRunner(env: GateEnv) {
             return false;
         }
         try {
-            runArgvFn('git', ['fetch', 'origin', branch], { env: gitNetworkEnv() });
+            runArgvFn('git', ['fetch', 'origin', branch], gitNetworkOpts());
         } catch (e: unknown) {
             logFn(
                 `⛔ git fetch origin ${branch} упал (${(e as Error).message}) — без свежего remote нельзя убедиться, что тестируем то, что мерджим. Авто-мердж отменён.`,
@@ -968,6 +967,13 @@ export function createGateRunner(env: GateEnv) {
             getToolFailureSkipsFn = () => lastToolSkips,
             getLastMainSyncStopFn = () => lastMainSyncStop,
             getLastHeadDivergenceFn = () => lastHeadDivergence,
+            // #88: метка начатого мерджа — запись state раньше POST. Гейт state не знает,
+            // поэтому пишет её вызывающий; без него (юнит гейта) шаг пуст, как до карточки.
+            onMergeStartFn = () => {},
+            // #88: исход мерджа определён без влития — форж отказал по существу на ПЕРВОЙ
+            // попытке. Только тогда метку можно снять: после транзиента любая из попыток
+            // могла лечь в очередь форжа с потерянным ответом.
+            onMergeSettledFn = () => {},
         }: {
             dry?: boolean;
             shFn?: ShFn;
@@ -1000,6 +1006,8 @@ export function createGateRunner(env: GateEnv) {
             getToolFailureSkipsFn?: () => ToolFailureSkip[];
             getLastMainSyncStopFn?: () => typeof lastMainSyncStop;
             getLastHeadDivergenceFn?: () => typeof lastHeadDivergence;
+            onMergeStartFn?: (prNumber: number, head: string | null) => void;
+            onMergeSettledFn?: () => void;
         } = {},
     ):
         | 'merged'
@@ -1301,6 +1309,11 @@ export function createGateRunner(env: GateEnv) {
         // таймаут, обрыв) — растущая пауза до предела по времени; отказ по существу —
         // стоп сразу, повторять нечего; нераспознанный — один повтор, как до #47. Отсчёт
         // предела — от первого отказа: он меряет терпение к сбою площадки, а не длину гейта.
+        // #88: метка начатого мерджа ложится ДО первого POST и не снимается здесь: принятый
+        // форжем мердж — неизвестный исход до подтверждения, и рестарт, убитый в этом окне,
+        // не должен ни повторить POST вслепую, ни счесть фазу смердженной. Запись бросила —
+        // мерджа нет: без метки POST был бы ровно тем слепым окном, которое она закрывает.
+        onMergeStartFn(pr.number, verifiedHead);
         let mergedOk = false;
         let failedSinceMs: number | null = null;
         // Один повтор нераспознанного — по ЧИСЛУ его повторов, а не по номеру попытки:
@@ -1360,6 +1373,7 @@ export function createGateRunner(env: GateEnv) {
                               : 'отказ не распознан и после повтора') +
                         ' — оставлен человеку.',
                 );
+                if (kind === 'refusal' && attempt === 1) onMergeSettledFn();
                 parkFn();
                 return 'not-merged';
             }

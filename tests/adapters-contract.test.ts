@@ -188,6 +188,7 @@ function buildFakeTaskSource(): { adapter: TaskSourceAdapter; calls: string[] } 
         checkAuth: () => {
             if (authFails) throw new Error('форж отверг авторизацию');
         },
+        secretEnvNames: () => ['FAKE_FORGE_TOKEN'],
         listReadyIssues: (milestone) => (milestone === MILESTONE ? filterReady(ISSUES) : []),
         listAllOpenIssues: (milestone) => {
             if (allOpenThrows) throw new Error('gh issue list упал');
@@ -550,6 +551,16 @@ function registerTaskSourceContract(
         it('listReadyIssues отдаёт готовые issues отсортированными, без blocked и чужих авторов', () => {
             const { adapter } = build();
             expect(adapter.listReadyIssues(MILESTONE).map((i) => i.number)).toEqual([10, 30]);
+        });
+
+        // #56: ядро редактирует вывод упавшей сессии по тому, что шов назвал своим
+        // секретом. Пустой список — тихая утечка токена площадки, поэтому реализация,
+        // которой нечего назвать, контракт не проходит.
+        it('secretEnvNames называет хотя бы одну переменную с секретом площадки', () => {
+            const { adapter } = build();
+            const names = adapter.secretEnvNames();
+            expect(names.length).toBeGreaterThan(0);
+            expect(names.every((n) => typeof n === 'string' && n.trim() !== '')).toBe(true);
         });
 
         it('listAllOpenIssues НЕ фильтрует (C2: blocked и чужие тоже считаются)', () => {

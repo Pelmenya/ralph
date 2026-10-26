@@ -86,8 +86,147 @@ export function errorText(e: unknown): string {
 // дедмана, петля не падает и причины в лог не пишет. Отказ здесь дешевле молчания. Раньше
 // запрет стоял только у проводки на ветку фазы, а fetch и ls-remote остального ядра —
 // включая перенесённые из копии потребителя — шли без него.
-export function gitNetworkEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-    return { ...env, GIT_TERMINAL_PROMPT: '0' };
+//
+// Задача 30 добавила к запрету второй сценарий, тише первого: креды есть, но origin молчит
+// (мёртвый прокси, отвалившийся туннель). Запрет промпта тут не помогает, помогает только
+// срок. Срок держит `shArgv` (`timeoutMs` → `timeout` + `SIGKILL` у `execFileSync`), но
+// убивает он лишь сам `git`: транспорт `git-remote-http` — его ребёнок, и после убийства
+// родителя он остаётся сиротой, держащей сокет (проверено на стенде с молчащим сервером).
+// Поэтому транспорту уходит свой детектор молчания — порог низкой скорости: меньше байта в
+// секунду дольше `GIT_NETWORK_STALL_S`, и транспорт отказывает сам. Порог и срок разведены
+// намеренно: порог ловит тишину и живую передачу не трогает, а срок — страховка поверх него
+// и убивает git, даже когда байты идут. Равные, они обрывали бы медленный, но живой fetch
+// крупной ветки ровно на пороге тишины. Значение пользователя, если он его задал, не
+// перекрываем; короткий явный срок вызывающего порог укорачивает до себя.
+//
+// Транспорт `ssh://` / `git@` порог не накрывает: это переменные libcurl. Git по сроку
+// вернётся вовремя (spawnSync отдаёт ETIMEDOUT и при внуке, держащем пайпы), но `ssh`
+// останется сиротой с открытым соединением, как `git-remote-http` без порога. Своего
+// `GIT_SSH_COMMAND` мы не ставим: он сильнее `core.sshCommand` и молча снял бы ключ и опции,
+// которые пользователь задал в конфиге git. Ограничение названо, а не закрыто.
+function gitNetworkEnv(
+    env: NodeJS.ProcessEnv = process.env,
+    timeoutMs: number = GIT_NETWORK_TIMEOUT_MS,
+): NodeJS.ProcessEnv {
+    const stallS = Math.min(GIT_NETWORK_STALL_S, Math.max(1, Math.ceil(timeoutMs / 1000)));
+    return {
+        ...env,
+        GIT_TERMINAL_PROMPT: '0',
+        GIT_HTTP_LOW_SPEED_LIMIT: env.GIT_HTTP_LOW_SPEED_LIMIT ?? '1',
+        GIT_HTTP_LOW_SPEED_TIME: env.GIT_HTTP_LOW_SPEED_TIME ?? String(stallS),
+    };
+}
+
+// Порог тишины транспорта: минута без единого байта — канал мёртв. Это детектор молчания, а
+// не предел длительности передачи.
+export const GIT_NETWORK_STALL_S = 60;
+
+// Жёсткий срок сетевого вызова git — страховка поверх порога тишины, а не детектор: живую
+// медленную передачу он рвёт, поэтому стоит заметно выше порога. Десять минут — с запасом на
+// fetch и push крупной ветки по медленному каналу и всё ещё ничто рядом с окном AFK, которое
+// без срока уходило в ожидание целиком. Цена `SIGKILL` посреди обновления ссылок — брошенный
+// `*.lock` в `.git`; при этом сроке её платит только вызов, который и так уже завис.
+export const GIT_NETWORK_TIMEOUT_MS = 600_000;
+
+// Подкоманды git, которые ходят в сеть. Остальные (`diff`, `status`, `rev-parse`, …) ни
+// запрета, ни срока не получают: по сети они не ходят, а срок на них — источник мигания под
+// нагрузкой. Список закрытый: новая сетевая подкоманда в ядре — повод дописать её сюда, и
+// барьер `tests/git-network-calls.test.ts` смотрит в этот же список.
+export const GIT_NETWORK_SUBCOMMANDS: readonly string[] = [
+    'fetch',
+    'pull',
+    'push',
+    'clone',
+    'ls-remote',
+];
+
+// Глобальные опции git, за которыми идёт отдельный аргумент-значение. Список закрыт так же,
+// как подкоманды: пропущенная опция отдала бы своё значение за подкоманду, и сетевой вызов
+// ушёл бы без политики.
+const GIT_GLOBAL_OPTS_WITH_VALUE = new Set([
+    '-C',
+    '-c',
+    '--config-env',
+    '--git-dir',
+    '--work-tree',
+    '--namespace',
+]);
+
+/** Подкоманда git из argv: первый аргумент после глобальных опций, иначе `null`. */
+export function gitSubcommand(args: readonly string[]): string | null {
+    for (let i = 0; i < args.length; i++) {
+        const a = args[i];
+        if (GIT_GLOBAL_OPTS_WITH_VALUE.has(a)) {
+            i++;
+            continue;
+        }
+        if (a.startsWith('-')) continue;
+        return a;
+    }
+    return null;
+}
+
+/** Вызов `file args` — сетевой вызов git. */
+export function isGitNetworkCall(file: string, args: readonly string[]): boolean {
+    const sub = file === 'git' ? gitSubcommand(args) : null;
+    return sub !== null && GIT_NETWORK_SUBCOMMANDS.includes(sub);
+}
+
+export type GitNetworkOpts = { env: NodeJS.ProcessEnv; timeoutMs: number };
+
+// Опции исполнителя argv, общие для всех модулей ядра, которые его принимают. Копия формы в
+// каждом модуле расходилась бы молча: задача 30 правила шесть копий по одной.
+export type ExecOpts = { env?: NodeJS.ProcessEnv; timeoutMs?: number };
+
+/** Исполнитель argv без шелла — форма `shArgv`, которую модули ядра получают инъекцией. */
+export type ShArgvFn = (file: string, args: string[], opts?: ExecOpts) => string;
+
+/** Опции сетевого вызова git: запрет промпта кредов и срок — всегда парой. */
+export function gitNetworkOpts(
+    env: NodeJS.ProcessEnv = process.env,
+    timeoutMs: number = GIT_NETWORK_TIMEOUT_MS,
+): GitNetworkOpts {
+    return { env: gitNetworkEnv(env, timeoutMs), timeoutMs };
+}
+
+/**
+ * Опции запуска, которые `shArgv` применит на деле. Сетевой git получает запрет промпта и
+ * срок, даже если вызывающий их не передал: забытая опция у нового вызова — ровно тот
+ * дефект, из которого выросла задача 30, и закрывать его нужно на единственном пути
+ * исполнения, а не просьбой к каждому месту вызова. Явный срок вызывающего уважается.
+ */
+export function execPolicy(file: string, args: readonly string[], opts: ExecOpts): ExecOpts {
+    if (!isGitNetworkCall(file, args)) return { env: opts.env, timeoutMs: opts.timeoutMs };
+    const timeoutMs = opts.timeoutMs ?? GIT_NETWORK_TIMEOUT_MS;
+    return { env: gitNetworkEnv(opts.env ?? process.env, timeoutMs), timeoutMs };
+}
+
+/**
+ * Отказ по сроку называется сроком. Голый `spawnSync … ETIMEDOUT` или код убитого процесса
+ * уводит разбор по ложному следу — «git сломался», «нет кредов», — тогда как на деле молчит
+ * канал. Ошибка без `stderr` намеренно: `gitErrorText` читает его первым, и обрывок вывода
+ * убитого процесса заслонил бы причину.
+ */
+export class ExecTimeoutError extends Error {
+    constructor(file: string, args: readonly string[], timeoutMs: number) {
+        super(
+            `срок ${formatTimeout(timeoutMs)} истёк — ${file} ${args.join(' ')} убит: ` +
+                'ответа нет (сеть, прокси или туннель молчат)',
+        );
+        this.name = 'ExecTimeoutError';
+    }
+}
+
+// Срок в сообщении: короткий не округляется в «0 с» — срок, которого будто не было,
+// отправил бы разбор искать что угодно, кроме срока.
+function formatTimeout(ms: number): string {
+    return ms < 1000 ? `${ms} мс` : `${Math.ceil(ms / 1000)} с`;
+}
+
+/** Отказ — истёкший срок (свой `ExecTimeoutError` или сырой `ETIMEDOUT` процесса). */
+export function isExecTimeout(e: unknown): boolean {
+    if (e instanceof ExecTimeoutError) return true;
+    return (e as { code?: unknown } | null)?.code === 'ETIMEDOUT';
 }
 
 // Разбор отказа git из `execFileSync` — один на ядро (ревью #66/#85). Три копии жили в

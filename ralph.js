@@ -22,6 +22,7 @@
  *   node .claude/ralph/ralph.js --reset     сбросить state на первую фазу конфига
  *   node .claude/ralph/ralph.js --resubmit  повторить полный цикл сдачи фазы (PR/ревью/правки)
  *   node .claude/ralph/ralph.js --deploy-resolved  снять барьер красного пост-мердж деплоя (#165) и продолжить
+ *   touch <runtimeDir>/ralph.stop                 мягкая остановка: петля встанет на границе шага (#88)
  *   node .claude/ralph/ralph.js --migrate-runtime   перевезти состояние в runtimeDir и выйти
  *   node .claude/ralph/ralph.js --migrate-rollback  вернуть состояние в прежнюю раскладку
  *   node .claude/ralph/ralph.js --profile <name>   профиль конфига (по умолчанию defaultProfile)

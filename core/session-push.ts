@@ -19,9 +19,9 @@
 // ветка, которую допушили снаружи, и гейт подтягивает его fast-forward сам. Молча он при
 // этом не проходит — строка в логе говорит, что пуш пропущен и почему.
 
-import { gitErrorText, gitExitStatus, gitNetworkEnv } from '../shared/ralph-util.ts';
+import { gitErrorText, gitExitStatus, gitNetworkOpts } from '../shared/ralph-util.ts';
+import type { ShArgvFn } from '../shared/ralph-util.ts';
 
-type ShArgvFn = (file: string, args: string[], opts?: { env?: NodeJS.ProcessEnv }) => string;
 type LogFn = (msg: string) => void;
 
 export type SessionPushResult =
@@ -70,7 +70,7 @@ export function pushSessionCommits(
         const out = runArgvFn(
             'git',
             ['ls-remote', '--exit-code', 'origin', `refs/heads/${branch}`],
-            { env: gitNetworkEnv() },
+            gitNetworkOpts(),
         );
         remote = out.trim().split(/\s+/)[0] || null;
     } catch (e: unknown) {
@@ -98,9 +98,7 @@ export function pushSessionCommits(
         } catch {}
     }
     try {
-        runArgvFn('git', ['push', 'origin', `${local}:refs/heads/${branch}`], {
-            env: gitNetworkEnv(),
-        });
+        runArgvFn('git', ['push', 'origin', `${local}:refs/heads/${branch}`], gitNetworkOpts());
     } catch (e: unknown) {
         return {
             kind: 'failed',

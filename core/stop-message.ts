@@ -24,6 +24,8 @@ export type TStopReason =
     | 'head-diverged'
     | 'session-unpushed'
     | 'tree-dirty'
+    | 'intent-unknown'
+    | 'merge-unknown'
     | 'breaker'
     | 'deadman'
     | 'unknown';
@@ -60,6 +62,10 @@ export const REASON_TITLES: Record<TStopReason, string> = {
     'head-diverged': 'локальный ref ветки разошёлся с головой PR',
     'session-unpushed': 'незапушенный коммит сессии разбора',
     'tree-dirty': 'дерево не на нужной ветке',
+    // #86: раннер убит между эффектом намерения на форже и записью «применено».
+    'intent-unknown': 'исход намерения сессии неизвестен',
+    // #53/#88: форж принял мердж и не подтвердил его, либо раннер убит после POST.
+    'merge-unknown': 'исход мерджа неизвестен',
     breaker: 'circuit breaker',
     deadman: 'тишина лога (deadman)',
     unknown: 'причина не установлена',

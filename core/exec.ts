@@ -26,7 +26,12 @@ import path from 'node:path';
 import { execSync, execFileSync } from 'node:child_process';
 import type { StdioOptions } from 'node:child_process';
 import { NO_SIDE_EFFECTS } from '../shared/side-effect-guard.ts';
-import { redactSecrets } from '../shared/ralph-util.ts';
+import {
+    ExecTimeoutError,
+    execPolicy,
+    isExecTimeout,
+    redactSecrets,
+} from '../shared/ralph-util.ts';
 
 type GuardFn = (what: string) => void;
 type SleepFn = (ms: number) => void;
@@ -35,7 +40,10 @@ type SleepFn = (ms: number) => void;
 // одного аргумента у ядра ОС жёсткий (128 КБ) — обрезка здесь дала бы тихо заниженную
 // метрику вместо отказа. Секрет через argv не гонять — тот же довод, что у TG-токена
 // (виден в /proc/<pid>/cmdline), но здесь это про размер, а не про тайну.
-type ExecOpts = { env?: NodeJS.ProcessEnv; input?: string };
+// `timeoutMs` — срок процесса (задача 30): по истечении он убивается `SIGKILL`, а отказ
+// приходит `ExecTimeoutError` с именем срока. Сетевой git получает срок и без опции —
+// см. `execPolicy`.
+type ExecOpts = { env?: NodeJS.ProcessEnv; input?: string; timeoutMs?: number };
 
 export type ExecEnv = {
     guardSideEffect: GuardFn;
@@ -132,19 +140,33 @@ export function createExec(env: ExecEnv) {
     // шелл вообще, поэтому пробелы и спецсимволы в них не раскрываются: класс shell-инъекции
     // закрыт СТРУКТУРНО, а не квотированием shq(). env — как в sh(): по умолчанию наследуем
     // полный env раннера (git-мутациям и gh нужен GH_TOKEN).
-    function shArgv(file: string, args: string[], { env: cmdEnv, input }: ExecOpts = {}): string {
+    function shArgv(file: string, args: string[], opts: ExecOpts = {}): string {
         // #138: реальный процесс в тестах запрещён — тот же предохранитель, что в sh().
         // Печатаем file+argv: по строке видно, какой дефолт-коллаборатор не подменили.
         // Содержимое stdin в журнал НЕ пишем: это данные (комментарии PR), а не команда.
         guardSideEffect(`shArgv(${file} ${args.join(' ')})`);
-        return execFileSync(file, args, {
-            ...EXEC_OPTS,
-            ...(cmdEnv ? { env: cmdEnv } : {}),
-            // `input` перекрывает stdio[0] (документированное поведение execFileSync), но
-            // ставим 'pipe' явно: молчаливая зависимость от перекрытия — ровно то место,
-            // где следующая правка EXEC_OPTS тихо оборвёт stdin.
-            ...(input === undefined ? {} : { input, stdio: ['pipe', 'pipe', 'pipe'] }),
-        }).trim();
+        const { input } = opts;
+        // Задача 30: сетевой git идёт с запретом промпта кредов и сроком, даже если место
+        // вызова их забыло, — путь исполнения один, и закрыт он здесь.
+        const { env: cmdEnv, timeoutMs } = execPolicy(file, args, opts);
+        try {
+            return execFileSync(file, args, {
+                ...EXEC_OPTS,
+                ...(cmdEnv ? { env: cmdEnv } : {}),
+                // SIGKILL, а не дефолтный SIGTERM: процесс, ждущий сеть, обязан умереть
+                // наверняка — срок, который можно проигнорировать, сроком не является.
+                ...(timeoutMs === undefined ? {} : { timeout: timeoutMs, killSignal: 'SIGKILL' }),
+                // `input` перекрывает stdio[0] (документированное поведение execFileSync), но
+                // ставим 'pipe' явно: молчаливая зависимость от перекрытия — ровно то место,
+                // где следующая правка EXEC_OPTS тихо оборвёт stdin.
+                ...(input === undefined ? {} : { input, stdio: ['pipe', 'pipe', 'pipe'] }),
+            }).trim();
+        } catch (e: unknown) {
+            if (timeoutMs !== undefined && isExecTimeout(e)) {
+                throw new ExecTimeoutError(file, args, timeoutMs);
+            }
+            throw e;
+        }
     }
 
     // M3: все ЧТЕНИЯ форжа — с ретраями и backoff. AFK-прогон идёт часами без

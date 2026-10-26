@@ -12,6 +12,7 @@ import {
     type TConsumerTreeKind,
 } from './consumer-tree.ts';
 import type { TResolvedRoots } from './roots.ts';
+import { GIT_NETWORK_TIMEOUT_MS } from '../shared/ralph-util.ts';
 
 const CONSUMER = '/path/to/app';
 const REF = 'refs/ralph/consumer-main';
@@ -41,13 +42,15 @@ function world(replies: Record<string, string | Error | Array<string | Error>> =
     const logs: string[] = [];
     const queues = new Map<string, Array<string | Error>>();
     const envs: Array<NodeJS.ProcessEnv | undefined> = [];
+    const timeouts: Array<number | undefined> = [];
     const runArgvFn = (
         file: string,
         args: string[],
-        opts?: { env?: NodeJS.ProcessEnv },
+        opts?: { env?: NodeJS.ProcessEnv; timeoutMs?: number },
     ): string => {
         calls.push([file, ...args]);
         envs.push(opts?.env);
+        timeouts.push(opts?.timeoutMs);
         // Ключ — хвост argv без общего префикса: он одинаков у всех команд и только шумит.
         const key = args.slice(PREFIX.length).join(' ');
         const declared = replies[key];
@@ -65,6 +68,7 @@ function world(replies: Record<string, string | Error | Array<string | Error>> =
     return {
         calls,
         envs,
+        timeouts,
         run: (roots: TResolvedRoots | null = ROOTS, env?: NodeJS.ProcessEnv): TConsumerTreeKind =>
             updateConsumerTree(roots, { runArgvFn, logFn: (m) => logs.push(m), env }),
         /** Только то, что МЕНЯЕТ дерево. Их отсутствие — предмет половины проб ниже. */
@@ -315,9 +319,10 @@ describe('updateConsumerTree — кто держит дерево потреби
         expect(w.envs[0]?.HOME).toBe('/home/dev');
     });
 
-    it('fetch — с запретом промпта кредов, остальные команды — без него (задача 71)', () => {
-        // Без кредов git открывает `/dev/tty` и ждёт логина: AFK-раннер висел бы в
-        // пост-мердж обновлении до дедмана вместо быстрого отказа с диагнозом.
+    it('fetch — с запретом промпта кредов и сроком, остальные команды — без них (задачи 71, 30)', () => {
+        // Без кредов git открывает `/dev/tty` и ждёт логина, а молчащий origin держит
+        // вызов вечно: AFK-раннер висел бы в пост-мердж обновлении до дедмана вместо
+        // быстрого отказа с диагнозом. Локальным командам срок не нужен — по сети они не ходят.
         const w = happy();
         w.run(ROOTS, { PATH: '/usr/bin', HOME: '/home/dev' });
         const fetchAt = w.calls.findIndex((c) => c.includes('fetch'));
@@ -325,12 +330,21 @@ describe('updateConsumerTree — кто держит дерево потреби
         w.envs.forEach((env, i) =>
             expect(env?.GIT_TERMINAL_PROMPT).toBe(i === fetchAt ? '0' : undefined),
         );
+        w.timeouts.forEach((t, i) =>
+            expect(t).toBe(i === fetchAt ? GIT_NETWORK_TIMEOUT_MS : undefined),
+        );
     });
 
-    it('окружение не передали — не выдумываем своё', () => {
+    it('окружение не передали — локальным командам своего не выдумываем, fetch идёт с запретом', () => {
+        // Раньше без `env` и fetch шёл голым — ровно та дыра, из которой выросла задача 30.
         const w = happy();
         w.run();
-        for (const env of w.envs) expect(env).toBeUndefined();
+        const fetchAt = w.calls.findIndex((c) => c.includes('fetch'));
+        w.envs.forEach((env, i) =>
+            i === fetchAt
+                ? expect(env?.GIT_TERMINAL_PROMPT).toBe('0')
+                : expect(env).toBeUndefined(),
+        );
     });
 
     it('в подмодули не рекурсирует — и запрет ЯВНЫЙ, а не «мы не просили»', () => {

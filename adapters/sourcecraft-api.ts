@@ -34,11 +34,16 @@ export type SourcecraftApiDeps = {
 
 export const SOURCECRAFT_BASE_URL = 'https://api.sourcecraft.tech';
 
+// Имя переменной с токеном по умолчанию. Экспортировано, потому что его же называет шов
+// задач как свой секрет (#56): разойдись эти два места — редакция вырезала бы не ту
+// переменную, из которой транспорт на самом деле берёт токен.
+export const SOURCECRAFT_TOKEN_ENV = 'SOURCECRAFT_TOKEN';
+
 export function createSourcecraftApi(deps: SourcecraftApiDeps): SourcecraftApi {
     const {
         org,
         repo,
-        tokenEnv = 'SOURCECRAFT_TOKEN',
+        tokenEnv = SOURCECRAFT_TOKEN_ENV,
         baseUrl = SOURCECRAFT_BASE_URL,
         spawnFn = realSpawnFn,
         envSource = process.env,

@@ -50,7 +50,8 @@
  * TS-модуль без билд-шага: исполняется нативным type stripping Node 24 (erasable-only).
  */
 
-import { gitErrorText, gitExitStatus, gitNetworkEnv } from '../shared/ralph-util.ts';
+import { gitErrorText, gitExitStatus, gitNetworkOpts } from '../shared/ralph-util.ts';
+import type { ShArgvFn } from '../shared/ralph-util.ts';
 
 /** Чем кончилась постановка дерева на ветку. Каждый исход — свой факт, не оттенок общего. */
 export type TPhaseBranchKind =
@@ -74,7 +75,7 @@ export type TPhaseBranchResult = {
 
 export type TPhaseBranchDeps = {
     /** Тот же контракт, что у `shArgv` ядра: argv плюс опции запуска (нам нужен `env`). */
-    runArgvFn: (file: string, args: string[], opts?: { env?: NodeJS.ProcessEnv }) => string;
+    runArgvFn: ShArgvFn;
     logFn: (msg: string) => void;
     /**
      * Проверка имени ветки — коллаборатором, как у `gate.ts`. Имя приходит из конфига и
@@ -82,7 +83,7 @@ export type TPhaseBranchDeps = {
      * каждой (тот же довод, что у гейта).
      */
     safeBranch: (branch: string | undefined, opts?: { where?: string }) => boolean;
-    /** Окружение вызывающего: на сетевых вызовах к нему добавляется запрет промпта. */
+    /** Окружение вызывающего: на сетевых вызовах к нему добавляются запрет промпта и срок. */
     env?: NodeJS.ProcessEnv;
 };
 
@@ -96,17 +97,6 @@ export type TPhaseBranchDeps = {
  * казалось нужнее.
  */
 const GIT_FLAGS = ['-c', 'submodule.recurse=false'];
-
-/**
- * Окружение сетевого вызова: интерактивный запрос кредов запрещён.
- *
- * Без этого git при отсутствии кредов открывает `/dev/tty` и ждёт логин — не stdin, а
- * именно tty, поэтому перенаправление ввода не спасает. В петле отвечать некому: вызов
- * стоит до дедмана, петля не падает и причины в лог не пишет. Отказ здесь дешевле молчания.
- */
-function networkEnv(env: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv | undefined {
-    return env === undefined ? undefined : gitNetworkEnv(env);
-}
 
 /**
  * Поставить дерево работы на ветку фазы.
@@ -124,8 +114,12 @@ export function ensurePhaseBranch(branch: string, deps: TPhaseBranchDeps): TPhas
     }
 
     const git = (args: string[]): string => runArgvFn('git', [...GIT_FLAGS, ...args]);
+    // Сетевой вызов — с запретом промпта кредов и сроком (задачи 71 и 30): без запрета git
+    // при отсутствии кредов ждёт логина на `/dev/tty` (перенаправление stdin не спасает), без
+    // срока молчащий origin держит вызов вечно. Отвечать в петле некому — вызов стоял бы до
+    // дедмана без причины в логе. Раньше запрет ставился только при переданном `env`.
     const gitNet = (args: string[]): string =>
-        runArgvFn('git', [...GIT_FLAGS, ...args], { env: networkEnv(env) });
+        runArgvFn('git', [...GIT_FLAGS, ...args], gitNetworkOpts(env));
     const fail = (reason: string): TPhaseBranchResult => {
         logFn(`⛔ Ветка фазы ${branch}: ${reason}`);
         return { kind: 'failed', branch, sha: null, reason };

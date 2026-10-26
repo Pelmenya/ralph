@@ -64,7 +64,16 @@ export type RalphState = {
     // на уже починенный лог. Переживает рестарт по той же причине, что gateHeals: бюджет
     // лечения тоже переживает. `null` — лечения по чеку форжа в этой фазе не было.
     forgeHealedRunId: string | null;
+    // #88: метка начатого мерджа. Ставится записью ДО POST мерджа и снимается той же
+    // записью, что переход фазы, либо определённым отказом форжа. Метка на диске при
+    // рестарте — исход мерджа неизвестен: форж мог принять операцию и ещё не показать её.
+    // Тогда мердж не повторяется вслепую (задвоение принятой операции), а фаза не
+    // считается смердженной без ответа форжа. Опциональна: state прошлых ревизий её не
+    // содержит, и отсутствие читается как «мерджа не начинали».
+    mergeInFlight?: TMergeInFlight | null;
 };
+
+export type TMergeInFlight = { milestone: string; pr: number; sha: string | null };
 
 // Исход чтения state с диска (задача 80). `raw` — разобранный JSON там, где он разобрался:
 // --reset достаёт из него барьер деплоя, даже когда форма в целом не прошла проверку.
@@ -160,6 +169,23 @@ export function inspectState(text: string): TStateInspection {
         const b = db as Record<string, unknown>;
         if (typeof b.milestone !== 'string' || typeof b.reason !== 'string') {
             return bad('deployBlock без строковых milestone и reason');
+        }
+    }
+    // Метка начатого мерджа держит фазу от повтора POST: без номера PR и фазы стоп не
+    // назвал бы, что проверять человеку, а прочитанная «как есть» строка сошла бы за метку.
+    const mf = raw.mergeInFlight;
+    if (mf !== undefined && mf !== null) {
+        const m = mf as Record<string, unknown>;
+        if (
+            typeof mf !== 'object' ||
+            Array.isArray(mf) ||
+            typeof m.milestone !== 'string' ||
+            typeof m.pr !== 'number' ||
+            (m.sha !== null && typeof m.sha !== 'string')
+        ) {
+            return bad(
+                'mergeInFlight без строковой milestone, числового pr и sha строкой или null',
+            );
         }
     }
     return {
