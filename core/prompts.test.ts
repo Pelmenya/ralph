@@ -397,6 +397,19 @@ describe('промпты сессий: намерение вместо спос�
         expect(prompt).toMatch(/сводн|сводк/i);
     });
 
+    // Задача 78: вердикт — структурный контракт. Сессия обязана знать, что проход без
+    // сводки и без pr-block не засчитывается, иначе «замечаний нет» она выразит молчанием.
+    it('ревью требует вердикт: сводка или pr-block обязательны, без них проход не засчитан', () => {
+        const prompt = buildReviewPrompt({
+            branch: BRANCH,
+            diffContext: '',
+            requestsPath: REQUESTS,
+        });
+        expect(prompt).toMatch(/ВЕРДИКТ/);
+        expect(prompt).toMatch(/не засчит/i);
+        expect(prompt).toMatch(/даже если замечаний нет/i);
+    });
+
     it('чини-сессия не может попросить снять блок — такого намерения нет', () => {
         expect(
             buildBlockedFixPrompt({

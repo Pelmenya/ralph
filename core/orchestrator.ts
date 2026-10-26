@@ -76,8 +76,8 @@ import { formatStopMessage, type TStopReason } from './stop-message.ts';
 // Подмножество причин стопа, которыми кончается проводка на ветку фазы: `switch` по нему
 // закрывается `never`-веткой, и новая природа отказа падает на компиляции.
 type TPhaseBranchStopKind = Extract<TStopReason, 'tree-dirty' | 'main-conflict' | 'unknown'>;
-import { createReviewModule } from './review.ts';
-import { createGateRunner, resolveGateChecks } from './gate.ts';
+import { createReviewModule, reviewVerdict } from './review.ts';
+import { createGateRunner, resolveGateChecks, resolveGatePolicy } from './gate.ts';
 import { createDeployCheckModule } from './deploy-check.ts';
 // #82: классификация отказа запуска рантайма (E2BIG, ENOENT, таймаут) — чистые функции
 // без замыканий на config/DRY/adapters, общие для обоих spawn-путей.
@@ -147,6 +147,9 @@ import {
     runtimeUnavailableMessage,
     runtimeUnavailableExhaustedMessage,
     DEFAULT_RUNTIME_UNAVAILABLE_MAX_WAIT_MS,
+    isModelProxyUnavailable,
+    modelProxyRetryWaitMs,
+    MODEL_PROXY_RETRIES,
 } from './runtime-availability.ts';
 // #369 (фаза 5): сборка адаптеров — текущие реализации пяти швов (форж/гейт/нотификатор/
 // деплой/рантайм) оформлены как интерфейсы adapters.ts и выбираются через конфиг. Ядро
@@ -443,7 +446,15 @@ export type RalphConfig = {
     // сессия получает только нейтральное «отказ живёт в контейнере форжа, ищи разницу сред».
     forgeEnvHint?: string;
     runnerWorktreeDirname?: string;
-    gate?: { checks?: unknown; prodChecks?: unknown; prodDropChecks?: unknown };
+    // Ключи — как в `GateConfigRaw` (gate.ts): политику (`externalCi`, `onToolFailure`, задача
+    // 81) читает `resolveGatePolicy` из этого же блока, и тип не должен врать о его форме.
+    gate?: {
+        checks?: unknown;
+        prodChecks?: unknown;
+        prodDropChecks?: unknown;
+        externalCi?: unknown;
+        onToolFailure?: unknown;
+    };
     // #369 (фаза 5): выбор реализации каждого шва по ключу (форж/гейт/нотификатор/деплой/
     // рантайм). Опционально — отсутствующий шов берёт канон-дефолт (ADAPTER_DEFAULTS);
     // неизвестный ключ/имя = fail-closed (resolveAdapterSelection). Свап реализации =
@@ -711,6 +722,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
     const {
         defaultState,
         loadState,
+        resetState,
         saveState,
         lockHash,
         writeLockMarker,
@@ -740,7 +752,6 @@ export function createOrchestrator(env: OrchestratorEnv) {
         log,
         fail,
         guardSideEffect,
-        loadJson,
         processAlive,
         cmdlineIncludes,
         buildSanitizedGateEnv,
@@ -1845,6 +1856,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
     function withHumanFilter(
         seam: TaskSourceAdapter,
         failFn: (msg: string) => unknown = fail,
+        {
+            logFn = log,
+            notifyFn = (msg: string) => pushEvent(msg),
+        }: { logFn?: LogFn; notifyFn?: (msg: string) => unknown } = {},
     ): TaskSourceAdapter {
         return {
             ...seam,
@@ -1852,7 +1867,56 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 excludeHumanIssues(seam.listReadyIssues(milestone), failFn),
             listAllOpenIssues: (milestone: string) =>
                 excludeHumanIssues(seam.listAllOpenIssues(milestone), failFn),
+            closeMilestone: (title: string) =>
+                closeMilestoneUnlessHumanOpen(seam, title, { logFn, notifyFn }),
         };
+    }
+
+    /**
+     * Закрыть веху сданной фазы — если в ней не осталось открытых `human` (#63).
+     *
+     * Фильтр выше прячет `human` и от проверки сдачи (C2), и это верно: иначе фаза не
+     * сдаётся вовсе (#10). Но следом веха закрывалась безусловно, и человеческая половина
+     * фазы оставалась открытой внутри ЗАКРЫТОЙ вехи — «фаза сделана», а решение человека
+     * не начато и выпало из поля зрения ровно тогда, когда держит следующий шаг.
+     *
+     * Держать сдачу, как держит `blocked`, отвергнуто: любая человеческая карточка в вехе
+     * остановила бы автономный цикл целиком — исход, от которого метку и заводили. Поэтому
+     * фаза сдаётся, а веха остаётся открытой, и об этом пуш с номерами карточек (строку в
+     * лог он пишет сам).
+     * Один пуш без вехи-свидетеля держался бы на том, что его прочтут; открытая веха
+     * остаётся долгом, видным на доске и после того, как пуш пролистан.
+     *
+     * Место — шов, а не вызовы закрытия: их двое (мердж гейтом и «фаза уже смерджена»), и
+     * забыть проверку в одном — тот же тихий дефолт, что и у фильтра очереди.
+     *
+     * Не прочитали веху — НЕ закрываем: открытую веху видно и закрыть недолго, а закрытая
+     * при открытой `human` и есть дефект. Сдачу фазы это не рвёт — закрытие вехи по
+     * контракту шва fail-open. Конфликт `human`+`complexity:*` здесь не проверяется: до
+     * закрытия вехи его уже отсеяла C2.
+     */
+    function closeMilestoneUnlessHumanOpen(
+        seam: TaskSourceAdapter,
+        title: string,
+        { logFn, notifyFn }: { logFn: LogFn; notifyFn: (msg: string) => unknown },
+    ): void {
+        let humanOpen: Issue[];
+        try {
+            humanOpen = seam.listAllOpenIssues(title).filter(isHumanIssue);
+        } catch (e) {
+            logFn(
+                `⚠ Веха "${title}" остаётся открытой: не смог проверить, нет ли в ней открытых '${HUMAN_LABEL}'-карточек (${(e as Error).message}). Закрой её руками, если человеческая часть фазы сделана.`,
+            );
+            return;
+        }
+        if (humanOpen.length === 0) {
+            seam.closeMilestone(title);
+            return;
+        }
+        const list = humanOpen.map((i) => `#${i.number} ${i.title}`).join('; ');
+        const msg = `👤 Ralph: фаза "${title}" сдана, но веха остаётся открытой — в ней открыты карточки '${HUMAN_LABEL}': ${list}. Закрой веху, когда человеческая часть фазы будет сделана.`;
+        // Строку в лог пишет сам пуш (`🔔 PUSH:`) — и в dry, и вне prod, где доставки нет.
+        notifyFn(msg);
     }
 
     // Описание PR фазы — из ФАКТОВ ветки, а не из пересказа модели (#46). Раньше его писала
@@ -3260,6 +3324,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         getLastGatePr: gateGetLastGatePr,
         getLastForgeRedCheck: gateGetLastForgeRedCheck,
         getLastForgeStop: gateGetLastForgeStop,
+        getLastToolFailure: gateGetLastToolFailure,
     } = createGateRunner({
         mergePr,
         phaseMerged,
@@ -3626,6 +3691,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // кодер-сессии — особенно больно свежему порту с кривым конфигом (инвариант №1:
         // authorAllowlist/TG/review-модели/haltBeforeDeploy тоже валидируются на старте).
         resolveGateChecks(cfg, failFn);
+        // Задача 81: политика внешнего CI и сбоев инструмента — тем же ранним отказом.
+        // Опечатка в `gate.externalCi` всплыла бы иначе только на гейте, через часы работы.
+        resolveGatePolicy(cfg, failFn);
 
         // Канон, задача 27: заданный скрипт потребителя ищется на диске ДО первой итерации.
         // Форму пути закрыл валидатор конфига (задача 23), но опечатка в САМОМ пути формы не
@@ -3955,6 +4023,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
         phaseDiffFilesFn?: typeof phaseDiffFiles;
         removeBlockedLabelFn?: typeof removeBlockedLabel;
         addBlockedLabelFn?: typeof addBlockedLabel;
+        // Задача 79: чтение ПОСЛЕ записи метки blocked. Запись fail-open по контракту
+        // адаптера, поэтому «встала ли метка» спрашивается отдельно — у самого PR.
+        // Бросок — неизвестный исход, и он держит мердж наравне с «не встала».
+        prHasBlockedLabelFn?: (branch: string) => boolean;
         runClaudeFn?: typeof runClaude;
         ensureCleanFn?: typeof ensureClean;
         branchPushedFn?: typeof branchPushed;
@@ -3985,6 +4057,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
         closeIssueFn?: (issue: number) => void;
         commentOnIssueFn?: (issue: number, body: string) => void;
         nowFn?: () => number;
+        // Задача 78: пауза перед повтором ревью, упавшего на прокси моделей. DI ради тестов:
+        // настоящая пауза — минуты.
+        sleepFn?: typeof sleep;
         recordFixReviewFindingsFn?: (
             phase: Phase,
             prNumber: number | null,
@@ -3998,6 +4073,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
         getLastForgeRedCheck?: typeof gateGetLastForgeRedCheck;
         // #269-ревью: причина стопа на чеке форжа БЕЗ вердикта — тем же геттер-приёмом.
         getLastForgeStop?: typeof gateGetLastForgeStop;
+        // Задача 81: чек, упавший на ИНСТРУМЕНТЕ, — тем же геттер-приёмом.
+        getLastToolFailure?: typeof gateGetLastToolFailure;
         pushEventFn?: typeof pushEvent;
         deployPhaseFn?: typeof deployPhasePlaceholder;
         deployEnabledFn?: () => boolean;
@@ -4070,6 +4147,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
             phaseDiffFilesFn = phaseDiffFiles,
             removeBlockedLabelFn = adapters.taskSource.removeBlockedLabel,
             addBlockedLabelFn = adapters.taskSource.addBlockedLabel,
+            prHasBlockedLabelFn = (branch: string) =>
+                (findOpenPrFn(branch)?.labels ?? []).some((l) => l.name === 'blocked'),
             runClaudeFn = runClaude,
             ensureCleanFn = ensureClean,
             branchPushedFn = branchPushed,
@@ -4097,6 +4176,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             // Время — параметр, а не `Date.now()` в теле: иначе тест на срок годности
             // недетерминирован (правило `tests/CLAUDE.md`).
             nowFn = () => Date.now(),
+            sleepFn = sleep,
             recordFixReviewFindingsFn = recordFixReviewFindings as (
                 phase: Phase,
                 prNumber: number | null,
@@ -4107,6 +4187,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             getLastGatePr = gateGetLastGatePr,
             getLastForgeRedCheck = gateGetLastForgeRedCheck,
             getLastForgeStop = gateGetLastForgeStop,
+            getLastToolFailure = gateGetLastToolFailure,
             pushEventFn = pushEvent,
             deployPhaseFn = deployPhasePlaceholder,
             // #51: «есть ли деплой» — вопрос к шву, и он задаётся ПЕРЕД всеми остальными
@@ -4138,6 +4219,39 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // раннера — осознанное действие человека, после которого честно дать новый бюджет.
         const coderTurnRetriesUsed = new Map<number, number>();
         const coderTurnRetries = nonNegativeIntOrDefault(cfg.coderTurnRetries, CODER_TURN_RETRIES);
+
+        // Задача 79: метка blocked, от которой зависит мердж, ставится с чтением ПОСЛЕ
+        // записи — тем же приёмом, что у намерения pr-block. Запись в адаптерах fail-open
+        // («не вернули метку — косметика цикла разбора»), а на путях восстановления и
+        // арбитра метка — единственное, что отделяет фазу от мерджа: гейт читает PR, и
+        // не легшая молча метка означала бы мердж с известным блокером.
+        //
+        // Флаг `reReviewPending` здесь — «метка обязана стоять, но не подтверждена». Он
+        // ставится на диск ДО записи и снимается только подтверждённым чтением, поэтому
+        // не легшая метка и неизвестный исход (чтение упало, раннер убит посреди) одинаково
+        // доживают до восстановления перед гейтом, а не до мерджа. Это важно и для пути
+        // арбитра: после рестарта лестница с `arbitrated` решает «мердж», и держит фазу
+        // только этот флаг.
+        const restoreBlockedLabel = (branch: string): boolean => {
+            state.reReviewPending = true;
+            saveStateFn(state);
+            let outcome: string;
+            try {
+                addBlockedLabelFn(branch, { shFn, logFn });
+                if (prHasBlockedLabelFn(branch)) {
+                    state.reReviewPending = false;
+                    saveStateFn(state);
+                    return true;
+                }
+                outcome = 'метки на PR нет после записи';
+            } catch (e) {
+                outcome = `исход записи неизвестен (${(e as Error).message})`;
+            }
+            logFn(
+                `⚠ Метка blocked на PR ветки ${branch} не подтверждена: ${outcome} — мердж держу, восстановление повторится перед гейтом.`,
+            );
+            return false;
+        };
 
         while (true) {
             const idx = phaseIndexOfFn(state);
@@ -4964,31 +5078,88 @@ export function createOrchestrator(env: OrchestratorEnv) {
                             files: phaseFiles,
                             limit: positiveIntOrDefault(cfg.review?.diffLimit, REVIEW_DIFF_LIMIT),
                         });
-                        const reviewCode = runClaudeFn(
-                            buildReviewPrompt({
-                                branch: phase.branch,
-                                diffContext,
-                                requestsPath: RUNTIME.requests,
-                            }),
-                            // #221: fallbackModel — явный override (не noFallback:true из M8).
-                            // #130: у ревью свой бюджет ходов (review.maxTurns, дефолт 80).
-                            // Кодерские 200 ему не нужны — ревью не пишет код, и лишний
-                            // бюджет уходит на перечитывание уже прочитанного.
-                            {
-                                model: reviewModel,
-                                maxTurns: positiveIntOrDefault(cfg.review?.maxTurns, maxTurns),
-                                fallbackModel: reviewFallback,
-                            },
-                        );
+                        const reviewPrompt = buildReviewPrompt({
+                            branch: phase.branch,
+                            diffContext,
+                            requestsPath: RUNTIME.requests,
+                        });
+                        let reviewCode = 0;
+                        let reviewOutput = '';
+                        let verdict: ReturnType<typeof reviewVerdict> = null;
+                        let reviewIntentsApplied = true;
+                        // Задача 78: сбой прокси моделей (`No upstream account`, overload)
+                        // приходит С КОДОМ 0 и без единого намерения. Это транзиент, а не
+                        // вердикт: повтор с паузой здесь же, в шаге сдачи, — итерации
+                        // кодера (state.count) он не тратит. Повторяется только проход, не
+                        // оставивший НИ ОДНОГО намерения: сессия, записавшая сводку и
+                        // процитировавшая такую строку, не перезапускается, и так же не
+                        // перезапускается проход с якорными находками без сводки — его
+                        // комментарии уже легли в PR, повтор их задвоил бы. Такой проход —
+                        // обычный обрыв без вердикта, стоп `review-no-verdict` ниже.
+                        for (let attempt = 0; ; attempt++) {
+                            reviewOutput = '';
+                            reviewCode = runClaudeFn(
+                                reviewPrompt,
+                                // #221: fallbackModel — явный override (не noFallback:true из M8).
+                                // #130: у ревью свой бюджет ходов (review.maxTurns, дефолт 80).
+                                // Кодерские 200 ему не нужны — ревью не пишет код, и лишний
+                                // бюджет уходит на перечитывание уже прочитанного.
+                                {
+                                    model: reviewModel,
+                                    maxTurns: positiveIntOrDefault(cfg.review?.maxTurns, maxTurns),
+                                    fallbackModel: reviewFallback,
+                                },
+                                { onOutput: (text: string) => (reviewOutput = text) },
+                            );
 
-                        // #45: намерения ревью применяем СРАЗУ после сессии. Ревью в форж не
-                        // ходит — замечания, сводка и просьба о блоке лежат в файле-запросе,
-                        // и пока петля их не применила, для гейта и человека ревью не
-                        // состоялось: метки нет, комментариев нет, находок в журнале нет.
-                        if (!sessionIntentsApplied('ревью')) break;
+                            // #45: намерения ревью применяем СРАЗУ после сессии. Ревью в форж не
+                            // ходит — замечания, сводка и просьба о блоке лежат в файле-запросе,
+                            // и пока петля их не применила, для гейта и человека ревью не
+                            // состоялось: метки нет, комментариев нет, находок в журнале нет.
+                            if (!sessionIntentsApplied('ревью')) {
+                                reviewIntentsApplied = false;
+                                break;
+                            }
+                            verdict = reviewVerdict(lastPrFindings, lastPrBlocked);
+                            if (verdict || lastPrFindings.length > 0) break;
+                            if (!isModelProxyUnavailable(reviewOutput)) break;
+                            if (attempt >= MODEL_PROXY_RETRIES) break;
+                            const waitMs = modelProxyRetryWaitMs(attempt + 1);
+                            logFn(
+                                `⚠ Ревью без вердикта: в выводе сбой прокси моделей (нет свободного аккаунта / overload). ` +
+                                    `Повтор через ${Math.round(waitMs / 1000)}с (попытка ${attempt + 2} из ${MODEL_PROXY_RETRIES + 1}).`,
+                            );
+                            sleepFn(waitMs);
+                        }
+                        if (!reviewIntentsApplied) break;
                         if (reviewCode !== 0) {
                             logFn(
                                 `⛔ Ревью-сессия упала (код ${reviewCode}) — БЕЗ ревью фазу не мерджим (fail-closed). Перезапусти loop или проведи ревью руками.`,
+                            );
+                            break;
+                        }
+                        // Задача 78: код 0 — не доказательство ревью. Без сводки и без
+                        // pr-block проход не засчитан: сессия правок получила бы ноль
+                        // замечаний, гейт позеленел бы, и фаза ушла бы в main непрочитанной.
+                        if (!verdict && !dry) {
+                            // Повторов не было, если проход оставил находки: «после N
+                            // повторов» в диагнозе тогда соврало бы.
+                            const proxyDown =
+                                lastPrFindings.length === 0 &&
+                                isModelProxyUnavailable(reviewOutput);
+                            pushEventFn(
+                                `⛔ Ralph: фаза "${phase.milestone}" не сдана — ` +
+                                    formatStopMessage({
+                                        reason: 'review-no-verdict',
+                                        diagnosis: proxyDown
+                                            ? `ревью вышло с кодом 0, но в выводе сбой прокси моделей и после ${MODEL_PROXY_RETRIES} повторов — ни сводки, ни pr-block`
+                                            : 'ревью вышло с кодом 0, не оставив ни сводки прохода, ни pr-block',
+                                        question: proxyDown
+                                            ? 'проверь канал моделей и перезапусти loop — ревью пройдёт заново.'
+                                            : 'посмотри вывод ревью-сессии в логе и перезапусти loop или проведи ревью руками.',
+                                    }),
+                                cfg,
+                                { logFn },
                             );
                             break;
                         }
@@ -5610,7 +5781,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
                                 logFn(
                                     '♻️ Ревью правок: арбитра нет (модель не задана) — ставлю label blocked, гейт отправит фазу в разбор.',
                                 );
-                                addBlockedLabelFn(phase.branch, { shFn, logFn });
+                                // Задача 79: с чтением после записи; не подтвердилась —
+                                // флаг держит мердж, и восстановление перед гейтом её доведёт.
+                                restoreBlockedLabel(phase.branch);
                                 break;
                             }
                             logFn(
@@ -5642,7 +5815,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
                                         : '♻️ Намерения арбитра ревью правок не применились (fail-closed по батчу)') +
                                         ' — ставлю label blocked, гейт отправит фазу в разбор.',
                                 );
-                                addBlockedLabelFn(phase.branch, { shFn, logFn });
+                                // Задача 79: с чтением после записи; не подтвердилась —
+                                // флаг держит мердж, и восстановление перед гейтом её доведёт.
+                                restoreBlockedLabel(phase.branch);
                                 break;
                             }
                             // #115-ревью (blocker): `arbitrated` фиксируется ТОЛЬКО здесь —
@@ -5663,8 +5838,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
                                 // Воспроизвёл: метку уже поставило намерение pr-block (либо
                                 // ставим её сами по severity находок) — дальше штатный
                                 // разбор blocked, а не стоп.
-                                if (!lastPrBlocked)
-                                    addBlockedLabelFn(phase.branch, { shFn, logFn });
+                                // Задача 79: `arbitrated` уже на диске, и после рестарта
+                                // лестница решит «мердж» — не подтверждённую метку держит
+                                // только флаг восстановления, который ставит restoreBlockedLabel.
+                                if (!lastPrBlocked) restoreBlockedLabel(phase.branch);
                                 pushEventFn(
                                     `⛔ Ralph: фаза "${phase.milestone}" — независимый арбитр подтвердил блокирующий дефект в правках (PR #${String(prNow ?? '?')}), фаза ушла в разбор blocked.`,
                                     cfg,
@@ -5765,13 +5942,30 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 // вердиктом ревью: метки на PR нет, а вердикта не было. Слепой мердж здесь
                 // обошёл бы барьер #217 — возвращаем метку, гейт прочитает blocked и прогонит
                 // ещё один круг разбора (повторное ревью заново), а не смерджит без вердикта.
+                //
+                // Задача 79: возврат подтверждается чтением PR. Флаг снимается только им —
+                // метка, не легшая молча, или неизвестный исход оставляют флаг и стоп ДО
+                // гейта: гейт увидел бы PR без blocked и смерджил бы. Этим же путём
+                // доводится метка, не подтверждённая на путях арбитра и повторного ревью.
                 if (state.reReviewPending) {
                     logFn(
-                        '♻️ Повторное ревью blocked не доведено до вердикта (рестарт посреди) — возвращаю label blocked, гейт переоценит фазу.',
+                        '♻️ Метка blocked обязана стоять, но не подтверждена (повторное ревью без вердикта или рестарт посреди) — возвращаю label blocked, гейт переоценит фазу.',
                     );
-                    addBlockedLabelFn(phase.branch, { shFn, logFn });
-                    state.reReviewPending = false;
-                    saveStateFn(state);
+                    if (!restoreBlockedLabel(phase.branch)) {
+                        pushEventFn(
+                            `⛔ Ralph: фаза "${phase.milestone}" не смерджена — ` +
+                                formatStopMessage({
+                                    reason: 'blocked-unconfirmed',
+                                    diagnosis:
+                                        'метка blocked на PR фазы не подтверждена чтением после записи — без неё гейт смерджил бы блокер',
+                                    question:
+                                        'проверь метку blocked на PR фазы и права токена на метки, затем перезапусти loop — возврат метки повторится перед гейтом.',
+                                }),
+                            cfg,
+                            { logFn },
+                        );
+                        break;
+                    }
                 }
 
                 // 4. Детерминированный гейт: раннер сам проверяет hold + blocked + HEAD==PR + чеки.
@@ -6288,9 +6482,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         // а метку раннер уже снял. Возвращаем её детерминированно — иначе
                         // следующий проход (submitted === true) уйдёт прямо на гейт, увидит
                         // PR без blocked и смерджит фазу без вердикта (обход барьера #217).
-                        addBlockedLabelFn(phase.branch, { shFn, logFn });
-                        state.reReviewPending = false;
-                        saveStateFn(state);
+                        restoreBlockedLabel(phase.branch);
                         break;
                     }
                     if (rCode !== 0) {
@@ -6300,11 +6492,35 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         // blocked, зелёные чеки → смердж фазы ВООБЩЕ без вердикта повторного
                         // ревью (обход барьера #217). Детерминированно возвращаем метку и
                         // снимаем флаг — гейт следующего прохода перечитает blocked.
-                        addBlockedLabelFn(phase.branch, { shFn, logFn });
-                        state.reReviewPending = false;
-                        saveStateFn(state);
+                        const labelBack = restoreBlockedLabel(phase.branch);
                         logFn(
-                            `⛔ Повторное ревью blocked упало (код ${rCode}) — БЕЗ ревью фазу не мерджим (fail-closed), label blocked возвращён. Перезапусти loop.`,
+                            `⛔ Повторное ревью blocked упало (код ${rCode}) — БЕЗ ревью фазу не мерджим (fail-closed), ` +
+                                (labelBack
+                                    ? 'label blocked возвращён'
+                                    : 'label blocked не подтверждён, восстановится перед гейтом') +
+                                '. Перезапусти loop.',
+                        );
+                        break;
+                    }
+                    // Задача 78: код 0 — ещё не вердикт. Повторное ревью, не оставившее ни
+                    // pr-block, ни сводки, ровно как упавшее: метка снята раннером, и без
+                    // возврата гейт следующего прохода смерджил бы фазу непрочитанной.
+                    if (!dry && !reviewVerdict(lastPrFindings, lastPrBlocked)) {
+                        const labelBack = restoreBlockedLabel(phase.branch);
+                        pushEventFn(
+                            `⛔ Ralph: фаза "${phase.milestone}" не сдана — ` +
+                                formatStopMessage({
+                                    reason: 'review-no-verdict',
+                                    diagnosis:
+                                        'повторное ревью после разбора blocked вышло с кодом 0, не оставив ни сводки, ни pr-block; ' +
+                                        (labelBack
+                                            ? 'label blocked возвращён'
+                                            : 'label blocked не подтверждён, восстановится перед гейтом'),
+                                    question:
+                                        'посмотри вывод ревью-сессии в логе и перезапусти loop — повторное ревью пройдёт заново.',
+                                }),
+                            cfg,
+                            { logFn },
                         );
                         break;
                     }
@@ -6420,6 +6636,32 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     // что в `forge-unknown` выше: стоп отдан человеку, и следующий заход
                     // обязан прочитать вердикт площадки заново, а не ждать прогон новее
                     // того, номер которого пережил рестарт.
+                    state.forgeHealedRunId = null;
+                    saveStateFn(state);
+                    break;
+                }
+                // Задача 81: чек упал на ИНСТРУМЕНТЕ (нет бинаря, убит сигналом, не
+                // запустился) при `gate.onToolFailure: fail-closed`. Это не регрессия:
+                // чини-сессия по такому выводу правила бы код, которого никто не ломал, и
+                // жгла бы бюджет лечения. Ветка стоит ДО выбора топлива чини-сессии и
+                // уходит своим стопом — катч-олл ниже назвал бы известную причину `unknown`.
+                if (gate === 'gate-tool-failure') {
+                    const tool = getLastToolFailure();
+                    const stopMsg =
+                        `⛔ Ralph: сбой инструмента гейта — PR оставлен человеку. ` +
+                        formatStopMessage({
+                            reason: 'gate-tool-failure',
+                            diagnosis: tool
+                                ? `чек «${tool.name}» (${tool.cmd}) упал на инструменте: ${tool.why}`
+                                : 'гейт вернул сбой инструмента без записи о чеке (регресс проводки)',
+                            question:
+                                'почини среду гейта (бинарь, память, права) и перезапусти loop; ' +
+                                'пропускать такие сбои без стопа — gate.onToolFailure: fail-open',
+                        });
+                    pushEventFn(stopMsg, cfg, { logFn });
+                    // Тот же сброс, что у остальных стопов, отдающих PR человеку: он чинит
+                    // среду, и после рестарта бюджет лечения обязан быть полным.
+                    state.gateHeals = 0;
                     state.forgeHealedRunId = null;
                     saveStateFn(state);
                     break;
@@ -7389,28 +7631,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
         log(`📂 Рабочее дерево раннера: ${sessionTree}`);
 
         if (RESET) {
-            // #THS8J: --reset пишет defaultState() (deployBlock: null) — без защиты это молча
-            // стёрло бы активный барьер красного пост-мердж деплоя (#165), и человек,
-            // сбрасывающий state по НЕСВЯЗАННОЙ причине («state разъехался со схемой»), даже не
-            // узнал бы, что снял блок. Снятие барьера — только осознанное решение (тот же принцип
-            // владения, что у --deploy-resolved): при активном deployBlock требуем явный
-            // --deploy-resolved вместе с --reset, иначе fail-closed отказ.
-            const cur = loadState(() => null);
-            if (cur && cur.deployBlock && !DEPLOY_RESOLVED) {
-                fail(
-                    `--reset при активном барьере красного деплоя фазы "${(cur.deployBlock as DeployBlock).milestone}" ` +
-                        `(${(cur.deployBlock as DeployBlock).reason}). --reset стёр бы барьер молча — снятие барьера деплоя ` +
-                        `должно быть осознанным. Разберись с деплоем и повтори с --deploy-resolved, если ` +
-                        `действительно сбрасываешь state вместе с барьером.`,
-                );
-            }
-            if (cur && cur.deployBlock) {
-                console.log(
-                    `⚠ --reset вместе с --deploy-resolved стирает барьер красного деплоя фазы ` +
-                        `"${(cur.deployBlock as DeployBlock).milestone}" (${(cur.deployBlock as DeployBlock).reason}).`,
-                );
-            }
-            saveState(defaultState());
+            // #THS8J: --reset не стирает барьер красного деплоя молча, а задача 80 — не
+            // теряет улику: state, не прошедший проверку, сохраняется копией до перезаписи.
+            // Оба правила держит resetState (state-lock.ts), там же их юниты.
+            resetState({ deployResolved: DEPLOY_RESOLVED });
             console.log('✅ State сброшен на первую фазу конфига.');
             process.exit(0);
         }
@@ -7695,6 +7919,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         getLastGatePr: gateGetLastGatePr,
         getLastForgeRedCheck: gateGetLastForgeRedCheck,
         getLastForgeStop: gateGetLastForgeStop,
+        getLastToolFailure: gateGetLastToolFailure,
         main,
     };
 }

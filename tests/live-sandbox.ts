@@ -182,7 +182,11 @@ function sandboxConfig(sb: LiveSandbox): unknown {
     };
 }
 
-/** Фейк форжа. `--state all` отвечает всегда: «у фазы карточки были» — предусловие сдачи (C2). */
+/**
+ * Фейк форжа. `--state all` отвечает всегда: «у фазы карточки были» — предусловие сдачи (C2).
+ * Открытый PR появляется после `pr create`: сводке ревью (вердикту прохода, задача 78)
+ * нужен PR, в который её положить.
+ */
 function forgeShim(sb: LiveSandbox): string {
     return `#!/bin/sh
 echo "gh $*" >> "${sb.root}/forge-calls.log"
@@ -194,6 +198,20 @@ case "$1 $2" in
       *) cat "${sb.root}/open-issues.json" ;;
     esac ;;
   "issue view") echo '{"number":101,"title":"Карточка песочницы","body":"тело карточки"}' ;;
+  "pr create") touch "${sb.root}/pr-open"; echo '[]' ;;
+  "pr list")
+    case "$*" in
+      *"--state open"*)
+        if [ -e "${sb.root}/pr-open" ]; then
+          case "$*" in
+            *"--jq"*) echo 7 ;;
+            *) echo '[{"number":7,"labels":[]}]' ;;
+          esac
+        else
+          echo '[]'
+        fi ;;
+      *) echo '[]' ;;
+    esac ;;
   *) echo '[]' ;;
 esac
 `;
@@ -207,12 +225,21 @@ esac
  * начинается с проверки «ветка есть на origin», и без пуша цикл сдачи в песочнице
  * останавливался бы на ней, не дойдя до гейта, — то есть сценарий проверял бы меньше,
  * чем обещает его название.
+ *
+ * Ревью фазы шим отвечает сводкой прохода в файл намерений: проход без вердикта — стоп
+ * (задача 78), и цикл сдачи иначе не доходил бы до гейта. Путь файла песочница знает сама
+ * (`runtimeDir` — её же конфиг) и вшивает его в шим при сборке, а не выкусывает из текста
+ * промпта: переформулировка промпта оставила бы сводку незаписанной, и живой цикл встал бы
+ * на `review-no-verdict` — стопом, который выглядит дефектом ядра, а не песочницы.
  */
 function coderShim(sb: LiveSandbox, extra: string): string {
     return `#!/bin/sh
 SANDBOX_PRODUCT_ROOT="${sb.productRoot}"
 cat > "${sb.root}/coder-prompt.txt"
 ${extra}
+if grep -q 'проведи детальное code review' "${sb.root}/coder-prompt.txt"; then
+  echo '{"kind":"pr-comment","comment":"⚪ [nit] сводка прохода песочницы"}' >> "${path.join(sb.runtimeDir, 'ralph.requests.jsonl')}"
+fi
 branch=$(git symbolic-ref --quiet --short HEAD) && git push --quiet origin "HEAD:refs/heads/$branch" >/dev/null 2>&1
 echo "кодер-сессия песочницы отработала"
 `;

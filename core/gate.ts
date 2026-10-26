@@ -74,6 +74,11 @@ type SyncDepsFn = (opts?: { env?: NodeJS.ProcessEnv }) => void;
 // Один упавший чек гейта — топливо чини-сессии (self-heal). null = гейт падал не на
 // чеках (fetch/HEAD/detach): такие причины кодом не лечатся.
 type RedCheck = { name: string; cmd: string; excerpt: string };
+// Задача 81: чек, упавший на ИНСТРУМЕНТЕ, а не на коде. Отдельный тип и отдельный геттер, а
+// не `RedCheck` с флагом: цикл выбирает топливо чини-сессии по наличию `RedCheck`, и сбой,
+// оказавшийся в нём, ушёл бы на лечение кода, которого никто не ломал.
+type ToolFailure = { name: string; cmd: string; why: string; excerpt: string };
+type ToolFailureSkip = { name: string; cmd: string; why: string };
 
 // #269: сигнатуры шва «чек PR у форжа». Обе НЕОБЯЗАТЕЛЬНЫЕ: реализация без них означает
 // прежнее поведение — мердж сразу после локальных чеков, а красный чек форжа отвергает
@@ -105,8 +110,127 @@ type GateConfigRaw = {
         checks?: unknown;
         prodChecks?: unknown;
         prodDropChecks?: unknown;
+        externalCi?: unknown;
+        onToolFailure?: unknown;
     };
 };
+
+// ── Политика гейта (задача 81) ───────────────────────────────────────────────
+//
+// Что считается подтверждением внешнего CI (`externalCi`). До задачи политика была одна и
+// неявная: чеков нет дольше `absentGraceMs` — «мерджим без ожидания», прогон без даты —
+// «считаем свежим». Для репозитория без CI это верно, для репозитория, где CI —
+// обязательная половина гейта, это дыра: прогон, не заведённый площадкой, и прогон, чью
+// свежесть не проверить, пропускали мердж так же, как зелёный.
+//
+// - `required` — мердж только по зелёному датированному прогону не старше проверенной
+//   головы; отсутствие прогона, прогон без даты, неизвестное время коммита головы и шов
+//   без чтения чеков — стоп;
+// - `optional` — прежнее поведение: прогона нет — мерджим, дата не разобралась — свежим;
+// - `disabled` — адаптер чеков не зовётся вовсе.
+//
+// Что делать со СБОЕМ ИНСТРУМЕНТА (`onToolFailure`) — третьим исходом чека рядом с «прошёл»
+// и «регрессия». Образец — флаг `GATE_STRICT` в mshogin/archlint: падение самого
+// инструмента не равно находке, и решение о нём принимается настройкой, а не молча.
+// `fail-closed` — стоп человеку; `fail-open` — пропуск с записью в доказательстве мерджа.
+// При `required` сбой чтения CI мердж не даёт и под `fail-open`: «обязательный» и
+// «пропустим, если не прочитался» друг другу противоречат.
+//
+// Умолчания — `optional` и `fail-closed`: ключей нет — поведение то же, что до задачи, и это
+// сказано вслух здесь, а не спрятано. Заданное значение вне списка — стоп: опечатка в
+// `requird` молча означала бы `optional`.
+export type ExternalCiPolicy = 'required' | 'optional' | 'disabled';
+export type ToolFailurePolicy = 'fail-closed' | 'fail-open';
+export type GatePolicy = { externalCi: ExternalCiPolicy; onToolFailure: ToolFailurePolicy };
+
+const EXTERNAL_CI_POLICIES: readonly string[] = ['required', 'optional', 'disabled'];
+const TOOL_FAILURE_POLICIES: readonly string[] = ['fail-closed', 'fail-open'];
+
+/**
+ * Разбор политики гейта из блока `gate`, fail-closed. Если `failFn` вернулся (тестовый или
+ * иной потребитель), политика берётся СТРОЖАЙШАЯ, а не умолчание: отказ разбора не имеет
+ * права ослабить гейт. Отсутствующий блок `gate` — забота `resolveGateChecks`.
+ */
+export function resolveGatePolicy(
+    cfg: GateConfigRaw | undefined,
+    failFn: (msg: string) => unknown,
+): GatePolicy {
+    const gate = cfg && typeof cfg.gate === 'object' && cfg.gate ? cfg.gate : {};
+    let externalCi: ExternalCiPolicy = 'optional';
+    let onToolFailure: ToolFailurePolicy = 'fail-closed';
+    let broken = false;
+    if (gate.externalCi !== undefined) {
+        if (typeof gate.externalCi === 'string' && EXTERNAL_CI_POLICIES.includes(gate.externalCi)) {
+            externalCi = gate.externalCi as ExternalCiPolicy;
+        } else {
+            failFn(
+                `ralph.config.json: gate.externalCi = ${JSON.stringify(gate.externalCi)} — ожидалось ` +
+                    `одно из ${EXTERNAL_CI_POLICIES.join(' | ')}.`,
+            );
+            broken = true;
+        }
+    }
+    if (gate.onToolFailure !== undefined) {
+        if (
+            typeof gate.onToolFailure === 'string' &&
+            TOOL_FAILURE_POLICIES.includes(gate.onToolFailure)
+        ) {
+            onToolFailure = gate.onToolFailure as ToolFailurePolicy;
+        } else {
+            failFn(
+                `ralph.config.json: gate.onToolFailure = ${JSON.stringify(gate.onToolFailure)} — ` +
+                    `ожидалось одно из ${TOOL_FAILURE_POLICIES.join(' | ')}.`,
+            );
+            broken = true;
+        }
+    }
+    // Любой отказ разбора — обе половины строжайшие: валидный `fail-open` рядом с
+    // опечаткой в `externalCi` не должен пережить стоп, который не остановил.
+    return broken
+        ? { externalCi: 'required', onToolFailure: 'fail-closed' }
+        : { externalCi, onToolFailure };
+}
+
+// Упавший локальный чек: регрессия (чинится кодом) или сбой инструмента (кодом не чинится).
+//
+// Признаки сбоя — только те, что дают сам процесс и шелл, а не текст вывода: код 127
+// (команда не найдена) и 126 (не исполняется), код ≥ 128 (убит сигналом сквозь шелл — 137
+// у OOM-killer), сигнал у самого процесса, `status === null` (процесс не дал кода вовсе)
+// и системный код ошибки запуска (`ENOENT`, `ETIMEDOUT`, `ENOBUFS`). Код 2 — НЕ сбой:
+// `tsc` и `prettier` так сообщают о находках, и перевод его в сбой увёл бы регрессию от
+// чини-сессии. Ошибка без поля `status` — регрессия: формы `execSync` у неё нет, и делать
+// вывод о сбое не из чего.
+//
+// Трейдофф, принятый осознанно: ЛЮБОЙ `E*`-код — сбой, включая `ENOBUFS` на переполнении
+// буфера вывода. Регрессия, зацикливающая вывод теста (бесконечный лог в цикле), уйдёт
+// сбоем инструмента, а не чини-сессии. Обратный выбор хуже: `ENOBUFS` чаще значит «вывод
+// честно большой» или сбой среды, и чини-сессия по обрезанному выводу правила бы вслепую.
+// Цена — стоп человеку вместо лечения (при `fail-closed`) либо пропуск чека вслух (при
+// `fail-open`, и только рядом с прошедшими чеками). Не «чинить» в обратную сторону без
+// разбора этого случая.
+export type CheckFailureKind = 'regression' | 'tool-failure';
+
+export function classifyCheckFailure(e: unknown): CheckFailureKind {
+    const err = (e ?? {}) as { status?: unknown; signal?: unknown; code?: unknown };
+    if (typeof err.signal === 'string' && err.signal.length > 0) return 'tool-failure';
+    if (typeof err.code === 'string' && /^E[A-Z]+$/.test(err.code)) return 'tool-failure';
+    if (err.status === null) return 'tool-failure';
+    if (typeof err.status === 'number') {
+        if (err.status === 126 || err.status === 127 || err.status >= 128) return 'tool-failure';
+    }
+    return 'regression';
+}
+
+// Короткое имя сбоя для лога, стопа и доказательства мерджа: по нему человек отличает
+// «нет бинаря» от «убит по памяти», не открывая вывод.
+function toolFailureWhy(e: unknown): string {
+    const err = (e ?? {}) as { status?: unknown; signal?: unknown; code?: unknown };
+    const parts: string[] = [];
+    if (typeof err.status === 'number') parts.push(`код ${String(err.status)}`);
+    if (typeof err.signal === 'string' && err.signal) parts.push(`сигнал ${err.signal}`);
+    if (typeof err.code === 'string' && err.code) parts.push(err.code);
+    return parts.join(', ') || 'процесс не дал кода выхода';
+}
 
 // Разобранный и провалидированный состав гейта. base — всем профилям; prodChecks —
 // добавка prod; prodDrop — имена базовых чеков, которые prod снимает (дедуп test↔coverage,
@@ -316,6 +440,14 @@ export function createGateRunner(env: GateEnv) {
     // что lastForgeRedCheck: цикл читает её ПОСЛЕ возврата статуса `forge-unknown` и
     // кладёт в пуш человеку — иначе ночная остановка выясняется только утром.
     let lastForgeStop: string | null = null;
+    // Задача 81: чек последнего прогона, упавший на ИНСТРУМЕНТЕ при `fail-closed` (null —
+    // такого не было), и чеки, пропущенные по `fail-open`. Оба ставятся побочкой
+    // checksGreen и читаются геттерами — тем же приёмом, что lastRedCheck.
+    let lastToolFailure: ToolFailure | null = null;
+    let lastToolSkips: ToolFailureSkip[] = [];
+    // Доказательство мерджа последнего прохода: что проверено, по какой политике и что
+    // решено со сбоями инструмента. null — до мерджа проход не дошёл.
+    let lastMergeProof: string | null = null;
 
     // ── Состав шагов гейта: из конфига (#204, фаза 4) ─────────────────────────
     //
@@ -381,6 +513,9 @@ export function createGateRunner(env: GateEnv) {
             // чеки. Дефолт вычисляется лениво (#204) — конфиг присваивается в main() уже
             // после сборки фабрики; в проде checksGreen всегда зовут с явным `checks`.
             checks = gateChecksFor(),
+            // Задача 81: что делать с чеком, упавшим на инструменте. Дефолт — из конфига
+            // тем же ленивым приёмом, что `checks`; tryMergePhase прокидывает явно.
+            onToolFailure = resolveGatePolicy(getConfig(), fail).onToolFailure,
         }: {
             shFn?: ShFn;
             runArgvFn?: ShArgvFn;
@@ -390,6 +525,7 @@ export function createGateRunner(env: GateEnv) {
             syncDepsFn?: SyncDepsFn;
             buildGateEnvFn?: BuildGateEnvFn;
             checks?: GateCheck[];
+            onToolFailure?: ToolFailurePolicy;
         } = {},
     ): boolean {
         // Сброс СРАЗУ: любой выход из этого раунда до чеков не должен носить red-check
@@ -398,6 +534,8 @@ export function createGateRunner(env: GateEnv) {
         // старый sha не должен доехать до --match-head-commit, если этот раунд упал до чеков.
         lastRedCheck = null;
         lastVerifiedHead = null;
+        lastToolFailure = null;
+        lastToolSkips = [];
         // #204-ревью: пустой список чеков не имеет права привести к мерджу. Цикл ниже с
         // пустым `checks` не сделал бы ни одной итерации, lastVerifiedHead записался бы и
         // фаза уехала в main без единой проверки. Сегодня этот путь прикрыт тем, что боевой
@@ -540,17 +678,42 @@ export function createGateRunner(env: GateEnv) {
         // дерева раннера — старые). Переустанавливаем ДО чеков при расхождении lock, иначе
         // build/test упали бы красным на «module not found» из-за инфраструктуры, а не кода.
         syncDepsFn({ env: gateEnv });
+        // Хвост вывода последнего пропущенного по fail-open чека — на случай, если пропущены
+        // ВСЕ: тогда он становится выводом стопа (см. нижнюю планку после цикла).
+        let lastSkipExcerpt = '';
         for (const [name, cmd] of checks) {
             try {
                 shFn(cmd, { env: gateEnv });
                 logFn(`  ✓ ${name}`);
             } catch (e: unknown) {
-                logFn(`  ✗ ${name} — красный, авто-мердж отменён`);
-                // Хвост вывода чека — топливо для чини-сессии гейта (self-heal): без
-                // текста ошибки агент чинил бы вслепую. Спецсимволы безопасны — см. formatExcerpt.
                 const err = e as { stdout?: string; stderr?: string; message?: string };
                 const raw =
                     `${err.stdout || ''}\n${err.stderr || ''}`.trim() || String(err.message);
+                // Задача 81: третий исход. Чек, упавший на инструменте (нет бинаря, убит
+                // сигналом, не запустился), — не регрессия: в `lastRedCheck` он не попадает
+                // никогда, иначе цикл отдал бы его чини-сессии, и та «чинила» бы код,
+                // которого никто не ломал.
+                if (classifyCheckFailure(e) === 'tool-failure') {
+                    const why = toolFailureWhy(e);
+                    if (onToolFailure === 'fail-open') {
+                        logFn(
+                            `  ⚠ ${name} — сбой инструмента (${why}), не регрессия: пропущен по ` +
+                                'gate.onToolFailure: fail-open, решение уйдёт в доказательство мерджа',
+                        );
+                        lastToolSkips.push({ name, cmd, why });
+                        lastSkipExcerpt = formatExcerpt(raw);
+                        continue;
+                    }
+                    logFn(
+                        `  ✗ ${name} — сбой инструмента (${why}), не регрессия: кодом не чинится, авто-мердж отменён`,
+                    );
+                    lastToolFailure = { name, cmd, why, excerpt: formatExcerpt(raw) };
+                    parkFn();
+                    return false;
+                }
+                logFn(`  ✗ ${name} — красный, авто-мердж отменён`);
+                // Хвост вывода чека — топливо для чини-сессии гейта (self-heal): без
+                // текста ошибки агент чинил бы вслепую. Спецсимволы безопасны — см. formatExcerpt.
                 lastRedCheck = {
                     name,
                     cmd,
@@ -559,6 +722,27 @@ export function createGateRunner(env: GateEnv) {
                 parkFn();
                 return false;
             }
+        }
+        // Нижняя планка fail-open (задача 81, ревью): если на инструменте упали ВСЕ чеки
+        // (нет node — каждый `npm run …` даёт 127), реально не прошёл ни один, и мердж ушёл
+        // бы в main с нулём проверок — тот же случай, что пустой список чеков выше.
+        // Пропуск по fail-open разрешён только РЯДОМ с хотя бы одним прошедшим чеком; иначе
+        // это стоп сбоя инструмента, как при fail-closed.
+        if (lastToolSkips.length === checks.length) {
+            const names = lastToolSkips.map((k) => `${k.name} — ${k.why}`).join('; ');
+            logFn(
+                `  ✗ все ${String(checks.length)} чек(а) упали на инструменте (${names}) — ` +
+                    'fail-open не пропускает гейт без единого прошедшего чека, авто-мердж отменён',
+            );
+            const last = lastToolSkips[lastToolSkips.length - 1];
+            lastToolFailure = {
+                name: last.name,
+                cmd: last.cmd,
+                why: `все чеки гейта упали на инструменте: ${names}`,
+                excerpt: lastSkipExcerpt,
+            };
+            parkFn();
+            return false;
         }
         // Все чеки зелёные на ЭТОМ sha — запоминаем его для --match-head-commit при мердже
         // (#SiaTz): gh иначе смерджил бы голову PR НА МОМЕНТ мерджа, а не ту, что прогнали.
@@ -724,6 +908,11 @@ export function createGateRunner(env: GateEnv) {
             waitForForgeChecksFn = waitForForgeChecks,
             classifyForgeFailureFn = classifyForgeFailure,
             nowFn = () => Date.now(),
+            // Задача 81: политика внешнего CI и сбоев инструмента. Дефолт — из конфига;
+            // тесты кладут свою через getConfig фабрики или этим параметром.
+            gatePolicy = resolveGatePolicy(getConfig(), fail),
+            getLastToolFailureFn = () => lastToolFailure,
+            getToolFailureSkipsFn = () => lastToolSkips,
         }: {
             dry?: boolean;
             shFn?: ShFn;
@@ -750,6 +939,9 @@ export function createGateRunner(env: GateEnv) {
             waitForForgeChecksFn?: typeof waitForForgeChecks;
             classifyForgeFailureFn?: typeof classifyForgeFailure;
             nowFn?: () => number;
+            gatePolicy?: GatePolicy;
+            getLastToolFailureFn?: () => ToolFailure | null;
+            getToolFailureSkipsFn?: () => ToolFailureSkip[];
         } = {},
     ):
         | 'merged'
@@ -761,6 +953,7 @@ export function createGateRunner(env: GateEnv) {
         | 'forge-red'
         | 'forge-env'
         | 'forge-unknown'
+        | 'gate-tool-failure'
         | 'not-merged' {
         // #218: сброс СРАЗУ, тем же приёмом, что checksGreen сбрасывает lastRedCheck/
         // lastVerifiedHead — раунд, упавший ДО findOpenPr (dry/грязное дерево), не должен
@@ -770,6 +963,7 @@ export function createGateRunner(env: GateEnv) {
         // не должен носить красный куб прошлого раунда.
         lastForgeRedCheck = null;
         lastForgeStop = null;
+        lastMergeProof = null;
         // C1: dry-run строго read-only. Основной guard стоит в цикле ДО вызова гейта;
         // этот — defense in depth: даже если будущая правка цикла потеряет внешний
         // guard, dry-run всё равно не смерджит и не тронет дерево раннера.
@@ -799,16 +993,31 @@ export function createGateRunner(env: GateEnv) {
             logFn(`⛔ Гейт: PR #${pr.number} помечен 'blocked'.`);
             return 'blocked';
         }
+        const gateChecks = gateChecksFor(profileName);
+        // Число чеков — для доказательства мерджа: «прошли N из M» при пропусках по fail-open.
+        const checksCount = gateChecks.length;
         if (
             !checksGreenFn(phase.branch, pr.number, {
-                checks: gateChecksFor(profileName),
+                checks: gateChecks,
                 prHeadShaFn,
+                onToolFailure: gatePolicy.onToolFailure,
             })
         ) {
             const redCheck = getLastRedCheckFn();
             if (redCheck) {
                 logFn(`⛔ Гейт: чек ${redCheck.name} красный на PR #${pr.number}.`);
                 return 'red-checks';
+            }
+            // Задача 81: сбой инструмента — свой исход, а не 'red-checks' и не безымянный
+            // 'not-merged'. Первое отдало бы его чини-сессии, второе — катч-оллу с
+            // причиной `unknown`, хотя причина как раз известна.
+            const toolFailure = getLastToolFailureFn();
+            if (toolFailure) {
+                logFn(
+                    `⛔ Гейт: чек ${toolFailure.name} упал на инструменте (${toolFailure.why}) на PR #${pr.number} — ` +
+                        'это не регрессия, чини-сессии не будет.',
+                );
+                return 'gate-tool-failure';
             }
             logFn(`⛔ Гейт: не прошёл до чеков (fetch/HEAD/detach) на PR #${pr.number}.`);
             return 'not-merged';
@@ -825,8 +1034,32 @@ export function createGateRunner(env: GateEnv) {
         // чинится дешевле и не должен ждать двадцать минут; к этому моменту прогон
         // площадки обычно уже отработал параллельно нашему гейту.
         //
-        // Шов необязателен: без него шаг пропускается, и мердж идёт ровно как до карточки.
-        if (forgeChecksFn) {
+        // Шов необязателен: без него шаг пропускается, и мердж идёт ровно как до карточки, —
+        // кроме политики `required` (задача 81): там «прочитать CI нечем» мердж не даёт.
+        //
+        // `ciVerdict` — строка внешнего CI для доказательства мерджа: каждая ветка ниже,
+        // разрешившая мердж, обязана её назвать, иначе решение не было бы видно.
+        const required = gatePolicy.externalCi === 'required';
+        const stopRequired = (why: string): 'forge-unknown' => {
+            lastForgeStop = `чек PR #${String(pr.number)}: ${why}`;
+            logFn(`⛔ Гейт: ${lastForgeStop} — мердж отменён.`);
+            parkFn();
+            return 'forge-unknown';
+        };
+        let ciVerdict: string;
+        if (gatePolicy.externalCi === 'disabled') {
+            ciVerdict = 'не спрашивался';
+            logFn(
+                '🚦 Чек площадки: внешний CI выключен (gate.externalCi: disabled) — адаптер чеков не зовём.',
+            );
+        } else if (!forgeChecksFn) {
+            if (required) {
+                return stopRequired(
+                    'политика required, а у адаптера форжа нет чтения чеков PR — подтвердить прогон нечем',
+                );
+            }
+            ciVerdict = 'не проверен: у адаптера форжа нет чтения чеков';
+        } else {
             // #278: свежесть вердикта — форж отдаёт ПОСЛЕДНИЙ прогон workflow, а не прогон
             // именно этой головы, и «на практике успевает» (тайминг локального гейта)
             // барьером не было. Нижняя граница — момент коммита проверенной головы: прогон
@@ -843,6 +1076,13 @@ export function createGateRunner(env: GateEnv) {
                     );
                 }
             }
+            // Задача 81: без нижней границы свежесть не проверить вовсе, и при `required`
+            // это стоп ДО похода к форжу — ждать вердикт, который не примем, незачем.
+            if (required && sinceMs === undefined) {
+                return stopRequired(
+                    'политика required, а время коммита проверенной головы неизвестно — свежесть прогона CI не проверить',
+                );
+            }
             const forge = waitForForgeChecksFn({
                 readFn: () => forgeChecksFn(pr.number),
                 sleepFn: sleepFn,
@@ -850,14 +1090,41 @@ export function createGateRunner(env: GateEnv) {
                 logFn,
                 ...(healedForgeRunId ? { healedRunId: healedForgeRunId } : {}),
                 ...(sinceMs !== undefined ? { sinceMs } : {}),
+                ...(required ? { requireDated: true } : {}),
             });
             if (forge.kind === 'timeout' || forge.kind === 'error') {
-                lastForgeStop = `чек PR #${String(pr.number)} у форжа не дал вердикта (${forge.detail})`;
-                logFn(`⛔ Гейт: ${lastForgeStop} — мердж отменён, PR оставлен человеку.`);
-                parkFn();
-                return 'forge-unknown';
-            }
-            if (forge.kind === 'red') {
+                // Сбой инструмента на стороне CI: вердикта нет. `fail-open` пропускает его
+                // только при `optional` — для `required` «не прочиталось» и есть «не
+                // подтверждено». И только исход `error` (сбой ЧТЕНИЯ): `timeout` — не сбой
+                // инструмента, а «площадка не завела прогон новее пуша», при том что старый
+                // прогон мог быть красным (он отфильтрован как устаревший, а не как
+                // зелёный). Под fail-open он превратился бы в «медленный CI = мердж».
+                if (
+                    forge.kind === 'error' &&
+                    !required &&
+                    gatePolicy.onToolFailure === 'fail-open'
+                ) {
+                    ciVerdict = `сбой инструмента (${forge.detail}), пропущен по gate.onToolFailure: fail-open`;
+                    logFn(`⚠ Гейт: чек PR #${String(pr.number)} у форжа — ${ciVerdict}.`);
+                } else {
+                    lastForgeStop = `чек PR #${String(pr.number)} у форжа не дал вердикта (${forge.detail})`;
+                    logFn(`⛔ Гейт: ${lastForgeStop} — мердж отменён, PR оставлен человеку.`);
+                    parkFn();
+                    return 'forge-unknown';
+                }
+            } else if (forge.kind === 'absent') {
+                // Очередь площадка отдаёт ждущим прогоном (`created`), а не `none`: так
+                // видно по логу петли потребителя. Значит, `none` дольше льготы — прогона
+                // действительно нет, и при `required` подтверждать мердж нечем.
+                if (required) {
+                    return stopRequired(
+                        'политика required, а за льготный срок у PR не завелось ни одного прогона CI',
+                    );
+                }
+                ciVerdict = 'прогонов нет, мерджим без ожидания';
+            } else if (forge.kind === 'green') {
+                ciVerdict = 'зелёный';
+            } else {
                 // Диагноз читается ОТДЕЛЬНЫМ вызовом и его отсутствие не приговор коду:
                 // «прогон красный, а какой куб — форж не сказал» лечить вслепую нельзя,
                 // это стоп человеку, но и молчать о нём нельзя.
@@ -898,9 +1165,21 @@ export function createGateRunner(env: GateEnv) {
                 parkFn();
                 return 'forge-red';
             }
-            // 'green' и 'absent' — мердж разрешён: во втором случае у PR чеков нет вовсе,
-            // и площадке нечего отвергать.
+            // 'green', 'absent' при optional и пропущенный по fail-open сбой — мердж разрешён.
         }
+        // Доказательство мерджа (задача 81): одна строка, в которой видно, на чём мердж
+        // держится, — голова, локальный гейт, политика и исход внешнего CI, решение о
+        // сбоях инструмента. Пишется ДО вызова мерджа: после — ему уже нечего доказывать.
+        const skips = getToolFailureSkipsFn();
+        lastMergeProof =
+            `PR #${String(pr.number)}, голова ${verifiedHead ? verifiedHead.slice(0, 8) : 'не зафиксирована'}: ` +
+            (skips.length > 0
+                ? `локальный гейт: прошли ${String(checksCount - skips.length)} из ${String(checksCount)}, ` +
+                  `пропущены по fail-open: ${skips.map((k) => `${k.name} — ${k.why}`).join('; ')}`
+                : 'локальный гейт зелёный') +
+            `; внешний CI — политика ${gatePolicy.externalCi}, ${ciVerdict}` +
+            `; сбой инструмента — ${gatePolicy.onToolFailure}.`;
+        logFn(`🧾 Доказательство мерджа: ${lastMergeProof}`);
         // H4: merge и пост-мердж шаги — РАЗНЫЕ try. Упал сам merge → PR цел, честное
         // «не удался». Merge прошёл, а обновление дерева раннера упало → это НЕ «мердж
         // не удался», а «смерджено, локалка отстала»: другой статус, другое восстановление.
@@ -1045,5 +1324,8 @@ export function createGateRunner(env: GateEnv) {
         getLastGatePr: (): number | null => lastGatePr,
         getLastForgeRedCheck: (): ForgeRedCheck | null => lastForgeRedCheck,
         getLastForgeStop: (): string | null => lastForgeStop,
+        getLastToolFailure: (): ToolFailure | null => lastToolFailure,
+        getToolFailureSkips: (): ToolFailureSkip[] => lastToolSkips,
+        getLastMergeProof: (): string | null => lastMergeProof,
     };
 }

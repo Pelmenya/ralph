@@ -10,6 +10,9 @@ import {
     runtimeUnavailableExhaustedMessage,
     DEFAULT_RUNTIME_UNAVAILABLE_MAX_WAIT_MS,
     DEFAULT_RUNTIME_UNAVAILABLE_RETRY_DELAY_MS,
+    isModelProxyUnavailable,
+    modelProxyRetryWaitMs,
+    MODEL_PROXY_RETRIES,
 } from './runtime-availability.ts';
 
 describe('isRuntimeUnavailable — детекция транзиентной недоступности CLI', () => {
@@ -123,5 +126,41 @@ describe('тексты сообщений — формулировка прич�
         expect(msg).toMatch(/5 мин/);
         expect(msg).toMatch(/7 повторов/);
         expect(msg).not.toMatch(/вердикт/);
+    });
+});
+
+// Задача 78: прокси моделей отвечает «No upstream account» или overload, а `claude -p`
+// выходит с кодом 0. По коду такую сессию от честной не отличить, поэтому детект идёт по
+// тексту — и применяется только к проходу БЕЗ вердикта (см. оркестратор).
+describe('isModelProxyUnavailable — сбой прокси моделей в выводе', () => {
+    it('ловит строку прокси из инцидента 16.10', () => {
+        expect(isModelProxyUnavailable('No upstream account is currently available')).toBe(true);
+    });
+
+    it('ловит overload API', () => {
+        expect(isModelProxyUnavailable('API Error: 529 {"type":"overloaded_error"}')).toBe(true);
+        expect(isModelProxyUnavailable('API Error: 529')).toBe(true);
+        expect(isModelProxyUnavailable('{"type":"overloaded_error"}')).toBe(true);
+    });
+
+    it('слово overloaded в прозе ревью сбоем не считается', () => {
+        expect(isModelProxyUnavailable('Overloaded')).toBe(false);
+        expect(isModelProxyUnavailable('функция overloaded для двух сигнатур TS')).toBe(false);
+    });
+
+    it('осмысленный вывод сбоем не считается', () => {
+        expect(isModelProxyUnavailable('Ревью готово, сводка записана')).toBe(false);
+        expect(isModelProxyUnavailable('')).toBe(false);
+    });
+});
+
+describe('modelProxyRetryWaitMs — пауза перед повтором', () => {
+    it('растёт линейно от минуты', () => {
+        expect(modelProxyRetryWaitMs(1)).toBe(60_000);
+        expect(modelProxyRetryWaitMs(3)).toBe(180_000);
+    });
+
+    it('бюджет повторов конечен', () => {
+        expect(MODEL_PROXY_RETRIES).toBeGreaterThan(0);
     });
 });

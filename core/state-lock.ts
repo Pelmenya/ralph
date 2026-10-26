@@ -3,7 +3,8 @@
 // вся работа с тремя файлами раннера — `ralph.state.json` (state фазы), `ralph.lock`
 // (файл-лок от двойного запуска #176/#177/#178) и `.deps-lock.sha` (маркер последнего
 // `npm ci` #SiaUX) — собрана здесь одним связным модулем, а ralph.js пользуется только
-// его API. Форматы файлов НЕ меняются: существующий state/lock/маркер читается как был.
+// его API. Lock и маркер читаются как были; state с задачи 80 несёт `schemaVersion`, а
+// state прежних ревизий (без поля) принимается проверенной миграцией — см. inspectState.
 //
 // TS-модуль без билд-шага: исполняется нативным type stripping Node 24 (erasable-only
 // синтаксис — только аннотации типов, ни enum, ни namespace, ни parameter properties).
@@ -27,12 +28,19 @@ import path from 'node:path';
 import { execSync } from 'node:child_process';
 import { resolveInstallCmd } from '../shared/ralph-util.ts';
 
-// Формат ralph.state.json — контракт, этим рефактором НЕ меняется (критерий #359).
-// milestone === null означает «все фазы пройдены» (см. phaseIndexOf/advancePhase в
-// ralph.js). Остальные поля — счётчики брейкеров и планки ревью (#217/#223) и барьер
-// пост-мердж деплоя (#165). loadState возвращает то, что лежит на диске, как есть —
-// тип описывает канонический полный state (его строит defaultState).
+// Формат ralph.state.json — контракт (критерий #359). milestone === null означает «все
+// фазы пройдены» (см. phaseIndexOf/advancePhase в ralph.js). Остальные поля — счётчики
+// брейкеров и планки ревью (#217/#223) и барьер пост-мердж деплоя (#165). Тип описывает
+// канонический полный state (его строит defaultState); с диска state приходит только через
+// inspectState — проверку формы и версии схемы (задача 80).
+//
+// Версия схемы — номер ФОРМЫ файла, а не ревизии раннера: поднимать её нужно, когда
+// прежний раннер прочитал бы новый файл неверно (переименовали, сменили смысл поля), а не
+// на каждое новое поле — новые поля опциональны и читаются старыми раннерами безвредно.
+export const STATE_SCHEMA_VERSION = 1;
+
 export type RalphState = {
+    schemaVersion: number;
     count: number;
     milestone: string | null;
     submitted: boolean;
@@ -57,6 +65,153 @@ export type RalphState = {
     // лечения тоже переживает. `null` — лечения по чеку форжа в этой фазе не было.
     forgeHealedRunId: string | null;
 };
+
+// Исход чтения state с диска (задача 80). `raw` — разобранный JSON там, где он разобрался:
+// --reset достаёт из него барьер деплоя, даже когда форма в целом не прошла проверку.
+export type TStateInspection =
+    | { status: 'absent' }
+    | { status: 'ok'; state: RalphState; migrated: boolean }
+    | { status: 'old-schema'; raw: Record<string, unknown> }
+    | { status: 'foreign-version'; found: number; raw: Record<string, unknown> }
+    | { status: 'corrupt'; reason: string; raw: Record<string, unknown> | null }
+    // Файл есть, но не читается (EACCES, EISDIR, EIO): это права или тип файла, а не
+    // повреждение содержимого, и совет «--reset с копией» тут не помог бы — копировать
+    // нечего, раз не читается.
+    | { status: 'unreadable'; code: string };
+
+// Счётчики проверяются так же, как `count`: целое неотрицательное. `gateHeals: -1` или `1.5`
+// сравнивались бы с бюджетом лечения молча и давали бы лишнюю попытку или ни одной.
+const NUMBER_FIELDS = ['noProgress', 'gateHeals', 'blockedHeals'] as const;
+const NULLABLE_STRING_FIELDS = ['reviewModelFloor', 'lastReviewModel', 'forgeHealedRunId'] as const;
+
+/**
+ * Проверка текста state: JSON, версия схемы, форма полей. Чистая — без fs, ей всё равно,
+ * откуда пришёл текст.
+ *
+ * Версия проверяется ДО формы: файл чужой схемы вправе выглядеть иначе, и отказ «не та
+ * форма» назвал бы повреждённым файл, который просто писал другой раннер. Отсутствие
+ * версии — не отказ, а проверенная миграция v0 → v1: так выглядит каждый state, записанный
+ * до задачи 80, и v1 от него отличается только самим полем версии. «Проверенная» значит,
+ * что форма сверена целиком теми же правилами, что у v1, — молча принят не будет ни один
+ * файл, который v1 бы отверг.
+ *
+ * Опциональные поля проверяются по типу, только если присутствуют: их добавляли по одному
+ * (#217, #223, #269…), и state прошлых ревизий их законно не содержит — код читает их
+ * отсутствие как дефолт. Обязательны три поля, без которых раннер не знает, где он:
+ * count, milestone, submitted.
+ */
+export function inspectState(text: string): TStateInspection {
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(text);
+    } catch (e) {
+        const why = text.trim() === '' ? 'файл пуст' : `не JSON (${(e as Error).message})`;
+        return { status: 'corrupt', reason: why, raw: null };
+    }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+        return { status: 'corrupt', reason: 'ожидался JSON-объект', raw: null };
+    }
+    const raw = parsed as Record<string, unknown>;
+    const bad = (reason: string): TStateInspection => ({ status: 'corrupt', reason, raw });
+
+    const v = raw.schemaVersion;
+    if (v !== undefined) {
+        if (typeof v !== 'number' || !Number.isInteger(v) || v < 1) {
+            return bad(`schemaVersion не целое положительное число (${JSON.stringify(v)})`);
+        }
+        if (v !== STATE_SCHEMA_VERSION) return { status: 'foreign-version', found: v, raw };
+    }
+    // Старая схема (phaseIndex) — это файл БЕЗ версии и без milestone. При заданной версии
+    // отсутствие milestone — не другая схема, а повреждение: v1 его требует.
+    if (v === undefined && raw.milestone === undefined) return { status: 'old-schema', raw };
+
+    if (typeof raw.count !== 'number' || !Number.isInteger(raw.count) || raw.count < 0) {
+        return bad('count — не целое неотрицательное число');
+    }
+    if (raw.milestone === undefined) return bad('milestone отсутствует');
+    if (typeof raw.milestone !== 'string' && raw.milestone !== null) {
+        return bad('milestone — не строка и не null');
+    }
+    if (typeof raw.submitted !== 'boolean') return bad('submitted — не boolean');
+    for (const k of NUMBER_FIELDS) {
+        const n = raw[k];
+        if (n !== undefined && (typeof n !== 'number' || !Number.isInteger(n) || n < 0)) {
+            return bad(`${k} — не целое неотрицательное число`);
+        }
+    }
+    for (const k of NULLABLE_STRING_FIELDS) {
+        if (raw[k] !== undefined && raw[k] !== null && typeof raw[k] !== 'string') {
+            return bad(`${k} — не строка и не null`);
+        }
+    }
+    if (raw.reReviewPending !== undefined && typeof raw.reReviewPending !== 'boolean') {
+        return bad('reReviewPending — не boolean');
+    }
+    // Барьер деплоя — единственное, что держит следующую фазу от недоехавшего main (#165):
+    // строка или число на его месте прочитались бы как «блок есть» без единого его поля.
+    const db = raw.deployBlock;
+    if (db !== undefined && db !== null && (typeof db !== 'object' || Array.isArray(db))) {
+        return bad('deployBlock — не объект и не null');
+    }
+    // Барьер без фазы и причины прочитался бы как блок, о котором нечего сказать: стоп и
+    // --reset напечатали бы `фазы "undefined" (undefined)`. Обе строки пишет каждый путь,
+    // который барьер ставит (оркестратор), — их отсутствие и есть порча.
+    if (db && typeof db === 'object') {
+        const b = db as Record<string, unknown>;
+        if (typeof b.milestone !== 'string' || typeof b.reason !== 'string') {
+            return bad('deployBlock без строковых milestone и reason');
+        }
+    }
+    return {
+        status: 'ok',
+        state: { ...raw, schemaVersion: STATE_SCHEMA_VERSION } as RalphState,
+        migrated: v === undefined,
+    };
+}
+
+/** Текст стопа на непрошедшем проверку state: причина, что с файлом и как выйти. */
+export function stateRefusal(statePath: string, r: TStateInspection): string {
+    if (r.status === 'unreadable') {
+        return (
+            `State ${statePath} не читается (${r.code}) — это права или тип файла, а не ` +
+            `повреждение содержимого. Старт отвергнут: прочитанный как отсутствующий, он начал ` +
+            `бы петлю с первой фазы поверх незаконченной. Поправь права (или убери каталог на ` +
+            `месте файла) и перезапусти; --reset тут не поможет — сохранить копию нечем.`
+        );
+    }
+    const keep =
+        `Файл оставлен на месте для разбора; --reset сохранит его копией ` +
+        `${statePath}.${rejectedSuffix(r)}-<время> и вернёт первую фазу конфига.`;
+    if (r.status === 'old-schema') {
+        return (
+            `${statePath} старой схемы (phaseIndex). Раннер адресует фазы по имени milestone. ` +
+            `Запусти --reset (вернёт на первую фазу конфига) или пропиши руками: ` +
+            `{ count, milestone: <имя фазы>, submitted: false }.`
+        );
+    }
+    if (r.status === 'foreign-version') {
+        return (
+            `State ${statePath} схемы v${r.found}, а этот раннер знает v${STATE_SCHEMA_VERSION}. ` +
+            `Старт отвергнут: прочитанная молча чужая схема теряет или искажает её поля. ` +
+            `Запусти ревизию раннера, которая писала этот state, либо --reset. ${keep}`
+        );
+    }
+    if (r.status === 'corrupt') {
+        return (
+            `State ${statePath} повреждён: ${r.reason}. Старт отвергнут — прочитанный как ` +
+            `отсутствующий, он начал бы петлю с первой фазы поверх незаконченной. ${keep}`
+        );
+    }
+    throw new Error(`stateRefusal: исход ${r.status} — не отказ`);
+}
+
+// Суффикс копии непрошедшего state — по причине отказа: файл чужой или старой схемы не
+// повреждён, и имя `.corrupt-…` соврало бы тому, кто найдёт копию через месяц.
+function rejectedSuffix(r: TStateInspection): string {
+    if (r.status === 'old-schema') return 'old-schema';
+    if (r.status === 'foreign-version') return `v${String(r.found)}`;
+    return 'corrupt';
+}
 
 type KillFn = (pid: number, signal?: number | string) => void;
 type ReadFn = typeof fs.readFileSync;
@@ -85,7 +240,13 @@ export type StateLockEnv = {
     log: LogFn;
     fail: FailFn;
     guardSideEffect: (what: string) => void;
-    loadJson: (p: string, fallback: unknown) => unknown;
+    // Чтение файла state. Дефолт — fs.readFileSync; отсутствие файла — ENOENT, и только
+    // оно: любой другой отказ чтения — не «состояния нет», а стоп (задача 80).
+    readFile?: (p: string) => string;
+    // Копия повреждённого state перед --reset. Дефолт — fs.copyFileSync под общим
+    // предохранителем побочек, без перезаписи существующей копии.
+    copyFile?: (from: string, to: string) => void;
+    now?: () => Date;
     processAlive: (pid: number, killFn?: KillFn) => boolean;
     cmdlineIncludes: (pid: number, needle: string, readFn?: ReadFn) => boolean;
     buildSanitizedGateEnv: () => NodeJS.ProcessEnv;
@@ -100,7 +261,6 @@ export function createStateLock(env: StateLockEnv) {
         log,
         fail,
         guardSideEffect,
-        loadJson,
         processAlive,
         cmdlineIncludes,
         buildSanitizedGateEnv,
@@ -110,6 +270,7 @@ export function createStateLock(env: StateLockEnv) {
 
     function defaultState(): RalphState {
         return {
+            schemaVersion: STATE_SCHEMA_VERSION,
             count: 0,
             milestone: getConfig().phases[0].milestone,
             submitted: false,
@@ -122,6 +283,8 @@ export function createStateLock(env: StateLockEnv) {
             lastReviewModel: null,
             // #223: раннер снял label blocked, но повторное ревью ещё не дало вердикта.
             // Флаг переживает рестарт → гейт вернёт метку, если сессия ревью погибла.
+            // Задача 79: шире — «метка blocked обязана стоять, но не подтверждена чтением
+            // PR» (путь арбитра тоже); снимает его только подтверждённая запись.
             reReviewPending: false,
             // #625: лестница ревью правок ещё не начиналась. Живёт ровно одну фазу —
             // advancePhase её обнуляет вместе с blockedHeals: дедуп находок и счётчик
@@ -138,18 +301,114 @@ export function createStateLock(env: StateLockEnv) {
         };
     }
 
+    // Только ENOENT — «нет»: EACCES/EISDIR/EIO, прочитанные как отсутствие, вернули бы ту же
+    // потерю фазы, от которой защищает inspectState, — просто через другую дверь.
+    function inspectStateFile(): TStateInspection {
+        const read = env.readFile ?? ((p: string) => fs.readFileSync(p, 'utf-8'));
+        try {
+            return inspectState(read(env.statePath));
+        } catch (e) {
+            const code = (e as NodeJS.ErrnoException).code;
+            if (code === 'ENOENT') return { status: 'absent' };
+            return { status: 'unreadable', code: code ?? (e as Error).message };
+        }
+    }
+
     // failFn инжектируется (дефолт — module-level fail): preflight пробрасывает свой
-    // failFn, чтобы юнит-тест ловил fail старой схемы через исключение, а не process.exit.
+    // failFn, чтобы юнит-тест ловил отказ через исключение, а не process.exit.
+    //
+    // Задача 80: раньше чтение шло через loadJson с фолбэком null, и обрезанный файл читался
+    // как отсутствующий — петля стартовала с первой фазы поверх незаконченной, теряя её
+    // счётчики, барьер деплоя и флаг «метка blocked не подтверждена». Теперь «нет» — только
+    // отсутствие файла; всё, что лежит, но не проходит проверку, — стоп с диагнозом, а сам
+    // файл остаётся на месте нетронутым: разбирать его человеку.
     function loadState(failFn: FailFn = fail): RalphState {
-        const s = loadJson(env.statePath, null) as RalphState | null;
-        if (!s) return defaultState();
-        if (s.milestone === undefined) {
-            failFn(
-                `${env.statePath} старой схемы (phaseIndex). Раннер адресует фазы по имени milestone. ` +
-                    `Запусти --reset (вернёт на первую фазу конфига) или пропиши руками: { count, milestone: <имя фазы>, submitted: false }.`,
+        const r = inspectStateFile();
+        if (r.status === 'absent') return defaultState();
+        if (r.status === 'ok') {
+            if (r.migrated) {
+                log(
+                    `🗂 State ${env.statePath} без версии схемы — форма проверена, принят как ` +
+                        `v${STATE_SCHEMA_VERSION}; версия запишется со следующим сохранением.`,
+                );
+            }
+            return r.state;
+        }
+        const msg = stateRefusal(env.statePath, r);
+        failFn(msg);
+        // Боевой fail уходит в process.exit; failFn, который вернулся, не должен превратить
+        // отказ в «читаем дальше» — у вызывающего нет state, с которым можно продолжать.
+        throw new Error(msg);
+    }
+
+    // --reset. Жил в main() оркестратора, но решает он о state, и с задачей 80 у него
+    // появились исходы, которые надо проверять юнитом: файл, который не разобрался, —
+    // это одновременно улика (сохраняем копией до перезаписи) и неизвестный барьер деплоя
+    // (#THS8J: снимать его молча нельзя, а прочитать нечем — требуем --deploy-resolved).
+    // Возвращает путь сохранённой копии или null, если копировать было нечего.
+    function resetState({
+        deployResolved,
+        failFn = fail,
+    }: {
+        deployResolved: boolean;
+        failFn?: FailFn;
+    }): string | null {
+        const r = inspectStateFile();
+        // Нечитаемый файл --reset не лечит: копию снять нечем, а перезапись поверх файла,
+        // который мы не прочли (или каталога на его месте), — та же слепая потеря барьера.
+        if (r.status === 'unreadable') {
+            const msg = `--reset: ${stateRefusal(env.statePath, r)}`;
+            failFn(msg);
+            throw new Error(msg);
+        }
+        let block: unknown = null;
+        let unknownBlock = false;
+        if (r.status === 'ok') block = r.state.deployBlock;
+        else if (r.status !== 'absent') {
+            if (r.raw) block = r.raw.deployBlock;
+            else unknownBlock = true;
+        }
+        if (unknownBlock && !deployResolved) {
+            const msg =
+                `--reset: state ${env.statePath} не разбирается, и активен ли в нём барьер ` +
+                `красного деплоя, не прочитать. --reset стёр бы его вслепую — разбери файл ` +
+                `руками или повтори с --deploy-resolved, если сбрасываешь state вместе с барьером.`;
+            failFn(msg);
+            throw new Error(msg);
+        }
+        const b = block as { milestone?: unknown; reason?: unknown } | null;
+        if (b && !deployResolved) {
+            const msg =
+                `--reset при активном барьере красного деплоя фазы "${b.milestone}" ` +
+                `(${b.reason}). --reset стёр бы барьер молча — снятие барьера деплоя ` +
+                `должно быть осознанным. Разберись с деплоем и повтори с --deploy-resolved, если ` +
+                `действительно сбрасываешь state вместе с барьером.`;
+            failFn(msg);
+            throw new Error(msg);
+        }
+        if (b || unknownBlock) {
+            log(
+                `⚠ --reset вместе с --deploy-resolved стирает барьер красного деплоя` +
+                    (b
+                        ? ` фазы "${b.milestone}" (${b.reason}).`
+                        : ' (какой — из файла не прочитать).'),
             );
         }
-        return s;
+        let kept: string | null = null;
+        if (r.status !== 'absent' && r.status !== 'ok' && !DRY) {
+            const stamp = (env.now ?? (() => new Date()))().toISOString().replace(/[:.]/g, '-');
+            kept = `${env.statePath}.${rejectedSuffix(r)}-${stamp}`;
+            const copy =
+                env.copyFile ??
+                ((from: string, to: string) => {
+                    guardSideEffect(`copyFile(${from} → ${to})`);
+                    fs.copyFileSync(from, to, fs.constants.COPYFILE_EXCL);
+                });
+            copy(env.statePath, kept);
+            log(`🗂 Непрошедший проверку state сохранён для разбора: ${kept}`);
+        }
+        saveState(defaultState());
+        return kept;
     }
 
     function saveState(state: RalphState): void {
@@ -470,6 +729,7 @@ export function createStateLock(env: StateLockEnv) {
     return {
         defaultState,
         loadState,
+        resetState,
         saveState,
         lockHash,
         writeLockMarker,

@@ -62,8 +62,10 @@ export type ForgeCheckFailure = {
 
 export type ForgeWaitOutcome =
     | { kind: 'green' }
-    // Чеков у PR нет вовсе — форж их не заводит (репозиторий без CI). Не отказ: мердж
-    // идёт как раньше, площадке нечего отвергать.
+    // Чеков у PR нет вовсе — форж их не заводит (репозиторий без CI). Приговор выносит
+    // политика гейта (задача 81): при `optional` мердж идёт, площадке нечего отвергать, при
+    // `required` — стоп. Прогон в очереди сюда не попадает: площадка отдаёт его ждущим
+    // (`created`), а не `none` — так по логу петли потребителя.
     | { kind: 'absent' }
     | { kind: 'red'; run: ForgeCheckRun }
     | { kind: 'timeout'; detail: string }
@@ -116,6 +118,12 @@ export type WaitForForgeChecksDeps = {
     // как актуальный и останавливал фазу человеку по логу, который уже не про эту голову.
     // Не задан ⇒ свежесть не проверяется вовсе — прежнее поведение.
     sinceMs?: number;
+    // Задача 81: политика `required` внешнего CI. Прогон без `createdAt` в вердикте
+    // (зелёном или красном) тогда — `error`, а не «считаем свежим»: свежесть такого
+    // прогона не проверить, а для `required` «не смогли проверить» мердж не даёт. Ждать
+    // дальше бессмысленно — дата, не разобравшаяся в одном ответе, не разберётся и в
+    // следующем. Ждущий прогон без даты вердиктом не является и ожидание не обрывает.
+    requireDated?: boolean;
 };
 
 // Допуск на расхождение часов (правка по ревью #278). `sinceMs` снимается ЛОКАЛЬНО
@@ -131,7 +139,8 @@ const STALE_TOLERANCE_MS = 2 * 60 * 1000;
 // Прогон старше пуша правок — вердикт другого, более раннего состояния кода (#278).
 // `createdAt` не задан (адаптер не смог разобрать дату площадки) ⇒ прогон считается
 // свежим: сбой формы ответа — отдельная причина отказа, а не повод объявить вердикт
-// устаревшим.
+// устаревшим. Эту причину отказа называет `requireDated` (задача 81): при политике
+// `required` до `isStale` прогон без даты не доходит вовсе.
 function isStale(run: ForgeCheckRun, sinceMs: number | undefined): boolean {
     return (
         sinceMs !== undefined &&
@@ -177,6 +186,7 @@ export function waitForForgeChecks({
     maxReadErrors = DEFAULT_MAX_READ_ERRORS,
     healedRunId = '',
     sinceMs,
+    requireDated = false,
 }: WaitForForgeChecksDeps): ForgeWaitOutcome {
     const started = nowFn();
     let readErrors = 0;
@@ -200,6 +210,23 @@ export function waitForForgeChecks({
             continue;
         }
         lastRaw = checks.runs.map((r) => `${r.workflow}=${r.rawStatus}`).join(', ') || checks.state;
+        if (requireDated && (checks.state === 'success' || checks.state === 'failed')) {
+            if (checks.runs.length === 0) {
+                return {
+                    kind: 'error',
+                    detail: `форж вернул ${checks.state} без единого прогона — политика required подтверждать нечем`,
+                };
+            }
+            const undated = checks.runs.find((r) => r.createdAt === undefined);
+            if (undated) {
+                return {
+                    kind: 'error',
+                    detail:
+                        `прогон ${undated.runId} (${undated.workflow}=${undated.rawStatus}) без даты — ` +
+                        'свежесть не проверить, политика required мердж не даёт',
+                };
+            }
+        }
         for (const run of checks.runs) {
             const skew = clockSkewMs(run, sinceMs);
             if (skew !== undefined) {
@@ -298,7 +325,7 @@ export function waitForForgeChecks({
         if (checks.state === 'none' && elapsed >= absentGraceMs) {
             logFn(
                 `🚦 Чек площадки: за ${String(Math.round(absentGraceMs / 1000))}с ни одного прогона не завелось — ` +
-                    'мерджим без ожидания (у PR чеков нет).',
+                    'мердж решает политика внешнего CI (gate.externalCi).',
             );
             return { kind: 'absent' };
         }

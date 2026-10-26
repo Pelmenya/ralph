@@ -10,7 +10,7 @@ import { describe, it, expect, vi } from 'vitest';
 // через фабрику адаптера, а не через ре-экспорт ralph.js — потому здесь нет ни импорта
 // entry, ни @ts-expect-error к нему.
 import type { GateEnv } from './gate.ts';
-import { createGateRunner } from './gate.ts';
+import { classifyCheckFailure, createGateRunner, resolveGatePolicy } from './gate.ts';
 
 const SHA = 'a'.repeat(40);
 const OTHER_SHA = 'b'.repeat(40);
@@ -1175,5 +1175,375 @@ describe('headCommittedAt — время коммита проверенной �
                 (v: unknown) => `'${String(v)}'`,
             ),
         ).toThrow(/bad object/);
+    });
+});
+
+// ── Задача 81: политика внешнего CI и три исхода гейта ──────────────────────────
+//
+// Политика приходит из конфига (`gate.externalCi`, `gate.onToolFailure`) и решает две
+// разные вещи. `externalCi` — что считается подтверждением CI: при `required` мердж не
+// дают ни отсутствие прогона, ни прогон без даты, ни невозможность проверить свежесть.
+// `onToolFailure` — что делать, когда чек упал не на коде, а на инструменте: это третий
+// исход рядом с «прошёл» и «регрессия», и чини-сессия его не получает никогда.
+
+describe('resolveGatePolicy — политика гейта из конфига, fail-closed (задача 81)', () => {
+    const withGate = (extra: Record<string, unknown>) => ({
+        gate: { ...SYNTH_GATE.gate, ...extra },
+    });
+    const failing = (msg: string): never => {
+        throw new Error(msg);
+    };
+
+    it('ключей нет — прежнее поведение, сказанное вслух: optional и fail-closed', () => {
+        expect(resolveGatePolicy(SYNTH_GATE, failing)).toEqual({
+            externalCi: 'optional',
+            onToolFailure: 'fail-closed',
+        });
+    });
+
+    it.each(['required', 'optional', 'disabled'])('externalCi=%s принимается', (v) => {
+        expect(resolveGatePolicy(withGate({ externalCi: v }), failing).externalCi).toBe(v);
+    });
+
+    it('опечатка в externalCi — стоп, а не «дефолт как у нас»', () => {
+        expect(() => resolveGatePolicy(withGate({ externalCi: 'requird' }), failing)).toThrow(
+            /gate\.externalCi/,
+        );
+    });
+
+    it('опечатка в onToolFailure — стоп', () => {
+        expect(() => resolveGatePolicy(withGate({ onToolFailure: 'open' }), failing)).toThrow(
+            /gate\.onToolFailure/,
+        );
+    });
+
+    it('fail, который вернулся, оставляет СТРОЖАЙШУЮ политику, а не мягкую', () => {
+        const quiet = () => undefined;
+        expect(resolveGatePolicy(withGate({ externalCi: 1, onToolFailure: 2 }), quiet)).toEqual({
+            externalCi: 'required',
+            onToolFailure: 'fail-closed',
+        });
+    });
+});
+
+describe('classifyCheckFailure — регрессия против сбоя инструмента (задача 81)', () => {
+    const err = (fields: Record<string, unknown>) => Object.assign(new Error('x'), fields);
+
+    it.each([
+        ['код 1 — регрессия', { status: 1 }, 'regression'],
+        ['код 2 — регрессия (tsc, prettier так сообщают о находках)', { status: 2 }, 'regression'],
+        ['ошибка без кода выхода — регрессия (форма неизвестна)', {}, 'regression'],
+        ['127 — команда не найдена', { status: 127 }, 'tool-failure'],
+        ['126 — не исполняется', { status: 126 }, 'tool-failure'],
+        ['137 — убит SIGKILL через шелл', { status: 137 }, 'tool-failure'],
+        ['убит сигналом', { status: null, signal: 'SIGKILL' }, 'tool-failure'],
+        ['не запустился', { status: null, code: 'ENOENT' }, 'tool-failure'],
+        ['переполнен буфер вывода', { status: 1, code: 'ENOBUFS' }, 'tool-failure'],
+    ])('%s', (_name, fields, want) => {
+        expect(classifyCheckFailure(err(fields))).toBe(want);
+    });
+});
+
+describe('checksGreen — сбой инструмента не регрессия (задача 81)', () => {
+    function run(
+        g: ReturnType<typeof createGateRunner>,
+        failure: Record<string, unknown>,
+        extra: Record<string, unknown> = {},
+    ) {
+        const sh = vi.fn((cmd: string) => {
+            if (cmd.includes('rev-parse') || cmd === 'npm run lint') return '';
+            throw Object.assign(new Error('boom'), { stderr: 'sh: vitest: not found' }, failure);
+        });
+        return g.checksGreen('feature/x', 7, {
+            shFn: sh,
+            runArgvFn: () => '',
+            prHeadShaFn: () => SHA,
+            syncDepsFn: () => {},
+            checks: [
+                ['test', 'npm run test'],
+                ['lint', 'npm run lint'],
+            ],
+            ...extra,
+        });
+    }
+
+    it('fail-closed: false, red-check пуст (лечить нечего), сбой назван с кодом', () => {
+        const park = vi.fn();
+        const g = createGateRunner(makeEnv({ parkOnOriginMain: park }));
+        expect(run(g, { status: 127 })).toBe(false);
+        expect(g.getLastRedCheck()).toBeNull();
+        expect(g.getLastToolFailure()).toMatchObject({ name: 'test', cmd: 'npm run test' });
+        expect(g.getLastToolFailure()?.why).toContain('127');
+        expect(g.getVerifiedHead()).toBeNull();
+        expect(park).toHaveBeenCalledTimes(1);
+    });
+
+    it('fail-open: чек пропущен вслух, следующие идут, голова проверена', () => {
+        const logs: string[] = [];
+        const g = createGateRunner(makeEnv());
+        const ok = run(
+            g,
+            { status: null, signal: 'SIGKILL' },
+            {
+                onToolFailure: 'fail-open',
+                logFn: (m: string) => logs.push(m),
+            },
+        );
+        expect(ok).toBe(true);
+        expect(g.getVerifiedHead()).toBe(SHA);
+        expect(g.getLastToolFailure()).toBeNull();
+        expect(g.getToolFailureSkips()).toEqual([
+            expect.objectContaining({ name: 'test', why: expect.stringContaining('SIGKILL') }),
+        ]);
+        expect(logs.join('\n')).toContain('fail-open');
+        expect(logs.join('\n')).toContain('✓ lint');
+    });
+
+    it('fail-open не глушит регрессию: код 1 по-прежнему красный', () => {
+        const g = createGateRunner(makeEnv());
+        expect(run(g, { status: 1 }, { onToolFailure: 'fail-open' })).toBe(false);
+        expect(g.getLastRedCheck()).toMatchObject({ name: 'test' });
+        expect(g.getToolFailureSkips()).toEqual([]);
+    });
+
+    it('fail-open с нижней планкой: все чеки упали на инструменте → false, стоп сбоя', () => {
+        const park = vi.fn();
+        const g = createGateRunner(makeEnv({ parkOnOriginMain: park }));
+        const sh = vi.fn((cmd: string) => {
+            if (cmd.includes('rev-parse')) return '';
+            throw Object.assign(new Error('boom'), { stderr: 'sh: npm: not found', status: 127 });
+        });
+        const ok = g.checksGreen('feature/x', 7, {
+            shFn: sh,
+            runArgvFn: () => '',
+            prHeadShaFn: () => SHA,
+            syncDepsFn: () => {},
+            checks: [
+                ['test', 'npm run test'],
+                ['lint', 'npm run lint'],
+            ],
+            onToolFailure: 'fail-open',
+        });
+        expect(ok).toBe(false);
+        expect(g.getVerifiedHead()).toBeNull();
+        expect(g.getLastRedCheck()).toBeNull();
+        expect(g.getLastToolFailure()?.why).toContain('все чеки');
+        expect(g.getLastToolFailure()?.excerpt).toContain('not found');
+        expect(park).toHaveBeenCalledTimes(1);
+    });
+
+    it('дефолт политики — из конфига: onToolFailure: fail-open в gate доезжает до чеков', () => {
+        const cfg = { gate: { ...SYNTH_GATE.gate, onToolFailure: 'fail-open' } };
+        const g = createGateRunner(makeEnv({ getConfig: () => cfg }));
+        expect(run(g, { status: 127 })).toBe(true);
+    });
+});
+
+describe('tryMergePhase — три исхода гейта и политика внешнего CI (задача 81)', () => {
+    const phase = { branch: 'feature/m1', milestone: 'M1' };
+    const policy = (externalCi: string, onToolFailure = 'fail-closed') => ({
+        gate: { ...SYNTH_GATE.gate, externalCi, onToolFailure },
+    });
+    const DATED_GREEN = {
+        state: 'success' as const,
+        runs: [
+            {
+                workflow: 'gate',
+                runId: '400',
+                state: 'success' as const,
+                rawStatus: 'success',
+                createdAt: 2_000_000,
+            },
+        ],
+    };
+
+    function merge81(g: ReturnType<typeof createGateRunner>, over: Record<string, unknown> = {}) {
+        let clock = 0;
+        return tryMergeWith(g, phase, {
+            findOpenPrFn: () => ({ number: 9, labels: [] }),
+            checksGreenFn: () => true,
+            getVerifiedHeadFn: () => SHA,
+            headCommittedAtFn: () => 2_000_000,
+            nowFn: () => (clock += 30_000),
+            ...over,
+        });
+    }
+
+    it('сбой инструмента локального чека → gate-tool-failure, не red-checks', () => {
+        const g = createGateRunner(makeEnv());
+        const mergePrFn = vi.fn();
+        const res = merge81(g, {
+            checksGreenFn: () => false,
+            getLastRedCheckFn: () => null,
+            getLastToolFailureFn: () => ({
+                name: 'test',
+                cmd: 'npm run test',
+                why: 'код 127',
+                excerpt: 'not found',
+            }),
+            mergePrFn,
+        });
+        expect(res).toBe('gate-tool-failure');
+        expect(mergePrFn).not.toHaveBeenCalled();
+    });
+
+    it('required + прогона нет дольше grace → нет мерджа', () => {
+        const g = createGateRunner(makeEnv({ getConfig: () => policy('required') }));
+        const mergePrFn = vi.fn();
+        const res = merge81(g, {
+            forgeChecksFn: () => ({ state: 'none', runs: [] }),
+            mergePrFn,
+        });
+        expect(res).toBe('forge-unknown');
+        expect(mergePrFn).not.toHaveBeenCalled();
+        expect(g.getLastForgeStop()).toContain('required');
+    });
+
+    it('optional + прогона нет → мердж, как раньше', () => {
+        const g = createGateRunner(makeEnv({ getConfig: () => policy('optional') }));
+        const mergePrFn = vi.fn();
+        const res = merge81(g, {
+            forgeChecksFn: () => ({ state: 'none', runs: [] }),
+            mergePrFn,
+        });
+        expect(res).toBe('merged');
+        expect(mergePrFn).toHaveBeenCalledTimes(1);
+    });
+
+    it('required + прогон без даты → нет мерджа', () => {
+        const g = createGateRunner(makeEnv({ getConfig: () => policy('required') }));
+        const mergePrFn = vi.fn();
+        const undated = {
+            state: 'success' as const,
+            runs: [
+                { workflow: 'gate', runId: '400', state: 'success' as const, rawStatus: 'success' },
+            ],
+        };
+        const res = merge81(g, { forgeChecksFn: () => undated, mergePrFn });
+        expect(res).toBe('forge-unknown');
+        expect(mergePrFn).not.toHaveBeenCalled();
+        expect(g.getLastForgeStop()).toContain('без даты');
+    });
+
+    it('required + время коммита головы неизвестно → нет мерджа, CI даже не спрашиваем', () => {
+        const g = createGateRunner(makeEnv({ getConfig: () => policy('required') }));
+        const forgeChecksFn = vi.fn(() => DATED_GREEN);
+        const mergePrFn = vi.fn();
+        const res = merge81(g, {
+            headCommittedAtFn: () => {
+                throw new Error('git log упал');
+            },
+            forgeChecksFn,
+            mergePrFn,
+        });
+        expect(res).toBe('forge-unknown');
+        expect(forgeChecksFn).not.toHaveBeenCalled();
+        expect(mergePrFn).not.toHaveBeenCalled();
+    });
+
+    it('required + у адаптера нет чтения чеков → нет мерджа', () => {
+        const g = createGateRunner(makeEnv({ getConfig: () => policy('required') }));
+        const mergePrFn = vi.fn();
+        const res = merge81(g, { mergePrFn });
+        expect(res).toBe('forge-unknown');
+        expect(mergePrFn).not.toHaveBeenCalled();
+    });
+
+    it('required + датированный свежий зелёный → мердж', () => {
+        const g = createGateRunner(makeEnv({ getConfig: () => policy('required') }));
+        const res = merge81(g, { forgeChecksFn: () => DATED_GREEN });
+        expect(res).toBe('merged');
+    });
+
+    it('disabled → адаптер чеков не вызывается, мердж идёт', () => {
+        const g = createGateRunner(makeEnv({ getConfig: () => policy('disabled') }));
+        const forgeChecksFn = vi.fn(() => DATED_GREEN);
+        const res = merge81(g, { forgeChecksFn });
+        expect(res).toBe('merged');
+        expect(forgeChecksFn).not.toHaveBeenCalled();
+        expect(g.getLastMergeProof()).toContain('disabled');
+    });
+
+    it('optional + сбой инструмента CI + fail-open → мердж, решение в доказательстве', () => {
+        const g = createGateRunner(makeEnv({ getConfig: () => policy('optional', 'fail-open') }));
+        const mergePrFn = vi.fn();
+        const res = merge81(g, {
+            forgeChecksFn: () => {
+                throw new Error('площадка 503');
+            },
+            mergePrFn,
+        });
+        expect(res).toBe('merged');
+        expect(mergePrFn).toHaveBeenCalledTimes(1);
+        expect(g.getLastMergeProof()).toContain('fail-open');
+        expect(g.getLastMergeProof()).toContain('площадка 503');
+    });
+
+    it('optional + таймаут ожидания CI + fail-open → нет мерджа: медленный CI не сбой инструмента', () => {
+        const g = createGateRunner(makeEnv({ getConfig: () => policy('optional', 'fail-open') }));
+        const mergePrFn = vi.fn();
+        const res = merge81(g, {
+            forgeChecksFn: () => DATED_GREEN,
+            waitForForgeChecksFn: () => ({ kind: 'timeout', detail: 'прогона новее пуша нет' }),
+            mergePrFn,
+        });
+        expect(res).toBe('forge-unknown');
+        expect(mergePrFn).not.toHaveBeenCalled();
+        expect(g.getLastForgeStop()).toContain('прогона новее пуша нет');
+    });
+
+    it('optional + сбой инструмента CI + fail-closed → нет мерджа', () => {
+        const g = createGateRunner(makeEnv({ getConfig: () => policy('optional') }));
+        const res = merge81(g, {
+            forgeChecksFn: () => {
+                throw new Error('площадка 503');
+            },
+        });
+        expect(res).toBe('forge-unknown');
+    });
+
+    it('required сильнее fail-open: сбой инструмента CI мердж не даёт', () => {
+        const g = createGateRunner(makeEnv({ getConfig: () => policy('required', 'fail-open') }));
+        const mergePrFn = vi.fn();
+        const res = merge81(g, {
+            forgeChecksFn: () => {
+                throw new Error('площадка 503');
+            },
+            mergePrFn,
+        });
+        expect(res).toBe('forge-unknown');
+        expect(mergePrFn).not.toHaveBeenCalled();
+    });
+
+    it('доказательство мерджа называет голову, политику и исход CI; пишется в лог до мерджа', () => {
+        const logs: string[] = [];
+        const order: string[] = [];
+        const g = createGateRunner(makeEnv({ getConfig: () => policy('required') }));
+        merge81(g, {
+            forgeChecksFn: () => DATED_GREEN,
+            logFn: (m: string) => {
+                logs.push(m);
+                if (m.includes('Доказательство мерджа')) order.push('proof');
+            },
+            mergePrFn: () => order.push('merge'),
+        });
+        const proof = g.getLastMergeProof() ?? '';
+        expect(proof).toContain(SHA.slice(0, 8));
+        expect(proof).toContain('required');
+        expect(proof).toContain('зелёный');
+        expect(proof).toContain('fail-closed');
+        expect(order).toEqual(['proof', 'merge']);
+    });
+
+    it('fail-open пропуски локальных чеков видны в доказательстве', () => {
+        const g = createGateRunner(makeEnv({ getConfig: () => policy('disabled', 'fail-open') }));
+        merge81(g, {
+            getToolFailureSkipsFn: () => [{ name: 'test', cmd: 'npm run test', why: 'код 137' }],
+        });
+        expect(g.getLastMergeProof()).toContain('test');
+        expect(g.getLastMergeProof()).toContain('код 137');
+        // При пропусках «зелёный» — неправда: чек не прошёл, его не дозапустили.
+        expect(g.getLastMergeProof()).not.toContain('зелёный');
+        expect(g.getLastMergeProof()).toMatch(/прошли \d+ из \d+/);
     });
 });

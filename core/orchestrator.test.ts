@@ -52,6 +52,7 @@ import type { ReviewComment } from '../adapters/adapters.ts';
 import type { DeployOutcome } from './deploy-check.ts';
 import type { RalphState } from './state-lock.ts';
 import { COMMENT_NOTICE_THRESHOLD } from './session-requests.ts';
+import { MODEL_PROXY_RETRIES } from './runtime-availability.ts';
 
 // #204: состав чеков гейта переехал в ralph.config.json. gateChecksFor и tryMergePhase
 // читают ФАБРИЧНЫЙ config, который в проде ставит main() (в юнит-тестах не запускаемая).
@@ -3294,6 +3295,16 @@ describe('preflight — валидация конфига/среды и подг
         expect(() => preflight(cfg, okDeps({ loadStateFn: fakeState }))).toThrow(/gate/);
     });
 
+    it('задача 81: опечатка в политике гейта (gate.externalCi) → fail на СТАРТЕ', () => {
+        // «requird» молча означал бы optional — ровно та дыра, которую политика закрывает.
+        const cfg = validCfg({
+            gate: { checks: [['test', 'npm run test']], externalCi: 'requird' },
+        });
+        expect(() => preflight(cfg, okDeps({ loadStateFn: fakeState }))).toThrow(
+            /gate\.externalCi/,
+        );
+    });
+
     // Ревью-thread: env-ключи ВСЕХ рантаймов, достижимых из modelRouting (не только
     // статического coderRuntime), резолвим на СТАРТЕ — иначе конфиг фолбэка/label на
     // провайдера без ключа взорвался бы process.exit только в момент использования.
@@ -3828,6 +3839,8 @@ describe('runLoop — основной while-цикл: итерации коде
             // #217: снятие label blocked — побочка (gh), в тестах заглушка. Реальный
             // removeBlockedLabel зовёт sh и попал бы в предохранитель #138.
             removeBlockedLabelFn: () => {},
+            // Задача 79: чтение метки после записи — «встала»; отказы сверки — свои сценарии.
+            prHasBlockedLabelFn: () => true,
             runClaudeFn: () => 0,
             ensureCleanFn: () => true,
             phaseMergedFn: () => false,
@@ -5100,6 +5113,178 @@ describe('runLoop — основной while-цикл: итерации коде
         );
     });
 
+    // ── Задача 78: ревью засчитывается только по вердикту ─────────────────────────────
+    // 16.10 ревью легло на прокси моделей за 8 с: «No upstream account is currently
+    // available», `claude -p` вышел с кодом 0, намерений ноль — и фаза уехала в main
+    // непрочитанной. Вердикт — это сводка без якоря или pr-block; нет ни того, ни другого —
+    // стоп, а не «замечаний нет».
+    const reviewVerdictDeps = (
+        logs: string[],
+        reviewRuns: Array<{ output: string; verdict: boolean; anchored?: boolean }>,
+        o: Record<string, unknown> = {},
+    ) => {
+        let session = -1;
+        const runClaudeFn = vi.fn<RunClaudeFake>((_p, _o, extra) => {
+            session++;
+            const run = reviewRuns[Math.min(session, reviewRuns.length - 1)];
+            (extra?.onOutput as ((s: string) => void) | undefined)?.(run.output);
+            return 0;
+        });
+        // Намерения применяются после каждой сессии; ревью-сессии — первые в сдаче.
+        const applySessionRequestsFn = () => {
+            const run = reviewRuns[session];
+            if (run?.anchored && !run.verdict) {
+                return {
+                    applied: 1,
+                    failed: false,
+                    closedIssues: [],
+                    prFindings: [
+                        {
+                            comment: '🟡 [minor] находка у строки',
+                            anchor: { path: 'core/x.ts', line: 1 },
+                        },
+                    ],
+                    prBlocked: false,
+                };
+            }
+            return run?.verdict
+                ? {
+                      applied: 1,
+                      failed: false,
+                      closedIssues: [],
+                      prFindings: [{ comment: '⚪ [nit] сводка: замечаний нет' }],
+                      prBlocked: false,
+                  }
+                : { applied: 0, failed: false, closedIssues: [], prFindings: [], prBlocked: false };
+        };
+        return {
+            runClaudeFn,
+            deps: deps(logs, {
+                pickReviewModelFn: () => 'claude-opus-4-8',
+                runClaudeFn,
+                applySessionRequestsFn,
+                ...o,
+            }),
+        };
+    };
+
+    it('задача 78: код 0 и ноль намерений ревью — фаза не мерджится, причина «ревью без вердикта»', () => {
+        const logs: string[] = [];
+        const pushes: string[] = [];
+        const tryMergePhaseFn = vi.fn(() => 'merged' as const);
+        const state = mkState();
+        const { runClaudeFn, deps: d } = reviewVerdictDeps(
+            logs,
+            [{ output: 'Готово.', verdict: false }],
+            {
+                tryMergePhaseFn,
+                // Как боевой pushEvent: строка уходит и в уведомление, и в лог.
+                pushEventFn: (m: string, _c: unknown, o?: { logFn?: (s: string) => void }) => {
+                    pushes.push(m);
+                    o?.logFn?.(`🔔 PUSH: ${m}`);
+                    return false;
+                },
+            },
+        );
+        runLoop(validCfg({ review: { default: 'claude-opus-4-8' } }), ctx(state), d);
+        expect(tryMergePhaseFn).not.toHaveBeenCalled();
+        // Сессия правок не стартовала: ревью без вердикта — стоп сдачи целиком.
+        expect(runClaudeFn).toHaveBeenCalledTimes(1);
+        expect(pushes.join('\n')).toMatch(/ревью без вердикта/);
+        expect(logs.join('\n')).toMatch(/ревью без вердикта/);
+        // Не сдано: рестарт обязан повторить ревью, а не прыгнуть к гейту.
+        expect((state as { submitted: boolean }).submitted).toBe(false);
+    });
+
+    it('задача 78: честное чистое ревью (сводка есть, замечаний нет) по-прежнему проходит', () => {
+        const logs: string[] = [];
+        const tryMergePhaseFn = vi.fn(() => 'merged' as const);
+        const { deps: d } = reviewVerdictDeps(logs, [{ output: 'Ревью готово.', verdict: true }], {
+            tryMergePhaseFn,
+        });
+        runLoop(validCfg({ review: { default: 'claude-opus-4-8' } }), ctx(mkState()), d);
+        expect(tryMergePhaseFn).toHaveBeenCalled();
+        expect(logs.join('\n')).not.toMatch(/ревью без вердикта/);
+    });
+
+    it('задача 78: «No upstream account» в выводе — повтор с паузой, счётчик брейкера не растёт', () => {
+        const logs: string[] = [];
+        const sleepFn = vi.fn();
+        const tryMergePhaseFn = vi.fn(() => 'merged' as const);
+        const state = mkState({ count: 3 });
+        const { runClaudeFn, deps: d } = reviewVerdictDeps(
+            logs,
+            [
+                { output: 'No upstream account is currently available', verdict: false },
+                { output: 'Ревью готово.', verdict: true },
+            ],
+            { tryMergePhaseFn, sleepFn },
+        );
+        runLoop(validCfg({ review: { default: 'claude-opus-4-8' } }), ctx(state), d);
+        // Ревью дважды, затем сессия правок.
+        expect(runClaudeFn.mock.calls[0][0]).toBe(runClaudeFn.mock.calls[1][0]);
+        expect(sleepFn).toHaveBeenCalledTimes(1);
+        expect(sleepFn.mock.calls[0][0]).toBeGreaterThan(0);
+        expect(logs.join('\n')).toMatch(/прокси моделей/);
+        expect((state as { count: number }).count).toBe(3);
+        expect(tryMergePhaseFn).toHaveBeenCalled();
+    });
+
+    it('задача 78: якорные находки без сводки и строка прокси — без повтора, комментарии не задваиваются', () => {
+        const logs: string[] = [];
+        const sleepFn = vi.fn();
+        const tryMergePhaseFn = vi.fn(() => 'merged' as const);
+        const { runClaudeFn, deps: d } = reviewVerdictDeps(
+            logs,
+            [
+                {
+                    output: 'No upstream account is currently available',
+                    verdict: false,
+                    anchored: true,
+                },
+            ],
+            {
+                tryMergePhaseFn,
+                sleepFn,
+                pushEventFn: (m: string, _c: unknown, o?: { logFn?: (s: string) => void }) => {
+                    o?.logFn?.(`🔔 PUSH: ${m}`);
+                    return false;
+                },
+            },
+        );
+        runLoop(validCfg({ review: { default: 'claude-opus-4-8' } }), ctx(mkState()), d);
+        expect(runClaudeFn).toHaveBeenCalledTimes(1);
+        expect(sleepFn).not.toHaveBeenCalled();
+        expect(tryMergePhaseFn).not.toHaveBeenCalled();
+        expect(logs.join('\n')).toMatch(/ревью без вердикта/);
+        expect(logs.join('\n')).not.toMatch(/после \d+ повторов/);
+    });
+
+    it('задача 78: прокси лежит дольше бюджета повторов — стоп «ревью без вердикта», не мердж', () => {
+        const logs: string[] = [];
+        const sleepFn = vi.fn();
+        const tryMergePhaseFn = vi.fn(() => 'merged' as const);
+        const state = mkState({ count: 3 });
+        const { runClaudeFn, deps: d } = reviewVerdictDeps(
+            logs,
+            [{ output: 'No upstream account is currently available', verdict: false }],
+            {
+                tryMergePhaseFn,
+                sleepFn,
+                pushEventFn: (m: string, _c: unknown, o?: { logFn?: (s: string) => void }) => {
+                    o?.logFn?.(`🔔 PUSH: ${m}`);
+                    return false;
+                },
+            },
+        );
+        runLoop(validCfg({ review: { default: 'claude-opus-4-8' } }), ctx(state), d);
+        expect(tryMergePhaseFn).not.toHaveBeenCalled();
+        expect(runClaudeFn).toHaveBeenCalledTimes(MODEL_PROXY_RETRIES + 1);
+        expect(sleepFn).toHaveBeenCalledTimes(MODEL_PROXY_RETRIES);
+        expect(logs.join('\n')).toMatch(/ревью без вердикта/);
+        expect((state as { count: number }).count).toBe(3);
+    });
+
     // Снятие барьера #415 для taskSource. Раньше `tryMergePhase` брал примитивы форжа из
     // замыкания gate.ts, поэтому недефолтная реализация шва была бы «тихим дефолтом» —
     // резолвер её и отвергал. Теперь composition root передаёт их явно.
@@ -6174,6 +6359,13 @@ describe('runLoop — основной while-цикл: итерации коде
             // phaseIndexOfFn НЕ переопределяем: дефолтный счётчик (0 → 99) даёт ровно
             // один рабочий проход, иначе continue после разбора крутил бы цикл до брейкера.
             deps(logs, {
+                // Задача 78: чистое повторное ревью — это сводка без якоря, а не ноль намерений.
+                applySessionRequestsFn: () => ({
+                    applied: 1,
+                    failed: false,
+                    prFindings: [{ comment: '⚪ [nit] блокеры сняты' }],
+                    prBlocked: false,
+                }),
                 openIssuesFn: () => [],
                 allOpenIssuesFn: () => [],
                 phaseMergedFn: () => false,
@@ -6295,6 +6487,13 @@ describe('runLoop — основной while-цикл: итерации коде
             validCfg({ blockedHealAttempts: 3 }),
             ctx(state),
             deps(logs, {
+                // Задача 78: чистое повторное ревью — это сводка без якоря, а не ноль намерений.
+                applySessionRequestsFn: () => ({
+                    applied: 1,
+                    failed: false,
+                    prFindings: [{ comment: '⚪ [nit] блокеры сняты' }],
+                    prBlocked: false,
+                }),
                 phaseIndexOfFn: () => (idxCalls++ < 2 ? 0 : 99),
                 openIssuesFn: () => [],
                 allOpenIssuesFn: () => [],
@@ -6534,6 +6733,13 @@ describe('runLoop — основной while-цикл: итерации коде
             validCfg({ blockedHealAttempts: 3 }),
             ctx(state),
             deps(logs, {
+                // Задача 78: чистое повторное ревью — это сводка без якоря, а не ноль намерений.
+                applySessionRequestsFn: () => ({
+                    applied: 1,
+                    failed: false,
+                    prFindings: [{ comment: '⚪ [nit] блокеры сняты' }],
+                    prBlocked: false,
+                }),
                 phaseIndexOfFn: () => (idxCalls++ < 2 ? 0 : 99),
                 openIssuesFn: () => [],
                 allOpenIssuesFn: () => [],
@@ -6553,6 +6759,139 @@ describe('runLoop — основной while-цикл: итерации коде
         expect(runClaudeFn).toHaveBeenCalledTimes(2);
         expect(runClaudeFn.mock.calls[0][0]).toMatch(/метку blocked снять ты не можешь/i);
         expect(runClaudeFn.mock.calls[1][0]).toMatch(/повторн|устранен/i);
+    });
+
+    // Задача 78: повторное ревью, вышедшее с кодом 0 без единого намерения, — не «блокеры
+    // сняты». Метку раннер уже снял, и без возврата следующий гейт смерджил бы фазу.
+    it('задача 78: повторное ревью без вердикта → label blocked возвращён, мерджа нет', () => {
+        const logs: string[] = [];
+        const state = mkState({
+            submitted: true,
+            blockedHeals: 0,
+            lastReviewModel: 'claude-opus-4-8',
+        });
+        const addBlockedLabelFn = vi.fn();
+        const advancePhaseFn = vi.fn();
+        let gateCalls = 0;
+        const tryMergePhaseFn = vi.fn(() => (gateCalls++ === 0 ? 'blocked' : 'merged'));
+        let idxCalls = 0;
+        runLoop(
+            validCfg({ blockedHealAttempts: 3 }),
+            ctx(state),
+            deps(logs, {
+                phaseIndexOfFn: () => (idxCalls++ < 2 ? 0 : 99),
+                pickReviewModelFn: () => 'claude-opus-4-8',
+                tryMergePhaseFn,
+                runClaudeFn: () => 0,
+                removeBlockedLabelFn: () => {},
+                addBlockedLabelFn,
+                advancePhaseFn,
+                pushEventFn: (m: string, _c: unknown, o?: { logFn?: (s: string) => void }) => {
+                    o?.logFn?.(`🔔 PUSH: ${m}`);
+                    return false;
+                },
+            }),
+        );
+        expect(addBlockedLabelFn).toHaveBeenCalledTimes(1);
+        expect(advancePhaseFn).not.toHaveBeenCalled();
+        expect(tryMergePhaseFn).toHaveBeenCalledTimes(1);
+        expect(state.reReviewPending).toBe(false);
+        expect(logs.join('\n')).toMatch(/ревью без вердикта/);
+    });
+
+    // Задача 79: восстановление после рестарта зовёт запись метки, а запись в адаптерах
+    // fail-open. Флаг сбрасывался сразу после вызова — и метка, не легшая молча, уводила
+    // гейт в мердж. Теперь метку перечитывают, и флаг снимает только подтверждение.
+    it.each([
+        ['запись метки не применилась', () => false, /метки на PR нет после записи/],
+        [
+            'чтение после записи упало — исход неизвестен',
+            (): boolean => {
+                throw new Error('форж не ответил');
+            },
+            /исход записи неизвестен \(форж не ответил\)/,
+        ],
+    ])(
+        'задача 79: reReviewPending, %s → после рестарта мерджа нет, флаг не сброшен',
+        (_t, readBack, why) => {
+            const logs: string[] = [];
+            const state = mkState({ submitted: true, reReviewPending: true });
+            const addBlockedLabelFn = vi.fn();
+            const tryMergePhaseFn = vi.fn(() => 'merged');
+            const advancePhaseFn = vi.fn();
+            const pushEventFn = vi.fn();
+            runLoop(
+                validCfg(),
+                ctx(state),
+                deps(logs, {
+                    addBlockedLabelFn,
+                    prHasBlockedLabelFn: readBack,
+                    tryMergePhaseFn,
+                    advancePhaseFn,
+                    pushEventFn,
+                }),
+            );
+            expect(addBlockedLabelFn).toHaveBeenCalledTimes(1);
+            expect(tryMergePhaseFn).not.toHaveBeenCalled();
+            expect(advancePhaseFn).not.toHaveBeenCalled();
+            expect(state.reReviewPending).toBe(true);
+            expect(logs.some((l) => why.test(l))).toBe(true);
+            expect(pushEventFn).toHaveBeenCalledTimes(1);
+            expect(pushEventFn.mock.calls[0][0]).toMatch(/blocked-unconfirmed/);
+        },
+    );
+
+    it('задача 79: reReviewPending, метка подтверждена чтением → флаг снят, гейт идёт', () => {
+        const logs: string[] = [];
+        const state = mkState({ submitted: true, reReviewPending: true });
+        const tryMergePhaseFn = vi.fn(() => 'not-merged');
+        runLoop(
+            validCfg(),
+            ctx(state),
+            deps(logs, {
+                addBlockedLabelFn: vi.fn(),
+                prHasBlockedLabelFn: () => true,
+                tryMergePhaseFn,
+            }),
+        );
+        expect(tryMergePhaseFn).toHaveBeenCalledTimes(1);
+        expect(state.reReviewPending).toBe(false);
+    });
+
+    // Тот же класс на пути повторного ревью: метку возвращают, а встала ли — не знали.
+    it('задача 79: повторное ревью без вердикта, метка не встала → флаг не сброшен', () => {
+        const logs: string[] = [];
+        const state = mkState({
+            submitted: true,
+            blockedHeals: 0,
+            lastReviewModel: 'claude-opus-4-8',
+        });
+        const advancePhaseFn = vi.fn();
+        let gateCalls = 0;
+        const tryMergePhaseFn = vi.fn(() => (gateCalls++ === 0 ? 'blocked' : 'merged'));
+        let idxCalls = 0;
+        runLoop(
+            validCfg({ blockedHealAttempts: 3 }),
+            ctx(state),
+            deps(logs, {
+                phaseIndexOfFn: () => (idxCalls++ < 2 ? 0 : 99),
+                pickReviewModelFn: () => 'claude-opus-4-8',
+                tryMergePhaseFn,
+                runClaudeFn: () => 0,
+                addBlockedLabelFn: vi.fn(),
+                prHasBlockedLabelFn: () => false,
+                advancePhaseFn,
+                pushEventFn: (m: string, _c: unknown, o?: { logFn?: (s: string) => void }) => {
+                    o?.logFn?.(`🔔 PUSH: ${m}`);
+                    return false;
+                },
+            }),
+        );
+        expect(advancePhaseFn).not.toHaveBeenCalled();
+        expect(state.reReviewPending).toBe(true);
+        // Стоп не врёт о метке: соседняя строка уже сказала «не подтверждена».
+        expect(logs.join('\n')).not.toMatch(/label blocked возвращён/);
+        expect(logs.join('\n')).toMatch(/label blocked не подтверждён/);
     });
 
     it('гейт red-checks → чини-сессия гейта с деталями чека из getLastRedCheck', () => {
@@ -7482,6 +7821,45 @@ describe('runLoop — основной while-цикл: итерации коде
         expect(stopText).toContain('диагноз:');
         expect(stopText).toContain('вопрос человеку:');
         // Человек чинит СРЕДУ, а не код: после рестарта бюджет лечения обязан быть полным.
+        expect(state.gateHeals).toBe(0);
+    });
+
+    // Задача 81: сбой ИНСТРУМЕНТА гейта — третий исход рядом с «прошёл» и «регрессия».
+    // Он не читается как регрессия: чини-сессии нет, а стоп уходит пушем со своей причиной,
+    // не катч-оллом `unknown`. Бюджет лечения при этом не тратится и сбрасывается — человек
+    // чинит среду, а не код.
+    it('задача 81: gate-tool-failure — стоп пушем с причиной, без чини-сессии', () => {
+        const logs: string[] = [];
+        const state = mkState({ submitted: true, gateHeals: 1 });
+        const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+        const pushEventFn = vi.fn((msg: string) => msg.length > 0);
+        runLoop(
+            validCfg({ gateHealAttempts: 2 }),
+            ctx(state),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => false,
+                tryMergePhaseFn: () => 'gate-tool-failure',
+                getLastRedCheck: () => null,
+                getLastForgeRedCheck: () => null,
+                getLastToolFailure: () => ({
+                    name: 'test',
+                    cmd: 'npm run test',
+                    why: 'код 127',
+                    excerpt: 'sh: vitest: not found',
+                }),
+                runClaudeFn,
+                pushEventFn,
+            }),
+        );
+        expect(runClaudeFn).not.toHaveBeenCalled();
+        expect(pushEventFn).toHaveBeenCalledTimes(1);
+        const stopText = String(pushEventFn.mock.calls[0][0]);
+        expect(stopText).toContain('gate-tool-failure');
+        expect(stopText).toContain('test');
+        expect(stopText).toContain('код 127');
+        expect(stopText).not.toContain('(unknown)');
         expect(state.gateHeals).toBe(0);
     });
 

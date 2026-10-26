@@ -8,7 +8,7 @@ import { describe, it, expect, vi } from 'vitest';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import type { StateLockEnv } from './state-lock.ts';
-import { createStateLock } from './state-lock.ts';
+import { createStateLock, inspectState, STATE_SCHEMA_VERSION } from './state-lock.ts';
 // @ts-expect-error — JS-entry раннера без деклараций типов; блоки в конце файла
 // перенесены из ralph.test.js как есть и ходят через его ре-экспорт (#366).
 import ralph from '../ralph.js';
@@ -20,6 +20,11 @@ import ralph from '../ralph.js';
 const itPosix = it.skipIf(process.platform === 'win32');
 
 const { isRalphProcess, lockAlive, writeLock, removeLock, releaseLockIfOurs } = ralph;
+
+const noFile = (): string => {
+    throw Object.assign(new Error('ENOENT: no such file'), { code: 'ENOENT' });
+};
+const fileWith = (text: string) => () => text;
 
 // Синтетический env: пути-заглушки, отдельный (не общий #138) guardSideEffect, чтобы тест
 // не трогал журнал side-effect-guard.ts и не зависел от боевого контекста ralph.js.
@@ -34,7 +39,11 @@ function makeEnv(over: Partial<StateLockEnv> = {}): StateLockEnv {
         log: () => {},
         fail: () => {},
         guardSideEffect: () => {},
-        loadJson: () => null,
+        readFile: noFile,
+        copyFile: () => {
+            throw new Error('copyFile не подменён в тесте');
+        },
+        now: () => new Date('2026-10-26T01:02:03.456Z'),
         processAlive: () => false,
         cmdlineIncludes: () => false,
         buildSanitizedGateEnv: () => ({ PATH: '/x' }),
@@ -46,6 +55,7 @@ describe('defaultState — канонический полный state из пе
     it('milestone берётся из getConfig().phases[0], счётчики нулевые, барьеры пустые', () => {
         const { defaultState } = createStateLock(makeEnv());
         expect(defaultState()).toEqual({
+            schemaVersion: STATE_SCHEMA_VERSION,
             count: 0,
             milestone: 'M1',
             submitted: false,
@@ -69,26 +79,294 @@ describe('defaultState — канонический полный state из пе
     });
 });
 
-describe('loadState — резолв state с диска через инжектированный loadJson', () => {
+// Задача 80: раньше чтение шло через loadJson с фолбэком null, и обрезанный файл читался
+// как отсутствующий — петля начинала с первой фазы поверх незаконченной.
+describe('inspectState — версия схемы и форма state', () => {
+    const v1 = { schemaVersion: 1, count: 2, milestone: 'M1', submitted: false };
+
+    it('годный v1 — ok без миграции', () => {
+        const r = inspectState(JSON.stringify(v1));
+        expect(r).toEqual({ status: 'ok', state: v1, migrated: false });
+    });
+
+    it('без версии, но годной формы — проверенная миграция в текущую версию', () => {
+        const r = inspectState(JSON.stringify({ count: 1, milestone: null, submitted: true }));
+        expect(r.status).toBe('ok');
+        if (r.status !== 'ok') return;
+        expect(r.migrated).toBe(true);
+        expect(r.state.schemaVersion).toBe(STATE_SCHEMA_VERSION);
+    });
+
+    it('без версии и НЕгодной формы — не миграция, а повреждение', () => {
+        const r = inspectState(JSON.stringify({ count: '1', milestone: 'M1', submitted: true }));
+        expect(r).toMatchObject({ status: 'corrupt', reason: expect.stringMatching(/count/) });
+    });
+
+    it.each([
+        ['обрезанный JSON', '{"count": 3, "milestone": "M'],
+        ['пустой файл', ''],
+        ['не объект', '[1,2]'],
+        ['null', 'null'],
+    ])('%s — повреждён', (_, text) => {
+        expect(inspectState(text).status).toBe('corrupt');
+    });
+
+    it.each([
+        ['submitted не boolean', { submitted: 'no' }],
+        ['milestone число', { milestone: 3 }],
+        ['count отрицательный', { count: -1 }],
+        ['gateHeals строка', { gateHeals: '2' }],
+        ['gateHeals отрицательный', { gateHeals: -1 }],
+        ['blockedHeals дробный', { blockedHeals: 1.5 }],
+        ['deployBlock без milestone и reason', { deployBlock: { status: 'red' } }],
+        ['reviewModelFloor число', { reviewModelFloor: 5 }],
+        ['reReviewPending строка', { reReviewPending: 'yes' }],
+        ['deployBlock строка', { deployBlock: 'red' }],
+        ['schemaVersion строка', { schemaVersion: '1' }],
+    ])('%s — повреждён, а не принят', (_, over) => {
+        const r = inspectState(JSON.stringify({ ...v1, ...over }));
+        expect(r.status).toBe('corrupt');
+    });
+
+    it('другая версия схемы — отдельный исход, форма не проверяется', () => {
+        // Будущая схема вправе выглядеть иначе: «повреждён» здесь было бы ложью.
+        const r = inspectState(JSON.stringify({ schemaVersion: 2, phase: { name: 'M1' } }));
+        expect(r).toMatchObject({ status: 'foreign-version', found: 2 });
+    });
+
+    it('без milestone — старая схема (phaseIndex)', () => {
+        const r = inspectState(JSON.stringify({ count: 3, phaseIndex: 0, submitted: false }));
+        expect(r.status).toBe('old-schema');
+    });
+
+    it('v1 без milestone — не старая схема, а повреждение', () => {
+        const r = inspectState(JSON.stringify({ schemaVersion: 1, count: 0, submitted: false }));
+        expect(r).toMatchObject({ status: 'corrupt', reason: expect.stringMatching(/milestone/) });
+    });
+});
+
+describe('loadState — state с диска через инжектированный readFile', () => {
     it('валидный state (с milestone) возвращается как есть', () => {
-        const state = { count: 5, milestone: 'M3', submitted: true, noProgress: 1 };
-        const { loadState } = createStateLock(makeEnv({ loadJson: () => state }));
+        const state = {
+            schemaVersion: 1,
+            count: 5,
+            milestone: 'M3',
+            submitted: true,
+            noProgress: 1,
+        };
+        const { loadState } = createStateLock(
+            makeEnv({ readFile: fileWith(JSON.stringify(state)) }),
+        );
         expect(loadState()).toEqual(state);
     });
 
-    it('нет файла (loadJson → null) → defaultState первой фазы', () => {
-        const { loadState } = createStateLock(makeEnv({ loadJson: () => null }));
-        expect(loadState().milestone).toBe('M1');
+    it('нет файла (ENOENT) → штатный defaultState первой фазы', () => {
+        const { loadState, defaultState } = createStateLock(makeEnv({ readFile: noFile }));
+        expect(loadState()).toEqual(defaultState());
+    });
+
+    it('обрезанный JSON → старт отвергнут с диагнозом «повреждён», файл не тронут', () => {
+        const guardSideEffect = vi.fn();
+        const copyFile = vi.fn();
+        const { loadState } = createStateLock(
+            makeEnv({
+                readFile: fileWith('{"count": 3, "milestone": "M2", "subm'),
+                guardSideEffect,
+                copyFile,
+            }),
+        );
+        const failFn = vi.fn();
+        expect(() => loadState(failFn)).toThrow(/повреждён/);
+        expect(failFn).toHaveBeenCalledTimes(1);
+        const msg = failFn.mock.calls[0][0] as string;
+        expect(msg).toMatch(/State \/x\/ralph\.state\.json повреждён: не JSON/);
+        expect(msg).toMatch(/оставлен на месте для разбора/);
+        // Сохранён — значит не перезаписан и не скопирован: ни одной пишущей побочки.
+        expect(guardSideEffect).not.toHaveBeenCalled();
+        expect(copyFile).not.toHaveBeenCalled();
+    });
+
+    it('файл есть, но не читается (EACCES) → отказ «не читается», а не «состояния нет» и не «повреждён»', () => {
+        const { loadState } = createStateLock(
+            makeEnv({
+                readFile: () => {
+                    throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
+                },
+            }),
+        );
+        const failFn = vi.fn();
+        expect(() => loadState(failFn)).toThrow(/не читается \(EACCES\)/);
+        const msg = failFn.mock.calls[0][0] as string;
+        expect(msg).toMatch(/права/);
+        expect(msg).not.toMatch(/повреждён/);
+        expect(msg).not.toMatch(/сохранит его копией/);
+    });
+
+    it('state другой версии схемы → отказ с обеими версиями в тексте', () => {
+        const { loadState } = createStateLock(
+            makeEnv({
+                readFile: fileWith(
+                    JSON.stringify({
+                        schemaVersion: 7,
+                        count: 0,
+                        milestone: 'M1',
+                        submitted: false,
+                    }),
+                ),
+            }),
+        );
+        const failFn = vi.fn();
+        expect(() => loadState(failFn)).toThrow();
+        expect(failFn.mock.calls[0][0]).toMatch(/схемы v7, а этот раннер знает v1/);
+    });
+
+    it('state без версии → проверенная миграция с строкой в логе', () => {
+        const log = vi.fn();
+        const { loadState } = createStateLock(
+            makeEnv({
+                log,
+                readFile: fileWith(JSON.stringify({ count: 1, milestone: 'M2', submitted: false })),
+            }),
+        );
+        expect(loadState()).toMatchObject({ schemaVersion: 1, milestone: 'M2', count: 1 });
+        expect(log).toHaveBeenCalledWith(
+            expect.stringMatching(/без версии схемы — форма проверена/),
+        );
     });
 
     it('state старой схемы (без milestone) → зовёт инжектированный failFn', () => {
         const { loadState } = createStateLock(
-            makeEnv({ loadJson: () => ({ count: 3, phaseIndex: 0, submitted: false }) }),
+            makeEnv({
+                readFile: fileWith(JSON.stringify({ count: 3, phaseIndex: 0, submitted: false })),
+            }),
         );
         const failFn = vi.fn();
-        loadState(failFn);
+        expect(() => loadState(failFn)).toThrow();
         expect(failFn).toHaveBeenCalledTimes(1);
         expect(failFn.mock.calls[0][0]).toMatch(/схем|phaseIndex/i);
+    });
+});
+
+describe('resetState — --reset не теряет улику и не снимает барьер деплоя вслепую', () => {
+    it('повреждённый state без --deploy-resolved → отказ: барьер деплоя не прочитать', () => {
+        const guardSideEffect = vi.fn();
+        const copyFile = vi.fn();
+        const { resetState } = createStateLock(
+            makeEnv({ readFile: fileWith('{"deployBl'), guardSideEffect, copyFile }),
+        );
+        const failFn = vi.fn();
+        expect(() => resetState({ deployResolved: false, failFn })).toThrow(/не прочитать/);
+        expect(copyFile).not.toHaveBeenCalled();
+        expect(guardSideEffect).not.toHaveBeenCalled();
+    });
+
+    it('повреждённый state с --deploy-resolved → копия для разбора ДО перезаписи', () => {
+        const order: string[] = [];
+        const copyFile = vi.fn(
+            (from: string, to: string) => void order.push(`copy ${from} → ${to}`),
+        );
+        const guardSideEffect = (what: string) => {
+            order.push(what);
+            throw new Error('стоп до настоящей записи');
+        };
+        const { resetState } = createStateLock(
+            makeEnv({ readFile: fileWith('{"count":'), guardSideEffect, copyFile }),
+        );
+        expect(() => resetState({ deployResolved: true })).toThrow(/стоп до настоящей записи/);
+        expect(order).toEqual([
+            'copy /x/ralph.state.json → /x/ralph.state.json.corrupt-2026-10-26T01-02-03-456Z',
+            'saveState(/x/ralph.state.json)',
+        ]);
+    });
+
+    it('нечитаемый state (EISDIR) → --reset отказывает, ничего не копирует и не пишет', () => {
+        const guardSideEffect = vi.fn();
+        const copyFile = vi.fn();
+        const { resetState } = createStateLock(
+            makeEnv({
+                readFile: () => {
+                    throw Object.assign(new Error('EISDIR'), { code: 'EISDIR' });
+                },
+                guardSideEffect,
+                copyFile,
+            }),
+        );
+        expect(() => resetState({ deployResolved: true, failFn: () => {} })).toThrow(
+            /не читается \(EISDIR\)/,
+        );
+        expect(copyFile).not.toHaveBeenCalled();
+        expect(guardSideEffect).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        ['старой схемы', { count: 3, phaseIndex: 0, submitted: false }, '.old-schema-'],
+        ['чужой версии', { schemaVersion: 9, count: 0, milestone: 'M1', submitted: false }, '.v9-'],
+    ])('копия state %s названа по причине, а не «corrupt»', (_t, state, suffix) => {
+        const copies: string[] = [];
+        const { resetState } = createStateLock(
+            makeEnv({
+                readFile: fileWith(JSON.stringify(state)),
+                copyFile: (_from: string, to: string) => void copies.push(to),
+                guardSideEffect: () => {
+                    throw new Error('стоп до записи');
+                },
+            }),
+        );
+        expect(() => resetState({ deployResolved: false })).toThrow('стоп до записи');
+        expect(copies).toEqual([expect.stringContaining(`ralph.state.json${suffix}`)]);
+        expect(copies[0]).not.toContain('corrupt');
+    });
+
+    it('годный state без барьера — сброс без копии', () => {
+        const writes: string[] = [];
+        // Guard бросает, как боевой под RALPH_NO_SIDE_EFFECTS: до настоящей записи не доходит.
+        const guardSideEffect = (what: string) => {
+            writes.push(what);
+            throw new Error('стоп до записи');
+        };
+        const copyFile = vi.fn();
+        const state = { schemaVersion: 1, count: 4, milestone: 'M2', submitted: true };
+        const { resetState } = createStateLock(
+            makeEnv({ readFile: fileWith(JSON.stringify(state)), guardSideEffect, copyFile }),
+        );
+        expect(() => resetState({ deployResolved: false })).toThrow('стоп до записи');
+        expect(copyFile).not.toHaveBeenCalled();
+        expect(writes).toEqual(['saveState(/x/ralph.state.json)']);
+    });
+
+    it('годный state с активным барьером деплоя без флага → прежний отказ #THS8J', () => {
+        const state = {
+            schemaVersion: 1,
+            count: 0,
+            milestone: 'M2',
+            submitted: false,
+            deployBlock: { milestone: 'M1', reason: 'деплой красный' },
+        };
+        const { resetState } = createStateLock(
+            makeEnv({ readFile: fileWith(JSON.stringify(state)) }),
+        );
+        expect(() => resetState({ deployResolved: false, failFn: () => {} })).toThrow(
+            /активном барьере красного деплоя фазы "M1" \(деплой красный\)/,
+        );
+    });
+
+    it('чужая версия схемы: барьер достаётся из разобранного JSON, копия сохраняется', () => {
+        const state = { schemaVersion: 9, deployBlock: { milestone: 'M1', reason: 'r' } };
+        const { resetState } = createStateLock(
+            makeEnv({ readFile: fileWith(JSON.stringify(state)) }),
+        );
+        expect(() => resetState({ deployResolved: false, failFn: () => {} })).toThrow(/барьере/);
+    });
+
+    it('dry: копию не пишет и state не перезаписывает', () => {
+        const copyFile = vi.fn();
+        const guardSideEffect = vi.fn();
+        const { resetState } = createStateLock(
+            makeEnv({ dry: true, readFile: fileWith('{'), guardSideEffect, copyFile }),
+        );
+        expect(resetState({ deployResolved: true })).toBeNull();
+        expect(copyFile).not.toHaveBeenCalled();
+        expect(guardSideEffect).not.toHaveBeenCalled();
     });
 });
 

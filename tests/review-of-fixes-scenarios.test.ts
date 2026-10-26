@@ -39,6 +39,7 @@ const isFixReviewPrompt = (p: string) => p.includes('отревьюй ИМЕНН
 const isArbiterPrompt = (p: string) => p.includes('Ты независимый арбитр');
 const isPhaseReviewPrompt = (p: string) => p.includes('проведи детальное code review');
 const isFixPrompt = (p: string) => p.includes('Разбери замечания code review');
+const isReReviewPrompt = (p: string) => p.includes('Ранее ревью пометило его меткой blocked');
 
 type Finding = { comment: string; anchor?: { path: string; line: number } };
 type PassResult = { findings: Finding[]; blocked?: boolean };
@@ -76,6 +77,7 @@ const cfg = (o: Partial<RalphConfig> = {}): RalphConfig => ({
 });
 
 const mkState = (o: Partial<RalphState> = {}): RalphState => ({
+    schemaVersion: 1,
     count: 0,
     milestone: 'M1',
     submitted: false,
@@ -128,6 +130,9 @@ function runPhase({
     // тест берёт из `placements` зелёного прогона: так он роняет проводку ИМЕННО той сессии,
     // которую проверяет, а не проводку итерации, стоящую раньше при том же числе сессий.
     failPlacementCall = -1,
+    // Задача 79: чтение PR после записи метки blocked. `true` — метка встала, `false` —
+    // запись молча не легла, бросок — исход неизвестен.
+    labelReadBack = (() => true) as () => boolean,
 } = {}) {
     const prompts: string[] = [];
     // Сколько сессий уже отработало к каждой проводке — по этому видно, перед какой
@@ -238,6 +243,7 @@ function runPhase({
             },
             removeBlockedLabelFn: () => {},
             addBlockedLabelFn,
+            prHasBlockedLabelFn: labelReadBack,
             runClaudeFn: (prompt: string, opts?: { model?: string }) => {
                 prompts.push(prompt);
                 models.push(opts?.model ?? '');
@@ -270,11 +276,16 @@ function runPhase({
                         prBlocked: arbiter.blocked === true,
                     };
                 }
+                // Задача 78: ревью фазы и повторное ревью засчитываются по вердикту —
+                // сводке без якоря.
                 return {
                     applied: 0,
                     failed: false,
                     closedIssues: [],
-                    prFindings: [],
+                    prFindings:
+                        isPhaseReviewPrompt(last) || isReReviewPrompt(last)
+                            ? [{ comment: '⚪ [nit] сводка прохода ревью фазы' }]
+                            : [],
                     prBlocked: false,
                 };
             },
@@ -1060,6 +1071,59 @@ describe('крит. 3: три прохода с новыми major → неза�
         });
         expect(s.addBlockedLabelFn).toHaveBeenCalledTimes(1);
         expect(s.merged()).toBe(false);
+    });
+
+    // Задача 79: запись метки fail-open по контракту адаптера. `arbitrated` к этому моменту
+    // уже на диске, и после рестарта лестница решит «мердж», — так что гейт с зелёными
+    // чеками (`gate: 'merged'`) смерджил бы блокер, если бы метку не перечитали.
+    it.each([
+        ['метка не легла', () => false, /метки на PR нет после записи/],
+        [
+            'чтение после записи упало — исход неизвестен',
+            () => {
+                throw new Error('форж не ответил');
+            },
+            /исход записи неизвестен \(форж не ответил\)/,
+        ],
+    ])(
+        'арбитр воспроизвёл, %s → мерджа нет, флаг держит мердж и после рестарта',
+        (_t, readBack, why) => {
+            const s = runPhase({
+                passes: threeFreshMajors,
+                arbiter: { findings: [blocker('правка убила фичу', 9)] },
+                gate: 'merged',
+                labelReadBack: readBack,
+            });
+            expect(s.merged()).toBe(false);
+            expect(s.state.reReviewPending).toBe(true);
+            expect(s.logs.some((l) => why.test(l))).toBe(true);
+            expect(s.pushTexts().some((t) => /blocked-unconfirmed/.test(t))).toBe(true);
+        },
+    );
+
+    it.each([
+        ['метка не легла', () => false],
+        [
+            'чтение после записи упало',
+            () => {
+                throw new Error('форж не ответил');
+            },
+        ],
+    ])('арбитр упал, %s → мерджа нет, флаг не сброшен', (_t, readBack) => {
+        const s = runPhase({ passes: threeFreshMajors, arbiterCode: 1, labelReadBack: readBack });
+        expect(s.addBlockedLabelFn).toHaveBeenCalled();
+        expect(s.merged()).toBe(false);
+        expect(s.state.reReviewPending).toBe(true);
+    });
+
+    it('арбитр воспроизвёл, метка подтверждена чтением → флаг снят, дальше штатный гейт', () => {
+        const s = runPhase({
+            passes: threeFreshMajors,
+            arbiter: { findings: [blocker('правка убила фичу', 9)] },
+            gate: 'blocked',
+        });
+        expect(s.state.reReviewPending).toBe(false);
+        expect(s.pushTexts().some((t) => /blocked-unconfirmed/.test(t))).toBe(false);
     });
 });
 

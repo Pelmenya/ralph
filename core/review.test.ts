@@ -13,7 +13,7 @@
 // describe в orchestrator.test.ts.
 import { describe, it, expect, vi } from 'vitest';
 import type { ReviewEnv } from './review.ts';
-import { createReviewModule } from './review.ts';
+import { createReviewModule, reviewVerdict } from './review.ts';
 import { shq } from '../shared/ralph-util.ts';
 // @ts-expect-error — JS-entry раннера без деклараций типов; блоки в конце файла
 // перенесены из ralph.test.js как есть и ходят через его ре-экспорт (#366).
@@ -814,5 +814,33 @@ describe('pickReviewModel — сбой диффа и небезопасная в
         expect(shCmds).toEqual([]);
         expect(model).toBe('claude-opus-4-8');
         expect(logs.join('\n')).toMatch(/ветк/i);
+    });
+});
+
+// Задача 78: ревью засчитывается по ВЕРДИКТУ, а не по коду выхода. 16.10 сессия ревью
+// легла на прокси моделей за 8 с, вышла с кодом 0, не оставив ни одного намерения, — и
+// фаза уехала в main непрочитанной.
+describe('reviewVerdict — структурный вердикт прохода', () => {
+    it('ни одного намерения — вердикта нет (сценарий 16.10)', () => {
+        expect(reviewVerdict([], false)).toBeNull();
+    });
+
+    it('только находки с якорем — вердикта нет: сводка прохода не записана', () => {
+        expect(
+            reviewVerdict([{ comment: '⚪ [nit] имя', anchor: { path: 'a.ts', line: 1 } }], false),
+        ).toBeNull();
+    });
+
+    it('сводка без якоря — проход засчитан, даже без замечаний', () => {
+        expect(reviewVerdict([{ comment: '⚪ [nit] замечаний нет' }], false)).toBe('pass');
+    });
+
+    it('pr-block — вердикт «блок», со сводкой или без', () => {
+        expect(reviewVerdict([], true)).toBe('block');
+        expect(reviewVerdict([{ comment: '🔴 [blocker] сводка' }], true)).toBe('block');
+    });
+
+    it('сводка из пробелов вердиктом не считается', () => {
+        expect(reviewVerdict([{ comment: '   ' }], false)).toBeNull();
     });
 });

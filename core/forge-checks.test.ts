@@ -774,3 +774,74 @@ describe('classifyForgeFailure — что чинится кодом, а что �
         expect(classifyForgeFailure(OOM_TAIL, 'failed')).toBe('oom');
     });
 });
+
+// Задача 81: политика `required` внешнего CI. Прогон без даты при ней — не вердикт:
+// свежесть такого прогона не проверить, а «не смогли проверить» для `required` значит
+// «мердж не даём». Ждать его тоже бессмысленно: дата, не разобравшаяся в одном ответе,
+// не разберётся и в следующем — это сбой формы ответа, и исход у него `error`.
+describe('waitForForgeChecks — requireDated: прогон без даты не вердикт (задача 81)', () => {
+    const DATED = (state: ForgeChecks['runs'][number]['state']) => ({
+        ...RUN(state),
+        createdAt: 1_000_000,
+    });
+
+    it('зелёный прогон без даты → error, а не green', () => {
+        const clock = fakeClock();
+        const out = waitForForgeChecks({
+            readFn: () => checks('success', [RUN('success')]),
+            ...clock,
+            logFn: () => {},
+            requireDated: true,
+        });
+
+        expect(out.kind).toBe('error');
+        if (out.kind === 'error') expect(out.detail).toContain('без даты');
+    });
+
+    it('красный прогон без даты → error: лечить лог неизвестной свежести нельзя', () => {
+        const clock = fakeClock();
+        const out = waitForForgeChecks({
+            readFn: () => checks('failed', [RUN('failed')]),
+            ...clock,
+            logFn: () => {},
+            requireDated: true,
+        });
+
+        expect(out.kind).toBe('error');
+    });
+
+    it('success без единого прогона → error: подтверждать нечем', () => {
+        const clock = fakeClock();
+        const out = waitForForgeChecks({
+            readFn: () => checks('success', []),
+            ...clock,
+            logFn: () => {},
+            requireDated: true,
+        });
+
+        expect(out.kind).toBe('error');
+    });
+
+    it('ждущий прогон без даты — не приговор: дождались датированного зелёного → green', () => {
+        const clock = fakeClock();
+        const readFn = vi
+            .fn<() => ForgeChecks>()
+            .mockReturnValueOnce(checks('pending', [RUN('pending', 'created')]))
+            .mockReturnValue(checks('success', [DATED('success')]));
+
+        const out = waitForForgeChecks({ readFn, ...clock, logFn: () => {}, requireDated: true });
+
+        expect(out).toEqual({ kind: 'green' });
+    });
+
+    it('без requireDated прогон без даты по-прежнему годится (политика optional)', () => {
+        const clock = fakeClock();
+        const out = waitForForgeChecks({
+            readFn: () => checks('success', [RUN('success')]),
+            ...clock,
+            logFn: () => {},
+        });
+
+        expect(out).toEqual({ kind: 'green' });
+    });
+});

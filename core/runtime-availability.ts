@@ -117,3 +117,30 @@ export function runtimeUnavailableExhaustedMessage(
         `Причина — CLI недоступен (обновление/симлинк), а НЕ отказ ревью или сессии по существу.`
     );
 }
+
+// ── Сбой прокси моделей (задача 78) ──────────────────────────────────────────────────
+// Инцидент 16.10: прокси моделей ответил «No upstream account is currently available»,
+// `claude -p` вышел с кодом 0 за 8 с, а ревью было засчитано по коду — фаза уехала в main
+// непрочитанной. Этот класс отказа кодом НЕ виден, поэтому детект текстовый, и именно
+// поэтому он не применяется сам по себе: оркестратор зовёт его только для прохода, который
+// не оставил вердикта. Сессию с вердиктом, процитировавшую такую строку, повтор не тронет.
+//
+// Overload ловится только в ФОРМЕ ОШИБКИ API (`overloaded_error`, `API Error: 529`), а не
+// голым словом: «overloaded» встречается в прозе ревью (перегрузки функций TS), и ложное
+// срабатывание стоило бы до 15 минут пауз и лишних сессий.
+export const MODEL_PROXY_UNAVAILABLE_RE =
+    /No upstream account is currently available|overloaded_error|API Error:\s*529\b/i;
+
+export function isModelProxyUnavailable(output: string): boolean {
+    return MODEL_PROXY_UNAVAILABLE_RE.test(output);
+}
+
+// Пауза длиннее, чем у моргания CLI: прокси ждёт освобождения аккаунта или спада нагрузки,
+// это минуты, а не секунды. Пять повторов с линейным ростом — 15 минут суммарно: дольше
+// стоять в шаге сдачи нет смысла, стоп с названной причиной дешевле.
+export const MODEL_PROXY_RETRIES = 5;
+export const MODEL_PROXY_RETRY_DELAY_MS = 60 * 1000;
+
+export function modelProxyRetryWaitMs(attempt: number): number {
+    return MODEL_PROXY_RETRY_DELAY_MS * attempt;
+}

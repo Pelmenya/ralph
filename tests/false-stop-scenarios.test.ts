@@ -169,6 +169,94 @@ describe('human: фильтр живёт в ядре поверх шва, а н�
     });
 });
 
+// ── #63: открытая `human` не остаётся молча в ЗАКРЫТОЙ вехе ─────────────────
+// Фильтр `human` прячет карточку и от проверки сдачи (C2) — это верно, иначе фаза не
+// сдаётся вовсе (#10). Но следом безусловно закрывалась веха, и человеческая половина
+// фазы оставалась открытой внутри закрытой вехи: «фаза сделана», а её решение не начато.
+// Выбранное поведение: фаза сдаётся, веха остаётся открытой, причина — строкой в логе и
+// пушем с номерами карточек.
+describe('сдача фазы с открытой human не закрывает веху (#63)', () => {
+    const human = { number: 5, title: 'решение человека', labels: [{ name: 'human' }] };
+    const human2 = { number: 8, title: 'ship там же', labels: [{ name: 'human' }] };
+
+    function fakeSeam(issues: Array<Record<string, unknown>> | Error) {
+        const closed: string[] = [];
+        const seam = {
+            listReadyIssues: () => (issues instanceof Error ? [] : issues.slice()),
+            listAllOpenIssues: () => {
+                if (issues instanceof Error) throw issues;
+                return issues.slice();
+            },
+            closeMilestone: (title: string) => {
+                closed.push(title);
+            },
+        } as unknown as Parameters<typeof ralph.withHumanFilter>[0];
+        return { seam, closed };
+    }
+
+    function wrap(issues: Array<Record<string, unknown>> | Error) {
+        const { seam, closed } = fakeSeam(issues);
+        const logs: string[] = [];
+        const pushes: string[] = [];
+        const wrapped = ralph.withHumanFilter(seam, undefined, {
+            logFn: (m: string) => logs.push(m),
+            notifyFn: (m: string) => pushes.push(m),
+        });
+        return { wrapped, closed, logs, pushes };
+    }
+
+    it('очередь пуста, в вехе открыта только human → фаза сдаётся, веха остаётся открытой', () => {
+        const w = wrap([human, human2]);
+        // Сдачу human НЕ держит: C2 видит пустую веху, иначе вернулся бы круг #10.
+        expect(w.wrapped.listReadyIssues('Фаза 5')).toEqual([]);
+        expect(w.wrapped.listAllOpenIssues('Фаза 5')).toEqual([]);
+        // А закрыть веху обёртка не даёт: человеческая половина фазы не сделана.
+        w.wrapped.closeMilestone('Фаза 5');
+        expect(w.closed).toEqual([]);
+        // Молчать нельзя: номера карточек — в пуше. Строку в лог боевой пуш пишет сам
+        // (`🔔 PUSH:`), отдельная запись её бы задвоила.
+        expect(w.pushes).toHaveLength(1);
+        expect(w.pushes[0]).toMatch(/Фаза 5/);
+        expect(w.pushes[0]).toMatch(/#5/);
+        expect(w.pushes[0]).toMatch(/#8/);
+        expect(w.pushes[0]).toMatch(/остаётся открытой/);
+        expect(w.logs).toEqual([]);
+    });
+
+    it('human в вехе нет → веха закрывается как раньше, без пуша', () => {
+        const w = wrap([]);
+        w.wrapped.closeMilestone('Фаза 4');
+        expect(w.closed).toEqual(['Фаза 4']);
+        expect(w.pushes).toEqual([]);
+    });
+
+    it('не смогли прочитать веху → не закрываем, и это сказано в логе', () => {
+        // Закрытая веха необратима по смыслу «фаза сделана», открытая — видна. Сомнение
+        // решается в сторону видимого; сдачу фазы при этом ничего не рвёт.
+        const w = wrap(new Error('форж молчит'));
+        expect(() => w.wrapped.closeMilestone('Фаза 6')).not.toThrow();
+        expect(w.closed).toEqual([]);
+        expect(w.logs.join('\n')).toMatch(/Фаза 6[\s\S]*форж молчит/);
+    });
+
+    it('сдача фазы закрывает веху через обёрнутый шов, а не мимо него', () => {
+        // Применение, а не работоспособность: дефолт `closeMilestoneByTitleFn` обязан
+        // вести в `adapters.taskSource` — тот обёрнут фильтром в buildRuntimeAdapters.
+        const SRC = readFileSync(
+            join(import.meta.dirname, '..', 'core', 'orchestrator.ts'),
+            'utf-8',
+        );
+        const code = stripComments(SRC, { dropTrailing: true });
+        const defaults = [...code.matchAll(/closeMilestoneByTitleFn\s*=\s*([^,\n]+)/g)].map((m) =>
+            m[1].trim(),
+        );
+        expect(defaults.length).toBeGreaterThanOrEqual(1);
+        for (const d of defaults) expect(d).toBe('adapters.taskSource.closeMilestone');
+        const wrapper = code.slice(code.indexOf('function withHumanFilter'));
+        expect(wrapper.slice(0, wrapper.indexOf('\n    }'))).toMatch(/closeMilestone\s*:/);
+    });
+});
+
 // ── Барьер на ПРИМЕНЕНИЕ фильтра, а не на его работоспособность ──────────────
 // Удаление `excludeHumanIssues` из очереди не покрасило НИ ОДНОГО теста: все они звали
 // саму функцию напрямую и доказывали, что она умеет фильтровать, — мимо вопроса, зовут

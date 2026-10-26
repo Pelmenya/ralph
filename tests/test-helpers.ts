@@ -91,6 +91,7 @@ export const SCENARIO_B_MAX = 3;
 // гейта. lastReviewModel — модель, поставившая блок. Остальные поля — те же нейтральные
 // дефолты, что и в defaultState() (state-lock.ts): RalphState не знает опциональных полей.
 const scenarioState = (o: Partial<RalphState> = {}): RalphState => ({
+    schemaVersion: 1,
     count: 0,
     milestone: 'M1',
     submitted: true,
@@ -167,11 +168,23 @@ export function makeRunLoopScenario(
 } {
     const logs: string[] = [];
     const saved: RalphState[] = [];
-    const runClaudeFn = vi.fn(() => 0);
+    const runClaudeFn = vi.fn((_prompt: string) => 0);
     const pushEventFn = vi.fn();
     const removeBlockedLabelFn = vi.fn();
     const addBlockedLabelFn = vi.fn();
     const placements: number[] = [];
+    // Задача 78: ревью засчитывается по вердикту. Сценарий гейта переходы держит сам
+    // (`pass(gate)`), поэтому ревью и повторное ревью в нём всегда отдают сводку прохода —
+    // иначе каждый круг разбора blocked кончался бы стопом «ревью без вердикта».
+    const sessionRequests = () => {
+        const last = runClaudeFn.mock.calls.at(-1)?.[0] ?? '';
+        const review =
+            last.includes('проведи детальное code review') ||
+            last.includes('Ранее ревью пометило его меткой blocked');
+        return review
+            ? { ...noSessionRequests(), prFindings: [{ comment: '⚪ [nit] сводка прохода' }] }
+            : noSessionRequests();
+    };
     let state = scenarioState(initialState);
 
     function pass(
@@ -205,10 +218,12 @@ export function makeRunLoopScenario(
                 phaseDiffFilesFn: () => [],
                 removeBlockedLabelFn,
                 addBlockedLabelFn,
+                // Задача 79: чтение метки после записи — «встала»; отказы сверки — свои сценарии.
+                prHasBlockedLabelFn: () => true,
                 runClaudeFn,
                 // #144: без заглушки проход читал бы файл намерений живого прогона —
                 // см. докблок noSessionRequests выше.
-                applySessionRequestsFn: noSessionRequests,
+                applySessionRequestsFn: sessionRequests,
                 ensureCleanFn: () => true,
                 // #134: проводка на ветку фазы — настоящий git в дереве тестов;
                 // сценарии самой проводки живут в core/phase-branch.test.ts.
@@ -362,6 +377,7 @@ export function runFixtureLoop(
         failFn: boom,
         logFn,
         loadStateFn: () => ({
+            schemaVersion: 1,
             count: 0,
             milestone: (cfg.phases as Array<{ milestone: string }>)[0].milestone,
             submitted: false,
@@ -422,6 +438,7 @@ export function runFixtureLoop(
         findOpenPrFn: () => null,
         removeBlockedLabelFn: () => {},
         addBlockedLabelFn: () => {},
+        prHasBlockedLabelFn: () => true,
         phaseMergedFn: () => true,
         mergedPhasePrFn: () => null,
         closeMilestoneByTitleFn: () => boom('closeMilestoneByTitleFn не должен вызываться в dry'),

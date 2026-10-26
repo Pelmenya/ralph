@@ -15,7 +15,10 @@
 export type TStopReason =
     | 'platform-check-red'
     | 'gate-red'
+    | 'gate-tool-failure'
     | 'review-dispute'
+    | 'review-no-verdict'
+    | 'blocked-unconfirmed'
     | 'main-conflict'
     | 'tree-dirty'
     | 'breaker'
@@ -41,7 +44,10 @@ export type TStopMessageInput = {
 export const REASON_TITLES: Record<TStopReason, string> = {
     'platform-check-red': 'красный чек площадки',
     'gate-red': 'чек не зазеленел за отведённые чини-сессии',
+    'gate-tool-failure': 'чек упал на инструменте, а не на коде',
     'review-dispute': 'спор ревью',
+    'review-no-verdict': 'ревью без вердикта',
+    'blocked-unconfirmed': 'метка blocked не подтверждена',
     'main-conflict': 'конфликт веток',
     'tree-dirty': 'дерево не на нужной ветке',
     breaker: 'circuit breaker',

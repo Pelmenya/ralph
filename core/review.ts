@@ -105,6 +105,23 @@ export type ReviewEnv = {
     prComments: PrCommentsFn;
 };
 
+// Задача 78: проход ревью засчитывается по ВЕРДИКТУ, а не по коду выхода сессии. 16.10
+// ревью легло на прокси моделей, `claude -p` вышел с кодом 0, не оставив ни одного
+// намерения, — и сессия правок получила ноль замечаний, гейт позеленел, фаза уехала в main.
+// «Ноль намерений» и «замечаний нет» должны различаться структурно: вердикт — это либо
+// `pr-block`, либо сводка прохода (`pr-comment` без якоря), которую промпт ревью требует
+// всегда. Находки с якорем без сводки вердиктом не считаются: проход, оборванный на
+// середине, выглядит ровно так. Текст сводки не разбирается — барьер держит факт записи.
+export type TReviewVerdict = 'pass' | 'block';
+
+export function reviewVerdict(
+    findings: readonly { comment: string; anchor?: unknown }[],
+    blocked: boolean,
+): TReviewVerdict | null {
+    if (blocked) return 'block';
+    return findings.some((f) => !f.anchor && f.comment.trim() !== '') ? 'pass' : null;
+}
+
 export function createReviewModule(env: ReviewEnv) {
     const {
         getConfig,
