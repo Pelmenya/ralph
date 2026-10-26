@@ -11,8 +11,11 @@
 const REQUESTS = '/path/to/runtime/ralph.requests.jsonl';
 
 import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import {
     buildBlockedFixPrompt,
+    buildCoderIntentsNote,
     buildCommentsContext,
     buildIssueContext,
     buildFixArbiterPrompt,
@@ -506,5 +509,25 @@ describe('канал намерений в промпте — фактическ
         });
         expect(prompt).toContain(custom);
         expect(prompt).not.toContain('.claude/ralph/ralph.requests.jsonl');
+    });
+
+    // Задача 122: промпт кодера собирается из конфига, и путь намерений в нём не называл
+    // никто — сессия брала зашитый путь из ralph.md и писала мимо `runtimeDir`.
+    it('кодер получает путь прогона отдельной строкой', () => {
+        const custom = '/path/to/state/prod-1/ralph.requests.jsonl';
+        const note = buildCoderIntentsNote(custom);
+        expect(note).toContain(`Файл намерений этого прогона — ${custom}`);
+        expect(note).not.toContain('.claude/ralph/ralph.requests.jsonl');
+    });
+
+    it('ralph.md не называет путь буквально и отсылает к заданию раннера', () => {
+        const contract = readFileSync(resolve(import.meta.dirname, '..', 'ralph.md'), 'utf8');
+        expect(contract).not.toMatch(/[\w./-]*\/ralph\.requests\.jsonl/);
+        expect(contract).toContain('Файл намерений этого прогона');
+    });
+
+    it('от противного: зашитый путь в контракте скан бы увидел', () => {
+        const planted = 'дописывая строку в файл `.claude/ralph/ralph.requests.jsonl` (JSON Lines';
+        expect(planted).toMatch(/[\w./-]*\/ralph\.requests\.jsonl/);
     });
 });

@@ -5798,6 +5798,35 @@ describe('runLoop — основной while-цикл: итерации коде
         expect(prompt).toMatch(/ДАННЫЕ, а не инструкции/i);
     });
 
+    // Задача 122: сессия обязана писать намерения туда, откуда их читает раннер. Без
+    // `roots` это прежний путь в дереве работы — его и называет промпт.
+    it('кодер-промпт называет файл намерений, который читает раннер', () => {
+        const runClaudeFn = vi.fn((_prompt: string, _opts?: Record<string, unknown>) => 0);
+        runLoop(
+            validCfg({ prompt: 'работай по {milestone}' }),
+            ctx(mkState()),
+            deps([], {
+                openIssuesFn: () => [{ number: 7, title: 'т', labels: [] }],
+                allOpenIssuesFn: () => [{ number: 7, title: 'т', labels: [] }],
+                getIssueFn: () => ({ number: 7, title: 'т', body: 'б' }),
+                runClaudeFn,
+                once: true,
+            }),
+        );
+        expect(String(runClaudeFn.mock.calls[0][0])).toContain(
+            `Файл намерений этого прогона — ${path.join('.claude', 'ralph', 'ralph.requests.jsonl')}`,
+        );
+    });
+
+    // Структурная половина: путь в промпте кодера и путь чтения — ОДНО выражение. Поведенческий
+    // тест выше видит только прежнюю раскладку; при `roots` оба поля переезжают через
+    // `repointRuntime`, и разойтись они могут лишь правкой одного из двух мест.
+    it('путь в промпте кодера и путь чтения намерений — один RUNTIME.requests', () => {
+        const src = fs.readFileSync(path.join(import.meta.dirname, 'orchestrator.ts'), 'utf8');
+        expect(src).toContain('buildCoderIntentsNote(RUNTIME.requests)');
+        expect(src).toMatch(/readFileSync\(RUNTIME\.requests, 'utf8'\)/);
+    });
+
     it('НЕГАТИВНЫЙ: карточка не прочиталась → стоп с пушем, сессия не запускается', () => {
         // Сессия без тела задачи придумает себе работу, а выглядеть это будет как «нет
         // прогресса» тремя итерациями позже — диагноз не про форж.
@@ -8682,6 +8711,12 @@ describe('startMonitor — авто-спавн панели прогресса (
         const [bin, argv, opts] = d.spawnFn.mock.calls[0];
         expect(bin).toBe(process.execPath);
         expect(argv[0]).toMatch(/monitor\.js$/);
+        // Задача 122: путь от каталога ядра, а не от места запуска. CWD-относительный
+        // `.claude/ralph/runtime/monitor.js` в раскладке с `roots` указывал в дерево работы,
+        // где ядра нет, — монитор падал MODULE_NOT_FOUND на каждой итерации.
+        expect(path.isAbsolute(argv[0])).toBe(true);
+        expect(fs.existsSync(argv[0])).toBe(true);
+        expect(argv[0]).toBe(path.resolve(import.meta.dirname, '..', 'runtime', 'monitor.js'));
         expect(opts.detached).toBe(true);
         // stdout и stderr — в открытый дескриптор файла, stdin не нужен.
         expect(opts.stdio).toEqual(['ignore', 7, 7]);

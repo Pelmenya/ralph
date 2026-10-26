@@ -6,6 +6,7 @@
 // перенесённых из ralph.test.js при её разнесении по модулям (#366).
 import { describe, it, expect, vi } from 'vitest';
 import crypto from 'node:crypto';
+import path from 'node:path';
 import type { StateLockEnv } from './state-lock.ts';
 import { createStateLock } from './state-lock.ts';
 // @ts-expect-error — JS-entry раннера без деклараций типов; блоки в конце файла
@@ -27,7 +28,7 @@ function makeEnv(over: Partial<StateLockEnv> = {}): StateLockEnv {
         statePath: '/x/ralph.state.json',
         lockPath: '/x/ralph.lock',
         lockMarkerPath: '.deps-lock.sha',
-        ralphPath: '.claude/ralph/ralph.js',
+        ralphPaths: ['.claude/ralph/ralph.js'],
         dry: false,
         getConfig: () => ({ phases: [{ milestone: 'M1' }, { milestone: 'M2' }] }),
         log: () => {},
@@ -296,6 +297,20 @@ describe('isRalphProcess — за pid действительно наш ralph.js
         const readFn = vi.fn(() => 'node\0.claude/ralph/ralph.js\0--profile\0prod\0');
         expect(isRalphProcess(4242, readFn)).toBe(true);
         expect(readFn).toHaveBeenCalledWith('/proc/4242/cmdline', 'utf-8');
+    });
+
+    // Задача 122: раннер из установки запущен по абсолютному пути
+    // (`node <установка>/ralph.js`) — подстроки `.claude/ralph/ralph.js` в cmdline нет, и по
+    // одной ей лок ЖИВОГО раннера считался сиротой.
+    itPosix('запуск из установки по абсолютному пути — тоже наш раннер', () => {
+        const entry = path.resolve(import.meta.dirname, '..', 'ralph.js');
+        expect(isRalphProcess(4242, () => `node\0${entry}\0--profile\0prod\0`)).toBe(true);
+    });
+
+    it('от противного: соседняя установка другой ревизии — не наш раннер', () => {
+        const entry = path.resolve(import.meta.dirname, '..', 'ralph.js');
+        const other = entry.replace(/[^/]+\/ralph\.js$/, 'other-rev/ralph.js');
+        expect(isRalphProcess(4242, () => `node\0${other}\0--profile\0prod\0`)).toBe(false);
     });
 
     // Строгая сверка по полному пути: раннер чужого проекта со своим ralph.js (имя

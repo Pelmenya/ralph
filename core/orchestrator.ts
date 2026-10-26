@@ -92,6 +92,7 @@ import {
 // (в самом оркестраторе команды `gh` законны — там живёт реализация форжа GitHub).
 import {
     buildBlockedFixPrompt,
+    buildCoderIntentsNote,
     buildCommentsContext,
     buildIssueContext,
     buildFixArbiterPrompt,
@@ -220,16 +221,30 @@ function repointRuntime(runtimeDir: string): void {
 /**
  * Пути ПРОДУКТА — код ядра. Он read-only во время работы и переезжает вместе с подмодулем,
  * а не со состоянием: смешать их значило бы позволить прогону писать в продукт.
+ *
+ * Якорь — каталог ЭТОГО модуля, а не место запуска (канон, задача 122). Пока ядро было
+ * копией в `.claude/ralph/` дерева, CWD-относительный путь и путь от модуля совпадали. В
+ * раскладке с `roots` ядро исполняется из установки, а CWD — дерево работы, где ядра нет:
+ * первый боевой старт петли на каноне поднимал монитор по несуществующему пути
+ * (`MODULE_NOT_FOUND` на каждой итерации, ночного пуша о тишине не было бы вовсе).
  */
+const PRODUCT_DIR = path.resolve(import.meta.dirname, '..');
 const PRODUCT = {
-    monitor: path.join(LEGACY_DIR, 'runtime', 'monitor.js'),
-    // Путь к самому раннеру — для cmdline-сверки лока (isRalphProcess): за pid из лок-файла
+    monitor: path.join(PRODUCT_DIR, 'runtime', 'monitor.js'),
+    // Пути к самому раннеру — для cmdline-сверки лока (isRalphProcess): за pid из лок-файла
     // должен стоять именно наш ralph.js (entry), а не чужой процесс, которому ОС отдала
-    // переиспользованный номер. Путь ОТНОСИТЕЛЬНЫЙ — уникальности проекта он НЕ гарантирует:
-    // любой другой клон с той же раскладкой даёт в cmdline ровно ту же подстроку. Для лока
-    // это приемлемо: цена промаха при pid-reuse — ложный ОТКАЗ старта (fail-closed), а не
-    // SIGTERM чужой группе, как было бы у sweepOrphanMonitors.
-    entry: path.join(LEGACY_DIR, 'ralph.js'),
+    // переиспользованный номер. Подстрок две, потому что cmdline хранит путь в том виде, в
+    // каком его набрали: `node .claude/ralph/ralph.js` в прежней раскладке и
+    // `node <установка>/ralph.js` у запуска из установки. Одна относительная подстрока
+    // (как было до задачи 122) у второго не находилась, и лок ЖИВОГО раннера считался
+    // сиротой. Остаток назван: не узнаются запуск из установки по относительному пути
+    // (`node ralph.js`) и раннер ДРУГОЙ ревизии установки (живой старый при старте нового —
+    // RUNBOOK велит гасить старый до смены ревизии). В обоих случаях второй старт на тот же
+    // origin держит только реестр владения (`repo-owner.ts`), сверяющий pid и время старта.
+    // Относительная подстрока уникальности проекта не гарантирует; для лока это приемлемо:
+    // цена промаха при pid-reuse — ложный ОТКАЗ старта (fail-closed), а не SIGTERM чужой
+    // группе, как было бы у sweepOrphanMonitors.
+    entries: [path.join(PRODUCT_DIR, 'ralph.js'), path.join(LEGACY_DIR, 'ralph.js')],
 };
 // Предел выборки карточек фазы — ОДИН на все три вопроса к форжу (очередь, полный список,
 // метки). Не «сколько влезет», а граница, за которой ответ перестаёт быть доказательством:
@@ -719,7 +734,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         get lockMarkerPath() {
             return RUNTIME.lockMarker;
         },
-        ralphPath: PRODUCT.entry,
+        ralphPaths: PRODUCT.entries,
         dry: DRY,
         getConfig: () => config,
         log,
@@ -4398,7 +4413,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         // replaceAll (L5): .replace менял только первое вхождение — правка шаблона
                         // с двумя {branch} молча оставила бы плейсхолдер в промпте.
                         .replaceAll('{milestone}', phase.milestone)
-                        .replaceAll('{branch}', phase.branch) + issueContext;
+                        .replaceAll('{branch}', phase.branch) +
+                    // Задача 122: путь намерений — от раннера, а не текстом ralph.md.
+                    buildCoderIntentsNote(RUNTIME.requests) +
+                    issueContext;
                 // #376: рантайм — по резолву pickRuntimeFn, а не статический
                 // adapters.coderRuntime.run (дефолт runClaude). При провайдере без явного
                 // override в modelRouting это ТА ЖЕ ссылка (coderRuntimeRunFor('claude') ===

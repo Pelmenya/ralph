@@ -76,7 +76,8 @@ export type StateLockEnv = {
     statePath: string;
     lockPath: string;
     lockMarkerPath: string;
-    ralphPath: string;
+    // Подстроки cmdline, любая из которых узнаёт наш раннер (см. PRODUCT.entries).
+    ralphPaths: readonly string[];
     dry: boolean;
     // #204: installCmd — команда установки зависимостей из конфига (дефолт `npm ci`).
     // Читается лениво из того же getConfig, что и phases (config ставится в main()).
@@ -253,13 +254,13 @@ export function createStateLock(env: StateLockEnv) {
 
     // ── Файл-лок от двойного запуска: ralph.lock (#176/#177/#178) ─────────────
 
-    // Сверка «за pid действительно наш ralph.js» — по пути env.ralphPath в cmdline. Тот же приём,
-    // что isRalphMonitorProcess. ВНИМАНИЕ: env.ralphPath относительный и уникальности проекта не
-    // гарантирует (см. коммент у объявления env.ralphPath) — для лока это лишь ложный отказ при
+    // Сверка «за pid действительно наш ralph.js» — по путям env.ralphPaths в cmdline. Тот же
+    // приём, что isRalphMonitorProcess. ВНИМАНИЕ: относительная подстрока уникальности проекта
+    // не гарантирует (см. PRODUCT.entries в оркестраторе) — для лока это лишь ложный отказ при
     // pid-reuse (fail-closed), не снос чужого процесса. Переиспользованный pid (чужой процесс
-    // под тем же номером) → подстроки нет → false, лок считается сиротой.
+    // под тем же номером) → ни одной подстроки нет → false, лок считается сиротой.
     function isRalphProcess(pid: number, readFn: ReadFn = fs.readFileSync): boolean {
-        return cmdlineIncludes(pid, env.ralphPath, readFn);
+        return env.ralphPaths.some((needle) => cmdlineIncludes(pid, needle, readFn));
     }
 
     // Держит ли лок ЖИВОЙ раннер: номер занят (kill 0) И cmdline подтверждает ralph.js.
