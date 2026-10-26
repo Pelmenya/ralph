@@ -530,9 +530,35 @@ describe('промпты сессий: без команд и механик ф�
         [/\bgh\b/i, 'GitHub CLI в тексте промпта — его место в адаптере'],
         [/\bglab\s/i, 'команда GitLab CLI — её место в адаптере'],
         [/\b(github|gitlab|sourcecraft|gitea|bitbucket)\b/i, 'имя форжа в тексте промпта'],
+        // Граница слова в ХВОСТЕ имени форжа не годится (находка ревью в копии потребителя,
+        // перенесена сведением — задача 72): в JS `\b` определён через `\w`, куда входит
+        // подчёркивание, поэтому `SOURCECRAFT_*` паттерн выше не ловит вовсе. Тот же класс
+        // дефекта, что `\??` у необязательных методов в `seam-defaults.test.ts`. Хвостовой
+        // класс вместо `\b` красит и `SOURCECRAFT_TOKEN`, и `github-actions`, и `gitlab_ci`.
+        [
+            /(?<![\w-])(github|gitlab|sourcecraft|gitea|bitbucket)[\w-]*/i,
+            'имя форжа с суффиксом (SOURCECRAFT_*, github-actions) в тексте промпта',
+        ],
         [/\b(closes|fixes|resolves)\s+#/i, 'автозакрытие по ключевому слову — механика GitHub'],
         [/resolveReviewThread|graphql/i, 'треды ревью через GraphQL — механика GitHub'],
     ];
+
+    // Мутационная проба паттерна выше: барьер, который ни разу не краснел, может не
+    // работать вовсе. Проверяется не файл, а сам паттерн — на форме, которая реально
+    // проезжала в ядро (`SOURCECRAFT_*`), и на той, что он ловил и раньше.
+    it('паттерн имени форжа краснеет на форме с суффиксом — иначе проба была бы холостой', () => {
+        const withSuffix = FORGE.find(([re]) => re.source.includes('[\\w-]*'));
+        expect(withSuffix, 'паттерн с хвостовым классом пропал — барьер снова слеп').toBeDefined();
+        const re = withSuffix?.[0] as RegExp;
+        // Ровно то, что проезжало: `\b` перед `_` не срабатывает, потому что `_` — это `\w`.
+        expect(/\b(github|gitlab|sourcecraft|gitea|bitbucket)\b/i.test('SOURCECRAFT_TOKEN')).toBe(
+            false,
+        );
+        expect(re.test('SOURCECRAFT_TOKEN')).toBe(true);
+        expect(re.test('переменные github-actions')).toBe(true);
+        // И не краснеет на посторонних словах: барьер, красящий всё подряд, отключают.
+        expect(re.test('переносимая формулировка про форж')).toBe(false);
+    });
 
     it.each(FORGE)('prompts.ts не содержит %s (%s)', (re, why) => {
         // Комментарии модуля объясняют, ЧЕМ дефект был, и сами содержат эти строки —

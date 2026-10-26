@@ -27,6 +27,7 @@
 | `review-of-fixes-scenarios.test.ts` | лестница «ревью правок» целиком                                           |
 | `phase-branch-scenarios.test.ts`    | ветка фазы на НАСТОЯЩЕМ git: достижимость коммита, non-ff, совет спасения |
 | `coder-prompt-branch.test.ts`       | промпт не велит сессии переключать ветку — это работа раннера             |
+| `delivery-sessions-branch.test.ts`  | разбор blocked и чини-сессия гейта стартуют на ветке фазы                 |
 | `adapters-contract.test.ts`         | реализации швов соответствуют интерфейсам                                 |
 | `__fixtures__/foreign-project/`     | конфиг синтетического чужого проекта                                      |
 

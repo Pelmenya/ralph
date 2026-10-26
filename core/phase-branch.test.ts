@@ -230,6 +230,21 @@ describe('ensurePhaseBranch', () => {
         expect(w.logs.join('\n')).toMatch(/HEAD оказался/);
     });
 
+    // Поведение из копии потребителя (сведение, задача 72): реализация канона его держала,
+    // но тест на него был только у второй реализации.
+    it('упавший switch — отказ, а не успех', () => {
+        const w = world({
+            [`rev-parse --verify --quiet refs/heads/${BRANCH}`]: NO_LOCAL_REF,
+            [`switch --create ${BRANCH} --track origin/${BRANCH}`]: gitFail('index.lock', 128),
+        });
+
+        const res = ensurePhaseBranch(BRANCH, w.deps);
+
+        expect(res.kind).toBe<TPhaseBranchKind>('failed');
+        expect(res.sha).toBeNull();
+        expect(w.logs.join('\n')).toMatch(/не смог поставить дерево на ветку — index\.lock/);
+    });
+
     it('небезопасное имя ветки — git не зовётся ни разу', () => {
         const w = world();
 

@@ -144,7 +144,12 @@ type RedCheckResult = ReturnType<Runtime['getLastRedCheck']>;
 // местом, оба тест-файла оставляют только свои describe.
 export function makeRunLoopScenario(
     initialState: Partial<RalphState> = {},
-    { lastGatePr = 777 }: { lastGatePr?: number } = {},
+    {
+        lastGatePr = 777,
+        // Задача 73: проводка с этим номером вызова (с нуля) отказывает, -1 — никогда.
+        // Тот же приём, что у runPhase в review-of-fixes-scenarios.
+        failPlacementCall = -1,
+    }: { lastGatePr?: number; failPlacementCall?: number } = {},
 ): {
     readonly state: RalphState;
     pass: (gate: GateVerdict, o?: { redCheck?: RedCheckResult }) => void;
@@ -157,6 +162,8 @@ export function makeRunLoopScenario(
     addBlockedLabelFn: Mock;
     pushTexts: () => string[];
     maxBlockedHeals: () => number;
+    // Сколько сессий уже отработало к каждой проводке на ветку фазы.
+    placements: number[];
 } {
     const logs: string[] = [];
     const saved: RalphState[] = [];
@@ -164,6 +171,7 @@ export function makeRunLoopScenario(
     const pushEventFn = vi.fn();
     const removeBlockedLabelFn = vi.fn();
     const addBlockedLabelFn = vi.fn();
+    const placements: number[] = [];
     let state = scenarioState(initialState);
 
     function pass(
@@ -204,11 +212,17 @@ export function makeRunLoopScenario(
                 ensureCleanFn: () => true,
                 // #134: проводка на ветку фазы — настоящий git в дереве тестов;
                 // сценарии самой проводки живут в core/phase-branch.test.ts.
-                ensurePhaseBranchFn: (branch: string) => ({
-                    kind: 'switched' as const,
-                    branch,
-                    sha: 'a'.repeat(40),
-                }),
+                ensurePhaseBranchFn: (branch: string) => {
+                    placements.push(runClaudeFn.mock.calls.length);
+                    return placements.length - 1 === failPlacementCall
+                        ? {
+                              kind: 'failed' as const,
+                              branch,
+                              sha: null,
+                              reason: 'origin недоступен',
+                          }
+                        : { kind: 'switched' as const, branch, sha: 'a'.repeat(40) };
+                },
                 // Страж после сессии — тем же приёмом: дерево тестов настоящий git не держит.
                 checkOnPhaseBranchFn: () => ({ ok: true, sha: 'a'.repeat(40) }),
                 // #183: ветка «запушена» — настоящая проверка читает git в дереве тестов.
@@ -251,6 +265,7 @@ export function makeRunLoopScenario(
         addBlockedLabelFn,
         pushTexts: () => pushEventFn.mock.calls.map((c: unknown[]) => c[0] as string),
         maxBlockedHeals: () => Math.max(0, ...saved.map((s) => s.blockedHeals ?? 0)),
+        placements,
     };
 }
 

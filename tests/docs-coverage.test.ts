@@ -127,6 +127,20 @@ describe('генератор доков — на подсунутом расхо
         expect(out).not.toContain('](core/CLAUDE.md)');
     });
 
+    // Три кейса ниже — из копии потребителя (сведение, задача 72): поведение канон уже
+    // имел, но не сторожил, и регресс в правиле ссылок прошёл бы зелёным.
+    it('ссылку на уровень выше переписывает тоже', () => {
+        expect(renderAgents('[в корне ядра](../CLAUDE.md)')).toContain('](../AGENTS.md)');
+    });
+
+    it('якорь в ссылке сохраняется', () => {
+        expect(renderAgents('[раздел](../CLAUDE.md#ловушки)')).toContain('](../AGENTS.md#ловушки)');
+    });
+
+    it('упоминание CLAUDE.md в прозе остаётся: это и есть источник правды', () => {
+        expect(renderAgents('Правь `CLAUDE.md`, а не копию.')).toContain('Правь `CLAUDE.md`');
+    });
+
     it('внешняя ссылка на файл с тем же именем не трогается', () => {
         const out = renderAgents('см. [шаблон](https://example.com/tpl/CLAUDE.md)');
         expect(out).toContain('https://example.com/tpl/CLAUDE.md');

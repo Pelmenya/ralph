@@ -124,8 +124,15 @@ function runPhase({
     >,
     // Часы прогона — параметром: иначе тест на срок годности недетерминирован.
     now = Date.parse('2026-08-21T00:00:00Z'),
+    // Задача 73: проводка с этим номером вызова (с нуля) отказывает, -1 — никогда. Номер
+    // тест берёт из `placements` зелёного прогона: так он роняет проводку ИМЕННО той сессии,
+    // которую проверяет, а не проводку итерации, стоящую раньше при том же числе сессий.
+    failPlacementCall = -1,
 } = {}) {
     const prompts: string[] = [];
+    // Сколько сессий уже отработало к каждой проводке — по этому видно, перед какой
+    // сессией дерево ставилось на ветку.
+    const placements: number[] = [];
     const logs: string[] = [];
     const models: string[] = [];
     const issues: Array<{
@@ -273,11 +280,12 @@ function runPhase({
             },
             ensureCleanFn: () => true,
             // #134: см. тот же дефолт в tests/test-helpers.ts.
-            ensurePhaseBranchFn: (branch: string) => ({
-                kind: 'switched' as const,
-                branch,
-                sha: 'a'.repeat(40),
-            }),
+            ensurePhaseBranchFn: (branch: string) => {
+                placements.push(prompts.length);
+                return placements.length - 1 === failPlacementCall
+                    ? { kind: 'failed' as const, branch, sha: null, reason: 'origin недоступен' }
+                    : { kind: 'switched' as const, branch, sha: 'a'.repeat(40) };
+            },
             checkOnPhaseBranchFn: () => ({ ok: true, sha: 'a'.repeat(40) }),
             // #183: ветка «запушена» — настоящая проверка читает git в дереве тестов.
             branchPushedFn: () => true,
@@ -316,6 +324,7 @@ function runPhase({
         arbiterPrompts: () => prompts.filter(isArbiterPrompt),
         heads: HEADS,
         applyArgs,
+        placements,
         pushTexts: () => pushEventFn.mock.calls.map((c: unknown[]) => c[0] as string),
         merged: () =>
             pushEventFn.mock.calls.some((c: unknown[]) => /смерджена в main/.test(c[0] as string)),
@@ -1228,5 +1237,42 @@ describe('#115-ревью: новый цикл сдачи начинает ле�
                 `сброс submitted в строке ${String(i + 1)} не сбрасывает лестницу ревью правок`,
             ).toBe(true);
         }
+    });
+});
+
+// Задача 73: обе сессии правок стартуют на ветке фазы. Гейт и ревью оставляют дерево где
+// угодно (детачем после красного гейта), и круг лестницы без своей проводки коммитил бы
+// вне ветки. Приём тот же, что в tests/delivery-sessions-branch.test.ts: зелёный прогон
+// находит последнюю проводку перед сессией, второй роняет именно её.
+describe('задача 73: сессии правок стартуют на ветке фазы', () => {
+    // Круг 1 нашёл блокер → правки по ревью правок; дифф правок непустой на обоих кругах.
+    const ladder = () => ({
+        passes: [{ findings: [blocker('правка убила отказ', 1)] }, { findings: [] }],
+        fixDiffFiles: [['src/a.ts'], ['src/a.ts']] as Array<string[] | null>,
+    });
+    const CASES = [
+        { name: 'правки по ревью', nth: 0, where: '(правки по ревью)' },
+        { name: 'правки по ревью правок', nth: 1, where: '(правки по ревью правок)' },
+    ];
+
+    const green = (nth: number) => {
+        const s = runPhase(ladder());
+        const fixAt = s.prompts.flatMap((p, i) => (isFixPrompt(p) ? [i] : []));
+        const at = fixAt[nth] ?? -1;
+        return { at, call: s.placements.lastIndexOf(at) };
+    };
+
+    it.each(CASES)('$name: проводка стоит после предыдущей сессии и до этой', ({ nth }) => {
+        const { at, call } = green(nth);
+        expect(at).toBeGreaterThan(-1);
+        expect(call).toBeGreaterThan(-1);
+    });
+
+    it.each(CASES)('$name: отказ ЕЁ проводки → сессия не запущена, стоп называет её', (c) => {
+        const { call } = green(c.nth);
+        const s = runPhase({ ...ladder(), failPlacementCall: call });
+        expect(s.fixPrompts()).toHaveLength(c.nth);
+        expect(s.pushTexts().some((t) => t.includes(c.where))).toBe(true);
+        expect(s.merged()).toBe(false);
     });
 });
