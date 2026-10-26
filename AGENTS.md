@@ -13,7 +13,8 @@
 Правила по папкам — рядом с кодом: [`core/`](core/AGENTS.md),
 [`adapters/`](adapters/AGENTS.md), [`runtime/`](runtime/AGENTS.md),
 [`shared/`](shared/AGENTS.md), [`tests/`](tests/AGENTS.md),
-[`provision/`](provision/AGENTS.md). Что такое раннер по существу — в [README](README.md).
+[`provision/`](provision/AGENTS.md), [`.claude/`](.claude/AGENTS.md) — хуки и барьер
+сессий в этом репозитории. Что такое раннер по существу — в [README](README.md).
 
 ## Гейт
 

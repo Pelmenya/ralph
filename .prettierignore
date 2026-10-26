@@ -1,2 +1,5 @@
 node_modules/
 package-lock.json
+
+# Скиллы — чужой сгенерированный текст (vitest: antfu/skills), правится только регенерацией.
+.claude/skills/

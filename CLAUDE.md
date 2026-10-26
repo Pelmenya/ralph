@@ -7,7 +7,8 @@
 Правила по папкам — рядом с кодом: [`core/`](core/CLAUDE.md),
 [`adapters/`](adapters/CLAUDE.md), [`runtime/`](runtime/CLAUDE.md),
 [`shared/`](shared/CLAUDE.md), [`tests/`](tests/CLAUDE.md),
-[`provision/`](provision/CLAUDE.md). Что такое раннер по существу — в [README](README.md).
+[`provision/`](provision/CLAUDE.md), [`.claude/`](.claude/CLAUDE.md) — хуки и барьер
+сессий в этом репозитории. Что такое раннер по существу — в [README](README.md).
 
 ## Гейт
 

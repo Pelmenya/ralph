@@ -13,5 +13,5 @@
         "allowImportingTsExtensions": true,
         "resolveJsonModule": true
     },
-    "include": ["**/*.ts", "**/*.mts"]
+    "include": ["**/*.ts", "**/*.mts", ".claude/hooks/*.ts"]
 }

@@ -61,6 +61,12 @@ export type LiveSandboxOptions = {
      * не запушена» до гейта.
      */
     phaseBranchOnOrigin?: boolean;
+    /**
+     * Команда PreToolUse-хука в настройках потребителя. По умолчанию — барьер продукта;
+     * `null` — настроек хуков нет вовсе. Пробы старта подсовывают сюда сломанный барьер:
+     * раннер обязан отказаться от запуска до первой сессии (`core/guard-probe.ts`).
+     */
+    guardHook?: string | null;
 };
 
 /**
@@ -223,6 +229,7 @@ export function buildLiveSandbox({
     ],
     coderScript = '',
     phaseBranchOnOrigin = false,
+    guardHook = 'node "${CLAUDE_PROJECT_DIR}/.claude/ralph/.claude/hooks/guard.cjs"',
 }: LiveSandboxOptions = {}): LiveSandbox {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-live-')));
     const consumerRoot = path.join(root, 'consumer');
@@ -252,6 +259,25 @@ export function buildLiveSandbox({
         JSON.stringify(sandboxConfig(sb), null, 4),
     );
     fs.writeFileSync(path.join(consumerRoot, 'README.md'), '# проект песочницы\n');
+    // Настройки хуков потребителя: раннер не стартует, пока барьер дерева сессий не держит
+    // (`core/guard-probe.ts`). Потребитель зовёт барьер продукта по пути внутри своего
+    // дерева — ровно та раскладка, в которой ядро подключено каталогом.
+    if (guardHook !== null) {
+        fs.mkdirSync(path.join(consumerRoot, '.claude'), { recursive: true });
+        fs.writeFileSync(
+            path.join(consumerRoot, '.claude', 'settings.json'),
+            JSON.stringify({
+                hooks: {
+                    PreToolUse: [
+                        {
+                            matcher: 'Bash|Read|Edit|Write|MultiEdit|NotebookEdit|Grep|mcp__.*',
+                            hooks: [{ type: 'command', command: guardHook }],
+                        },
+                    ],
+                },
+            }),
+        );
+    }
     fs.writeFileSync(path.join(root, 'bin', 'gh'), forgeShim(sb), { mode: 0o755 });
     fs.writeFileSync(path.join(root, 'bin', 'claude'), coderShim(sb, coderScript), { mode: 0o755 });
 

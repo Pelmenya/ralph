@@ -166,6 +166,7 @@ import type {
 } from '../adapters/adapters.ts';
 import { underRoot, type TResolvedRoots } from './roots.ts';
 import { updateConsumerTree } from './consumer-tree.ts';
+import { ensureGuardHolds } from './guard-probe.ts';
 import {
     buildAdapters,
     createCoderRuntime,
@@ -7307,7 +7308,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
         } else if (runnerWorktreeReady(worktreePath)) {
             process.chdir(worktreePath);
         }
-        log(`📂 Рабочее дерево раннера: ${process.cwd()}`);
+        // Дерево сессий читается ОДИН раз: им же ниже проверяется барьер (задача 6) — дерево
+        // в логе и дерево, чьи хуки прошли пробу, обязаны быть одним и тем же.
+        const sessionTree = process.cwd();
+        log(`📂 Рабочее дерево раннера: ${sessionTree}`);
 
         if (RESET) {
             // #THS8J: --reset пишет defaultState() (deployBlock: null) — без защиты это молча
@@ -7335,6 +7339,23 @@ export function createOrchestrator(env: OrchestratorEnv) {
             console.log('✅ State сброшен на первую фазу конфига.');
             process.exit(0);
         }
+
+        // Канон, задача 6: барьер обязан ДЕРЖАТЬ до первой сессии. Под bypassPermissions
+        // `permissions.deny` не действует, и единственная защита — PreToolUse-хук дерева, в
+        // котором пойдут сессии (cwd уже переведён в него выше). Проба подаёт хукам
+        // запрещённые вызовы и безобидный; не держит — старт отменён до монитора и
+        // preflight, ни одна сессия не запущена. В --dry-run проба тоже идёт: она ничего
+        // не меняет (исполняются только хуки, не сами вызовы), а ответ «барьер держит ли»
+        // dry обязан давать тот же, что живой запуск.
+        // Рантайм кодера тоже в пробе: сессия `codex exec` хуков `.claude/` не читает.
+        ensureGuardHolds(sessionTree, {
+            failFn: fail,
+            logFn: log,
+            runtimes: {
+                coderRuntime: adapterSelection.coderRuntime,
+                modelRouting: config.modelRouting,
+            },
+        });
 
         // Сироту от прошлого прогона (kill -9, OOM) подбираем ДО preflight: чаще всего
         // preflight и отвергает запуск (грязное дерево, active=false), а брошенный монитор
