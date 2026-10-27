@@ -1918,3 +1918,153 @@ describe('checksGreen/tryMergePhase — ветка фазы, отставшая 
         expect(mergePrFn).not.toHaveBeenCalled();
     });
 });
+
+// ── #139: защищаемые пути на площадке без правила ревью по путям ────────────────
+//
+// Гейт сверяет файлы PR со списком ядра, только когда ему дали чтение файлов: composition
+// root даёт его по шву форжа. Предмет — исход и текст стопа, а не разбор git.
+describe('tryMergePhase — защищаемые пути (#139)', () => {
+    const phase = { branch: 'feature/m1', milestone: 'M1' };
+
+    function guardedMerge(over: Record<string, unknown>) {
+        const g = createGateRunner(makeEnv());
+        const merge = vi.fn();
+        const park = vi.fn();
+        const logs: string[] = [];
+        const res = tryMergeWith(g, phase, {
+            findOpenPrFn: () => ({ number: 9, labels: [] }),
+            checksGreenFn: () => true,
+            getVerifiedHeadFn: () => SHA,
+            mergePrFn: merge,
+            parkFn: park,
+            logFn: (m: string) => logs.push(m),
+            ...over,
+        });
+        const last = g.getLastProtectedPathsStop();
+        return { res, merge, park, logs, stop: last?.why ?? null, kind: last?.kind ?? null };
+    }
+
+    it('PR с правкой lock — стоп с причиной и файлами, мердж не зовём', () => {
+        const forgeChecksFn = vi.fn();
+        const { res, merge, park, stop, kind } = guardedMerge({
+            changedFilesFn: () => ['src/a.ts', '.ralph/core.lock', '.github/workflows/ci.yml'],
+            forgeChecksFn,
+        });
+        expect(res).toBe('protected-paths');
+        expect(kind).toBe('hits');
+        expect(merge).not.toHaveBeenCalled();
+        // Сверка стоит до ожидания CI площадки: вердикт, которым не воспользуемся, не ждём.
+        expect(forgeChecksFn).not.toHaveBeenCalled();
+        expect(park).toHaveBeenCalledTimes(1);
+        expect(stop).toMatch(/правка защищаемого пути — мердж за человеком/);
+        expect(stop).toContain('.ralph/core.lock (.ralph/core.lock)');
+        expect(stop).toContain('.github/workflows/ci.yml (.github/**)');
+        expect(stop).not.toContain('src/a.ts');
+    });
+
+    it('доменный PR — мердж, файлы спрошены по проверенной голове', () => {
+        const changedFilesFn = vi.fn(() => ['src/a.ts', 'docs/x.md']);
+        const { res, merge, stop, logs } = guardedMerge({ changedFilesFn });
+        expect(res).toBe('merged');
+        expect(changedFilesFn).toHaveBeenCalledWith(SHA);
+        expect(merge).toHaveBeenCalledTimes(1);
+        expect(stop).toBeNull();
+        expect(logs.some((l) => l.includes('защищаемых путей в PR нет'))).toBe(true);
+    });
+
+    it('сбой получения файлов — стоп с причиной, а не мердж', () => {
+        const { res, merge, stop, kind } = guardedMerge({
+            changedFilesFn: () => {
+                throw new Error('fatal: bad revision');
+            },
+        });
+        expect(res).toBe('protected-paths');
+        expect(kind).toBe('unverified');
+        expect(merge).not.toHaveBeenCalled();
+        expect(stop).toMatch(/файлы PR не получены \(fatal: bad revision\)/);
+    });
+
+    it('пустой список файлов — стоп, а не «нечего сверять»', () => {
+        const { res, merge, stop, kind } = guardedMerge({ changedFilesFn: () => [] });
+        expect(res).toBe('protected-paths');
+        expect(merge).not.toHaveBeenCalled();
+        // Пустой дифф назван своей причиной: правки ветки бывают уже в main.
+        expect(kind).toBe('empty');
+        expect(stop).toMatch(/PR без изменений относительно main/);
+    });
+
+    it('голова не зафиксирована — стоп, файлы не спрашиваем', () => {
+        const changedFilesFn = vi.fn(() => ['src/a.ts']);
+        const { res, merge, stop, kind } = guardedMerge({
+            changedFilesFn,
+            getVerifiedHeadFn: () => null,
+        });
+        expect(res).toBe('protected-paths');
+        expect(kind).toBe('unverified');
+        expect(changedFilesFn).not.toHaveBeenCalled();
+        expect(merge).not.toHaveBeenCalled();
+        expect(stop).toMatch(/голова PR не зафиксирована/);
+    });
+
+    // От противного: без чтения файлов (площадка держит пути сама) тот же PR с lock
+    // мерджится — значит стоп выше держит именно сверка, а не что-то по соседству.
+    it('площадка держит пути сама — гейт lock не сверяет', () => {
+        const { res, merge, stop } = guardedMerge({});
+        expect(res).toBe('merged');
+        expect(merge).toHaveBeenCalledTimes(1);
+        expect(stop).toBeNull();
+    });
+
+    it('стоп прошлого раунда не переживает новый', () => {
+        const g = createGateRunner(makeEnv());
+        const base = {
+            findOpenPrFn: () => ({ number: 9, labels: [] }),
+            checksGreenFn: () => true,
+            getVerifiedHeadFn: () => SHA,
+            logFn: () => {},
+        };
+        tryMergeWith(g, phase, { ...base, changedFilesFn: () => ['ralph'] });
+        expect(g.getLastProtectedPathsStop()?.why).toMatch(/ralph/);
+        tryMergeWith(g, phase, { ...base, changedFilesFn: () => ['a.ts'] });
+        expect(g.getLastProtectedPathsStop()).toBeNull();
+    });
+});
+
+describe('prChangedFiles — файлы PR по git (#139)', () => {
+    it('три точки от origin/main, без переименований, имена через NUL', () => {
+        const g = createGateRunner(makeEnv());
+        const sh = vi.fn((_cmd: string) => '.ralph/core.lock\0dir/имя с пробелом.ts\0');
+        expect(g.prChangedFiles(SHA, sh, (s: unknown) => `'${String(s)}'`)).toEqual([
+            '.ralph/core.lock',
+            'dir/имя с пробелом.ts',
+        ]);
+        const cmd = String(sh.mock.calls[0]?.[0]);
+        expect(cmd).toContain(`origin/main...'${SHA}'`);
+        expect(cmd).toContain('--no-renames');
+        expect(cmd).toContain('-z');
+    });
+
+    // С `-z` разделитель — NUL, и имя с переводом строки на краю — настоящее имя файла:
+    // срезать его нельзя, иначе в стоп ушло бы не то имя.
+    it('перевод строки в имени сохраняется, хвостовой NUL не даёт пустого имени', () => {
+        const g = createGateRunner(makeEnv());
+        expect(
+            g.prChangedFiles(
+                SHA,
+                () => 'a\n\0b.ts\0',
+                (s: unknown) => String(s),
+            ),
+        ).toEqual(['a\n', 'b.ts']);
+    });
+
+    it('пустой вывод — пустой список (решает вызывающий)', () => {
+        const g = createGateRunner(makeEnv());
+        expect(
+            g.prChangedFiles(
+                SHA,
+                () => '',
+                (s: unknown) => String(s),
+            ),
+        ).toEqual([]);
+    });
+});

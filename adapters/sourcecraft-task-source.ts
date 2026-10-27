@@ -375,6 +375,8 @@ export function createSourcecraftTaskSource(deps: SourcecraftTaskSourceDeps): Ta
 
     return {
         secretEnvNames: () => [tokenEnv],
+        // #139: защищаемые пути держит правило ревью площадки (ship человека).
+        reviewProtectsPaths: true,
         // Дешёвый авторизованный запрос: карточка самого репозитория. Отвергнутый токен
         // даёт 401 на любом маршруте, транспорт превращает ненулевой код curl в
         // исключение — а `checkAuth` его не глушит (fail-closed по контракту шва).

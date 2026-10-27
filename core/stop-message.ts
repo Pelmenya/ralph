@@ -21,6 +21,7 @@ export type TStopReason =
     | 'blocked-unconfirmed'
     | 'main-conflict'
     | 'main-sync-failed'
+    | 'origin-network'
     | 'head-diverged'
     | 'session-unpushed'
     | 'tree-dirty'
@@ -28,6 +29,7 @@ export type TStopReason =
     | 'intent-rejected'
     | 'merge-unknown'
     | 'merge-failed'
+    | 'protected-paths'
     | 'stage-journal'
     | 'forge-unreadable'
     | 'issue-format'
@@ -65,6 +67,8 @@ export const REASON_TITLES: Record<TStopReason, string> = {
     // отрицал бы настоящий конфликт, после которого упал `--abort`, — что именно было,
     // говорит диагноз (ревью #66).
     'main-sync-failed': 'ветка не подтянута к main',
+    // #144: сетевой шаг постановки на ветку фазы не прошёл и после повторов транзиента.
+    'origin-network': 'сеть до origin',
     'head-diverged': 'локальный ref ветки разошёлся с головой PR',
     'session-unpushed': 'незапушенный коммит сессии разбора',
     'tree-dirty': 'дерево не на нужной ветке',
@@ -76,6 +80,10 @@ export const REASON_TITLES: Record<TStopReason, string> = {
     'merge-unknown': 'исход мерджа неизвестен',
     // #123: форж отказал в мердже по существу, транзиентами дольше предела или нераспознанно.
     'merge-failed': 'мердж не удался',
+    // #139: площадка не держит защищаемые пути своим правилом ревью — их держит гейт.
+    // Заголовок общий на три развилки (правка пути, файлы не сверены, пустой дифф), поэтому
+    // нейтральный: что именно было, говорят заголовок места стопа и диагноз.
+    'protected-paths': 'сверка защищаемых путей — мердж за человеком',
     // #92: журнал этапов попытки повреждён или не пишется — продолжать по нему нельзя.
     'stage-journal': 'журнал этапов попытки не читается или не пишется',
     // #97: чтение, без которого решение петли слепо (прогресс итерации, комментарии PR

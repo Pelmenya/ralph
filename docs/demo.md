@@ -120,8 +120,9 @@ node <установка>/$rev/ralph.js
 (имя задаёт `runnerWorktreeDirname` конфига). Каталог он создаёт сам на первом боевом
 запуске, и состояние прогона лежит там, а не в `<демо>`:
 
-- ход — в `<демо>/../ralph-demo-ralph/.claude/ralph/ralph.dry.log`. Имя не опечатка:
-  `ralph.log` пишет только профиль `prod`, у демо профиль `demo`;
+- ход — в `<демо>/../ralph-demo-ralph/.claude/ralph/ralph.log`. Живой прогон пишет туда
+  при любом профиле, в том числе `demo`; `ralph.dry.log` рядом — только от `--dry-run`
+  (шаг 5). Метрика (`npm run metric`) читает этот же `ralph.log`;
 - мягкая остановка — файл `<демо>/../ralph-demo-ralph/.claude/ralph/ralph.stop`: петля
   встанет на границе шага. Тот же файл, положенный в `<демо>/.claude/ralph/`, петлю не
   остановит.

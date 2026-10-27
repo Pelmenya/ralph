@@ -1301,3 +1301,82 @@ describe('resolveProfile — скрипты потребителя (канон, 
         expect(resolveProfile(cfgWith(LEGAL, { adapters: 5 }), 'prod', () => null)).toBe(null);
     });
 });
+
+// #140: ядро из установки, запущенное launcher'ом, выводит корни, которых конфиг не назвал.
+// Критерий карточки: конфиг без `roots` — старт разрешён, и в нём нет путей машины.
+describe('resolveProfile — корни по умолчанию при старте через launcher (#140)', () => {
+    const boom = (m: string) => {
+        throw new Error(m);
+    };
+    const raw = (prod: Record<string, unknown> = {}) => ({
+        defaultProfile: 'prod',
+        common: { phases: [{ milestone: 'M', branch: 'b' }] },
+        profiles: { prod },
+    });
+    const launch = { consumerRoot: '/path/to/app', env: { XDG_STATE_HOME: '/state' } };
+    const fromLock = (p: string) => ({ ok: true as const, path: `/data/${p.length}` });
+
+    it('конфиг без roots: корни выведены, productRoot — из lock, источники названы', () => {
+        const cfg = resolveProfile(raw(), 'prod', boom, fromLock, launch);
+        expect(cfg.rootsResolved).toMatchObject({
+            consumerRoot: '/path/to/app',
+            executionRoot: '/path/to/app-ralph',
+            productRoot: '/data/12',
+        });
+        expect(cfg.rootsResolved.runtimeDir).toMatch(/^\/state\/ralph\/prod-[0-9a-f]{12}$/);
+        expect(cfg.rootsDefaulted).toEqual(['consumerRoot', 'runtimeDir', 'executionRoot']);
+        expect(cfg.productRootFrom).toBe('lock');
+        expect(JSON.stringify(raw())).not.toMatch(/\/path\/to|\/state/);
+    });
+
+    it('без launcher конфиг без roots — прежняя раскладка, lock не читается', () => {
+        const never = () => {
+            throw new Error('lock читать не должны');
+        };
+        const cfg = resolveProfile(raw(), 'prod', boom, never);
+        expect(cfg.rootsResolved).toBe(null);
+        expect(cfg.rootsDefaulted).toEqual([]);
+    });
+
+    it('без launcher неполная секция — прежний отказ, умолчаний нет', () => {
+        expect(() =>
+            resolveProfile(
+                raw({ roots: { consumerRoot: '/path/to/app' } }),
+                'prod',
+                boom,
+                fromLock,
+            ),
+        ).toThrow(/executionRoot не задан/);
+    });
+
+    it('явный ключ перекрывает умолчание: runnerWorktreeDirname и runtimeDir из конфига', () => {
+        const cfg = resolveProfile(
+            raw({ runnerWorktreeDirname: 'wt', roots: { runtimeDir: '/var/ralph/x' } }),
+            'prod',
+            boom,
+            fromLock,
+            launch,
+        );
+        expect(cfg.rootsResolved.runtimeDir).toBe('/var/ralph/x');
+        expect(cfg.rootsResolved.executionRoot).toBe('/path/to/wt');
+        expect(cfg.rootsDefaulted).toEqual(['consumerRoot', 'executionRoot']);
+    });
+
+    it('явный consumerRoot мимо --consumer — отказ с обоими путями', () => {
+        expect(() =>
+            resolveProfile(
+                raw({ roots: { consumerRoot: '/path/to/other' } }),
+                'prod',
+                boom,
+                fromLock,
+                launch,
+            ),
+        ).toThrow(/roots\.consumerRoot \(\/path\/to\/other\).*--consumer \/path\/to\/app/s);
+    });
+
+    it('мягкий failFn: отказ умолчаний — наверх как есть', () => {
+        expect(
+            resolveProfile(raw(), 'prod', () => null, fromLock, { consumerRoot: '/a', env: {} }),
+        ).toBe(null);
+    });
+});

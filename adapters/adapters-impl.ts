@@ -247,6 +247,8 @@ export function createGithubTaskSource(fns: GithubTaskSourceFns): TaskSourceAdap
     return {
         checkAuth: fns.checkAuth,
         secretEnvNames: () => GITHUB_SECRET_ENV_NAMES,
+        // #139: ruleset одобрение по путям не требует — пути держит гейт раннера.
+        reviewProtectsPaths: false,
         listReadyIssues: fns.openIssues,
         listAllOpenIssues: fns.allOpenIssues,
         hasAnyIssues: fns.hasAnyIssues,

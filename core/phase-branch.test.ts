@@ -6,7 +6,14 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, it, expect } from 'vitest';
-import { ensurePhaseBranch, checkOnPhaseBranch, type TPhaseBranchKind } from './phase-branch.ts';
+import { ExecTimeoutError } from '../shared/ralph-util.ts';
+import {
+    ensurePhaseBranch,
+    checkOnPhaseBranch,
+    isOriginNetworkFailure,
+    PHASE_BRANCH_NET_ATTEMPTS,
+    type TPhaseBranchKind,
+} from './phase-branch.ts';
 
 const BRANCH = 'feature/faza-1';
 /** Запреты, общие у всех команд модуля: в ключах словаря и сверках они только шумят. */
@@ -29,6 +36,7 @@ function world(given: Record<string, string | Error | Array<string | Error>> = {
     const calls: string[][] = [];
     const logs: string[] = [];
     const envs: Array<NodeJS.ProcessEnv | undefined> = [];
+    const sleeps: number[] = [];
     const queues = new Map<string, Array<string | Error>>();
     // Дефолт «дерево встало куда просили»: успех подтверждается через symbolic-ref, и без
     // ответа каждый сценарий уходил бы в отказ вместо своей ветки.
@@ -68,7 +76,10 @@ function world(given: Record<string, string | Error | Array<string | Error>> = {
             logFn: (m: string) => logs.push(m),
             safeBranch: () => true,
             env: { PATH: '/usr/bin' } as NodeJS.ProcessEnv,
+            // Пауза между повторами — коллаборатором: настоящий сон в юните — минуты сьюта.
+            sleepFn: (ms: number) => sleeps.push(ms),
         },
+        sleeps,
     };
 }
 
@@ -379,6 +390,163 @@ describe('ensurePhaseBranch — работа на detached HEAD вне вето�
 
         expect(res.kind).toBe<TPhaseBranchKind>('failed');
         expect(args(w.calls)).not.toContain(`git ${ORPHANS}`);
+    });
+});
+
+describe('ensurePhaseBranch: сеть до origin (#144)', () => {
+    // Живой отказ демо 27.10: одиночный fetch упал TLS, повторный старт через 10 с прошёл.
+    const TLS = gitFail(
+        "fatal: unable to access 'https://example.com/r.git/': gnutls_handshake() failed: " +
+            'The TLS connection was non-properly terminated.',
+        128,
+    );
+    const DNS = gitFail(
+        "fatal: unable to access 'https://example.com/r.git/': Could not resolve host: example.com",
+        128,
+    );
+    const CONN_TIMEOUT = gitFail(
+        "fatal: unable to access 'https://example.com/r.git/': Failed to connect to example.com " +
+            'port 443 after 130000 ms: Connection timed out',
+        128,
+    );
+    const HTTP_503 = gitFail(
+        "fatal: unable to access 'https://example.com/r.git/': The requested URL returned error: 503",
+        128,
+    );
+    const FETCH_MAIN = 'fetch origin main --quiet';
+    const LS_REMOTE = `ls-remote --exit-code --heads origin ${BRANCH}`;
+    const count = (calls: string[][], key: string) =>
+        args(calls).filter((c) => c === `git ${key}`).length;
+
+    it.each([
+        ['TLS', TLS],
+        ['DNS', DNS],
+        ['таймаут соединения', CONN_TIMEOUT],
+        ['5xx', HTTP_503],
+    ])('одиночный сетевой отказ fetch (%s) — повтор с паузой, и ветка ставится', (_n, err) => {
+        const w = world({
+            [FETCH_MAIN]: [err, ''],
+            [`rev-parse --verify --quiet refs/heads/${BRANCH}`]: NO_LOCAL_REF,
+        });
+
+        const res = ensurePhaseBranch(BRANCH, w.deps);
+
+        expect(res.kind).toBe<TPhaseBranchKind>('adopted');
+        expect(count(w.calls, FETCH_MAIN)).toBe(2);
+        expect(w.sleeps).toHaveLength(1);
+        expect(w.sleeps[0]).toBeGreaterThan(0);
+        expect(w.logs.join('\n')).toMatch(/повтор/);
+    });
+
+    it('ls-remote с сетевым отказом — тоже повтор, а не «ветки нет» и не стоп', () => {
+        const w = world({
+            [LS_REMOTE]: [DNS, NO_REMOTE_BRANCH],
+            [`rev-parse --verify --quiet refs/heads/${BRANCH}`]: NO_LOCAL_REF,
+        });
+
+        const res = ensurePhaseBranch(BRANCH, w.deps);
+
+        expect(res.kind).toBe<TPhaseBranchKind>('created');
+        expect(count(w.calls, LS_REMOTE)).toBe(2);
+    });
+
+    it('fetch ветки с сетевым отказом — повтор', () => {
+        const w = world({
+            [`fetch origin ${BRANCH} --quiet`]: [TLS, ''],
+            [`rev-parse --verify --quiet refs/heads/${BRANCH}`]: NO_LOCAL_REF,
+        });
+
+        expect(ensurePhaseBranch(BRANCH, w.deps).kind).toBe<TPhaseBranchKind>('adopted');
+        expect(count(w.calls, `fetch origin ${BRANCH} --quiet`)).toBe(2);
+    });
+
+    it('исчерпание — стоп «сеть до origin» с последним выводом git, число попыток ограничено', () => {
+        const w = world({ [FETCH_MAIN]: [TLS, TLS, DNS] });
+
+        const res = ensurePhaseBranch(BRANCH, w.deps);
+
+        expect(res.kind).toBe<TPhaseBranchKind>('network');
+        expect(res.sha).toBeNull();
+        expect(count(w.calls, FETCH_MAIN)).toBe(PHASE_BRANCH_NET_ATTEMPTS);
+        // Пауз на одну меньше попыток: после последней ждать нечего.
+        expect(w.sleeps).toHaveLength(PHASE_BRANCH_NET_ATTEMPTS - 1);
+        expect(res.reason).toMatch(/^сеть до origin/);
+        // Последний ответ, а не первый: он и есть состояние сети к моменту стопа.
+        expect(res.reason).toMatch(/Could not resolve host/);
+        expect(w.logs.join('\n')).toMatch(/сеть до origin/);
+        // Дальше сети шаг не идёт: ни одной мутации дерева.
+        expect(args(w.calls).some((c) => / switch /.test(c))).toBe(false);
+    });
+
+    it.each([
+        ['нет кредов', gitFail('fatal: could not read Username for https://example.com', 128)],
+        [
+            'нет доступа',
+            gitFail(
+                "remote: Permission denied\nfatal: unable to access 'https://example.com/r.git/': The requested URL returned error: 403",
+                128,
+            ),
+        ],
+        [
+            'нет репозитория',
+            gitFail('remote: Repository not found.\nfatal: repository not found', 128),
+        ],
+        ['нет ветки', gitFail("fatal: couldn't find remote ref main", 128)],
+    ])('отказ по существу (%s) — стоп сразу, без повторов и пауз', (_n, err) => {
+        const w = world({ [FETCH_MAIN]: err });
+
+        const res = ensurePhaseBranch(BRANCH, w.deps);
+
+        expect(res.kind).toBe<TPhaseBranchKind>('failed');
+        expect(count(w.calls, FETCH_MAIN)).toBe(1);
+        expect(w.sleeps).toEqual([]);
+    });
+
+    it('истёкший срок раннера — сеть до origin, но без повтора: он сам уже был ожиданием', () => {
+        const w = world({
+            [FETCH_MAIN]: new ExecTimeoutError('git', ['fetch', 'origin', 'main'], 600_000),
+        });
+
+        const res = ensurePhaseBranch(BRANCH, w.deps);
+
+        expect(res.kind).toBe<TPhaseBranchKind>('network');
+        expect(res.reason).toMatch(/срок/);
+        expect(count(w.calls, FETCH_MAIN)).toBe(1);
+        expect(w.sleeps).toEqual([]);
+    });
+
+    it('классификатор: транзиент сети против отказа по существу', () => {
+        expect(isOriginNetworkFailure(TLS)).toBe(true);
+        expect(
+            isOriginNetworkFailure(gitFail('fatal: the remote end hung up unexpectedly', 128)),
+        ).toBe(true);
+        expect(
+            isOriginNetworkFailure(
+                gitFail('error: RPC failed; curl 56 Recv failure: Connection reset by peer', 128),
+            ),
+        ).toBe(true);
+        expect(
+            isOriginNetworkFailure(
+                gitFail('ssh: connect to host example.com port 22: Connection refused', 255),
+            ),
+        ).toBe(true);
+        expect(isOriginNetworkFailure(HTTP_503)).toBe(true);
+        expect(isOriginNetworkFailure(gitFail('The requested URL returned error: 501', 128))).toBe(
+            false,
+        );
+        expect(isOriginNetworkFailure(gitFail('The requested URL returned error: 404', 128))).toBe(
+            false,
+        );
+        expect(isOriginNetworkFailure(gitFail('network', 128))).toBe(false);
+        // Голое «timed out» — не признак: его пишут и отказы по существу (helper кредов).
+        expect(isOriginNetworkFailure(gitFail('fatal: credential helper timed out', 128))).toBe(
+            false,
+        );
+        expect(
+            isOriginNetworkFailure(
+                gitFail('error: RPC failed; curl 28 Operation timed out after 300000 ms', 128),
+            ),
+        ).toBe(true);
     });
 });
 

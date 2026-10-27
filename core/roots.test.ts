@@ -10,7 +10,18 @@ import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, readFileSync } from
 import { threadId } from 'node:worker_threads';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { instanceNamespace, resolveRoots, writeFileAtomic } from './roots.ts';
+import {
+    describeRoots,
+    doctorRootsLines,
+    rootsDefaultRefusal,
+    instanceNamespace,
+    launcherRootsInput,
+    parseLaunchConsumer,
+    resolveRoots,
+    runnerWorktreePathFor,
+    stateHomeDir,
+    writeFileAtomic,
+} from './roots.ts';
 import { sideEffectAttempts } from '../shared/side-effect-guard.ts';
 
 /** Каталог-песочница со всеми четырьмя корнями в законной раскладке. */
@@ -543,5 +554,159 @@ describe('права файла состояния переживают заме
                 renameFn: (from, to) => writeFileSync(to, readFileSync(from)),
             }),
         ).toThrow(/символическая ссылка/);
+    });
+});
+
+// #140: старт через launcher — корни, которых конфиг не назвал, выводятся из того, что
+// launcher знает сам. Иначе конфиг потребителя нёс бы пути машины и не мог жить в git.
+describe('умолчания корней при старте через launcher', () => {
+    const noReal = (): string => {
+        throw new Error('ENOENT');
+    };
+    const ctx = { consumerRoot: '/path/to/app', env: { HOME: '/home/user' } };
+
+    it('пустой конфиг: consumerRoot из --consumer, runtimeDir — состояние пользователя, executionRoot — сосед', () => {
+        const r = launcherRootsInput({}, ctx, 'prod', {}, noReal);
+        expect(r.input).toEqual({
+            consumerRoot: '/path/to/app',
+            runtimeDir: `/home/user/.local/state/ralph/${instanceNamespace('/path/to/app', 'prod')}`,
+            executionRoot: '/path/to/app-ralph',
+        });
+        expect(r.defaulted).toEqual(['consumerRoot', 'runtimeDir', 'executionRoot']);
+    });
+
+    it('XDG_STATE_HOME важнее HOME; профили получают разные каталоги состояния', () => {
+        const env = { XDG_STATE_HOME: '/xdg', HOME: '/home/user' };
+        const a = launcherRootsInput({}, { ...ctx, env }, 'prod', {}, noReal).input;
+        const b = launcherRootsInput({}, { ...ctx, env }, 'playground', {}, noReal).input;
+        expect(a.runtimeDir?.startsWith('/xdg/ralph/prod-')).toBe(true);
+        expect(a.runtimeDir).not.toBe(b.runtimeDir);
+    });
+
+    it('executionRoot — тем же правилом, что дерево раннера: путь, переменная, имя', () => {
+        const name = launcherRootsInput({}, ctx, 'prod', { runnerWorktreeDirname: 'wt' }, noReal);
+        expect(name.input.executionRoot).toBe('/path/to/wt');
+        const viaEnv = launcherRootsInput(
+            {},
+            { ...ctx, env: { HOME: '/home/user', RALPH_WORKTREE_PATH: '../env-wt' } },
+            'prod',
+            { runnerWorktreeDirname: 'wt' },
+            noReal,
+        );
+        expect(viaEnv.input.executionRoot).toBe('/path/to/env-wt');
+        const pathKey = launcherRootsInput(
+            {},
+            { ...ctx, env: { HOME: '/home/user', RALPH_WORKTREE_PATH: '/env' } },
+            'prod',
+            { runnerWorktreePath: '/srv/wt' },
+            noReal,
+        );
+        expect(pathKey.input.executionRoot).toBe('/srv/wt');
+    });
+
+    // Ревью #140: копия правила обрезала пробелы, раннер — нет, и лог называл одно дерево,
+    // а раннер работал в другом. Одна функция на оба места — один ответ.
+    it('executionRoot совпадает с путём раннера и при пробеле по краю имени', () => {
+        for (const wt of [{ runnerWorktreeDirname: ' wt ' }, { runnerWorktreePath: '../p ' }, {}]) {
+            const vars = { HOME: '/home/user', RALPH_WORKTREE_PATH: ' ../e' };
+            const got = launcherRootsInput({}, { ...ctx, env: vars }, 'prod', wt, noReal);
+            expect(got.input.executionRoot).toBe(runnerWorktreePathFor(wt, vars, '/path/to/app'));
+        }
+        expect(runnerWorktreePathFor({ runnerWorktreeDirname: ' wt ' }, {}, '/path/to/app')).toBe(
+            '/path/to/ wt ',
+        );
+    });
+
+    it('явный ключ перекрывает умолчание и в defaulted не попадает', () => {
+        const r = launcherRootsInput(
+            { runtimeDir: '/state/x', executionRoot: '/work/x', consumerRoot: '/path/to/app' },
+            ctx,
+            'prod',
+            {},
+            noReal,
+        );
+        expect(r.input).toMatchObject({ runtimeDir: '/state/x', executionRoot: '/work/x' });
+        expect(r.defaulted).toEqual([]);
+    });
+
+    it('явный consumerRoot, разошедшийся с --consumer, — отказ с обоими путями', () => {
+        expect(() =>
+            launcherRootsInput({ consumerRoot: '/path/to/other' }, ctx, 'prod', {}, noReal),
+        ).toThrow(/\/path\/to\/other.*--consumer \/path\/to\/app/s);
+    });
+
+    it('симлинк на то же дерево расхождением не считается', () => {
+        const real = (p: string) => (p === '/link/app' ? '/path/to/app' : p);
+        expect(
+            launcherRootsInput({ consumerRoot: '/link/app' }, ctx, 'prod', {}, real).defaulted,
+        ).not.toContain('consumerRoot');
+    });
+
+    it('--consumer относительный — отказ, а не резолв от места запуска', () => {
+        expect(() =>
+            launcherRootsInput({}, { ...ctx, consumerRoot: 'app' }, 'prod', {}, noReal),
+        ).toThrow(/относительным/);
+    });
+
+    it('каталог состояния: относительный XDG или HOME — отказ, нет обоих — отказ', () => {
+        expect(() => stateHomeDir({ XDG_STATE_HOME: 'rel' })).toThrow(/XDG_STATE_HOME=rel/);
+        expect(() => stateHomeDir({ HOME: 'rel' })).toThrow(/HOME=rel/);
+        expect(() => stateHomeDir({})).toThrow(/ни XDG_STATE_HOME, ни HOME/);
+        expect(stateHomeDir({ XDG_STATE_HOME: '', HOME: '/h' })).toBe('/h/.local/state');
+    });
+
+    it('флаг --consumer: нет — null; путь — он; без пути, относительный, повтор — отказ', () => {
+        expect(parseLaunchConsumer(['--dry-run'])).toBe(null);
+        expect(parseLaunchConsumer(['--consumer', '/path/to/app', '--once'])).toBe('/path/to/app');
+        expect(() => parseLaunchConsumer(['--consumer'])).toThrow(/без абсолютного пути/);
+        expect(() => parseLaunchConsumer(['--consumer', '--once'])).toThrow(/без абсолютного/);
+        expect(() => parseLaunchConsumer(['--consumer', 'app'])).toThrow(/без абсолютного/);
+        expect(() => parseLaunchConsumer(['--consumer', '/a', '--consumer', '/b'])).toThrow(
+            /повторён/,
+        );
+    });
+
+    it('строка раскладки называет все четыре корня и источник каждого выведенного', () => {
+        const line = describeRoots(
+            {
+                consumerRoot: '/path/to/app',
+                executionRoot: '/path/to/app-ralph',
+                productRoot: '/data/abc',
+                runtimeDir: '/state/x',
+            },
+            ['consumerRoot', 'runtimeDir'],
+            'lock',
+        );
+        expect(line).toBe(
+            '🗂  Корни: consumerRoot=/path/to/app (умолчание launcher), ' +
+                'executionRoot=/path/to/app-ralph, productRoot=/data/abc (из lock), ' +
+                'runtimeDir=/state/x (умолчание launcher)',
+        );
+    });
+});
+
+describe('развилки main() о корнях по умолчанию (#140)', () => {
+    const R = {
+        consumerRoot: '/path/to/app',
+        executionRoot: '/path/to/app-ralph',
+        productRoot: '/data/abc',
+        runtimeDir: '/state/x',
+    };
+
+    it('отказ умолчаний: только у ядра не из установки и только если что-то выведено', () => {
+        expect(rootsDefaultRefusal([], false, '/core')).toBe(null);
+        expect(rootsDefaultRefusal(['runtimeDir'], true, '/core')).toBe(null);
+        expect(rootsDefaultRefusal(['runtimeDir'], false, '/core')).toMatch(
+            /умолчания корней \(runtimeDir\).*ядро \/core не из установки/,
+        );
+    });
+
+    it('doctor печатает корни; раскладки нет — молчит; отказ умолчаний — провал', () => {
+        expect(doctorRootsLines(null, [], null, true, '/core')).toEqual([]);
+        expect(doctorRootsLines(R, ['runtimeDir'], 'lock', true, '/core')).toEqual([
+            { ok: true, line: describeRoots(R, ['runtimeDir'], 'lock') },
+        ]);
+        const lines = doctorRootsLines(R, ['runtimeDir'], 'config', false, '/core');
+        expect(lines.map((l) => l.ok)).toEqual([true, false]);
     });
 });

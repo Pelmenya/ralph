@@ -49,6 +49,7 @@ import type { MergeFailureKind } from './merge-retry.ts';
 import { errorText, gitNetworkOpts } from '../shared/ralph-util.ts';
 import type { ExecOpts, ShArgvFn } from '../shared/ralph-util.ts';
 import { syncPhaseBranchWithMain } from './main-sync.ts';
+import { protectedHits, type ProtectedHit } from './protected-paths.ts';
 import type { MainSyncResult } from './main-sync.ts';
 
 type ShFn = (cmd: string, opts?: ExecOpts) => string;
@@ -89,6 +90,9 @@ type RedCheck = { name: string; cmd: string; excerpt: string };
 // оказавшийся в нём, ушёл бы на лечение кода, которого никто не ломал.
 type ToolFailure = { name: string; cmd: string; why: string; excerpt: string };
 type ToolFailureSkip = { name: string; cmd: string; why: string };
+// #139: стоп сверки защищаемых путей. `hits` — PR правит защищаемый путь; `unverified` —
+// файлы не сверились (голова не зафиксирована, git упал); `empty` — дифф PR пуст.
+export type ProtectedPathsStop = { kind: 'hits' | 'unverified' | 'empty'; why: string };
 // #123: отказ мерджа, с которым гейт вернул `not-merged`: класс (merge-retry.ts), первая
 // строка ответа форжа (не командная строка исключения), сколько попыток сгорело и под каким
 // пределом — всё, из чего цикл собирает диагноз пуша, не пересказывая лог.
@@ -468,6 +472,12 @@ export function createGateRunner(env: GateEnv) {
     // что lastForgeRedCheck: цикл читает её ПОСЛЕ возврата статуса `forge-unknown` и
     // кладёт в пуш человеку — иначе ночная остановка выясняется только утром.
     let lastForgeStop: string | null = null;
+    // #139: файлы PR под защищаемыми путями на площадке, которая их не держит, либо причина,
+    // по которой список файлов не собрался. Строка стопа — геттером, тем же приёмом; вид
+    // развилки едет рядом, потому что заголовок и вопрос человеку у них разные: «правит
+    // защищаемый путь» на PR, где файлы просто не сверились, отправил бы искать правку,
+    // которой нет.
+    let lastProtectedPathsStop: ProtectedPathsStop | null = null;
     // #123: мердж не удался — класс отказа и строка ответа форжа. Раньше гейт писал их только
     // логом, и пуш на `not-merged` уходил катч-оллом «причина не установлена», хотя класс
     // (по существу / транзиент дольше предела / нераспознанный) гейт знал точно. Геттер тем
@@ -864,6 +874,21 @@ export function createGateRunner(env: GateEnv) {
         return ms;
     }
 
+    /**
+     * Изменённые файлы PR — по git, а не по ответу форжа (#139): к моменту вызова
+     * `checksGreen` уже влил свежий `origin/main` в проверенную голову, и три точки дают
+     * ровно то, что уедет в `main`. `--no-renames`: переименование из защищаемого каталога —
+     * тоже правка защищаемого пути, и старое имя обязано попасть в список. Пустой вывод —
+     * пустой список, а решение о нём принимает вызывающий (fail-closed).
+     */
+    function prChangedFiles(head: string, shFn: ShFn = sh, shqFn: ShqFn = shq): string[] {
+        return shFn(
+            `git -c core.quotePath=false diff --name-only --no-renames -z origin/main...${shqFn(head)}`,
+        )
+            .split('\0')
+            .filter(Boolean);
+    }
+
     // ── Гейт мерджа фазы ─────────────────────────────────────────────────────
 
     /**
@@ -912,6 +937,11 @@ export function createGateRunner(env: GateEnv) {
      *   'head-diverged'      — локальный ref ветки разошёлся с головой PR (#85): локально
      *                          есть коммиты, которых нет в PR. Строка гейта — в
      *                          `getLastHeadDivergence()`; стоп человеку пушем с ней же;
+     *   'protected-paths'    — PR правит защищаемый путь (`core/protected-paths.ts`) на
+     *                          площадке, правило ревью которой его не держит (#139), либо
+     *                          список файлов PR не собрался или пуст. Мердж за человеком;
+     *                          вид развилки, файлы или причина — в
+     *                          `getLastProtectedPathsStop()`;
      *   'pr-unreadable'      — открытый PR ветки не прочитался: форж бросил (#127). Это не
      *                          «PR нет» — стоп человеку пушем, причина в `lastForgeStop`;
      *   'not-merged'         — не мерджили по нечинимой причине (нет PR / blocked /
@@ -993,6 +1023,10 @@ export function createGateRunner(env: GateEnv) {
             // попытке. Только тогда метку можно снять: после транзиента любая из попыток
             // могла лечь в очередь форжа с потерянным ответом.
             onMergeSettledFn = () => {},
+            // #139: изменённые файлы PR для сверки с защищаемыми путями. Задан — сверка идёт;
+            // не задан — площадка держит пути своим правилом ревью, и гейт их не сверяет.
+            // Решает composition root по шву форжа (`reviewProtectsPaths`), а не гейт.
+            changedFilesFn,
         }: {
             dry?: boolean;
             shFn?: ShFn;
@@ -1027,6 +1061,7 @@ export function createGateRunner(env: GateEnv) {
             getLastHeadDivergenceFn?: () => typeof lastHeadDivergence;
             onMergeStartFn?: (prNumber: number, head: string | null) => void;
             onMergeSettledFn?: () => void;
+            changedFilesFn?: (head: string) => string[];
         } = {},
     ):
         | 'merged'
@@ -1042,6 +1077,7 @@ export function createGateRunner(env: GateEnv) {
         | 'main-conflict'
         | 'head-diverged'
         | 'pr-unreadable'
+        | 'protected-paths'
         | 'not-merged' {
         // #218: сброс СРАЗУ, тем же приёмом, что checksGreen сбрасывает lastRedCheck/
         // lastVerifiedHead — раунд, упавший ДО findOpenPr (dry/грязное дерево), не должен
@@ -1053,6 +1089,7 @@ export function createGateRunner(env: GateEnv) {
         lastForgeStop = null;
         lastMergeFailure = null;
         lastMergeProof = null;
+        lastProtectedPathsStop = null;
         // C1: dry-run строго read-only. Основной guard стоит в цикле ДО вызова гейта;
         // этот — defense in depth: даже если будущая правка цикла потеряет внешний
         // guard, dry-run всё равно не смерджит и не тронет дерево раннера.
@@ -1149,6 +1186,55 @@ export function createGateRunner(env: GateEnv) {
         // форжа (#278) и как `--match-head-commit` при мердже (#SiaTz); между этими
         // точками значение не меняется, и читателю не приходится это доказывать.
         const verifiedHead = getVerifiedHeadFn();
+        // #139: защищаемые пути на площадке, правило ревью которой их не держит (GitHub:
+        // ruleset не требует одобрения по путям, а при пороге 0 lock мерджился без
+        // человека). Сверка — после локальных чеков, по той же голове, что уйдёт в мердж,
+        // и до ожидания CI площадки: ждать вердикт, которым не воспользуемся, незачем.
+        // Fail-closed: голова не зафиксирована или список не собрался — тоже стоп.
+        if (changedFilesFn) {
+            const stopProtected = (
+                kind: ProtectedPathsStop['kind'],
+                why: string,
+            ): 'protected-paths' => {
+                lastProtectedPathsStop = { kind, why };
+                logFn(`⛔ Гейт: сверка защищаемых путей PR #${String(pr.number)}: ${why}.`);
+                parkFn();
+                return 'protected-paths';
+            };
+            if (!verifiedHead) {
+                return stopProtected(
+                    'unverified',
+                    'голова PR не зафиксирована — защищаемые пути не сверены, мердж за человеком',
+                );
+            }
+            let hits: ProtectedHit[];
+            try {
+                const files = changedFilesFn(verifiedHead);
+                // Пустой дифф бывает законным: правки ветки уже в main (cherry-pick, повторное
+                // влитие). Отказ тот же, но причина своя — иначе человек искал бы защищаемый
+                // путь в PR, где мерджить нечего.
+                if (files.length === 0) {
+                    return stopProtected(
+                        'empty',
+                        `PR без изменений относительно main (origin/main...${verifiedHead.slice(0, 12)} пуст) — защищаемые пути не сверены`,
+                    );
+                }
+                hits = protectedHits(files);
+            } catch (e: unknown) {
+                return stopProtected(
+                    'unverified',
+                    `изменённые файлы PR не получены (${errorText(e)}) — защищаемые пути не сверены, мердж за человеком`,
+                );
+            }
+            if (hits.length > 0) {
+                return stopProtected(
+                    'hits',
+                    'правка защищаемого пути — мердж за человеком: ' +
+                        hits.map((h) => `${h.file} (${h.pattern})`).join(', '),
+                );
+            }
+            logFn('🛡 Гейт: защищаемых путей в PR нет — сверено раннером.');
+        }
         // #269: локальные чеки зелёные — но у площадки СВОЙ чек, и мердж она отвергает
         // (400), пока он красный. Раньше раннер спрашивал только себя: три попытки мерджа
         // через 30 с и стоп «PR оставлен человеку», а причина оставалась в контейнере
@@ -1490,6 +1576,8 @@ export function createGateRunner(env: GateEnv) {
         getLastGatePr: (): number | null => lastGatePr,
         getLastForgeRedCheck: (): ForgeRedCheck | null => lastForgeRedCheck,
         getLastForgeStop: (): string | null => lastForgeStop,
+        getLastProtectedPathsStop: (): ProtectedPathsStop | null => lastProtectedPathsStop,
+        prChangedFiles,
         getLastMergeFailure: (): MergeFailure | null => lastMergeFailure,
         getLastToolFailure: (): ToolFailure | null => lastToolFailure,
         getToolFailureSkips: (): ToolFailureSkip[] => lastToolSkips,

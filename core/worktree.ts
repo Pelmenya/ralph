@@ -21,6 +21,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync, execSync } from 'node:child_process';
 import { ensureWorkspaceTrusted } from './workspace-trust.ts';
+import { defaultRunnerWorktreeDirname, runnerWorktreePathFor } from './roots.ts';
 import type { TrustOutcome } from './workspace-trust.ts';
 import { gitNetworkOpts } from '../shared/ralph-util.ts';
 import type { ShArgvFn } from '../shared/ralph-util.ts';
@@ -54,16 +55,10 @@ export type WorktreeEnv = {
     getInstallCmd: () => string;
 };
 
-// #204: имя соседнего дерева раннера больше НЕ прибито к проекту (раньше здесь стоял
-// литерал с именем репозитория первого потребителя).
-// Дефолт выводится из имени репозитория: `<basename(repoRoot)>-ralph` (для `/path/to/app`
-// — `/path/to/app-ralph`). Суффикс — общий, не проектный. Явный конфиг
-// (cfg.runnerWorktreeDirname / cfg.runnerWorktreePath) важнее дефолта.
-const RALPH_WORKTREE_SUFFIX = '-ralph';
-
-function defaultWorktreeDirnameFor(repoRoot: string): string {
-    return path.basename(repoRoot) + RALPH_WORKTREE_SUFFIX;
-}
+// #204: имя соседнего дерева раннера больше НЕ прибито к проекту. Правило пути — чистая
+// функция в `roots.ts` (`runnerWorktreePathFor`): его же зовёт вывод `executionRoot` при
+// старте через launcher (#140), и две копии уже расходились в мелочи.
+const defaultWorktreeDirnameFor = defaultRunnerWorktreeDirname;
 
 // #576: стоп на не сработавшем доверии. Подробную причину уже назвал workspace-trust
 // (битый JSON / нет прав / диск только на чтение) — здесь фиксируется ПОСЛЕДСТВИЕ, чтобы
@@ -99,20 +94,13 @@ export function createWorktreeManager(env: WorktreeEnv) {
     // игнорится .gitignore-правилами родителя, либо норовит закоммититься как
     // вложенный git-репозиторий.
 
-    // cfg.runnerWorktreePath (явный конфиг) важнее RALPH_WORKTREE_PATH (env) — молчаливая
-    // перебивка явной настройки переменной окружения была бы тем же тихим сдвигом режима,
-    // от которого fail-closed уже защищает профили (см. resolveProfile). Both отсутствуют →
-    // дефолт-сосед. repoRoot — параметр (не process.cwd() внутри resolve), чтобы функция
-    // оставалась чистой и тестируемой без реального cwd.
+    // Правило — `runnerWorktreePathFor` (roots.ts), общее с выводом `executionRoot`; здесь
+    // только боевые дефолты: окружение процесса и место запуска.
     function resolveWorktreePath(
         cfg: { runnerWorktreePath?: string; runnerWorktreeDirname?: string } = {},
         repoRoot: string = process.cwd(),
     ): string {
-        const override = cfg.runnerWorktreePath || process.env.RALPH_WORKTREE_PATH;
-        if (override) return path.resolve(repoRoot, override);
-        // #204: имя дерева — из конфига или дефолт от имени репозитория, не строка проекта.
-        const dirname = cfg.runnerWorktreeDirname || defaultWorktreeDirnameFor(repoRoot);
-        return path.resolve(repoRoot, '..', dirname);
+        return runnerWorktreePathFor(cfg, process.env, repoRoot);
     }
 
     // `git worktree list --porcelain`: блоки разделены пустой строкой, первая строка

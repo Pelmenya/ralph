@@ -48,6 +48,7 @@ import {
     type TLauncherDeps,
 } from '../core/launcher.ts';
 import { runtimePathsIn } from '../core/runtime-paths.ts';
+import { CONSUMERS_DIR } from '../core/consumer-registry.ts';
 import { Killed, world } from './crash-world.ts';
 
 /** update: установка новой ревизии рядом, ветка с lock, PR. */
@@ -72,8 +73,17 @@ const UPDATE_STEPS = [
 /** rollback: те же шаги, когда прежней ревизии в каталоге установок уже нет. */
 const ROLLBACK_STEPS = UPDATE_STEPS;
 
-/** Активация после мерджа lock: прежнее ядро выходит на рестарт, новое пишет журнал. */
-const ACTIVATION_STEPS = ['core:run-old', 'core:run-new', 'activation:append'] as const;
+/**
+ * Активация после мерджа lock: запись потребителя в реестр каталога установок (#138), прежнее
+ * ядро выходит на рестарт, новое пишет журнал. Повтор записи реестра — не эффект: та же
+ * запись не переписывается.
+ */
+const ACTIVATION_STEPS = [
+    'registry:register',
+    'core:run-old',
+    'core:run-new',
+    'activation:append',
+] as const;
 
 const V = supportedVersions();
 const OLD = 'a'.repeat(40);
@@ -330,6 +340,20 @@ function launcherProcess(killAt: { step: string; when: 'before' | 'after' } | nu
                 forge.set(pr.branch, n);
                 return n;
             }),
+        registryFs: {
+            readFile: (p) => read(() => fs.readFileSync(p, 'utf8')),
+            readdir: (d) => read(() => fs.readdirSync(d)),
+            mkdir: (d) => read(() => fs.mkdirSync(d, { recursive: true })),
+            writeAtomic: (p, t) =>
+                effect('registry:register', () => {
+                    fs.writeFileSync(`${p}.tmp`, t);
+                    fs.renameSync(`${p}.tmp`, p);
+                }),
+        },
+        listDataDirFn: unused('listDataDirFn'),
+        renameFn: unused('renameFn'),
+        rmFn: unused('rmFn'),
+        runningRevisionsFn: unused('runningRevisionsFn'),
     };
     return { w, out, steps, deps, effect };
 }
@@ -378,7 +402,14 @@ function expectBranchLock(branch: string, sha: string): void {
 }
 
 function expectNoLeftovers(): void {
-    expect(fs.readdirSync(dataDir).filter((n) => n.startsWith('.'))).toEqual([]);
+    // Реестр потребителей (#138) — не остаток; остаток в нём — недописанная запись.
+    expect(fs.readdirSync(dataDir).filter((n) => n.startsWith('.') && n !== CONSUMERS_DIR)).toEqual(
+        [],
+    );
+    const registry = path.join(dataDir, CONSUMERS_DIR);
+    if (fs.existsSync(registry)) {
+        expect(fs.readdirSync(registry).filter((n) => !n.endsWith('.json'))).toEqual([]);
+    }
     expect(git(consumer, 'for-each-ref', 'refs/ralph')).toBe('');
 }
 

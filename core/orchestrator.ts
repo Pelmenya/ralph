@@ -67,6 +67,7 @@ import {
     planRuntimeMigration,
     readMigrationJournal,
     rollbackRuntime,
+    runnerLegacyDir,
     type TMigrationDeps,
 } from './runtime-migration.ts';
 import type {
@@ -112,7 +113,10 @@ import {
 } from './submit-journal.ts';
 // Подмножество причин стопа, которыми кончается проводка на ветку фазы: `switch` по нему
 // закрывается `never`-веткой, и новая природа отказа падает на компиляции.
-type TPhaseBranchStopKind = Extract<TStopReason, 'tree-dirty' | 'main-conflict' | 'unknown'>;
+type TPhaseBranchStopKind = Extract<
+    TStopReason,
+    'tree-dirty' | 'main-conflict' | 'origin-network' | 'unknown'
+>;
 import { createReviewModule, reviewVerdict } from './review.ts';
 import { createGateRunner, resolveGateChecks, resolveGatePolicy } from './gate.ts';
 import { describeMergeFailure, resolveMergeRetryMaxMs } from './merge-retry.ts';
@@ -248,7 +252,15 @@ import type {
     RunResult,
     TaskSourceAdapter,
 } from '../adapters/adapters.ts';
-import { underRoot, writeFileAtomic, type TResolvedRoots } from './roots.ts';
+import {
+    describeRoots,
+    doctorRootsLines,
+    parseLaunchConsumer,
+    rootsDefaultRefusal,
+    underRoot,
+    writeFileAtomic,
+    type TResolvedRoots,
+} from './roots.ts';
 import { checkCoreBeforeStart, describeStartCheck, productRootMismatch } from './core-install.ts';
 import {
     ACTIVATION_RESTART_EXIT,
@@ -623,6 +635,8 @@ export type RalphConfig = {
     rootsResolved?: TResolvedRoots | null;
     /** Откуда взят `rootsResolved.productRoot`: ключ конфига или вывод из lock (#134). */
     productRootFrom?: 'config' | 'lock' | null;
+    /** Корни, выведенные умолчанием launcher (#140), а не названные конфигом. */
+    rootsDefaulted?: string[];
     // Скрипты ПОТРЕБИТЕЛЯ, которые зовёт ядро: их нет в каноне, и путь к ним — часть
     // контракта потребителя, а не зашитая строка (канон, задача 23). `consumerScripts` —
     // то, что написано в файле; исполняется РЕЗОЛВНУТОЕ, где относительный путь уже
@@ -4605,6 +4619,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
         getLastGatePr: gateGetLastGatePr,
         getLastForgeRedCheck: gateGetLastForgeRedCheck,
         getLastForgeStop: gateGetLastForgeStop,
+        getLastProtectedPathsStop: gateGetLastProtectedPathsStop,
+        prChangedFiles: gatePrChangedFiles,
         getLastMergeFailure: gateGetLastMergeFailure,
         getLastToolFailure: gateGetLastToolFailure,
         getLastMainSyncStop: gateGetLastMainSyncStop,
@@ -5532,6 +5548,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
         getLastForgeRedCheck?: typeof gateGetLastForgeRedCheck;
         // #269-ревью: причина стопа на чеке форжа БЕЗ вердикта — тем же геттер-приёмом.
         getLastForgeStop?: typeof gateGetLastForgeStop;
+        // #139: файлы PR под защищаемыми путями или причина, по которой они не сверены.
+        getLastProtectedPathsStop?: typeof gateGetLastProtectedPathsStop;
+        // #139: изменённые файлы PR для гейта; `null` — площадка держит пути сама.
+        prChangedFilesFn?: ((head: string) => string[]) | null;
         // #123: мердж вызван и не удался — класс отказа и строка форжа, тем же геттер-приёмом.
         getLastMergeFailure?: typeof gateGetLastMergeFailure;
         // Задача 81: чек, упавший на ИНСТРУМЕНТЕ, — тем же геттер-приёмом.
@@ -5669,6 +5689,12 @@ export function createOrchestrator(env: OrchestratorEnv) {
             getLastGatePr = gateGetLastGatePr,
             getLastForgeRedCheck = gateGetLastForgeRedCheck,
             getLastForgeStop = gateGetLastForgeStop,
+            getLastProtectedPathsStop = gateGetLastProtectedPathsStop,
+            // #139: решает шов форжа, а не гейт и не перечень площадок в ядре: площадка,
+            // правило ревью которой не держит защищаемые пути, получает сверку раннером.
+            prChangedFilesFn = adapters.taskSource.reviewProtectsPaths
+                ? null
+                : (head: string) => gatePrChangedFiles(head),
             getLastMergeFailure = gateGetLastMergeFailure,
             getLastToolFailure = gateGetLastToolFailure,
             getLastMainSyncStop = gateGetLastMainSyncStop,
@@ -6239,14 +6265,15 @@ export function createOrchestrator(env: OrchestratorEnv) {
             // отказы проводки (fetch/чтение git/сам switch) — разбором дерева раннера.
             // Ревью #289: веток здесь ТРИ, ровно по числу `kind`, которые возвращает
             // `ensurePhaseBranch`. Раньше их было две, и `unknown` получал совет про
-            // `git status` — то есть уводил от места отказа: у него источник либо сеть
-            // (`git fetch`/`rev-list` не ответили), либо конфиг (`phases[]` с небезопасным
+            // `git status` — то есть уводил от места отказа: у него источник либо git
+            // (`rev-list` не ответил), либо конфиг (`phases[]` с небезопасным
             // именем ветки), а дерево при этом в порядке.
             // Ревью #289, второй проход: разбор — `switch` с `never`-веткой, а не пара
             // `if` с молчаливым дефолтом. Дефолт вернулся бы к тому же отказу, который
             // `phase-branch.ts` убрал обязательным параметром: стоп новой природы уехал
             // бы человеку с чужим советом. Параметр сужен до `TPhaseBranchStopKind` —
-            // ровно те три причины, которые модуль возвращает, — поэтому четвёртая
+            // ровно те причины, которые модуль возвращает (#144 добавил четвёртую, сеть до
+            // origin: транзиент, переживший повторы, уходил `unknown`), — поэтому новая
             // падает на КОМПИЛЯЦИИ, а не проезжает без единого красного.
             const phaseBranchQuestion = (kind: TPhaseBranchStopKind): string => {
                 switch (kind) {
@@ -6260,6 +6287,12 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         );
                     case 'tree-dirty':
                         return 'проверь состояние дерева раннера руками (git status/git log — обычно незакоммиченные правки) и перезапусти loop';
+                    case 'origin-network':
+                        return (
+                            'origin не ответил и после повторов (#144) — проверь сеть, прокси или туннель ' +
+                            'хоста до origin по последнему ответу git в диагнозе; дерево не тронуто, ' +
+                            'перезапусти loop'
+                        );
                     default: {
                         const _never: never = kind;
                         return _never;
@@ -6273,6 +6306,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             // небезопасное имя — конфигом, прочий отказ — разбором дерева.
             const phaseBranchStopKind = (placed: TPhaseBranchResult): TPhaseBranchStopKind => {
                 if (placed.kind === 'diverged') return 'main-conflict';
+                if (placed.kind === 'network') return 'origin-network';
                 if (placed.kind === 'unsafe-name') return 'unknown';
                 if (placed.reason?.includes('вне всех веток')) return 'main-conflict';
                 if (placed.reason?.startsWith('не смог поставить дерево')) return 'tree-dirty';
@@ -6285,6 +6319,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     logFn,
                     safeBranch: (b, opts) => safeBranch(b, { logFn, ...opts }),
                     env: process.env,
+                    sleepFn,
                 });
                 if (placed.sha !== null && placed.kind !== 'diverged') return true;
                 const kind = phaseBranchStopKind(placed);
@@ -8548,6 +8583,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     // и подмена в тесте влияла бы на проверку «фаза уже смерджена», но не
                     // на сверку идемпотентности внутри ретрая мерджа. Один канал, не два.
                     phaseMergedFn,
+                    // #139: файлы PR против защищаемых путей — там, где площадка их не держит.
+                    ...(prChangedFilesFn ? { changedFilesFn: prChangedFilesFn } : {}),
                     // #88: метку снимает только ОПРЕДЕЛЁННЫЙ исход. Смерджено — снимет переход
                     // фазы той же записью; отказ форжа по существу с первой попытки — гейт
                     // (мерджа нет точно). Не подтверждено, транзиент за пределом, «влито, дерево
@@ -9221,6 +9258,41 @@ export function createOrchestrator(env: OrchestratorEnv) {
                             question:
                                 'реши, чья история верна: локальные коммиты запушь без --force либо сбрось ref на origin, ' +
                                 'затем перезапусти loop — сдача не повторится, пойдёт сразу гейт',
+                        });
+                    pushEventFn(stopMsg, cfg, { logFn });
+                    state.gateHeals = 0;
+                    state.forgeHealedRunId = null;
+                    saveStateFn(state);
+                    break;
+                }
+                // #139: PR правит защищаемый путь на площадке, которая его не держит, либо
+                // файлы PR не сверились. Чини-сессии нет: правка lock, шима или контракта —
+                // решение человека, а не дефект кода. Мерджит человек руками. Заголовок и
+                // вопрос — по виду развилки: «правит защищаемый путь» на PR, где файлы просто
+                // не сверились, отправил бы человека искать правку, которой нет.
+                if (gate === 'protected-paths') {
+                    const ppStop = getLastProtectedPathsStop();
+                    const kind = ppStop?.kind ?? 'unverified';
+                    const head =
+                        kind === 'hits'
+                            ? `PR фазы "${phase.milestone}" правит защищаемый путь`
+                            : kind === 'empty'
+                              ? `PR фазы "${phase.milestone}" пуст относительно main`
+                              : `защищаемые пути PR фазы "${phase.milestone}" не сверены`;
+                    const question =
+                        kind === 'hits'
+                            ? 'посмотри правку названных файлов и смерджи PR руками, затем перезапусти loop'
+                            : kind === 'empty'
+                              ? 'мерджить нечего: закрой PR или разбери, почему ветка пуста, затем перезапусти loop'
+                              : 'почини причину, по которой файлы PR не получены, и перезапусти loop — сдача не повторится, пойдёт сразу гейт';
+                    const stopMsg =
+                        `⛔ Ralph: ${head} — PR оставлен человеку. ` +
+                        formatStopMessage({
+                            reason: 'protected-paths',
+                            diagnosis:
+                                ppStop?.why ??
+                                'гейт вернул protected-paths без записи о причине (регресс проводки)',
+                            question,
                         });
                     pushEventFn(stopMsg, cfg, { logFn });
                     state.gateHeals = 0;
@@ -10063,7 +10135,21 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // Резолв здесь, до preflight/runLoop: весь раннер дальше читает ПЛОСКИЙ конфиг и
         // про профили не знает вовсе. Парсим флаг в main(), а не в entry рядом с ONCE/DRY —
         // иначе кривой argv ронял бы process.exit при простом import в тестах.
-        config = resolveProfile(raw, parseProfileFlag(argv)) as RalphConfig;
+        // #140: `--consumer` ставит launcher — с ним корни, которых конфиг не назвал,
+        // выводятся из того, что launcher знает сам. Без флага — прежнее правило.
+        let launchConsumer: string | null = null;
+        try {
+            launchConsumer = parseLaunchConsumer(argv);
+        } catch (e) {
+            fail(`🔐 Старт отвергнут: ${(e as Error).message}`);
+        }
+        config = resolveProfile(
+            raw,
+            parseProfileFlag(argv),
+            undefined,
+            undefined,
+            launchConsumer === null ? null : { consumerRoot: launchConsumer, env: process.env },
+        ) as RalphConfig;
         // Канон, задача 25: команда проверяется ДО первой записи на диск (ревью Codex, !23).
         // Все три случая — молчаливый сдвиг режима, худший исход для автономного раннера:
         //   • два режима разом: победил бы порядок веток кода, а не намерение человека;
@@ -10124,6 +10210,12 @@ export function createOrchestrator(env: OrchestratorEnv) {
                       productRootFrom,
                   )
                 : null;
+        // #140: умолчания корней — только ядру из установки (`rootsDefaultRefusal`).
+        const rootsDefaultDenied = rootsDefaultRefusal(
+            config.rootsDefaulted ?? [],
+            coreCheck.status === 'ok',
+            PRODUCT_DIR,
+        );
         if (DOCTOR) {
             // Тот же код, что у старта, — и до первой записи: doctor спрашивают как раз
             // тогда, когда старт под вопросом, и он не вправе ничего трогать. Проверки старта
@@ -10132,6 +10224,13 @@ export function createOrchestrator(env: OrchestratorEnv) {
             const wt = resolveWorktreePath(config);
             const roots0 = config.rootsResolved;
             const startChecks = [
+                ...doctorRootsLines(
+                    roots0 ?? null,
+                    config.rootsDefaulted ?? [],
+                    config.productRootFrom ?? null,
+                    coreCheck.status === 'ok',
+                    PRODUCT_DIR,
+                ),
                 ...doctorStartChecks({
                     productRootDrift,
                     productRoot: PRODUCT_DIR,
@@ -10171,6 +10270,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         }
         if (coreCheck.status === 'refused') fail(describeStartCheck(coreCheck));
         if (productRootDrift) fail(`🔐 Старт отвергнут: ${productRootDrift}.`);
+        if (rootsDefaultDenied) fail(`🔐 Старт отвергнут: ${rootsDefaultDenied}.`);
         const compat = checkCompatibility({ lock: compatLock, observed: compatObserved });
         if (!compat.ok) fail(describeCompat(compat));
 
@@ -10235,6 +10335,17 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 if (!owned) return;
                 process.on('exit', () => releaseRepoOwnershipIfOurs(owned));
             }
+            // #146: старая раскладка живёт в двух местах. До `chdir` лок, лог и события
+            // ложатся в `.claude/ralph` места запуска, а state — уже после него, в
+            // `.claude/ralph` дерева раннера. Опись и маркер по одному месту теряли state:
+            // переезд отчитывался успехом, а старт из дерева раннера маркера не видел.
+            // null — дерева раннера нет или оно и есть место запуска.
+            const legacyRunnerDir = runnerLegacyDir(
+                resolveWorktreePath(config),
+                LEGACY_DIR,
+                path.resolve(LEGACY_DIR),
+                migrationDeps.existsFn,
+            );
             if (roots) {
                 // Лог режима — в НОВЫЙ каталог: initialLogTarget фабрики захвачен до репойнта
                 // и указывает в старую раскладку, а писать туда после переезда значит заново
@@ -10253,6 +10364,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         LEGACY_DIR,
                         roots.runtimeDir,
                         migrationDeps.existsFn,
+                        { runnerDir: legacyRunnerDir },
                     );
                     const started = readMigrationJournal(roots.runtimeDir, migrationDeps);
                     if (plan.files.length === 0 && started?.status !== 'in-progress') {
@@ -10272,6 +10384,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
             // нет вовсе: иначе запуск со старым конфигом не увидел бы уехавшего состояния и
             // начал бы новую фазу рядом с ним.
             assertLegacyNotMigrated(LEGACY_DIR, roots?.runtimeDir ?? null, migrationDeps);
+            if (legacyRunnerDir) {
+                assertLegacyNotMigrated(legacyRunnerDir, roots?.runtimeDir ?? null, migrationDeps);
+            }
         }
         // Абсолютный путь лока фиксируем ДО chdir в worktree: exit-хендлер ниже снимает СВОЙ
         // лок (releaseLockIfOurs), а относительный путь после chdir указал бы внутрь дерева
@@ -10313,17 +10428,14 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // пропали бы. #386: репойнтим ВСЕГДА, в т.ч. для DRY — иначе logTarget остаётся
         // относительным, а process.chdir ниже (ветка runnerWorktreeReady) молча резолвит
         // его в ТОТ ЖЕ файл, что и боевой прогон (сам chdir не читает DRY). chooseLogPath
-        // разводит боевой прогон (профиль prod, не dry) и все остальные — по абсолютному
+        // разводит живой прогон и --dry-run (#141: профиль не решает) — по абсолютному
         // пути внутри worktree, так что результат не зависит от того, случился chdir или
         // нет. DRY при этом остаётся read-only в смысле C1 (git/worktree/state) — просто
         // хозяйский лог-канал больше не общий.
         setLogTarget(
             underRoot(
                 worktreePath,
-                chooseLogPath(
-                    { dry: DRY, profileName: config.profileName },
-                    { battle: RUNTIME.log, sideline: RUNTIME.dryLog },
-                ),
+                chooseLogPath({ dry: DRY }, { battle: RUNTIME.log, sideline: RUNTIME.dryLog }),
             ),
         );
 
@@ -10336,7 +10448,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
         log(`⚙️  Профиль: ${config.profileName}`);
         log(describeStartCheck(coreCheck));
         if (activated) log(describeActivation(activated));
-        if (roots) log(`🗂  Состояние экземпляра: ${roots.runtimeDir}`);
+        if (roots) {
+            log(`🗂  Состояние экземпляра: ${roots.runtimeDir}`);
+            log(describeRoots(roots, config.rootsDefaulted ?? [], config.productRootFrom ?? null));
+        }
 
         // #44: рантайм кодера — до worktree и установки зависимостей (докблок
         // checkCoderRuntimes). В --dry-run тоже: проба ничего не пишет, а ответ «запустится
@@ -10610,7 +10725,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // тоже обязаны падать guardSideEffect, если дефолт-коллаборатор не подменили.
         shArgv,
         log,
-        // #386: разводка лога боевого/не-боевого прогона — экспорт для юнита, main() не
+        // #386, #141: разводка лога живого прогона и --dry-run — экспорт для юнита, main() не
         // тестируется напрямую (см. докблок createOrchestrator).
         chooseLogPath,
         sideEffectAttempts,
@@ -10765,6 +10880,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         getLastGatePr: gateGetLastGatePr,
         getLastForgeRedCheck: gateGetLastForgeRedCheck,
         getLastForgeStop: gateGetLastForgeStop,
+        getLastProtectedPathsStop: gateGetLastProtectedPathsStop,
         getLastMergeFailure: gateGetLastMergeFailure,
         getLastToolFailure: gateGetLastToolFailure,
         getLastMainSyncStop: gateGetLastMainSyncStop,

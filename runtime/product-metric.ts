@@ -46,6 +46,8 @@ export const GATE_BARRIERS = {
     'forge-env': 'CI площадки: отказ среды или прерван',
     'forge-no-verdict': 'CI площадки без вердикта',
     'forge-required': 'политика required: подтвердить CI нечем',
+    // #139: на площадке без правила ревью по путям защищаемые пути держит гейт.
+    'protected-paths': 'правка защищаемого пути или файлы PR не сверены',
 } as const;
 
 export type TGateBarrier = keyof typeof GATE_BARRIERS;
@@ -62,6 +64,7 @@ const GATE_LINE_RES: Array<[RegExp, TGateBarrier]> = [
     [/^⛔ Гейт: чек PR #\S+: политика required/u, 'forge-required'],
     [/^⛔ Гейт: чек .* упал на инструменте/u, 'gate-tool-failure'],
     [/^⛔ Гейт: чек .* красный на PR/u, 'gate-red'],
+    [/^⛔ Гейт: сверка защищаемых путей PR #/u, 'protected-paths'],
 ];
 
 /** Барьер гейта по тексту строки лога (без отметки времени); null — не барьер или незнакомая строка. */
@@ -91,7 +94,11 @@ export const STOP_ROLES: Record<TStopReason, 'barrier' | 'paired' | 'loop'> = {
     'review-no-verdict': 'barrier',
     'blocked-unconfirmed': 'barrier',
     'main-conflict': 'loop',
+    // #139: строка гейта `сверка защищаемых путей PR #…` уже посчитана барьером.
+    'protected-paths': 'paired',
     'main-sync-failed': 'loop',
+    // #144: origin не ответил постановке на ветку фазы — стоп среды петли, не барьер.
+    'origin-network': 'loop',
     // Коммиты сессии разбора пушит сам раннер (#85), так что расхождение, дошедшее до
     // гейта, — коллизия историй (ветку допушили снаружи, пуш сессии не доехал), а не
     // пойманное плохое изменение: стоп петли того же рода, что `session-unpushed`.

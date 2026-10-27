@@ -4,8 +4,10 @@ import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { CONSUMER_CONFIG_REL } from '../core/consumer-config-path.ts';
+import { protectedPatterns } from '../core/protected-paths.ts';
 import {
     PROTECTED_PATHS,
+    approvalRules,
     isExactPath,
     parseReviewRules,
     patternCovers,
@@ -36,6 +38,25 @@ describe('фактическая политика ревью площадки', 
         // читает, и сверка была зелёной на дыре. Путь — константа ядра, а не повтор строкой.
         expect(byPath(CONSUMER_CONFIG_REL).path).toBe('.claude/ralph/ralph.config.json');
         expect(unprotectedPaths(actualRules(), [byPath(CONSUMER_CONFIG_REL)])).toEqual([]);
+    });
+
+    // #139: по тем же маскам гейт мерджа держит пути там, где площадка не держит. Маска,
+    // не покрывающая свою пробу, или маска, которой нет в политике, развела бы раннер и
+    // площадку: одна защищала бы то, чего не защищает другая.
+    it.each(PROTECTED_PATHS.map((p) => [p.path, p.pattern]))(
+        'маска раннера для %s (%s) покрывает пробу',
+        (path, pattern) => {
+            expect(pattern === path || patternCovers(pattern, path)).toBe(true);
+        },
+    );
+
+    it('каждая маска раннера стоит в политике площадки дословно', () => {
+        const patterns = approvalRules(actualRules()).flatMap((r) => r.patterns);
+        expect(protectedPatterns().filter((p) => !patterns.includes(p))).toEqual([]);
+    });
+
+    it('список защищаемых путей сам под защитой', () => {
+        expect(unprotectedPaths(actualRules(), [byPath('core/protected-paths.ts')])).toEqual([]);
     });
 
     it('разбор видит правило с одобрением, а не пустоту', () => {
@@ -104,7 +125,12 @@ describe('точный путь файла: маска каталога не з�
     });
 
     it('файл в корне точный и без флага: `**` и `*.json` его не защищают', () => {
-        const root: ProtectedPath = { path: 'root.json', exact: false, why: 'проба' };
+        const root: ProtectedPath = {
+            path: 'root.json',
+            exact: false,
+            pattern: 'root.json',
+            why: 'проба',
+        };
         expect(isExactPath(root)).toBe(true);
         expect(isExactPath({ ...root, path: 'dir/root.json' })).toBe(false);
         for (const pat of ['**', '*.json', '*']) {

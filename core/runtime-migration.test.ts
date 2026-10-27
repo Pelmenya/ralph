@@ -17,6 +17,7 @@ import {
     assertMigrationSettled,
     MIGRATION_JOURNAL,
     MIGRATED_MARKER,
+    runnerLegacyDir,
 } from './runtime-migration.ts';
 
 const FROM = '/app/.ralph/core';
@@ -109,9 +110,47 @@ describe('planRuntimeMigration — что именно переезжает', ()
         ]);
     });
 
+    it('#146: дерево раннера, совпавшее с местом запуска, не удваивает опись', () => {
+        const { deps } = fakeFs({ [`${FROM}/ralph.state.json`]: VALID_STATE });
+        const plan = planRuntimeMigration(FROM, TO, deps.existsFn, { runnerDir: FROM });
+        expect(plan.files.map((f) => f.name)).toEqual(['ralph.state.json']);
+        expect(plan.origins).toBeUndefined();
+    });
+
+    it('#146: без дерева раннера лог без state переезжает, как раньше', () => {
+        // Отказ «нет state» — только при живом дереве раннера: без него state в старой
+        // раскладке может не появиться законно (петля ни разу не дошла до итерации).
+        const { deps } = fakeFs({ [`${FROM}/ralph.log`]: 'лог' });
+        expect(planRuntimeMigration(FROM, TO, deps.existsFn).files.map((f) => f.name)).toEqual([
+            'ralph.log',
+        ]);
+    });
+
     it('пустая старая раскладка — план пуст, мигрировать нечего', () => {
         const { deps } = fakeFs();
         expect(planRuntimeMigration(FROM, TO, deps.existsFn).files).toEqual([]);
+    });
+});
+
+describe('runnerLegacyDir — второе место старой раскладки (#146)', () => {
+    const has =
+        (...paths: string[]) =>
+        (p: string) =>
+            paths.includes(p);
+    it('дерево раннера есть и отдельно — его .claude/ralph', () => {
+        expect(
+            runnerLegacyDir('/app-ralph', '.claude/ralph', '/app/.claude/ralph', has('/app-ralph')),
+        ).toBe('/app-ralph/.claude/ralph');
+    });
+    it('дерева нет — null: второго места нет', () => {
+        expect(runnerLegacyDir('/app-ralph', '.claude/ralph', '/app/.claude/ralph', has())).toBe(
+            null,
+        );
+    });
+    it('дерево раннера и есть место запуска — null, а не удвоенная опись', () => {
+        expect(runnerLegacyDir('/app', '.claude/ralph', '/app/.claude/ralph', has('/app'))).toBe(
+            null,
+        );
     });
 });
 

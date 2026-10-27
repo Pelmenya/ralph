@@ -1,6 +1,7 @@
 /**
- * Команды launcher `./ralph`: install, update, rollback, doctor, start, stop, version (Фаза 12, `#36`
- * часть 1; update — Фаза 13, #102, `core-update.ts`; rollback — #103, `core-rollback.ts`).
+ * Команды launcher `./ralph`: install, update, rollback, prune, doctor, start, stop, version (Фаза 12,
+ * `#36` часть 1; update — Фаза 13, #102, `core-update.ts`; rollback — #103, `core-rollback.ts`;
+ * prune — Ф15, #138, `consumer-registry.ts`).
  *
  * Пока человек вбивал SHA и пути руками, продукта не было — была инструкция по сборке
  * (PRD, сценарий владельца проекта). Здесь механизм доставки (`core-install.ts`) и контракт
@@ -15,6 +16,9 @@
  *   - **rollback** — обратная смена ревизии тем же путём PR, что update; цель — из журнала
  *     активации, а откат через необратимую миграцию state отвергается до правки lock
  *     (`core-rollback.ts`).
+ *   - **prune** чистит каталог установок с учётом ВСЕХ потребителей реестра хоста: install и
+ *     start записывают в него своего потребителя, чистка вычитает наборы «оставить» каждого
+ *     и ревизии живых раннеров; нечитаемый lock или журнал любого — отказ целиком.
  *   - **doctor** — те же проверки без старта, и проваленная проверка не прячет следующую:
  *     человек чинит установку за один заход, а не по одной причине на запуск. Проверка,
  *     которой нужен результат проваленной, не «проходит» и не молчит — она названа
@@ -48,6 +52,7 @@ import { isAbsolute, join } from 'node:path';
 import {
     CORE_LOCK_PATH,
     CORE_LOCK_SCHEMA,
+    isFullSha,
     parseCoreVersions,
     readCoreLock,
     resolveDataDir,
@@ -81,11 +86,22 @@ import {
     rollbackTarget,
 } from './core-rollback.ts';
 import { runtimePathsIn } from './runtime-paths.ts';
+import { LAUNCH_CONSUMER_FLAG } from './roots.ts';
+import { parseProfileArgv } from './config-profile.ts';
+import {
+    collectRetained,
+    prunePlan,
+    readConsumerRegistry,
+    registerConsumer,
+    type TConsumerRecord,
+    type TRegistryFs,
+} from './consumer-registry.ts';
 
 export const LAUNCHER_COMMANDS = [
     'install',
     'update',
     'rollback',
+    'prune',
     'doctor',
     'start',
     'stop',
@@ -106,7 +122,7 @@ export type TLauncherArgs = {
 export type TParsedArgs = { ok: true; args: TLauncherArgs } | { ok: false; reason: string };
 
 const USAGE =
-    'Команды: install [--rev <ревизия>], update <ревизия>, rollback [--profile <имя>], doctor, start [флаги ralph.js], stop [--profile <имя>], version.';
+    'Команды: install [--rev <ревизия>], update <ревизия>, rollback [--profile <имя>], prune, doctor, start [флаги ralph.js], stop [--profile <имя>], version.';
 
 /**
  * Разбор командной строки launcher. Свои флаги (`--consumer`, `--source`, `--rev`) launcher
@@ -198,7 +214,7 @@ export function parseLauncherArgv(argv: readonly string[]): TParsedArgs {
         }
         rest.length = 0;
     }
-    if ((cmd === 'install' || cmd === 'version') && rest.length > 0) {
+    if ((cmd === 'install' || cmd === 'version' || cmd === 'prune') && rest.length > 0) {
         return { ok: false, reason: `${cmd} не знает флага "${rest[0]}". ${USAGE}` };
     }
     return {
@@ -261,6 +277,18 @@ export type TLauncherDeps = {
      * после обрыва находит PR прежней попытки и второй не заводит (#104). Сбой — бросок.
      */
     findOpenPrFn: TFindLockPrFn;
+    /** Файлы реестра потребителей каталога установок (`consumer-registry.ts`). */
+    registryFs: TRegistryFs;
+    /** Имена в каталоге установок; каталога нет — пусто. */
+    listDataDirFn: (dataDir: string) => string[];
+    renameFn: (from: string, to: string) => void;
+    /** Рекурсивное удаление каталога. */
+    rmFn: (p: string) => void;
+    /**
+     * Ревизии каталога установок, чей `ralph.js` сейчас исполняется (`runnerRevision` по всем
+     * процессам). Не выяснить — бросок: чистка без этой сверки не идёт.
+     */
+    runningRevisionsFn: (dataDir: string) => Set<string>;
 };
 
 // Именованные алиасы, а не инлайновые типы: `=>` инлайнового типа скан дефолтов форжа
@@ -404,6 +432,15 @@ export function inspectInstallation(consumerRoot: string, deps: TLauncherDeps): 
     return { checks, lock, dir, treeOk };
 }
 
+/**
+ * argv ядра: `--consumer <каталог>` первым, затем аргументы человека (#140). По флагу ядро
+ * узнаёт старт через launcher и выводит корни, которых конфиг не назвал, — без него ядро из
+ * установки требовало абсолютные пути машины в конфиге, и тот не мог жить в git.
+ */
+export function coreArgv(consumerRoot: string, args: readonly string[]): string[] {
+    return [LAUNCH_CONSUMER_FLAG, consumerRoot, ...args];
+}
+
 const allOk = (checks: readonly TCheck[]) => checks.every((c) => c.status === 'ok');
 
 /**
@@ -420,7 +457,11 @@ export function runDoctorCommand(args: TLauncherArgs, deps: TLauncherDeps): numb
             detail: 'дерево не сверено с lock — его --doctor не исполняется',
         });
     } else {
-        const code = deps.runCoreFn(inst.dir, ['--doctor', ...args.passthrough], args.consumerRoot);
+        const code = deps.runCoreFn(
+            inst.dir,
+            coreArgv(args.consumerRoot, ['--doctor', ...args.passthrough]),
+            args.consumerRoot,
+        );
         checks.push(
             code === 0
                 ? { name: 'ядро', status: 'ok', detail: 'ralph.js --doctor: старт разрешён' }
@@ -486,6 +527,22 @@ export function runStartCommand(args: TLauncherArgs, deps: TLauncherDeps): numbe
             );
             return 1;
         }
+        // Реестр — до первого запуска ядра (#138): исполняемую ревизию держит сверка `/proc`,
+        // а вот цель отката живёт в журнале активации профиля, и потребитель, которого нет в
+        // реестре, отдал бы её чистке соседа. `--dry-run` реестр не пишет: сухой прогон по
+        // контракту ядра только читает, а журнала активации он не ведёт.
+        if (previous === null && !args.passthrough.includes('--dry-run')) {
+            const prof = startProfile(args.passthrough);
+            if (!prof.ok) {
+                deps.out(`⛔ start отменён: ${prof.reason}`);
+                return 1;
+            }
+            const reg = registerHere(args.consumerRoot, prof.profile, deps);
+            if (reg !== null) {
+                deps.out(`⛔ start отменён: ${reg}`);
+                return 1;
+            }
+        }
         if (previous !== null && inst.lock.sha === previous) {
             sameRestarts += 1;
             if (sameRestarts > 1) {
@@ -510,7 +567,11 @@ export function runStartCommand(args: TLauncherArgs, deps: TLauncherDeps): numbe
         // отвечает за то, ЧТО запускать, ядро — за то, что запущено именно оно, и сверка ядра
         // обязана стоять и при прямом `node <dir>/ralph.js` мимо launcher.
         const startedAt = deps.nowFn();
-        const code = deps.runCoreFn(inst.dir, args.passthrough, args.consumerRoot);
+        const code = deps.runCoreFn(
+            inst.dir,
+            coreArgv(args.consumerRoot, args.passthrough),
+            args.consumerRoot,
+        );
         if (code !== ACTIVATION_RESTART_EXIT) return code;
         if (deps.nowFn() - startedAt > SAME_RESTART_WORK_MS) sameRestarts = 0;
         previous = inst.lock.sha;
@@ -537,6 +598,17 @@ export function runInstallCommand(args: TLauncherArgs, deps: TLauncherDeps): num
                 return 1;
             }
             const sha = deps.resolveRevFn(args.source, args.rev);
+            // Запись реестра — до установки: чистка соседа, прошедшая между установкой и
+            // записью, удалила бы ревизию, которой ещё не назвал ни один lock.
+            const reg = registerIn(
+                dataDir,
+                { consumerRoot: args.consumerRoot, runtimeDir: null },
+                deps,
+            );
+            if (reg !== null) {
+                deps.out(`⛔ install: ${reg}`);
+                return 1;
+            }
             const res = deps.installFn({ sha, dataDir, source: args.source });
             if (res.status === 'present') {
                 // Каталог уже лежал, а lock ещё нет: сверить его не с чем, кроме собственного
@@ -591,6 +663,15 @@ export function runInstallCommand(args: TLauncherArgs, deps: TLauncherDeps): num
                     );
                     return 1;
                 }
+            }
+            const reg = registerIn(
+                dataDir,
+                { consumerRoot: args.consumerRoot, runtimeDir: null },
+                deps,
+            );
+            if (reg !== null) {
+                deps.out(`⛔ install: ${reg}`);
+                return 1;
             }
             const res = deps.installFn({
                 sha: r.lock.sha,
@@ -1029,6 +1110,131 @@ function lockedRevision(
     }
 }
 
+/**
+ * Профиль, с которым start запускает ядро: `--profile <имя>` или `--profile=<имя>`. Разбор —
+ * тот же, что у ядра (`parseProfileArgv`): своя копия писала бы в реестр каталог не того
+ * профиля там, где ядро откажет. Кривой флаг — отказ с текстом ядра.
+ */
+export function startProfile(
+    passthrough: readonly string[],
+): { ok: true; profile: string | null } | { ok: false; reason: string } {
+    let reason: string | null = null;
+    const profile = parseProfileArgv(passthrough, (msg) => {
+        reason = msg;
+        return null;
+    }) as string | null;
+    return reason === null ? { ok: true, profile } : { ok: false, reason };
+}
+
+/** Запись в реестр каталога установок; причина отказа или null. */
+function registerIn(dataDir: string, rec: TConsumerRecord, deps: TLauncherDeps): string | null {
+    try {
+        registerConsumer(dataDir, rec, deps.registryFs);
+        return null;
+    } catch (e) {
+        return (
+            `запись реестра потребителей в ${dataDir} не легла (${(e as Error).message}) — ` +
+            'без неё чистка соседа сочла бы ревизии этого потребителя ничьими.'
+        );
+    }
+}
+
+/** Запись старта: дерево и каталог состояния профиля, с которым идёт ядро. */
+function registerHere(
+    consumerRoot: string,
+    profile: string | null,
+    deps: TLauncherDeps,
+): string | null {
+    let rec: TConsumerRecord;
+    let dataDir: string;
+    try {
+        rec = { consumerRoot, runtimeDir: deps.runtimeDirOfFn(consumerRoot, profile) };
+        dataDir = resolveDataDir(deps.env);
+    } catch (e) {
+        return `каталог состояния для реестра потребителей не определён — ${(e as Error).message}`;
+    }
+    return registerIn(dataDir, rec, deps);
+}
+
+/**
+ * prune (#138): удаляет из каталога установок ревизии, которые не нужны НИ ОДНОМУ потребителю
+ * реестра (lock, исполняемая, цель отката — `collectRetained`) и не исполняются живым
+ * раннером. Нечитаемое у любого потребителя — отказ целиком: чистка, пропустившая соседа,
+ * удалила бы его ревизию. Удаление — переименованием в `.<sha>.pruning-<pid>` и затем `rm`:
+ * оборванное посреди `rm`, оно не оставляет под именем ревизии неполного дерева, которое
+ * выглядело бы установленным; остаток снимает следующая чистка.
+ */
+export function runPruneCommand(args: TLauncherArgs, deps: TLauncherDeps): number {
+    const refuse = (why: string) => {
+        deps.out(`⛔ prune: ${why} Ничего не удалено.`);
+        return 1;
+    };
+    let dataDir: string;
+    try {
+        dataDir = resolveDataDir(deps.env);
+    } catch (e) {
+        return refuse(`${(e as Error).message}.`);
+    }
+    // Себя — в реестр тоже: потребитель, поставленный до реестра, иначе не учёлся бы. И не
+    // одним lock, а с каталогом состояния профиля по умолчанию: журнал активации там держит
+    // цель отката, и без него она ушла бы в список
+    // на удаление — ровно в момент инцидента `./ralph rollback` без `RALPH_SOURCE` её бы не
+    // поставил. Каталог не определился — отказ, а не запись одного lock. Прочие профили
+    // пишут себя своим `start`.
+    let selfRuntimeDir: string;
+    try {
+        selfRuntimeDir = deps.runtimeDirOfFn(args.consumerRoot, args.profile);
+    } catch (e) {
+        return refuse(
+            `каталог состояния ${args.consumerRoot} для реестра не определён (${(e as Error).message}) — без журнала активации цель отката не видна.`,
+        );
+    }
+    const self = registerIn(
+        dataDir,
+        { consumerRoot: args.consumerRoot, runtimeDir: selfRuntimeDir },
+        deps,
+    );
+    if (self !== null) return refuse(self);
+    let entries: ReturnType<typeof readConsumerRegistry>;
+    let installed: string[];
+    let running: Set<string>;
+    try {
+        entries = readConsumerRegistry(dataDir, deps.registryFs);
+        installed = deps.listDataDirFn(dataDir);
+        running = deps.runningRevisionsFn(dataDir);
+    } catch (e) {
+        return refuse(`${(e as Error).message}.`);
+    }
+    const collected = collectRetained(entries, deps.readFn);
+    if (!collected.ok) {
+        for (const p of collected.problems) deps.out(`❌ ${p}`);
+        return refuse(
+            `наборы ${String(collected.problems.length)} потребителей не прочитаны — без них ревизии соседа не отличить от ничьих.`,
+        );
+    }
+    for (const s of collected.sets) deps.out(`🔒 ${s.who}: оставлены ${[...s.keep].join(', ')}`);
+    if (running.size > 0) deps.out(`🔒 исполняются сейчас: ${[...running].join(', ')}`);
+    const plan = prunePlan(installed, collected.sets, running);
+    try {
+        for (const name of plan.leftovers) deps.rmFn(join(dataDir, name));
+        for (const sha of plan.revisions) {
+            const doomed = join(dataDir, `.${sha}.pruning-${String(process.pid)}`);
+            deps.renameFn(join(dataDir, sha), doomed);
+            deps.rmFn(doomed);
+            deps.out(`🗑 ${sha} удалена`);
+        }
+    } catch (e) {
+        deps.out(`⛔ prune: удаление оборвалось — ${(e as Error).message}. Остаток снимет повтор.`);
+        return 1;
+    }
+    deps.out(
+        plan.revisions.length === 0
+            ? `🧹 prune: удалять нечего — все ${String(installed.filter((n) => isFullSha(n)).length)} ревизий кому-то нужны.`
+            : `🧹 prune: удалено ${String(plan.revisions.length)}, учтено потребителей: ${String(collected.sets.length)}.`,
+    );
+    return 0;
+}
+
 /** Версия продукта человеку: ревизия из lock и версии слоёв — без чтения git. */
 export function runVersionCommand(args: TLauncherArgs, deps: TLauncherDeps): number {
     const launcher = observeLauncher(deps.env);
@@ -1059,6 +1265,8 @@ export function runLauncher(argv: readonly string[], deps: TLauncherDeps): numbe
             return runUpdateCommand(a, deps);
         case 'rollback':
             return runRollbackCommand(a, deps);
+        case 'prune':
+            return runPruneCommand(a, deps);
         case 'doctor':
             return runDoctorCommand(a, deps);
         case 'start':

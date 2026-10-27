@@ -116,26 +116,21 @@ export function resolveRuntimeDir(args: string[], fallback: string): string {
 
 const RUNTIME_DIR = resolveRuntimeDir(process.argv.slice(2), RALPH_DIR);
 
-// #386: раннер разводит боевой ralph.log и не-боевой ralph.dry.log (chooseLogPath, exec.ts).
-// Панель выбирает между ними тем же кодом — см. monitorLogPath. LOG_PATH (боевой) остаётся
-// дефолтом readLogTail для ручных вызовов/тестов; snapshot() переопределяет его по профилю.
+// #386, #141: раннер разводит ralph.log живого прогона и ralph.dry.log --dry-run
+// (chooseLogPath, exec.ts). Панель выбирает между ними тем же кодом — см. monitorLogPath.
+// LOG_PATH остаётся дефолтом readLogTail для ручных вызовов/тестов.
 const LOG_PATH_BATTLE = path.join(RUNTIME_DIR, 'ralph.log');
 const LOG_PATH_SIDELINE = path.join(RUNTIME_DIR, 'ralph.dry.log');
 const LOG_PATH = LOG_PATH_BATTLE;
 const STATE_PATH = path.join(RUNTIME_DIR, 'ralph.state.json');
 
-// #386: путь лога, который читает панель, = путь, в который пишет наблюдаемый прогон.
-// Раннер решает его через chooseLogPath по РЕЗОЛВНУТОМУ профилю (боевой ralph.log только
-// для profileName==='prod' && !dry); панель обязана читать ровно тот же файл, иначе о жизни
-// боевой петли судила бы по протухшему ralph.dry.log (или наоборот). dry:false — у монитора
-// нет своего dry-режима: для dry-прогона раннер монитор вообще не спавнит, значит выбор
-// решает один профиль. Конфиг недоверенный/нечитаемый (config===null) → profileName undefined
-// → консервативно sideline, как и у самого chooseLogPath.
-export function monitorLogPath(config: ResolvedConfig): string {
-    return chooseLogPath(
-        { dry: false, profileName: config?.profileName },
-        { battle: LOG_PATH_BATTLE, sideline: LOG_PATH_SIDELINE },
-    );
+// #386, #141: путь лога, который читает панель, = путь, в который пишет наблюдаемый прогон.
+// Раннер решает его через chooseLogPath одним флагом --dry-run (профиль не решает, #141), а
+// монитор спавнится только живым прогоном — значит панель читает ralph.log при любом
+// профиле. Развилка та же функция, что у раннера: поменяй правило там — панель пойдёт следом,
+// а не останется смотреть в файл, куда уже никто не пишет.
+export function monitorLogPath(): string {
+    return chooseLogPath({ dry: false }, { battle: LOG_PATH_BATTLE, sideline: LOG_PATH_SIDELINE });
 }
 
 const args = process.argv.slice(2);
@@ -762,11 +757,10 @@ function snapshot(): void {
     // признак жизни (alive), и детект тишины, и последние значимые строки. Детект смотрит
     // сырой хвост (маркеры ✓/✗/🚦 в SIGNAL_RE не попадают), панель — только значимые
     // (signalTail). Сам пуш о тишине и дедуп — #149; здесь только детект и его показ.
-    // #386: путь лога — по профилю резолвнутого конфига, а не жёстко ralph.log: не-боевой
-    // прогон (playground) пишет в ralph.dry.log, и панель обязана читать именно его.
+    // #386, #141: путь лога — тот же, что выбрал наблюдаемый живой прогон (monitorLogPath).
     // Задача 95: свежесть берётся у лога ИЛИ у heartbeat — отказ записи лога при живом
     // раннере больше не выглядит тишиной (см. withHeartbeat).
-    const logPath = monitorLogPath(config);
+    const logPath = monitorLogPath();
     const { lines: allLogLines, lastMtime } = withHeartbeat(
         readLogTail(null, logPath),
         readHeartbeat(companionPaths(logPath).heartbeat),

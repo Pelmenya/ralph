@@ -35,8 +35,10 @@ import {
     runLauncher,
     runUpdateCommand,
     SAME_RESTART_WORK_MS,
+    startProfile,
     type TLauncherDeps,
 } from './launcher.ts';
+import { registerConsumer } from './consumer-registry.ts';
 
 const SHA = 'a'.repeat(40);
 const OTHER = 'b'.repeat(40);
@@ -115,6 +117,32 @@ function world(over: Partial<TLauncherDeps> = {}, opts: { lock?: string | null }
         pushLockBranchFn: vi.fn(() => 'c'.repeat(40)),
         openPrFn: vi.fn(() => 7),
         findOpenPrFn: vi.fn(() => null),
+        registryFs: {
+            readFile: (p) => {
+                const t = files.get(p);
+                if (t === undefined) {
+                    throw Object.assign(new Error(`ENOENT ${p}`), { code: 'ENOENT' });
+                }
+                return t;
+            },
+            readdir: (d) => {
+                const names = [...files.keys()]
+                    .filter((p) => p.startsWith(`${d}/`))
+                    .map((p) => p.slice(d.length + 1));
+                if (names.length === 0) {
+                    throw Object.assign(new Error(`ENOENT ${d}`), { code: 'ENOENT' });
+                }
+                return names;
+            },
+            mkdir: () => {},
+            writeAtomic: vi.fn((p: string, t: string) => {
+                files.set(p, t);
+            }),
+        },
+        listDataDirFn: vi.fn(() => [SHA]),
+        renameFn: vi.fn(),
+        rmFn: vi.fn(),
+        runningRevisionsFn: vi.fn(() => new Set<string>()),
         ...over,
     };
     return { files, dirs, out, deps };
@@ -196,7 +224,7 @@ describe('doctor', () => {
         ]);
         expect(w.deps.runCoreFn).toHaveBeenCalledWith(
             dir,
-            ['--doctor', '--profile', 'p'],
+            ['--consumer', CONSUMER, '--doctor', '--profile', 'p'],
             CONSUMER,
         );
     });
@@ -290,7 +318,11 @@ describe('start', () => {
         const w = world({ runCoreFn: vi.fn(() => 7) });
         expect(run(w, 'start', '--dry-run')).toBe(7);
         expect(w.out).toEqual([`▶ Ralph ${SHA} из ${dir}`]);
-        expect(w.deps.runCoreFn).toHaveBeenCalledWith(dir, ['--dry-run'], CONSUMER);
+        expect(w.deps.runCoreFn).toHaveBeenCalledWith(
+            dir,
+            ['--consumer', CONSUMER, '--dry-run'],
+            CONSUMER,
+        );
     });
 
     it('проваленная проверка — ядро не зовётся, причина названа', () => {
@@ -330,8 +362,18 @@ describe('start — активация рестартом (#38)', () => {
             }),
         });
         expect(run(w, 'start')).toBe(0);
-        expect(w.deps.runCoreFn).toHaveBeenNthCalledWith(1, dir, [], CONSUMER);
-        expect(w.deps.runCoreFn).toHaveBeenNthCalledWith(2, other, [], CONSUMER);
+        expect(w.deps.runCoreFn).toHaveBeenNthCalledWith(
+            1,
+            dir,
+            ['--consumer', CONSUMER],
+            CONSUMER,
+        );
+        expect(w.deps.runCoreFn).toHaveBeenNthCalledWith(
+            2,
+            other,
+            ['--consumer', CONSUMER],
+            CONSUMER,
+        );
         expect(w.out).toEqual([
             `▶ Ralph ${SHA} из ${dir}`,
             `🔁 Рестарт: ${SHA} → ${OTHER} из ${other}`,
@@ -1293,5 +1335,259 @@ describe('rollback (#103)', () => {
         const r = parseLauncherArgv(['--consumer', CONSUMER, ...argv]);
         expect(r.ok).toBe(false);
         expect(r.ok ? '' : r.reason).toMatch(why);
+    });
+});
+
+describe('реестр потребителей и prune (#138)', () => {
+    const NEIGHBOR = '/work/neighbor';
+    const C = 'c'.repeat(40);
+    const D = 'd'.repeat(40);
+    const records = (w: TWorld) =>
+        [...w.files.entries()]
+            .filter(([p]) => p.startsWith(join(dataDir, '.consumers') + '/'))
+            .map(([, t]) => JSON.parse(t) as unknown);
+    const journalLine = (sha: string, from: string | null) =>
+        `${JSON.stringify({ at: '2026-10-01T00:00:00Z', sha, from })}\n`;
+    /** Сосед в реестре: исполняется OTHER, цель отката — C. */
+    const withNeighbor = (w: TWorld) => {
+        registerConsumer(
+            dataDir,
+            { consumerRoot: NEIGHBOR, runtimeDir: '/run/nb' },
+            w.deps.registryFs,
+        );
+        w.files.set(join(NEIGHBOR, '.ralph', 'core.lock'), formatCoreLock({ ...lock, sha: OTHER }));
+        w.files.set(
+            '/run/nb/ralph.activations.jsonl',
+            journalLine(C, null) + journalLine(OTHER, C),
+        );
+    };
+
+    it('start пишет потребителя с каталогом состояния своего профиля до запуска ядра', () => {
+        const w = world();
+        const runtimeDirOfFn = vi.fn(() => '/run/p');
+        w.deps.runtimeDirOfFn = runtimeDirOfFn;
+        w.deps.runCoreFn = vi.fn(() => {
+            expect(records(w)).toEqual([{ consumerRoot: CONSUMER, runtimeDir: '/run/p' }]);
+            return 0;
+        });
+        expect(run(w, 'start', '--profile=p')).toBe(0);
+        expect(runtimeDirOfFn).toHaveBeenCalledWith(CONSUMER, 'p');
+    });
+
+    it('start не идёт, если запись реестра не легла', () => {
+        const w = world();
+        w.deps.registryFs.writeAtomic = () => {
+            throw new Error('ENOSPC');
+        };
+        expect(run(w, 'start')).toBe(1);
+        expect(w.deps.runCoreFn).not.toHaveBeenCalled();
+        expect(w.out.join('\n')).toMatch(/start отменён: запись реестра .*ENOSPC/);
+    });
+
+    it('start без каталога состояния — отказ, а не старт мимо реестра', () => {
+        const w = world({
+            runtimeDirOfFn: () => {
+                throw new Error('нет секции roots');
+            },
+        });
+        expect(run(w, 'start')).toBe(1);
+        expect(w.out.join('\n')).toMatch(/каталог состояния для реестра .*нет секции roots/);
+    });
+
+    it('install пишет потребителя без каталога состояния до установки', () => {
+        const w = world();
+        w.deps.installFn = vi.fn(({ sha }) => {
+            expect(records(w)).toEqual([{ consumerRoot: CONSUMER, runtimeDir: null }]);
+            return { status: 'present' as const, dir: join(dataDir, sha), treeHash: lock.treeHash };
+        });
+        run(w, 'install');
+        expect(w.deps.installFn).toHaveBeenCalled();
+    });
+
+    it('install по lock: отказ записи реестра — без установки', () => {
+        const w = world();
+        w.deps.registryFs.writeAtomic = () => {
+            throw new Error('EROFS');
+        };
+        expect(run(w, 'install')).toBe(1);
+        expect(w.deps.installFn).not.toHaveBeenCalled();
+        expect(w.out.join('\n')).toMatch(/⛔ install: запись реестра .*EROFS/);
+    });
+
+    it('install без lock тоже пишет реестр до установки, отказ записи — без установки', () => {
+        const w = world({}, { lock: null });
+        w.deps.registryFs.writeAtomic = () => {
+            throw new Error('EACCES');
+        };
+        expect(run(w, 'install', '--source', '/src', '--rev', 'v1')).toBe(1);
+        expect(w.deps.installFn).not.toHaveBeenCalled();
+        const w2 = world({}, { lock: null });
+        expect(run(w2, 'install', '--source', '/src', '--rev', 'v1')).toBe(0);
+        expect(records(w2)).toEqual([{ consumerRoot: CONSUMER, runtimeDir: null }]);
+    });
+
+    it('ревизии соседа (lock, исполняемая, цель отката) и живого раннера не удаляются', () => {
+        const w = world();
+        withNeighbor(w);
+        w.deps.listDataDirFn = vi.fn(() => [SHA, OTHER, C, D, 'e'.repeat(40), '.consumers']);
+        w.deps.runningRevisionsFn = vi.fn(() => new Set(['e'.repeat(40)]));
+        expect(run(w, 'prune')).toBe(0);
+        // Своему нужна SHA; без соседа ушли бы OTHER и C, без сверки раннеров — e….
+        expect(w.deps.renameFn).toHaveBeenCalledTimes(1);
+        const [from, to] = (w.deps.renameFn as ReturnType<typeof vi.fn>).mock.calls[0] as [
+            string,
+            string,
+        ];
+        expect(from).toBe(join(dataDir, D));
+        expect(to).toMatch(new RegExp(`/\\.${D}\\.pruning-\\d+$`));
+        expect(w.deps.rmFn).toHaveBeenCalledWith(to);
+        expect(w.out.join('\n')).toMatch(/удалено 1, учтено потребителей: 2/);
+    });
+
+    it('prune сам вписывает своего потребителя: поставленный до реестра свою ревизию не теряет', () => {
+        const w = world();
+        w.deps.listDataDirFn = vi.fn(() => [SHA]);
+        expect(run(w, 'prune')).toBe(0);
+        // С каталогом состояния профиля по умолчанию, а не одним lock: журнал там держит
+        // цель отката.
+        expect(records(w)).toEqual([{ consumerRoot: CONSUMER, runtimeDir: '/run/ralph' }]);
+        expect(w.deps.runtimeDirOfFn).toHaveBeenCalledWith(CONSUMER, null);
+        expect(w.deps.renameFn).not.toHaveBeenCalled();
+        expect(w.out.join('\n')).toMatch(/удалять нечего — все 1 ревизий кому-то нужны/);
+    });
+
+    // Ревью #138: потребитель, стартовавший ревизией без реестра, — цель отката из его
+    // журнала держится вписыванием самого prune, а не только исполняемая по `/proc`.
+    it('prune держит цель отката своего потребителя, стартовавшего до реестра', () => {
+        const w = world();
+        w.files.set(
+            '/run/ralph/ralph.activations.jsonl',
+            journalLine(C, null) + journalLine(SHA, C),
+        );
+        w.deps.listDataDirFn = vi.fn(() => [SHA, C, D]);
+        expect(run(w, 'prune')).toBe(0);
+        expect(w.deps.renameFn).toHaveBeenCalledTimes(1);
+        expect((w.deps.renameFn as ReturnType<typeof vi.fn>).mock.calls[0][0]).toBe(
+            join(dataDir, D),
+        );
+    });
+
+    it('prune: каталог состояния своего потребителя не определён — отказ, ничего не удалено', () => {
+        const w = world({
+            runtimeDirOfFn: () => {
+                throw new Error('нет секции roots');
+            },
+        });
+        w.deps.listDataDirFn = vi.fn(() => [SHA, D]);
+        expect(run(w, 'prune')).toBe(1);
+        expect(w.deps.renameFn).not.toHaveBeenCalled();
+        expect(w.out.join('\n')).toMatch(
+            /⛔ prune: каталог состояния .*нет секции roots.*Ничего не удалено/,
+        );
+    });
+
+    it('prune: запись своего потребителя не легла — отказ, ничего не удалено', () => {
+        const w = world();
+        w.deps.registryFs.writeAtomic = () => {
+            throw new Error('EROFS');
+        };
+        w.deps.listDataDirFn = vi.fn(() => [SHA, D]);
+        expect(run(w, 'prune')).toBe(1);
+        expect(w.deps.renameFn).not.toHaveBeenCalled();
+        expect(w.out.join('\n')).toMatch(/⛔ prune: запись реестра .*EROFS.*Ничего не удалено/);
+    });
+
+    it('start --dry-run реестр не пишет: сухой прогон только читает', () => {
+        const w = world();
+        expect(run(w, 'start', '--dry-run')).toBe(0);
+        expect(records(w)).toEqual([]);
+        expect(w.deps.runtimeDirOfFn).not.toHaveBeenCalled();
+    });
+
+    it('start с кривым --profile — отказ текстом ядра, ядро не зовётся, реестр не тронут', () => {
+        const w = world();
+        expect(run(w, 'start', '--profile', 'a', '--profile=b')).toBe(1);
+        expect(w.deps.runCoreFn).not.toHaveBeenCalled();
+        expect(records(w)).toEqual([]);
+        expect(w.out.join('\n')).toMatch(/start отменён: Флаг --profile указан 2 раза/);
+    });
+
+    it.each([
+        [
+            'нечитаемый lock соседа',
+            (w: TWorld) => w.files.delete(join(NEIGHBOR, '.ralph', 'core.lock')),
+        ],
+        [
+            'битый журнал соседа',
+            (w: TWorld) => w.files.set('/run/nb/ralph.activations.jsonl', '{\n'),
+        ],
+    ])('%s — отказ чистки целиком, ничего не удалено', (_n, spoil) => {
+        const w = world();
+        withNeighbor(w);
+        spoil(w);
+        w.deps.listDataDirFn = vi.fn(() => [SHA, OTHER, C, D]);
+        expect(run(w, 'prune')).toBe(1);
+        expect(w.deps.renameFn).not.toHaveBeenCalled();
+        expect(w.deps.rmFn).not.toHaveBeenCalled();
+        expect(w.out.join('\n')).toMatch(/❌ \/work\/neighbor[\s\S]*Ничего не удалено/);
+    });
+
+    it.each([
+        [
+            'живые раннеры не выяснены',
+            {
+                runningRevisionsFn: () => {
+                    throw new Error('/proc: EACCES');
+                },
+            },
+        ],
+        [
+            'каталог установок не читается',
+            {
+                listDataDirFn: () => {
+                    throw new Error('EIO');
+                },
+            },
+        ],
+        ['каталог установок не задан', { env: { RALPH_LAUNCHER_VERSION: '1' } }],
+    ] as [string, Partial<TLauncherDeps>][])('%s — отказ без удаления', (_n, over) => {
+        const w = world(over);
+        expect(run(w, 'prune')).toBe(1);
+        expect(w.out.join('\n')).toMatch(/⛔ prune: .*Ничего не удалено/);
+    });
+
+    it('остаток прерванной чистки снимается; оборванное удаление — код 1 с причиной', () => {
+        const w = world();
+        w.deps.listDataDirFn = vi.fn(() => [SHA, `.${D}.pruning-7`, OTHER]);
+        w.deps.rmFn = vi.fn((p: string) => {
+            if (p.includes(OTHER)) throw new Error('EBUSY');
+        });
+        expect(run(w, 'prune')).toBe(1);
+        expect(w.deps.rmFn).toHaveBeenCalledWith(join(dataDir, `.${D}.pruning-7`));
+        expect(w.out.join('\n')).toMatch(/удаление оборвалось — EBUSY/);
+    });
+
+    it('prune без флагов', () => {
+        expect(parseLauncherArgv(['--consumer', CONSUMER, 'prune', '--all'])).toEqual({
+            ok: false,
+            reason: expect.stringMatching(/prune не знает флага "--all"/),
+        });
+    });
+
+    it('startProfile: разбор ядра — обе формы, кривой флаг — отказ, а не «последний победил»', () => {
+        expect(startProfile(['--dry-run', '--profile', 'a'])).toEqual({ ok: true, profile: 'a' });
+        expect(startProfile(['--profile=b'])).toEqual({ ok: true, profile: 'b' });
+        expect(startProfile([])).toEqual({ ok: true, profile: null });
+        for (const bad of [
+            ['--profile'],
+            ['--profile', '--once'],
+            ['--profile='],
+            ['--profile', 'a', '--profile=b'],
+        ]) {
+            expect(startProfile(bad)).toEqual({
+                ok: false,
+                reason: expect.stringMatching(/--profile/),
+            });
+        }
     });
 });

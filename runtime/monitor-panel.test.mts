@@ -210,22 +210,12 @@ describe('readLogTail — сырой хвост лога + время после
     });
 });
 
-// #386: панель обязана читать РОВНО тот лог, в который пишет наблюдаемый прогон — иначе о
-// жизни боевой петли судила бы по протухшему ralph.dry.log (и наоборот). monitorLogPath —
-// та же развилка chooseLogPath, что у раннера, по резолвнутому профилю (dry монитор не
-// спавнится, поэтому решает один профиль).
-describe('monitorLogPath — панель читает лог наблюдаемого прогона (#386)', () => {
-    it('профиль prod → боевой ralph.log', () => {
-        expect(monitorLogPath({ profileName: 'prod' })).toMatch(/ralph\.log$/);
-        expect(monitorLogPath({ profileName: 'prod' })).not.toMatch(/ralph\.dry\.log$/);
-    });
-
-    it('профиль playground → не-боевой ralph.dry.log, не общий боевой', () => {
-        expect(monitorLogPath({ profileName: 'playground' })).toMatch(/ralph\.dry\.log$/);
-    });
-
-    it('конфиг нечитаем (null) → консервативно не-боевой лог, не боевой ralph.log', () => {
-        expect(monitorLogPath(null)).toMatch(/ralph\.dry\.log$/);
+// #386, #141: панель обязана читать РОВНО тот лог, в который пишет наблюдаемый прогон.
+// Монитор спавнит только живой прогон, а живой прогон любого профиля пишет в ralph.log.
+describe('monitorLogPath — панель читает лог наблюдаемого прогона (#386, #141)', () => {
+    it('живой прогон → ralph.log, не ralph.dry.log', () => {
+        expect(monitorLogPath()).toMatch(/ralph\.log$/);
+        expect(monitorLogPath()).not.toMatch(/ralph\.dry\.log$/);
     });
 });
 
@@ -614,22 +604,15 @@ describe('--runtime-dir: панель смотрит в каталог сост�
         process.argv = [...ARGV.slice(0, 2), '--runtime-dir', '/path/to/state/prod-abc'];
         vi.resetModules();
         const fresh = await import('./monitor-panel.mts');
-        expect(fresh.monitorLogPath({ profileName: 'prod' } as never)).toBe(
-            path.join('/path/to/state/prod-abc', 'ralph.log'),
-        );
-        expect(fresh.monitorLogPath({ profileName: 'playground' } as never)).toBe(
-            path.join('/path/to/state/prod-abc', 'ralph.dry.log'),
-        );
+        expect(fresh.monitorLogPath()).toBe(path.join('/path/to/state/prod-abc', 'ralph.log'));
     });
 
     it('без флага — прежняя раскладка: файлы рядом с ядром', async () => {
         process.argv = [...ARGV.slice(0, 2)];
         vi.resetModules();
         const fresh = await import('./monitor-panel.mts');
-        expect(fresh.monitorLogPath({ profileName: 'prod' } as never)).toMatch(/ralph\.log$/);
-        expect(fresh.monitorLogPath({ profileName: 'prod' } as never)).not.toContain(
-            '/path/to/state/',
-        );
+        expect(fresh.monitorLogPath()).toMatch(/ralph\.log$/);
+        expect(fresh.monitorLogPath()).not.toContain('/path/to/state/');
     });
 });
 

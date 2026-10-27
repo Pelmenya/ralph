@@ -239,6 +239,118 @@ describe('критерий 3: во время миграции петля не �
     });
 });
 
+// ── Задача #146: старая раскладка живёт в ДВУХ местах ──────────────────────────────────
+// Встроенное ядро с отдельным деревом раннера: лок, лог и события до `chdir` ложатся в
+// `.claude/ralph` места запуска, а state пишется уже после `chdir` — в `.claude/ralph`
+// дерева раннера. Опись по одному месту отчиталась «переехало» и потеряла фазу.
+describe('#146: state в дереве раннера, лог в дереве запуска', () => {
+    const RUNNER = '/path/to/app-ralph/.claude/ralph';
+    const split = () => ({
+        [`${LEGACY}/ralph.log`]: 'лог до chdir',
+        [`${LEGACY}/ralph.events.jsonl`]: '{"seq":1}\n',
+        [`${RUNNER}/ralph.state.json`]: LIVE_STATE,
+    });
+
+    it('переезд переносит оба, журнал называет оба, откат возвращает каждый на место', () => {
+        const w = world(split());
+        const plan = planRuntimeMigration(LEGACY, RUNTIME_DIR, w.deps.existsFn, {
+            runnerDir: RUNNER,
+        });
+        const done = migrateRuntime(plan, w.deps);
+        expect(done.files).toEqual(
+            expect.arrayContaining(['ralph.state.json', 'ralph.log', 'ralph.events.jsonl']),
+        );
+        expect(done.origins).toEqual({ 'ralph.state.json': RUNNER });
+        const moved = JSON.parse(w.files.get(`${RUNTIME_DIR}/ralph.state.json`) as string);
+        expect(moved.count).toBe(3);
+        expect(moved.milestone).toBe('Ralph R0 · Фаза 4');
+        expect(w.files.get(`${RUNTIME_DIR}/ralph.log`)).toBe('лог до chdir');
+        // Парковка — там, где файл лежал; маркер — в обоих местах старой раскладки: старт по
+        // ней из любого дерева обязан увидеть, что состояние уехало.
+        expect(w.files.has(`${RUNNER}/ralph.state.json${MIGRATED_SUFFIX}`)).toBe(true);
+        expect(w.files.has(`${LEGACY}/ralph.state.json${MIGRATED_SUFFIX}`)).toBe(false);
+        expect(w.files.has(`${LEGACY}/ralph.log${MIGRATED_SUFFIX}`)).toBe(true);
+        expect(() => assertLegacyNotMigrated(RUNNER, null, w.deps)).toThrow(/уже переехало/i);
+        expect(() => assertLegacyNotMigrated(LEGACY, null, w.deps)).toThrow(/уже переехало/i);
+
+        rollbackRuntime(RUNTIME_DIR, w.deps);
+        expect(w.files.get(`${RUNNER}/ralph.state.json`)).toBe(LIVE_STATE);
+        expect(w.files.has(`${LEGACY}/ralph.state.json`)).toBe(false);
+        expect(w.files.get(`${LEGACY}/ralph.log`)).toBe('лог до chdir');
+        expect(w.files.has(`${RUNNER}/${MIGRATED_MARKER}`)).toBe(false);
+        expect(w.files.has(`${LEGACY}/${MIGRATED_MARKER}`)).toBe(false);
+        expect(w.files.has(`${RUNTIME_DIR}/ralph.state.json`)).toBe(false);
+    });
+
+    it('обрыв посреди переезда из двух мест возобновляется по журналу', () => {
+        const w = world(split());
+        const plan = planRuntimeMigration(LEGACY, RUNTIME_DIR, w.deps.existsFn, {
+            runnerDir: RUNNER,
+        });
+        let renames = 0;
+        const flaky = {
+            ...w.deps,
+            renameFn: (from: string, to: string) => {
+                if (++renames === 2) throw new Error('обрыв');
+                w.deps.renameFn(from, to);
+            },
+        };
+        expect(() => migrateRuntime(plan, flaky)).toThrow(/обрыв/);
+        const done = migrateRuntime(
+            planRuntimeMigration(LEGACY, RUNTIME_DIR, w.deps.existsFn, { runnerDir: RUNNER }),
+            w.deps,
+        );
+        expect(done.status).toBe('done');
+        expect(w.files.has(`${RUNNER}/ralph.state.json${MIGRATED_SUFFIX}`)).toBe(true);
+        rollbackRuntime(RUNTIME_DIR, w.deps);
+        expect(w.files.get(`${RUNNER}/ralph.state.json`)).toBe(LIVE_STATE);
+        expect(w.files.get(`${LEGACY}/ralph.events.jsonl`)).toBe('{"seq":1}\n');
+    });
+
+    it('от противного: одно имя в двух местах — стоп с причиной, а не выбор молча', () => {
+        const w = world({ ...split(), [`${LEGACY}/ralph.state.json`]: LIVE_STATE });
+        expect(() =>
+            planRuntimeMigration(LEGACY, RUNTIME_DIR, w.deps.existsFn, { runnerDir: RUNNER }),
+        ).toThrow(/ralph\.state\.json.*в двух местах/);
+    });
+
+    it('от противного: файлы нашлись, а state нет при живом дереве раннера — стоп', () => {
+        // «Переехало» без state — ложный зелёный: следующий старт начнёт фазу с нуля.
+        const w = world({ [`${LEGACY}/ralph.log`]: 'лог' });
+        expect(() =>
+            planRuntimeMigration(LEGACY, RUNTIME_DIR, w.deps.existsFn, { runnerDir: RUNNER }),
+        ).toThrow(/ralph\.state\.json/);
+        // Одни логи — стоп называет и развилку «state не было никогда» с выходом из неё.
+        expect(() =>
+            planRuntimeMigration(LEGACY, RUNTIME_DIR, w.deps.existsFn, { runnerDir: RUNNER }),
+        ).toThrow(/только логи.*state не писала никогда.*убери или переименуй/);
+        const dry = world({
+            [`${RUNNER}/ralph.dry.log`]: 'dry',
+            [`${LEGACY}/ralph.events.jsonl`]: '',
+        });
+        expect(() =>
+            planRuntimeMigration(LEGACY, RUNTIME_DIR, dry.deps.existsFn, { runnerDir: RUNNER }),
+        ).toThrow(/только логи/);
+        // Не только логи — совета убрать файлы нет: там state, скорее всего, где-то лежит.
+        const mixed = world({ [`${LEGACY}/ralph.requests.jsonl`]: '{}\n' });
+        let msg = '';
+        try {
+            planRuntimeMigration(LEGACY, RUNTIME_DIR, mixed.deps.existsFn, { runnerDir: RUNNER });
+        } catch (e) {
+            msg = (e as Error).message;
+        }
+        expect(msg).toMatch(/Разбери руками, где state/);
+        expect(msg).not.toMatch(/только логи/);
+        // Пустая старая раскладка — по-прежнему «мигрировать нечего», а не отказ.
+        const empty = world({});
+        expect(
+            planRuntimeMigration(LEGACY, RUNTIME_DIR, empty.deps.existsFn, {
+                runnerDir: RUNNER,
+            }).files,
+        ).toEqual([]);
+    });
+});
+
 // ── Структурный барьер: миграция идёт ПОД локом ─────────────────────────────────────────
 // Поведенческим тестом не закрыть: main() читает конфиг, трогает git и файловую систему, и
 // в сьюте не исполняется (та же причина, по которой порядок «лок — первый шаг main()»

@@ -198,6 +198,7 @@ function buildFakeTaskSource(): { adapter: TaskSourceAdapter; calls: string[] } 
             if (authFails) throw new Error('форж отверг авторизацию');
         },
         secretEnvNames: () => ['FAKE_FORGE_TOKEN'],
+        reviewProtectsPaths: false,
         listReadyIssues: (milestone) => (milestone === MILESTONE ? filterReady(ISSUES) : []),
         listAllOpenIssues: (milestone) => {
             if (allOpenThrows) throw new Error('gh issue list упал');

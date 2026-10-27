@@ -737,6 +737,15 @@ describe('живость владельца', () => {
         expect(rev(['node', `/elsewhere/${SHA}/ralph.js`])).toBeNull();
         expect(rev(['node', '/data/abc/ralph.js'])).toBeNull();
         expect(rev(['node', `/data/${SHA}/other.js`])).toBeNull();
+        // launcher.mts — не петля: для лока и stop он не считается, для чистки — да (#138).
+        expect(rev(['node', `/data/${SHA}/launcher.mts`])).toBeNull();
+        expect(
+            runnerRevision(7, '/data', {
+                killFn: kill,
+                readFn: proc(['node', `/data/${SHA}/launcher.mts`, '--consumer', '/c']),
+                entries: ['ralph.js', 'launcher.mts'],
+            }),
+        ).toBe(SHA);
         expect(
             runnerRevision(7, '/data', {
                 killFn: kill,

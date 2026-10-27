@@ -38,13 +38,22 @@ const LOGS: ReadonlySet<string> = new Set([
 ]);
 
 export type TMigrationFile = { name: string; from: string; to: string };
-export type TMigrationPlan = { from: string; to: string; files: TMigrationFile[] };
+export type TMigrationPlan = {
+    from: string;
+    to: string;
+    files: TMigrationFile[];
+    /** Имя → каталог старой раскладки, если файл лежал НЕ в `from` (#146). */
+    origins?: Record<string, string>;
+};
 export type TMigrationStatus = 'in-progress' | 'done' | 'rolled-back';
 export type TMigrationJournal = {
     status: TMigrationStatus;
     from: string;
     to: string;
     files: string[];
+    /** Файлы, лежавшие не в `from`, — с каталогом, куда их вернёт откат (#146). Поле
+     *  необязательно: журнал прежних версий его не знает, и тогда всё лежало в `from`. */
+    origins?: Record<string, string>;
     startedAt: string;
     finishedAt?: string;
 };
@@ -73,11 +82,22 @@ function at(dir: string, name: string): string {
  * Состав переезда — по ОПИСИ путей состояния (`runtimePathsIn`), а не по перечислению
  * здесь. Перечисление разъехалось бы с описью на первом же новом файле состояния: его
  * добавили бы в опись и забыли тут, а он молча остался бы в старой раскладке.
+ *
+ * Старая раскладка бывает в ДВУХ местах (#146, репетиция отката): при встроенном ядре и
+ * отдельном дереве раннера лок, лог и события до `chdir` ложатся в `from` (место запуска),
+ * а state пишется уже после `chdir` — в `.claude/ralph` дерева раннера (`runnerDir`). Опись
+ * по одному месту отчиталась «переехало», а state с незаконченной фазой остался на месте.
+ * Поэтому опись берёт оба места; одно имя в обоих — стоп: выбрать молча значит выбрать
+ * наугад, какая фаза продолжится. И файлы без state при живом дереве раннера — тоже стоп:
+ * state в такой раскладке обычно есть, где-то, где опись его не видит. Исключение — петля,
+ * state не писавшая никогда (только `--dry-run`, падение до первой записи): стоп тот же, но
+ * для одних логов он называет и эту развилку с выходом из неё.
  */
 export function planRuntimeMigration(
     from: string,
     to: string,
     existsFn: (p: string) => boolean,
+    opts: { runnerDir?: string | null } = {},
 ): TMigrationPlan {
     // Из описи исключены два ключа, и оба — осознанно (ревью Codex, !23):
     //   • `sessions` — АРХИВ логов прошлых сессий, а не состояние, от которого зависит
@@ -90,10 +110,89 @@ export function planRuntimeMigration(
     const names = Object.entries(runtimePathsIn(''))
         .filter(([key]) => !SKIP.has(key))
         .map(([, p]) => p.replace(/^\/+/, ''));
-    const files = names
-        .map((name) => ({ name, from: at(from, name), to: at(to, name) }))
-        .filter((f) => existsFn(f.from));
-    return { from, to, files };
+    const runnerDir = opts.runnerDir && opts.runnerDir !== from ? opts.runnerDir : null;
+    const files: TMigrationFile[] = [];
+    const origins: Record<string, string> = {};
+    for (const name of names) {
+        const here = existsFn(at(from, name));
+        const there = runnerDir !== null && existsFn(at(runnerDir, name));
+        if (here && there) {
+            throw new Error(
+                `Файл состояния ${name} лежит в двух местах старой раскладки: ${at(from, name)} ` +
+                    `и ${at(runnerDir as string, name)}. Какой из них настоящий, переезд не ` +
+                    `выбирает — разбери руками и оставь один.`,
+            );
+        }
+        if (here) files.push({ name, from: at(from, name), to: at(to, name) });
+        if (there) {
+            files.push({ name, from: at(runnerDir as string, name), to: at(to, name) });
+            origins[name] = runnerDir as string;
+        }
+    }
+    // Припаркованный state тоже считается найденным: это возобновление после обрыва, и
+    // состав переезда тогда берётся из журнала, а не из этой описи.
+    const stateName = names.find(isStateName) ?? 'ralph.state.json';
+    const stateSeen = [from, runnerDir].some(
+        (dir) =>
+            dir !== null &&
+            (existsFn(at(dir, stateName)) || existsFn(at(dir, `${stateName}${MIGRATED_SUFFIX}`))),
+    );
+    if (runnerDir !== null && files.length > 0 && !stateSeen) {
+        // Развилка «state не было никогда» законна: петлю гоняли только `--dry-run` или она
+        // упала на сверках старта после первой строки лога, но до первой записи state. Тогда
+        // лежат одни логи, и совет «найди state» отказывал бы навсегда — state нет нигде.
+        // Стоп остаётся (по описи не отличить от state, лежащего вне её поля зрения), но
+        // называет обе развилки, а для одних логов — что с ними делать.
+        const p = runtimePathsIn('');
+        const logNames = new Set(
+            [p.log, p.dryLog, p.monitorOut, p.events, p.heartbeat, p.dryEvents, p.dryHeartbeat].map(
+                (n) => n.replace(/^\/+/, ''),
+            ),
+        );
+        const onlyLogs = files.every((f) => logNames.has(f.name));
+        throw new Error(
+            `В старой раскладке нашлись файлы (${files.map((f) => f.from).join(', ')}), но ` +
+                `ralph.state.json нет ни в ${from}, ни в ${runnerDir}. «Переехало» без state — ` +
+                `ложный зелёный: следующий старт начал бы фазу с нуля. ` +
+                (onlyLogs
+                    ? `Файлы — только логи. Если петля state не писала никогда (гонялась только ` +
+                      `--dry-run или упала на старте до первой записи state), переезжать нечему: ` +
+                      `убери или переименуй эти файлы и повтори. Иначе найди, где state, и разбери руками.`
+                    : `Разбери руками, где state.`),
+        );
+    }
+    return Object.keys(origins).length > 0 ? { from, to, files, origins } : { from, to, files };
+}
+
+/**
+ * Каталог старой раскладки в дереве раннера (#146) — или null, если дерева нет либо оно и
+ * есть место запуска (тогда второе место совпало бы с первым, и опись удвоилась бы).
+ * `legacyAbs` — тот же каталог места запуска абсолютным путём: сравниваются адреса, а не
+ * строки, иначе относительный `.claude/ralph` никогда не совпал бы с абсолютным.
+ */
+export function runnerLegacyDir(
+    runnerTree: string,
+    legacyRel: string,
+    legacyAbs: string,
+    existsFn: (p: string) => boolean,
+): string | null {
+    if (!existsFn(runnerTree)) return null;
+    const dir = at(runnerTree, legacyRel);
+    return dir === legacyAbs ? null : dir;
+}
+
+function isStateName(name: string): boolean {
+    return name.endsWith('ralph.state.json');
+}
+
+/** Каталог старой раскладки, где файл лежал до переезда (#146). */
+function originOf(journal: TMigrationJournal, name: string): string {
+    return journal.origins?.[name] ?? journal.from;
+}
+
+/** Все каталоги старой раскладки этого переезда: маркер ставится и снимается в каждом. */
+function legacyDirsOf(journal: TMigrationJournal): string[] {
+    return [...new Set([journal.from, ...Object.values(journal.origins ?? {})])];
 }
 
 function writeJournal(to: string, journal: TMigrationJournal, deps: TMigrationDeps): void {
@@ -198,6 +297,7 @@ export function migrateRuntime(plan: TMigrationPlan, deps: TMigrationDeps): TMig
               from: plan.from,
               to: plan.to,
               files: plan.files.map((f) => f.name),
+              ...(plan.origins ? { origins: plan.origins } : {}),
               startedAt: deps.now(),
           };
     // Журнал — первым, ДО единственного байта копирования: обрыв на любом следующем шаге
@@ -208,10 +308,10 @@ export function migrateRuntime(plan: TMigrationPlan, deps: TMigrationDeps): TMig
     // обязано доводить переезд с ЛЮБОГО места обрыва, включая «все переименованы, маркер не
     // записан» — иначе журнал остался бы in-progress навсегда, а петля не стартовала бы.
     for (const name of journal.files) {
-        const from = at(journal.from, name);
+        const from = at(originOf(journal, name), name);
         const to = at(journal.to, name);
         const parked = `${from}${MIGRATED_SUFFIX}`;
-        const isState = name.endsWith('ralph.state.json');
+        const isState = isStateName(name);
         // Годность копии решает СВЕРКА С ПАРКОВКОЙ, а не валидность формата (ревью Codex,
         // !23). Формат знает только `ralph.state.json`; у лога и `ralph.requests.jsonl`
         // «правильного вида» нет вовсе, и усечённый хвост JSONL выглядел бы целым файлом.
@@ -260,26 +360,30 @@ export function migrateRuntime(plan: TMigrationPlan, deps: TMigrationDeps): TMig
     }
 
     for (const name of journal.files) {
-        const from = at(journal.from, name);
+        const from = at(originOf(journal, name), name);
         if (deps.existsFn(from)) deps.renameFn(from, `${from}${MIGRATED_SUFFIX}`);
     }
     // Маркер — СТРУКТУРНЫЙ (ревью Codex, !23): сверка подстрокой пропустила бы запуск с
     // runtimeDir `/runtime/prod`, когда состояние уехало в `/runtime/prod-old`, — и петля
     // завела бы второе состояние. Человеку он тоже читается: JSON с полем `note`.
-    deps.writeFn(
-        at(journal.from, MIGRATED_MARKER),
-        JSON.stringify(
-            {
-                to: journal.to,
-                at: journal.startedAt,
-                note:
-                    `Состояние раннера уехало в ${journal.to}. Файлы рядом с суффиксом ` +
-                    `${MIGRATED_SUFFIX} — прежние копии, материал отката.`,
-            },
-            null,
-            2,
-        ),
-    );
+    // Маркер — в КАЖДОМ месте старой раскладки (#146): старт по ней идёт и из места запуска,
+    // и из дерева раннера, и тот, что не увидел бы маркера, завёл бы второе состояние.
+    for (const dir of legacyDirsOf(journal)) {
+        deps.writeFn(
+            at(dir, MIGRATED_MARKER),
+            JSON.stringify(
+                {
+                    to: journal.to,
+                    at: journal.startedAt,
+                    note:
+                        `Состояние раннера уехало в ${journal.to}. Файлы рядом с суффиксом ` +
+                        `${MIGRATED_SUFFIX} — прежние копии, материал отката.`,
+                },
+                null,
+                2,
+            ),
+        );
+    }
 
     const done: TMigrationJournal = { ...journal, status: 'done', finishedAt: deps.now() };
     writeJournal(journal.to, done, deps);
@@ -337,13 +441,15 @@ export function rollbackRuntime(to: string, deps: TMigrationDeps): TMigrationJou
         );
     }
     for (const name of journal.files) {
-        const original = at(journal.from, name);
+        const original = at(originOf(journal, name), name);
         const parked = `${original}${MIGRATED_SUFFIX}`;
         if (deps.existsFn(parked)) deps.renameFn(parked, original);
         if (deps.existsFn(at(journal.to, name))) deps.removeFn(at(journal.to, name));
     }
-    const marker = at(journal.from, MIGRATED_MARKER);
-    if (deps.existsFn(marker)) deps.removeFn(marker);
+    for (const dir of legacyDirsOf(journal)) {
+        const marker = at(dir, MIGRATED_MARKER);
+        if (deps.existsFn(marker)) deps.removeFn(marker);
+    }
     const rolled: TMigrationJournal = { ...journal, status: 'rolled-back', finishedAt: deps.now() };
     writeJournal(to, rolled, deps);
     return rolled;

@@ -27,6 +27,7 @@
  *   node .claude/ralph/ralph.js --migrate-rollback  вернуть состояние в прежнюю раскладку
  *   node .claude/ralph/ralph.js --doctor           совместимость слоёв и сверка ядра с lock; только чтение
  *   node .claude/ralph/ralph.js --profile <name>   профиль конфига (по умолчанию defaultProfile)
+ *   --consumer <каталог>  ставит launcher ./ralph: корни без ключа в конфиге выводятся (#140)
  *
  * Требования: gh CLI авторизован, git-репозиторий, ralph.config.json настроен, active: true.
  * Конфиг профильный: общие поля в `common`, дельта режима — в `profiles.<name>`.
@@ -107,19 +108,22 @@ const KNOWN_FLAGS = new Set([
     '--migrate-rollback',
     '--doctor',
     '--profile',
+    '--consumer',
 ]);
 function assertKnownFlags(args) {
     for (let i = 0; i < args.length; i++) {
         const a = args[i];
-        if (a === '--profile') {
-            i++; // следующий токен — имя профиля, не флаг
+        // Следующий токен — значение, а не флаг: имя профиля либо каталог потребителя,
+        // который ставит launcher (#140; форму значения проверяет main()).
+        if (a === '--profile' || a === '--consumer') {
+            i++;
             continue;
         }
         if (a.startsWith('--profile=')) continue;
         if (!KNOWN_FLAGS.has(a)) {
             console.error(
                 `❌ Неизвестный флаг "${a}". Допустимы: ${[...KNOWN_FLAGS]
-                    .filter((f) => f !== '--profile')
+                    .filter((f) => f !== '--profile' && f !== '--consumer')
                     .join(', ')}, --profile <name> | --profile=<name>.`,
             );
             process.exit(1);

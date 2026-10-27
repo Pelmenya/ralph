@@ -530,6 +530,12 @@ export function runnerRevision(
     deps: {
         killFn?: (pid: number, sig: 0) => unknown;
         readFn?: (p: string) => string;
+        /**
+         * Имена entry в корне ревизии. По умолчанию — только `ralph.js`: живость лока и
+         * `./ralph stop` спрашивают о ПЕТЛЕ. Чистке нужен и `launcher.mts` — см.
+         * `runningRevisions` в launcher.
+         */
+        entries?: readonly string[];
     } = {},
 ): string | null {
     if (!pidAlive(pid, deps.killFn)) return null;
@@ -540,9 +546,10 @@ export function runnerRevision(
     } catch {
         return null;
     }
+    const entries = deps.entries ?? ['ralph.js'];
     for (const arg of argv) {
         const sha = basename(dirname(arg));
-        if (SHA_RE.test(sha) && arg === join(dataDir, sha, 'ralph.js')) return sha;
+        if (SHA_RE.test(sha) && entries.some((e) => arg === join(dataDir, sha, e))) return sha;
     }
     return null;
 }

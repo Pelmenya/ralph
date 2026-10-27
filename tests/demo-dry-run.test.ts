@@ -13,6 +13,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { buildFixtureRuntime, loadConfigForLoop, runFixtureLoop } from './test-helpers.ts';
 import { checkGuardWiring, GUARD_FILE } from '../.claude/hooks/guard-wiring.ts';
+// @ts-expect-error — JS-entry раннера без деклараций типов.
+import ralph from '../ralph.js';
 
 const CANON = path.resolve(import.meta.dirname, '..');
 const DEMO = path.join(CANON, 'examples', 'demo');
@@ -93,6 +95,27 @@ describe('демо: конфиг проходит настоящий цикл я
         const raw = fs.readFileSync(DEMO_CONFIG, 'utf-8');
         expect(readJson(DEMO_CONFIG).common).not.toHaveProperty('roots');
         expect(raw).not.toMatch(/"\/[a-z]/i);
+    });
+
+    // #140: без секции `roots` ядро из установки раньше не стартовало, и конфиг демо
+    // приходилось выносить из git ради путей машины. Через launcher корни выводятся сами.
+    it('через launcher конфиг без roots собирает раскладку: корни выведены, путей в файле нет', () => {
+        const cfg = ralph.resolveProfile(
+            readJson(DEMO_CONFIG),
+            'demo',
+            (m: string) => {
+                throw new Error(m);
+            },
+            () => ({ ok: true, path: '/data/ralph/abc' }),
+            { consumerRoot: '/path/to/ralph-demo', env: { XDG_STATE_HOME: '/state' } },
+        ) as { rootsResolved: Record<string, string>; rootsDefaulted: string[] };
+        expect(cfg.rootsResolved).toMatchObject({
+            consumerRoot: '/path/to/ralph-demo',
+            executionRoot: '/path/to/ralph-demo-ralph',
+            productRoot: '/data/ralph/abc',
+        });
+        expect(cfg.rootsResolved.runtimeDir).toMatch(/^\/state\/ralph\/demo-/);
+        expect(cfg.rootsDefaulted).toEqual(['consumerRoot', 'runtimeDir', 'executionRoot']);
     });
 });
 

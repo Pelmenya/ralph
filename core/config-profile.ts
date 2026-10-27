@@ -25,7 +25,12 @@ import {
 // заводим: тот модуль — лист без импортов форжа и скриптов, поэтому core импортировать
 // его можно.
 import { FIX_SEVERITY_LEVELS } from './review-of-fixes.ts';
-import { resolveRoots, type TRootsInput } from './roots.ts';
+import {
+    launcherRootsInput,
+    resolveRoots,
+    type TLaunchContext,
+    type TRootsInput,
+} from './roots.ts';
 import { productRootFromLock } from './core-install.ts';
 
 // fail() боевой уходит в process.exit(1); тестовый failFn может вернуть значение или
@@ -113,6 +118,42 @@ function findForbiddenKey(value: unknown, path: string): string | null {
     return null;
 }
 
+/**
+ * Флаг --profile <name> | --profile=<name> (#72) — чистый разбор, общий на ядро и launcher
+ * (`startProfile`): вторая копия правил однажды разъехалась бы с первой (ревью #138 — у копии
+ * launcher дубль «побеждал последним», а `--profile --once` давал профиль `--once`). Нет
+ * флага → null, дальше решает defaultProfile из конфига. Флаг БЕЗ имени — отказ: это почти
+ * всегда оборванная команда, а «молча ушёл в playground, когда просили prod» — ровно тот
+ * тихий сдвиг режима, против которого затевались профили. Отказ — результатом `failFn`.
+ */
+export function parseProfileArgv(argv: readonly string[], failFn: FailFn): unknown {
+    // Обе формы собираем разом: при дубле (`--profile a --profile=b`) «кто победит»
+    // решал бы порядок веток кода, а не намерение человека — тихий уход не в тот
+    // профиль. Дубль — стоп, даже с одинаковыми именами: команда явно собрана криво.
+    const hits = argv.filter((a) => a === '--profile' || a.startsWith('--profile='));
+    if (hits.length === 0) return null;
+    if (hits.length > 1) {
+        return failFn(`Флаг --profile указан ${hits.length} раза — оставь один.`);
+    }
+    if (hits[0].startsWith('--profile=')) {
+        const name = hits[0].slice('--profile='.length);
+        // Пустое имя ИЛИ ведущий `--` (`--profile=--once`) — пропущенное имя, ровно как
+        // у пробельной формы ниже: без этой проверки `--once` уехал бы в имя профиля
+        // (downstream resolveProfile отверг бы «Неизвестный профиль "--once"», но
+        // сообщение хуже и поведение двух форм расходится).
+        if (!name || name.startsWith('--')) {
+            return failFn('Флаг --profile= без имени профиля.');
+        }
+        return name;
+    }
+    const value = argv[argv.indexOf('--profile') + 1];
+    // Следующий флаг вместо имени (`--profile --once`) — тоже пропущенное имя.
+    if (!value || value.startsWith('--')) {
+        return failFn('Флаг --profile требует имя профиля: --profile <name>.');
+    }
+    return value;
+}
+
 export function createConfigProfile(env: ConfigProfileEnv) {
     const { fail, assertKnownReviewModels } = env;
 
@@ -155,36 +196,10 @@ export function createConfigProfile(env: ConfigProfileEnv) {
         return deepMergeInner(base, override);
     }
 
-    // Флаг --profile <name> | --profile=<name> (#72). Нет флага → null, дальше решает
-    // defaultProfile из конфига. Флаг БЕЗ имени — стоп: это почти всегда оборванная
-    // команда, а «молча ушёл в playground, когда просили prod» — ровно тот тихий сдвиг
-    // режима, против которого затевались профили.
+    // Разбор флага --profile — общий с launcher (`parseProfileArgv`); здесь только дефолт
+    // отказа ядра.
     function parseProfileFlag(argv: string[], failFn: FailFn = fail): unknown {
-        // Обе формы собираем разом: при дубле (`--profile a --profile=b`) «кто победит»
-        // решал бы порядок веток кода, а не намерение человека — тихий уход не в тот
-        // профиль. Дубль — стоп, даже с одинаковыми именами: команда явно собрана криво.
-        const hits = argv.filter((a) => a === '--profile' || a.startsWith('--profile='));
-        if (hits.length === 0) return null;
-        if (hits.length > 1) {
-            return failFn(`Флаг --profile указан ${hits.length} раза — оставь один.`);
-        }
-        if (hits[0].startsWith('--profile=')) {
-            const name = hits[0].slice('--profile='.length);
-            // Пустое имя ИЛИ ведущий `--` (`--profile=--once`) — пропущенное имя, ровно как
-            // у пробельной формы ниже: без этой проверки `--once` уехал бы в имя профиля
-            // (downstream resolveProfile отверг бы «Неизвестный профиль "--once"», но
-            // сообщение хуже и поведение двух форм расходится).
-            if (!name || name.startsWith('--')) {
-                return failFn('Флаг --profile= без имени профиля.');
-            }
-            return name;
-        }
-        const value = argv[argv.indexOf('--profile') + 1];
-        // Следующий флаг вместо имени (`--profile --once`) — тоже пропущенное имя.
-        if (!value || value.startsWith('--')) {
-            return failFn('Флаг --profile требует имя профиля: --profile <name>.');
-        }
-        return value;
+        return parseProfileArgv(argv, failFn);
     }
 
     // #249: haltBeforeDeploy валидируется на старте — тип и место (инвариант №1: кривой
@@ -630,21 +645,46 @@ export function createConfigProfile(env: ConfigProfileEnv) {
      * требовал ручной правки на каждой смене ревизии. Вывод — не догадка от места запуска:
      * lock нет — отказ с причиной. Откуда взят путь, уходит вызывающему (`productRootFrom`):
      * старт сверяет с исполняемым ядром и выведенный путь, а не только заданный.
+     *
+     * Второе исключение — старт через launcher (`launch`, #140): `consumerRoot`, `runtimeDir`
+     * и `executionRoot` выводятся из того, что launcher знает сам (`launcherRootsInput`), и
+     * секция может отсутствовать вовсе. Иначе конфиг нёс бы пути машины и не мог жить в
+     * git. Без launcher — прежнее правило: корни явно. Какие корни выведены, уходит
+     * вызывающему (`rootsDefaulted`): лог старта и doctor называют их вслух.
      */
     function assertValidRoots(
         cfg: Record<string, unknown>,
         profileName: string,
         failFn: FailFn = fail,
         lockRootFn: TLockRootFn = productRootFromLock,
+        launch: TLaunchContext | null = null,
     ): unknown {
-        const raw = cfg.roots;
-        if (raw === undefined) return { rootsResolved: null, productRootFrom: null };
-        if (!isPlainObject(raw)) {
+        const given = cfg.roots;
+        if (given === undefined && launch === null) {
+            return { rootsResolved: null, productRootFrom: null, rootsDefaulted: [] };
+        }
+        if (given !== undefined && !isPlainObject(given)) {
             return failFn(`ralph.config.json: "roots" в профиле "${profileName}" — не объект.`);
         }
-        const input = { ...raw } as TRootsInput;
+        const raw = (given ?? {}) as Record<string, unknown>;
+        let input = { ...raw } as TRootsInput;
+        let rootsDefaulted: string[] = [];
+        if (launch !== null) {
+            try {
+                ({ input, defaulted: rootsDefaulted } = launcherRootsInput(
+                    input,
+                    launch,
+                    profileName,
+                    cfg,
+                ));
+            } catch (e) {
+                return failFn(
+                    `ralph.config.json: "roots" в профиле "${profileName}": ${(e as Error).message}`,
+                );
+            }
+        }
         const pinned = typeof raw.productRoot === 'string' && raw.productRoot.trim() !== '';
-        const consumer = typeof raw.consumerRoot === 'string' ? raw.consumerRoot.trim() : '';
+        const consumer = typeof input.consumerRoot === 'string' ? input.consumerRoot.trim() : '';
         // Без годного consumerRoot lock искать негде — резолв ниже назовёт сам consumerRoot.
         if (!pinned && path.isAbsolute(consumer)) {
             const fromLock = lockRootFn(consumer);
@@ -662,6 +702,7 @@ export function createConfigProfile(env: ConfigProfileEnv) {
             return {
                 rootsResolved: resolveRoots(input),
                 productRootFrom: pinned ? 'config' : 'lock',
+                rootsDefaulted,
             };
         } catch (e) {
             return failFn(
@@ -823,6 +864,7 @@ export function createConfigProfile(env: ConfigProfileEnv) {
         name: unknown,
         failFn: FailFn = fail,
         lockRootFn: TLockRootFn = productRootFromLock,
+        launch: TLaunchContext | null = null,
     ): unknown {
         if (!isPlainObject(raw)) return failFn('ralph.config.json: ожидался JSON-объект.');
         if (!isPlainObject(raw.common)) {
@@ -906,7 +948,7 @@ export function createConfigProfile(env: ConfigProfileEnv) {
         if (promptOk !== true) return promptOk; // мягкий failFn — наверх как есть
         // Канон, задача 21: раскладка корней. Последней в ряду — она про место на диске,
         // и осмысленна только когда остальная схема уже признана целой.
-        const rootsOk = assertValidRoots(merged, wanted, failFn, lockRootFn);
+        const rootsOk = assertValidRoots(merged, wanted, failFn, lockRootFn, launch);
         if (!isPlainObject(rootsOk) || !('rootsResolved' in rootsOk)) return rootsOk; // мягкий failFn
         const roots = rootsOk.rootsResolved as { consumerRoot?: string } | null;
         // Канон, задача 23: скрипты потребителя — ПОСЛЕ корней: их пути якорятся к
@@ -925,6 +967,7 @@ export function createConfigProfile(env: ConfigProfileEnv) {
             profileName: wanted,
             rootsResolved: rootsOk.rootsResolved,
             productRootFrom: rootsOk.productRootFrom,
+            rootsDefaulted: rootsOk.rootsDefaulted,
             consumerScriptsResolved: scriptsOk.consumerScriptsResolved,
         };
     }

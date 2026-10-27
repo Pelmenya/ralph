@@ -11,7 +11,16 @@
  * Пути — от `import.meta.dirname`: ревизия знает себя сама, где бы её ни запустили.
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+    existsSync,
+    mkdirSync,
+    mkdtempSync,
+    readdirSync,
+    readFileSync,
+    renameSync,
+    rmSync,
+    writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -38,7 +47,13 @@ const CORE_ENTRY = './ralph.js';
 // Фабрика оркестратора при импорте чистая (петлю не запускает: guard по entry в ralph.js).
 const { default: coreRuntime } = (await import(CORE_ENTRY)) as {
     default: {
-        resolveProfile: (raw: unknown, name: unknown, failFn: (m: string) => never) => unknown;
+        resolveProfile: (
+            raw: unknown,
+            name: unknown,
+            failFn: (m: string) => never,
+            lockRootFn?: undefined,
+            launch?: { consumerRoot: string; env: Record<string, string | undefined> },
+        ) => unknown;
         observerTaskSource: (
             adapters: unknown,
             failFn: (m: string) => never,
@@ -136,16 +151,17 @@ const deps: TLauncherDeps = {
     nowFn: () => Date.now(),
     runtimeDirOfFn: (consumerRoot, profile) => {
         // Каталог состояния решает тот же резолвер профиля, что у ядра: вторая копия правил
-        // слияния `common` и профиля однажды разошлась бы с первой молча.
+        // слияния `common` и профиля однажды разошлась бы с первой молча. Контекст launcher —
+        // тот же, что получит ядро флагом `--consumer` (#140): корни без ключа в конфиге
+        // выводятся одинаково у обоих.
         const configPath = join(consumerRoot, CONSUMER_CONFIG_REL);
         const raw = JSON.parse(readFileSync(configPath, 'utf8')) as unknown;
-        const cfg = coreRuntime.resolveProfile(raw, profile ?? undefined, (m) => {
-            throw new Error(m);
+        const cfg = coreRuntime.resolveProfile(raw, profile ?? undefined, throwFail, undefined, {
+            consumerRoot,
+            env: process.env,
         }) as { rootsResolved?: { runtimeDir: string } | null };
         if (!cfg.rootsResolved) {
-            throw new Error(
-                `в ${configPath} нет секции roots — ядро из установки без неё не стартует`,
-            );
+            throw new Error(`${configPath}: раскладка корней не собралась`);
         }
         return cfg.rootsResolved.runtimeDir;
     },
@@ -177,6 +193,40 @@ const deps: TLauncherDeps = {
     findOpenPrFn: (consumerRoot, branch, profile) => {
         const adapters = forgeOf(consumerRoot, profile);
         return adapters.taskSource.findOpenPullRequest(branch)?.number ?? null;
+    },
+    registryFs: {
+        readFile: (p) => readFileSync(p, 'utf8'),
+        readdir: (d) => readdirSync(d),
+        mkdir: (d) => mkdirSync(d, { recursive: true }),
+        writeAtomic: (p, text) => {
+            const tmp = `${p}.tmp-${String(process.pid)}`;
+            writeFileSync(tmp, text);
+            renameSync(tmp, p);
+        },
+    },
+    listDataDirFn: (dataDir) => {
+        try {
+            return readdirSync(dataDir);
+        } catch (e) {
+            if ((e as NodeJS.ErrnoException).code === 'ENOENT') return [];
+            throw e;
+        }
+    },
+    renameFn: (from, to) => renameSync(from, to),
+    rmFn: (p) => rmSync(p, { recursive: true, force: true }),
+    runningRevisionsFn: (dataDir) => {
+        // `/proc` не читается — бросок: чистка без сверки живых раннеров не идёт. Кроме петли
+        // (`ralph.js`) держится и ревизия, исполняющая `launcher.mts`: `update`/`rollback`
+        // посреди работы и внешний цикл `./ralph start` в окне рестарта по коду 75.
+        const running = new Set<string>();
+        for (const name of readdirSync('/proc')) {
+            if (!/^[1-9]\d*$/.test(name)) continue;
+            const sha = runnerRevision(Number(name), dataDir, {
+                entries: ['ralph.js', 'launcher.mts'],
+            });
+            if (sha !== null) running.add(sha);
+        }
+        return running;
     },
 };
 

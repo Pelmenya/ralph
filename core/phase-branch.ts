@@ -43,14 +43,30 @@
  *   - **не гасит git-хуки.** Это дерево работы: те же хуки в нём исполняет сессия и
  *     исполнил бы человек. Тихо отключить их значит сделать наш checkout не тем, что
  *     проверяется потом;
- *   - **не ставит срока на сетевые вызовы.** Запрет интерактивного запроса кредов здесь
- *     есть, а срока нет: его контракт живёт в `shArgv`, у которого такой опции пока нет.
- *     Это задача 30, и общая — сетевых git-вызовов без срока в ядре шесть штук.
+ *   - **не ставит срока на сетевые вызовы сам.** Срок и запрет промпта кредов приходят
+ *     из `gitNetworkOpts` (задача 30), а держит их путь исполнения `shArgv`.
+ *
+ * **Сетевой транзиент повторяется, отказ по существу — нет** (#144). Демо 27.10: после
+ * закрытия карточки одиночный `git fetch` упал `gnutls_handshake() failed`, и петля встала
+ * стопом `unknown`, хотя повторный старт через десять секунд прошёл. Поэтому три сетевых
+ * шага модуля (fetch main, ls-remote, fetch ветки) различают класс отказа по ответу git:
+ * TLS, DNS, обрыв и таймаут соединения, 5xx/408/429 — повтор с паузой, ограниченное число
+ * раз; исчерпание — свой исход `network` с последним ответом git, чтобы стоп назывался
+ * «сеть до origin», а не «причина не установлена». Нет кредов, нет доступа, нет репозитория
+ * или ветки — стоп сразу: повтором это не лечится, а пауза только отложила бы причину.
+ * Истёкший срок раннера — тоже `network`, но без повтора: он сам уже был десятиминутным
+ * ожиданием (то же правило у `main-sync.ts`), и три срока подряд держали бы петлю полчаса.
  *
  * TS-модуль без билд-шага: исполняется нативным type stripping Node 24 (erasable-only).
  */
 
-import { gitErrorText, gitExitStatus, gitNetworkOpts } from '../shared/ralph-util.ts';
+import {
+    gitErrorText,
+    gitExitStatus,
+    gitNetworkOpts,
+    isExecTimeout,
+    sleep,
+} from '../shared/ralph-util.ts';
 import type { ShArgvFn } from '../shared/ralph-util.ts';
 
 /** Чем кончилась постановка дерева на ветку. Каждый исход — свой факт, не оттенок общего. */
@@ -62,6 +78,7 @@ export type TPhaseBranchKind =
     | 'fast-forwarded'
     | 'switched'
     | 'diverged'
+    | 'network'
     | 'failed';
 
 export type TPhaseBranchResult = {
@@ -85,7 +102,54 @@ export type TPhaseBranchDeps = {
     safeBranch: (branch: string | undefined, opts?: { where?: string }) => boolean;
     /** Окружение вызывающего: на сетевых вызовах к нему добавляются запрет промпта и срок. */
     env?: NodeJS.ProcessEnv;
+    /** Пауза между повторами сетевого шага; по умолчанию — синхронный `sleep` ядра. */
+    sleepFn?: (ms: number) => void;
 };
+
+/** Попыток на сетевой шаг, включая первую: транзиент демо проходил со второй. */
+export const PHASE_BRANCH_NET_ATTEMPTS = 3;
+/**
+ * Пауза перед повтором номер i+1. Порядок окна, за которое проходил живой транзиент
+ * (рестарт через 10 с), и всё ещё ничтожно рядом с итерацией петли.
+ */
+const NET_RETRY_PAUSES_MS = [5_000, 15_000];
+
+/**
+ * Признаки сетевого транзиента в ответе git. Только транспорт и шлюз: 4xx кроме 408/429 —
+ * ответ по существу (нет доступа, нет репозитория), 501 — «не реализовано», повтором не
+ * появится. Голые слова «network» и «timed out» признаком не считаются: их пишут и в
+ * отказах по существу (ответ credential helper'а), поэтому таймаут — только формами curl.
+ */
+const ORIGIN_NET_TRANSIENT_RE = new RegExp(
+    [
+        'gnutls',
+        'TLS connection',
+        'SSL_(?:read|write|connect|ERROR)',
+        'SSL connection',
+        'Could not resolve (?:host|proxy)',
+        'Temporary failure in name resolution',
+        'Name or service not known',
+        'Failed to connect',
+        'Connection (?:timed out|reset|refused)',
+        'Operation timed out',
+        'Resolving timed out',
+        'early EOF',
+        'RPC failed',
+        'remote end hung up unexpectedly',
+        'unexpected disconnect',
+        'Recv failure',
+        'returned error: 50[0234]\\b',
+        'returned error: 4(?:08|29)\\b',
+        'HTTP 50[0234]\\b',
+    ].join('|'),
+    'i',
+);
+
+/** Отказ сетевого git — транзиент сети до origin (а не ответ по существу или наш срок). */
+export function isOriginNetworkFailure(e: unknown): boolean {
+    if (isExecTimeout(e)) return false;
+    return ORIGIN_NET_TRANSIENT_RE.test(gitErrorText(e));
+}
 
 /**
  * Запреты, общие на ВСЕ команды модуля.
@@ -105,7 +169,7 @@ const GIT_FLAGS = ['-c', 'submodule.recurse=false'];
  * что коммит сессии достижим из ветки фазы независимо от того, что делала предыдущая.
  */
 export function ensurePhaseBranch(branch: string, deps: TPhaseBranchDeps): TPhaseBranchResult {
-    const { runArgvFn, logFn, safeBranch, env } = deps;
+    const { runArgvFn, logFn, safeBranch, env, sleepFn = sleep } = deps;
     // Проверка имени — ДО первого git: имя уходит в argv, и `--upload-pack=…`-образное
     // значение git прочтёт как флаг. Тот же замок стоит у гейта; повторяем его здесь, а не
     // полагаемся на вызывающего, — при переезде кода такой замок теряется незаметно (#49).
@@ -118,17 +182,48 @@ export function ensurePhaseBranch(branch: string, deps: TPhaseBranchDeps): TPhas
     // при отсутствии кредов ждёт логина на `/dev/tty` (перенаправление stdin не спасает), без
     // срока молчащий origin держит вызов вечно. Отвечать в петле некому — вызов стоял бы до
     // дедмана без причины в логе. Раньше запрет ставился только при переданном `env`.
-    const gitNet = (args: string[]): string =>
-        runArgvFn('git', [...GIT_FLAGS, ...args], gitNetworkOpts(env));
+    //
+    // Транзиент сети повторяется здесь же (#144); бросает последний отказ — повтор
+    // исчерпан, либо это ответ по существу и повторять нечего. `isAnswer` — отказ, который
+    // для шага есть ответ, а не сбой (код 2 у `ls-remote --exit-code`): его не повторяют.
+    const gitNet = (args: string[], isAnswer: (e: unknown) => boolean = () => false): string => {
+        for (let attempt = 1; ; attempt++) {
+            try {
+                return runArgvFn('git', [...GIT_FLAGS, ...args], gitNetworkOpts(env));
+            } catch (e) {
+                if (isAnswer(e) || !isOriginNetworkFailure(e)) throw e;
+                if (attempt >= PHASE_BRANCH_NET_ATTEMPTS) throw e;
+                const pause = NET_RETRY_PAUSES_MS[attempt - 1] ?? NET_RETRY_PAUSES_MS.at(-1) ?? 0;
+                logFn(
+                    `⚠ Ветка фазы ${branch}: git ${args[0]} — сеть до origin (${gitErrorText(e)}); ` +
+                        `повтор ${attempt + 1}/${PHASE_BRANCH_NET_ATTEMPTS} через ${Math.round(pause / 1000)} с`,
+                );
+                sleepFn(pause);
+            }
+        }
+    };
     const fail = (reason: string): TPhaseBranchResult => {
         logFn(`⛔ Ветка фазы ${branch}: ${reason}`);
         return { kind: 'failed', branch, sha: null, reason };
+    };
+    // Отказ сетевого шага: сеть до origin — свой исход с последним ответом git, чтобы стоп
+    // назывался своей причиной; прочее — прежний `failed` с текстом шага.
+    const netFail = (what: string, e: unknown): TPhaseBranchResult => {
+        if (isExecTimeout(e) || isOriginNetworkFailure(e)) {
+            const tries = isExecTimeout(e)
+                ? 'срок вызова истёк, без повтора'
+                : `попыток: ${PHASE_BRANCH_NET_ATTEMPTS}`;
+            const reason = `сеть до origin: ${what} (${tries}) — последний ответ git: ${gitErrorText(e)}`;
+            logFn(`⛔ Ветка фазы ${branch}: ${reason}`);
+            return { kind: 'network', branch, sha: null, reason };
+        }
+        return fail(`${what} — ${gitErrorText(e)}`);
     };
 
     try {
         gitNet(['fetch', 'origin', 'main', '--quiet']);
     } catch (e) {
-        return fail(`не смог обновить origin/main — ${gitErrorText(e)}`);
+        return netFail('не смог обновить origin/main', e);
     }
 
     // Есть ли ветка на origin. `--exit-code` отвечает кодом 2 на «совпадений нет» — и это
@@ -137,11 +232,13 @@ export function ensurePhaseBranch(branch: string, deps: TPhaseBranchDeps): TPhas
     // origin/main поверх чужой работы и получить non-ff при пуше.
     let onOrigin: boolean;
     try {
-        gitNet(['ls-remote', '--exit-code', '--heads', 'origin', branch]);
+        gitNet(
+            ['ls-remote', '--exit-code', '--heads', 'origin', branch],
+            (e) => gitExitStatus(e) === 2,
+        );
         onOrigin = true;
     } catch (e) {
-        if (gitExitStatus(e) !== 2)
-            return fail(`не смог спросить origin о ветке — ${gitErrorText(e)}`);
+        if (gitExitStatus(e) !== 2) return netFail('не смог спросить origin о ветке', e);
         onOrigin = false;
     }
 
@@ -198,7 +295,7 @@ export function ensurePhaseBranch(branch: string, deps: TPhaseBranchDeps): TPhas
         try {
             gitNet(['fetch', 'origin', branch, '--quiet']);
         } catch (e) {
-            return fail(`не смог подтянуть origin/${branch} — ${gitErrorText(e)}`);
+            return netFail(`не смог подтянуть origin/${branch}`, e);
         }
     }
 

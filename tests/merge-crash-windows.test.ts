@@ -289,6 +289,8 @@ function runProcess(
                     },
                 ),
                 mergedPhasePrFn: read(() => PR),
+                // #139: доменный PR фазы — сверка защищаемых путей проходит, мердж идёт.
+                prChangedFilesFn: read(() => ['src/feature.ts']),
                 advancePhaseFn: (st: RalphState, idx: number) => {
                     st.milestone = PHASES[idx + 1]?.milestone ?? null;
                     st.count = 0;

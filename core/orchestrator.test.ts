@@ -5364,6 +5364,33 @@ describe('runLoop — основной while-цикл: итерации коде
         expect(order).toEqual(['branch:feature/m1', 'session']);
     });
 
+    // #144-ревью: пауза повтора сетевого транзиента — коллаборатором runLoop, а не боевым
+    // `sleep`: тест, подсунувший проводке сетевой отказ, иначе реально уснул бы на 20 с.
+    it('#144: проводка ветки получает sleepFn из параметров runLoop', () => {
+        const sleepFn = vi.fn();
+        const ensurePhaseBranchFn = vi.fn((branch: string, _deps: unknown) => ({
+            kind: 'created' as const,
+            branch,
+            sha: 'a'.repeat(40),
+        }));
+        runLoop(
+            validCfg(),
+            ctx(mkState()),
+            deps([], {
+                once: true,
+                phaseIndexOfFn: () => 0,
+                openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                ensurePhaseBranchFn,
+                sleepFn,
+                runClaudeFn: () => 0,
+            }),
+        );
+        expect(ensurePhaseBranchFn).toHaveBeenCalled();
+        expect((ensurePhaseBranchFn.mock.calls[0][1] as { sleepFn?: unknown }).sleepFn).toBe(
+            sleepFn,
+        );
+    });
+
     it('задача 11: не встали на ветку → сессия НЕ спавнится, стоп с пушем', () => {
         const logs: string[] = [];
         const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
@@ -5388,6 +5415,33 @@ describe('runLoop — основной while-цикл: итерации коде
         expect(runClaudeFn).not.toHaveBeenCalled();
         expect(pushEventFn).toHaveBeenCalledTimes(1);
         expect(pushEventFn.mock.calls[0][0]).toMatch(/не поставлено на ветку фазы feature\/m1/);
+    });
+
+    it('#144: сеть до origin пережила повторы — стоп своей причиной, а не unknown', () => {
+        const logs: string[] = [];
+        const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+        const pushEventFn = vi.fn();
+        runLoop(
+            validCfg(),
+            ctx(mkState()),
+            deps(logs, {
+                phaseIndexOfFn: () => 0,
+                openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                ensurePhaseBranchFn: () => ({
+                    kind: 'network' as const,
+                    branch: 'feature/m1',
+                    sha: null,
+                    reason: 'сеть до origin: не смог обновить origin/main (попыток: 3) — последний ответ git: gnutls_handshake() failed',
+                }),
+                runClaudeFn,
+                pushEventFn,
+            }),
+        );
+        expect(runClaudeFn).not.toHaveBeenCalled();
+        const msg = String(pushEventFn.mock.calls[0][0]);
+        expect(msg).toContain('(origin-network)');
+        expect(msg).not.toContain('(unknown)');
+        expect(msg).toMatch(/gnutls_handshake/);
     });
 
     it('задача 11: расхождение с origin — тоже стоп, а не попытка починить силой', () => {
@@ -9787,6 +9841,104 @@ describe('runLoop — основной while-цикл: итерации коде
         expect(state.gateHeals).toBe(0);
     });
 
+    // #139: PR правит защищаемый путь на площадке, правило ревью которой его не держит.
+    // Стоп с причиной и файлами, без чини-сессии: правка lock — решение человека.
+    it('#139: protected-paths — стоп с причиной и файлами, без чини-сессии', () => {
+        const state = mkState({ submitted: true, gateHeals: 1 });
+        const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+        const pushEventFn = vi.fn((msg: string) => msg.length > 0);
+        const why = {
+            kind: 'hits' as const,
+            why: 'правка защищаемого пути — мердж за человеком: .ralph/core.lock (.ralph/core.lock)',
+        };
+        runLoop(
+            validCfg({ gateHealAttempts: 2 }),
+            ctx(state),
+            deps([], {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => false,
+                tryMergePhaseFn: () => 'protected-paths',
+                getLastProtectedPathsStop: () => why,
+                runClaudeFn,
+                pushEventFn,
+            }),
+        );
+        expect(runClaudeFn).not.toHaveBeenCalled();
+        expect(pushEventFn).toHaveBeenCalledTimes(1);
+        const stopText = String(pushEventFn.mock.calls[0][0]);
+        expect(stopText).toContain('(protected-paths)');
+        expect(stopText).toContain('.ralph/core.lock');
+        expect(stopText).toContain('PR оставлен человеку');
+        expect(stopText).not.toContain('(unknown)');
+        expect(state.gateHeals).toBe(0);
+    });
+
+    // #139-ревью: файлы не сверились или дифф пуст — заголовок не говорит «правит
+    // защищаемый путь», а вопрос — свой у каждой развилки.
+    it.each([
+        ['unverified', 'не сверены', 'почини причину', 'правит защищаемый путь'],
+        ['empty', 'пуст относительно main', 'закрой PR', 'правит защищаемый путь'],
+        [null, 'не сверены', 'регресс проводки', 'правит защищаемый путь'],
+    ] as const)('protected-paths %s — свой заголовок и вопрос', (kind, head, question, absent) => {
+        const pushEventFn = vi.fn((msg: string) => msg.length > 0);
+        runLoop(
+            validCfg(),
+            ctx(mkState({ submitted: true })),
+            deps([], {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => false,
+                tryMergePhaseFn: () => 'protected-paths',
+                getLastProtectedPathsStop: () =>
+                    kind === null ? null : { kind, why: 'диагноз гейта' },
+                pushEventFn,
+            }),
+        );
+        const stopText = String(pushEventFn.mock.calls[0][0]);
+        expect(stopText).toContain(head);
+        expect(stopText).toContain(question);
+        if (kind !== null) expect(stopText).toContain('диагноз гейта');
+        expect(stopText).not.toContain(absent);
+    });
+
+    // #139: проводка. Чтение файлов PR доезжает до гейта, если площадка пути не держит, и
+    // не доезжает, если держит. Дефолт берётся из шва форжа (GitHub-реализация по
+    // умолчанию — `reviewProtectsPaths: false`), а не включается вызывающим по памяти.
+    describe('#139: чтение файлов PR в гейт — по шву форжа', () => {
+        function gateOpts(over: Record<string, unknown>) {
+            const tryMergePhaseFn = vi.fn((..._args: unknown[]) => 'protected-paths' as const);
+            runLoop(
+                validCfg(),
+                ctx(mkState({ submitted: true })),
+                deps([], {
+                    openIssuesFn: () => [],
+                    allOpenIssuesFn: () => [],
+                    phaseMergedFn: () => false,
+                    tryMergePhaseFn,
+                    getLastProtectedPathsStop: () => ({ kind: 'hits' as const, why: 'x' }),
+                    pushEventFn: () => true,
+                    ...over,
+                }),
+            );
+            expect(tryMergePhaseFn).toHaveBeenCalledTimes(1);
+            return tryMergePhaseFn.mock.calls[0][1] as { changedFilesFn?: unknown };
+        }
+
+        it('дефолт шва (площадка пути не держит) — чтение доезжает', () => {
+            expect(typeof gateOpts({}).changedFilesFn).toBe('function');
+        });
+
+        it('заданное чтение доезжает тем же объектом', () => {
+            const reader = (): string[] => ['a.ts'];
+            expect(gateOpts({ prChangedFilesFn: reader }).changedFilesFn).toBe(reader);
+        });
+
+        it('площадка держит пути сама (null) — чтения нет', () => {
+            expect(gateOpts({ prChangedFilesFn: null })).not.toHaveProperty('changedFilesFn');
+        });
+    });
+
     // #123: мердж не удался после вызова — класс отказа и строку форжа гейт знает, а пуш
     // раньше уходил катч-оллом «причина не установлена (unknown)».
     it('#123: исчерпанный предел повторов мерджа — пуш с классом отказа и строкой форжа', () => {
@@ -13659,6 +13811,17 @@ describe('observerTaskSource — шов задач для панели мони�
         expect(sc.secretEnvNames()).not.toEqual(gh.secretEnvNames());
         expect(typeof sc.listAllOpenIssues).toBe('function');
         expect(typeof sc.findOpenPullRequest).toBe('function');
+    });
+
+    // #139: SourceCraft держит защищаемые пути правилом ревью (ship человека), GitHub — нет:
+    // ruleset не требует одобрения по путям, и их держит гейт раннера.
+    it('#139: кто держит защищаемые пути — SourceCraft да, GitHub нет', () => {
+        const runtime = buildRuntime();
+        expect(
+            runtime.observerTaskSource({ taskSource: 'sourcecraft' }, throwFail)
+                .reviewProtectsPaths,
+        ).toBe(true);
+        expect(runtime.observerTaskSource(undefined, throwFail).reviewProtectsPaths).toBe(false);
     });
 
     it('неизвестная реализация — отказ через failFn вызывающего, а не exit процесса', () => {

@@ -75,18 +75,20 @@ export function loadJson<T>(p: string, fallback: T): T {
     }
 }
 
-// #386: выбор пути лога по режиму прогона. Свежесть ralph.log — признак жизни БОЕВОЙ
-// петли (инвариант №12); чужой прогон (--dry-run и/или профиль ≠ prod — обычный
-// ритуал кодер-сессии, проверяющей правки самого раннера: playground/dry-run) не имеет
-// права писать в тот же файл — его штатные маркеры остановки (⏸/✋/🎉) переводят
-// deadman в режим stopped (порог тишины Infinity) и ослепляют сторож боевой петли
-// навсегда. Чистая функция без побочек — тестируется отдельно от main().
+// #386, #141: выбор пути лога по режиму прогона. Свежесть ralph.log — признак жизни петли
+// (инвариант №12), и --dry-run не имеет права писать в тот же файл: dry-прогон лока не
+// берёт (C1, read-only) и поэтому идёт РЯДОМ с живой петлёй на том же каталоге состояния —
+// его штатные маркеры остановки (⏸/✋/🎉) перевели бы deadman в режим stopped (порог
+// тишины Infinity) и ослепили сторож навсегда. Живой прогон лок берёт, значит второго
+// живого на этом каталоге нет, и его лог — ralph.log при ЛЮБОМ профиле. Прежде боевым
+// считался только профиль prod (#141): живой прогон демо писал в ralph.dry.log, метрика
+// по ralph.log была пуста, а сухой и живой прогоны делили один файл.
+// Чистая функция без побочек — тестируется отдельно от main().
 export function chooseLogPath(
-    run: { dry: boolean; profileName?: string },
+    run: { dry: boolean },
     paths: { battle: string; sideline: string },
 ): string {
-    const isBattle = !run.dry && run.profileName === 'prod';
-    return isBattle ? paths.battle : paths.sideline;
+    return run.dry ? paths.sideline : paths.battle;
 }
 
 export function createExec(env: ExecEnv) {

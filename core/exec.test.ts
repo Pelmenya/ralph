@@ -150,38 +150,28 @@ describe('saveSessionOutput (#390)', () => {
     });
 });
 
-// #386: разводка лога боевого/не-боевого прогона — чужой прогон (dry-run и/или профиль
-// playground) не должен ослеплять deadman боевой петли своими маркерами остановки.
+// #386, #141: разводка лога решается ТОЛЬКО флагом --dry-run. Dry-прогон лока не берёт и
+// идёт рядом с живой петлёй — в её ralph.log ему нельзя. Живой прогон любого профиля держит
+// лок каталога и пишет в ralph.log: иначе живой прогон демо (профиль demo) уходил в
+// ralph.dry.log, и метрика по ralph.log была пуста (#141).
 // chooseLogPath — чистая функция, поэтому проверяется без main()/worktree/fs.
-describe('chooseLogPath — куда пишет лог (#386)', () => {
+describe('chooseLogPath — куда пишет лог (#386, #141)', () => {
     const PATHS = {
         battle: '/worktree/.claude/ralph/ralph.log',
         sideline: '/worktree/.claude/ralph/ralph.dry.log',
     };
 
-    it('боевой прогон (профиль prod, не dry) пишет в общий ralph.log', () => {
-        expect(ralph.chooseLogPath({ dry: false, profileName: 'prod' }, PATHS)).toBe(PATHS.battle);
-    });
+    it.each(['prod', 'demo', 'playground', undefined])(
+        'живой прогон профиля %s пишет в ralph.log',
+        (profileName) => {
+            expect(ralph.chooseLogPath({ dry: false, profileName }, PATHS)).toBe(PATHS.battle);
+        },
+    );
 
-    it('--dry-run на профиле prod пишет в отдельный лог, не в боевой', () => {
-        expect(ralph.chooseLogPath({ dry: true, profileName: 'prod' }, PATHS)).toBe(PATHS.sideline);
-    });
-
-    it('профиль playground без --dry-run пишет в отдельный лог, не в боевой', () => {
-        expect(ralph.chooseLogPath({ dry: false, profileName: 'playground' }, PATHS)).toBe(
-            PATHS.sideline,
-        );
-    });
-
-    it('профиль playground с --dry-run тоже пишет в отдельный лог', () => {
-        expect(ralph.chooseLogPath({ dry: true, profileName: 'playground' }, PATHS)).toBe(
-            PATHS.sideline,
-        );
-    });
-
-    it('профиль не задан (dry) — консервативно отдельный лог, не боевой', () => {
-        expect(ralph.chooseLogPath({ dry: false, profileName: undefined }, PATHS)).toBe(
-            PATHS.sideline,
-        );
-    });
+    it.each(['prod', 'demo', 'playground', undefined])(
+        '--dry-run профиля %s пишет в ralph.dry.log, не в боевой',
+        (profileName) => {
+            expect(ralph.chooseLogPath({ dry: true, profileName }, PATHS)).toBe(PATHS.sideline);
+        },
+    );
 });
