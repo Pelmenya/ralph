@@ -279,6 +279,14 @@ export function parseSessionRequests(
             fail(no, 'не разобралось как JSON');
         }
         const req = asRecord(parsed, no);
+        // #9: служебная строка раннера в батче. Отказ блока раннер пишет строкой с причиной
+        // — она валит батч целиком и называет, что именно было не так с блоком. Любая
+        // другая служебная строка здесь — подделка или порча, а не «неизвестный kind».
+        if (Object.hasOwn(req, 'ralph')) {
+            if (req['ralph'] === REJECTED_BLOCK_TAG && typeof req['why'] === 'string')
+                fail(no, `блок намерений в выводе сессии отвергнут раннером — ${req['why']}`);
+            fail(no, 'служебная строка раннера в батче намерений не на своём месте');
+        }
         const kind = req['kind'];
 
         if (kind === 'new-issue') {
@@ -354,6 +362,91 @@ export function parseSessionRequests(
     }
 
     return requests;
+}
+
+// ── #9: канал намерений — вывод сессии, а не файл ───────────────────────────────────
+//
+// Пойман живьём на первом прогоне потребителя: сессия ревью подготовила 17 замечаний и не
+// отдала ни одного — харнесс отказал ей в записи файла намерений («sensitive file»), и фаза
+// смерджилась без них. Каталог и расширение ни при чём: проба писала соседние `.jsonl`
+// свободно, режется именно файл очереди команд оркестратора, и `permissions.allow` его не
+// открывает. Запрет содержателен — сессия писала в то, что раннер исполнит с правами выше
+// её, — поэтому обход (другое имя, запись через оболочку) не годится: он снял бы
+// единственную проверку на этом шве и развалился бы в следующей версии харнесса.
+//
+// Направление развёрнуто: сессия ПЕЧАТАЕТ намерения блоком в своём выводе, раннер разбирает
+// вывод своего же дочернего процесса и сам дописывает строки в файл намерений. Дальше всё
+// прежнее — журнал «начато / применено», сверка, карантин: файл остался, сменился писатель.
+//
+// Маркер считается только целой строкой: сессия, рассказывающая о протоколе в прозе, не
+// открывает блок случайно. Форма блока проверяется здесь, содержимое — `parseSessionRequests`,
+// одним разбором на оба канала. Битая форма — отказ ВСЕГО батча, а не «что разобралось»:
+// незакрытый блок мог оборвать именно объясняющий `comment` перед `close`.
+
+export const INTENTS_BEGIN = '<<<RALPH-INTENTS>>>';
+export const INTENTS_END = '<<<END-RALPH-INTENTS>>>';
+const REJECTED_BLOCK_TAG = 'rejected-block';
+
+export type TIntentBlock =
+    | { kind: 'none' }
+    | { kind: 'block'; lines: string[] }
+    // `raw` — участок вывода от первого маркера до последнего (у незакрытого — до конца):
+    // он уходит в лог, потому что это последняя воля сессии, и терять её молча нельзя.
+    | { kind: 'rejected'; why: string; raw: string };
+
+/**
+ * Достаёт блок намерений из вывода сессии. Отказывает на любой неоднозначности формы:
+ * начало без конца, конец без начала, второй блок, вложенное начало, служебная строка
+ * раннера внутри (метка начатого намерения из вывода сессии остановила бы петлю ложным
+ * «исход неизвестен», а отказ блока выдавал бы себя за решение раннера).
+ */
+export function extractIntentBlock(output: string): TIntentBlock {
+    const lines = output.split('\n').map((l) => l.trim());
+    const markers = lines
+        .map((l, i) => ({ l, i }))
+        .filter(({ l }) => l === INTENTS_BEGIN || l === INTENTS_END);
+    if (markers.length === 0) return { kind: 'none' };
+    const first = markers[0].i;
+    const last = markers[markers.length - 1];
+    const raw = lines.slice(first, last.l === INTENTS_END ? last.i + 1 : lines.length).join('\n');
+    const rejected = (why: string): TIntentBlock => ({ kind: 'rejected', why, raw });
+
+    if (markers[0].l === INTENTS_END) return rejected(`маркер ${INTENTS_END} без начала блока`);
+    if (markers.length > 1 && markers[1].l === INTENTS_BEGIN)
+        return rejected(`повторный ${INTENTS_BEGIN} внутри блока`);
+    if (markers.length === 1) return rejected(`блок не закрыт маркером ${INTENTS_END}`);
+    if (markers.length > 2)
+        return rejected(
+            `маркеров ${String(markers.length)} — блок намерений в выводе ровно один, ` +
+                'все намерения сессии — в нём',
+        );
+
+    const inner = lines.slice(first + 1, markers[1].i).filter((l) => l !== '');
+    for (const l of inner) {
+        let parsed: unknown = null;
+        try {
+            parsed = JSON.parse(l);
+        } catch {
+            // Не JSON — разбор батча отвергнет его с номером строки; здесь только форма.
+        }
+        const service =
+            l.startsWith(IN_FLIGHT_PREFIX) ||
+            (typeof parsed === 'object' &&
+                parsed !== null &&
+                !Array.isArray(parsed) &&
+                Object.hasOwn(parsed, 'ralph'));
+        if (service) return rejected('служебная строка раннера внутри блока сессии');
+    }
+    return { kind: 'block', lines: inner };
+}
+
+/**
+ * Строка отказа блока для файла намерений. Раннер пишет её ВМЕСТО строк битого блока: так
+ * отказ идёт тем же путём, что и битая строка в файле, — батч отвергается целиком, в
+ * кодер-итерации уезжает в карантин, в сдаче фазы останавливает её, — и причина названа.
+ */
+export function serializeRejectedBlock(why: string): string {
+    return JSON.stringify({ ralph: REJECTED_BLOCK_TAG, why });
 }
 
 /**

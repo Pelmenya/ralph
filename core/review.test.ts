@@ -299,7 +299,7 @@ describe('assertKnownReviewModels — fail-closed планка моделей р
             review: {
                 default: 'claude-opus-4-8',
                 escalated: 'claude-fable-5',
-                fallback: 'claude-opus-4-8',
+                fallback: 'claude-fable-5',
             },
         };
         expect(assertKnownReviewModels(cfg, 'prod', boom)).toBe(true);
@@ -842,5 +842,86 @@ describe('reviewVerdict — структурный вердикт прохода
 
     it('сводка из пробелов вердиктом не считается', () => {
         expect(reviewVerdict([{ comment: '   ' }], false)).toBeNull();
+    });
+});
+
+describe('assertKnownReviewModels — эскалация и фолбэк обязаны что-то менять (#46)', () => {
+    // Конфиг, на котором дефект прожил незамеченным: все три модели ревью — одна строка,
+    // а эскалация на путях ядра честно писала в лог «ревью эскалировано».
+    const boom = (m: string) => {
+        throw new Error(m);
+    };
+    const check = (review: Record<string, unknown>) =>
+        createReviewModule(makeEnv()).assertKnownReviewModels({ review }, 'prod', boom);
+
+    it('escalated === default → стоп с названием обеих моделей', () => {
+        expect(() => check({ default: 'claude-opus-4-8', escalated: 'claude-opus-4-8' })).toThrow(
+            /review\.escalated = "claude-opus-4-8" не сильнее review\.default = "claude-opus-4-8"/,
+        );
+    });
+
+    it('escalated слабее default → стоп', () => {
+        expect(() => check({ default: 'claude-opus-4-8', escalated: 'claude-sonnet-5' })).toThrow(
+            /review\.escalated.*не сильнее/,
+        );
+    });
+
+    it('сила считается по modelStrength конфига, а не по встроенному списку', () => {
+        // По встроенному списку fable сильнее opus; конфиг вправе сказать обратное, и
+        // барьер обязан судить по нему — иначе он проверял бы чужую планку.
+        expect(() =>
+            check({
+                modelStrength: ['claude-fable-5', 'claude-opus-4-8'],
+                default: 'claude-opus-4-8',
+                escalated: 'claude-fable-5',
+            }),
+        ).toThrow(/не сильнее/);
+    });
+
+    it('escalated строго сильнее default → принимается', () => {
+        expect(check({ default: 'claude-opus-4-8', escalated: 'claude-fable-5' })).toBe(true);
+    });
+
+    it('escalated не задан — default на вершине списка законен, барьеру нечего сверять', () => {
+        expect(check({ default: 'claude-fable-5' })).toBe(true);
+    });
+
+    it('fallback === default → стоп с осознанными формами в тексте', () => {
+        expect(() =>
+            check({
+                default: 'claude-opus-4-8',
+                escalated: 'claude-fable-5',
+                fallback: 'claude-opus-4-8',
+            }),
+        ).toThrow(/review\.fallback = review\.default = "claude-opus-4-8".*'none'.*убери ключ/s);
+    });
+
+    it("fallback: 'none' — осознанный отказ, принимается", () => {
+        expect(check({ default: 'claude-opus-4-8', fallback: 'none' })).toBe(true);
+    });
+
+    it('fallback не задан — дефолт #221, принимается', () => {
+        expect(check({ default: 'claude-opus-4-8', escalated: 'claude-fable-5' })).toBe(true);
+    });
+});
+
+describe('pickReviewModel — лог различает эскалацию и обычный проход (#46)', () => {
+    it('зона риска — строка называет модель эскалации и модель, которую она заменила', () => {
+        const logs: string[] = [];
+        const { pickReviewModel } = createReviewModule(
+            makeEnv({ log: (m) => logs.push(m), matchRiskPaths: () => '.claude/ralph/x' }),
+        );
+        pickReviewModel('Фаза X', 'feature/x', { cfg: CFG, files: ['.claude/ralph/x'] });
+        expect(logs).toContain('🔺 Эскалация ревью: модель claude-fable-5 вместо claude-opus-4-8.');
+        expect(logs.join('\n')).not.toMatch(/без эскалации/);
+    });
+
+    it('вне зоны риска — строка «без эскалации» с моделью по умолчанию', () => {
+        const logs: string[] = [];
+        const { pickReviewModel } = createReviewModule(
+            makeEnv({ log: (m) => logs.push(m), matchRiskPaths: () => null }),
+        );
+        pickReviewModel('Фаза X', 'feature/x', { cfg: CFG, files: ['src/a.ts'] });
+        expect(logs).toEqual(['Ревью без эскалации: модель по умолчанию claude-opus-4-8.']);
     });
 });

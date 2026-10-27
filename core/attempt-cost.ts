@@ -4,11 +4,11 @@
 // Сколько стоила сессия, раньше не знал никто: `claude -p` в текстовом режиме печатает
 // только ответ. Токены по моделям отдаёт `--output-format json` — поэтому рантайм Claude
 // (и Kimi через тот же бинарь) теперь запускается с ним, а вывод переводится обратно в
-// текст, который ждут все читатели вывода: детект API-лимита, бюджета ходов, недоступности
-// прокси. Перевод — часть контракта, а не косметика: в JSON исчерпание ходов выглядит как
-// `subtype: error_max_turns` и `Reached maximum number of turns (N)`, а `TURN_LIMIT_RE`
-// ищет `Reached max turns` текстового режима (проверено живым CLI 2.1.311). Без перевода
-// продолжение по бюджету ходов превратилось бы в стоп «сессия упала».
+// текст для лога, разбора падения и блока намерений. Исход сессии (лимит, бюджет ходов,
+// обрыв) из этого текста больше не читается: его по сырому JSON — `subtype:
+// error_max_turns` и прочему — называет адаптер рантайма (`adapters/session-end.ts`, Фаза
+// 16). Прежде перевод синтезировал маркер `Reached max turns`, которого ждала регулярка
+// ядра; с переездом признаков в адаптер синтез снят.
 //
 // Вывод, который как JSON-результат не разобрался (старый CLI, обрыв посреди, чужой
 // рантайм), идёт дальше как есть — читатели видят прежний текст, — а попытка ложится в
@@ -18,9 +18,17 @@
 // а пересчёт прошлых попыток по новому соврал бы о них. Тарифа модели в конфиге нет — берётся
 // стоимость, которую посчитал сам рантайм по своему прайсу на момент вызова (`costUSD`), с
 // пометкой источника; нет и её — стоимость неизвестна, и это тоже сказано в записи.
+//
+// Рядом со стоимостью запись несёт фактическую версию CLI, профиль (харнесс, провайдер,
+// модель) и исход сессии (#113, R13): CLI обновляются сами, и без версии в записи дефект
+// ядра неотличим от смены поведения инструмента. Поля обязательные у КАЖДОЙ записи —
+// нечитаемая версия пишется словом `unknown` с причиной, а не пропуском поля
+// (`adapters/runtime-profile.ts`).
 
-import { TURN_LIMIT_RE } from './api-limit.ts';
 import type { TTariff } from './observability.ts';
+import type { SessionEndReason } from '../adapters/adapters.ts';
+import type { CliVersion, RuntimeProfile } from '../adapters/runtime-profile.ts';
+import { readClaudeResultEnvelope } from '../adapters/session-end.ts';
 
 export const CLAUDE_JSON_ARGS = ['--output-format', 'json'];
 
@@ -45,27 +53,21 @@ function isObject(v: unknown): v is Record<string, unknown> {
     return !!v && typeof v === 'object' && !Array.isArray(v);
 }
 
+// Конверт разбирает адаптер (`readClaudeResultEnvelope`) — тот же, по которому он называет
+// исход: две копии разбора одной формы разъехались бы при следующей правке CLI. Здесь —
+// только перевод в текст и токены.
 export function parseClaudeJsonResult(
     stdout: string,
 ): { text: string; models: TModelUsage[]; durationMs: number | null } | null {
-    let v: unknown;
-    try {
-        v = JSON.parse(stdout.trim());
-    } catch {
-        return null;
-    }
-    if (!isObject(v) || v.type !== 'result') return null;
+    const v = readClaudeResultEnvelope(stdout);
+    if (!v) return null;
     const parts: string[] = [];
     if (typeof v.result === 'string' && v.result !== '') parts.push(v.result);
     if (Array.isArray(v.errors)) {
         for (const e of v.errors) if (typeof e === 'string') parts.push(`Error: ${e}`);
     }
-    const joined = parts.join('\n');
-    if (v.subtype === 'error_max_turns' && !TURN_LIMIT_RE.test(joined)) {
-        parts.push(`Error: Reached max turns (${num(v.num_turns)})`);
-    }
-    // Ошибочный результат несёт ещё и сырой JSON: детекторы лимита и прокси ищут слова, а
-    // форм ошибки у CLI больше, чем проверено живьём, — потерять маркер дороже лишней строки.
+    // Ошибочный результат несёт ещё и сырой JSON: форм ошибки у CLI больше, чем проверено
+    // живьём, и человеку, разбирающему падение, лишняя строка дешевле потерянной причины.
     if (v.is_error === true) parts.push(stdout.trim());
     const models: TModelUsage[] = [];
     if (isObject(v.modelUsage)) {
@@ -119,9 +121,20 @@ export function priceModel(u: TModelUsage, pricing: Record<string, TTariff> | nu
     return { ...u, tariff: null, costUsd: null, costBasis: 'unknown' };
 }
 
+// Что о попытке известно помимо расхода: чем она шла и чем кончилась.
+export type TAttemptSession = {
+    profile: RuntimeProfile;
+    cliVersion: CliVersion;
+    endReason: SessionEndReason;
+};
+
 export type TAttemptRecord = {
     runtime: string;
     code: number;
+    profile: RuntimeProfile;
+    cliVersion: string;
+    cliVersionUnknown?: string;
+    endReason: SessionEndReason;
     durationMs: number | null;
     tokens: { input: number; output: number; cacheRead: number; cacheWrite: number } | null;
     costUsd: number | null;
@@ -137,17 +150,28 @@ export function attemptRecord({
     parsed,
     pricing,
     unknownReason,
+    session,
 }: {
     runtime: string;
     code: number;
     parsed: ReturnType<typeof parseClaudeJsonResult>;
     pricing: Record<string, TTariff> | null;
     unknownReason?: string;
+    session: TAttemptSession;
 }): TAttemptRecord {
+    const head = {
+        runtime,
+        code,
+        profile: session.profile,
+        cliVersion: session.cliVersion.version,
+        ...(session.cliVersion.unknownReason
+            ? { cliVersionUnknown: session.cliVersion.unknownReason }
+            : {}),
+        endReason: session.endReason,
+    };
     if (!parsed || parsed.models.length === 0) {
         return {
-            runtime,
-            code,
+            ...head,
             durationMs: parsed?.durationMs ?? null,
             tokens: null,
             costUsd: null,
@@ -172,18 +196,23 @@ export function attemptRecord({
     const costUsd = models.every((m) => m.costUsd !== null)
         ? models.reduce((a, m) => a + (m.costUsd as number), 0)
         : null;
-    return { runtime, code, durationMs: parsed.durationMs, tokens, costUsd, models };
+    return { ...head, durationMs: parsed.durationMs, tokens, costUsd, models };
 }
 
 // Человеческая строка о попытке — для лога. Маркер 💰 нейтрален для deadman: режим петли он
 // не меняет, и порог сессии не сбрасывается на короткий. Кеш назван отдельно от итога: у него
 // свой тариф и свой смысл, и одно число человек принял бы за объём работы — в типичной
 // попытке почти всё оно приходится на запись кеша.
+// Хвост — профиль, версия CLI и исход: по строке лога видно, чем шла попытка, без журнала.
 export function attemptLogLine(r: TAttemptRecord): string {
-    if (!r.tokens) return `💰 Попытка (${r.runtime}): расход неизвестен — ${r.usageUnknown}.`;
+    const p = r.profile;
+    const tail = ` Профиль ${p.harness}/${p.provider}/${p.model}, CLI ${r.cliVersion}, исход ${r.endReason}.`;
+    if (!r.tokens) {
+        return `💰 Попытка (${r.runtime}): расход неизвестен — ${r.usageUnknown}.${tail}`;
+    }
     const cache = r.tokens.cacheRead + r.tokens.cacheWrite;
     const total = r.tokens.input + r.tokens.output + cache;
     const bases = [...new Set(r.models.map((m) => m.costBasis))].join('+');
     const cost = r.costUsd === null ? 'стоимость неизвестна' : `$${r.costUsd.toFixed(4)}`;
-    return `💰 Попытка (${r.runtime}): ${total} токенов (из них кеш ${cache}), ${cost} (тариф: ${bases}).`;
+    return `💰 Попытка (${r.runtime}): ${total} токенов (из них кеш ${cache}), ${cost} (тариф: ${bases}).${tail}`;
 }

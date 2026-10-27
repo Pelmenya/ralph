@@ -67,8 +67,10 @@ import {
     planRuntimeMigration,
     readMigrationJournal,
     rollbackRuntime,
+    describeRollback,
     runnerLegacyDir,
     type TMigrationDeps,
+    fileTailHash,
 } from './runtime-migration.ts';
 import type {
     TConsumerScripts,
@@ -142,6 +144,8 @@ import {
     classifyIntentFailure,
     classifySessionRequests,
     COMMENT_NOTICE_THRESHOLD,
+    extractIntentBlock,
+    serializeRejectedBlock,
     inFlightEntry,
     inFlightMarker,
     inFlightStopMessage,
@@ -204,14 +208,7 @@ import {
     BACKLOG_MILESTONE_CAP,
     createBacklogAddress,
 } from './backlog-address.ts';
-import {
-    API_LIMIT_RE,
-    TURN_LIMIT_RE,
-    parseResetWaitMs,
-    minutesOrDefault,
-    apiLimitWaitMs,
-    apiLimitMessage,
-} from './api-limit.ts';
+import { minutesOrDefault, apiLimitWaitMs, apiLimitMessage } from './api-limit.ts';
 import {
     SUBSCRIPTION_KEY_ENV,
     SUBSCRIPTION_KEYS_ENV,
@@ -226,12 +223,10 @@ import {
     type TKeyLimitStep,
 } from './key-rotation.ts';
 import {
-    isRuntimeUnavailable,
     runtimeUnavailableWaitMs,
     runtimeUnavailableMessage,
     runtimeUnavailableExhaustedMessage,
     DEFAULT_RUNTIME_UNAVAILABLE_MAX_WAIT_MS,
-    isModelProxyUnavailable,
     modelProxyRetryWaitMs,
     MODEL_PROXY_RETRIES,
 } from './runtime-availability.ts';
@@ -250,8 +245,20 @@ import type {
     ReviewComment,
     RunOptions,
     RunResult,
+    SessionEndReason,
     TaskSourceAdapter,
 } from '../adapters/adapters.ts';
+// Фаза 16 (#112): исход сессии называет адаптер рантайма по признакам своего CLI. Ядро
+// зовёт классификатор только в spawn-путях Claude и Codex — реализациях шва, которые пока
+// живут в этом файле, — а решения принимает по одному `endReason`.
+import { classifyClaudeSessionEnd, classifyCodexSessionEnd } from '../adapters/session-end.ts';
+import {
+    CLI_VERSION_UNKNOWN,
+    RUNTIME_IDENTITIES,
+    runtimeProfile,
+    type CliVersion,
+    type RuntimeProfile,
+} from '../adapters/runtime-profile.ts';
 import {
     describeRoots,
     doctorRootsLines,
@@ -1276,16 +1283,70 @@ export function createOrchestrator(env: OrchestratorEnv) {
     }
 
     /**
+     * Исход сессии в форме, по которой решает ядро. Адаптер, назвавший исход, — источник
+     * истины. Не назвавший (реализация шва без классификации, фейк в тесте) получает
+     * исход по одному коду возврата: 0 — `completed`, иначе `unknown`. Текст вывода здесь
+     * не читается никогда (Фаза 16): решение по нему и было тем, от чего уходили.
+     */
+    function sessionEndReasonOf(res: {
+        code: number;
+        endReason?: SessionEndReason;
+    }): SessionEndReason {
+        return res.endReason ?? (res.code === 0 ? 'completed' : 'unknown');
+    }
+
+    /**
+     * Код, который runClaude отдаёт вызывающему по исходу без повтора. Два исхода
+     * называются в лог, потому что их иначе не отличить по одному коду:
+     *   - `unknown` — «прочее»: адаптер исход не узнал. Успехом он не становится НИКОГДА —
+     *     даже при коде 0 от реализации шва, которая так сказала: код 0 тогда заменяется
+     *     единицей. Неопознанный исход, засчитанный успехом, и был тем, от чего уходили;
+     *   - `auth` — вход отвергнут: повтор и ожидание не лечат, нужен человек. Стоп решает
+     *     вызывающий: кодер-итерация останавливает петлю в `handleCrashedCoderSession`, шаги
+     *     сдачи — своим fail-closed на ненулевом коде;
+     *   - `interrupted` при коде 0 — обрыв, после которого CLI вышел нулём (прокси «No
+     *     upstream account»). Код остаётся 0 НАМЕРЕННО: повтор с паузой есть только у прохода
+     *     ревью, где пустой проход иначе ушёл бы в main непрочитанным. Кодер-итерация и шаги
+     *     правок такую сессию засчитывают завершённой: карточка не закрыта, и следующая
+     *     итерация возьмёт её снова, а серию пустых ловит `maxNoProgress`. Свой повтор здесь
+     *     удвоил бы повтор ревью, поэтому его нет — но строка в лог есть.
+     * Фолбэк-провайдер проходит через ту же функцию: исход у двух веток один.
+     */
+    function settledCode(code: number, endReason: SessionEndReason): number {
+        if (endReason === 'interrupted' && code === 0) {
+            log(
+                '⚠ Сессия вышла с кодом 0, но рантайм назвал исход обрывом (interrupted) — ' +
+                    'решает вызывающий шаг (повтор с паузой — только у ревью).',
+            );
+            return code;
+        }
+        if (endReason === 'unknown') {
+            log(
+                `⚠ Исход сессии не опознан адаптером рантайма (код ${code}) — считаю «прочее», ` +
+                    'не успех: повтора нет, решение — у вызывающего шага.',
+            );
+            return code === 0 ? 1 : code;
+        }
+        if (endReason === 'auth') {
+            log(
+                `⛔ Рантайм отверг авторизацию (код ${code}) — повтор и ожидание не помогут: ` +
+                    'проверь вход или ключ рантайма.',
+            );
+        }
+        return code;
+    }
+
+    /**
      * Запуск claude -p. Возвращает exit-код процесса (0 = успех; DRY всегда 0).
      * H2: код возвращаем, а не глотаем, потому что фатальность решает ВЫЗЫВАЮЩИЙ:
      * для кодер-итераций ненулевой код не фатален (незакрытый issue возьмёт следующая
      * чистая сессия), а для шагов сдачи фазы — стоп fail-closed (упавшее ревью не
      * должно молча пропускать фазу в main).
      *
-     * Вывод claude захватывается (pipe), а не inherit: это цена за детекцию
-     * API-лимита в тексте. Потери живого стрима почти нет — `claude -p` печатает
-     * результат в конце сессии; захваченный вывод целиком уходит в консоль после.
-     * При маркере лимита: sleep до сброса (+ apiLimitGraceMin запаса) и повтор той же
+     * Вывод claude захватывается (pipe), а не inherit: из него берутся блок намерений и
+     * признаки исхода, которые адаптер сводит в `endReason`. Потери живого стрима почти
+     * нет — `claude -p` печатает результат в конце сессии; захваченный вывод целиком
+     * уходит в консоль после. При исходе `api-limit`: sleep до сброса (+ apiLimitGraceMin запаса) и повтор той же
      * команды, не более config.apiLimitMaxWaits раз (дефолт 3) — защита от вечного сна.
      * Задача 96: при нескольких ключах подписки сначала ротация на следующий свободный
      * ключ (без сна и без траты счётчика), и только когда упёрлись все — сон до ближайшего
@@ -1317,6 +1378,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
             // фейк в тесте) кольца по умолчанию не получает.
             keyRing = subscriptionKeyRing(runClaudeOnceFn),
             nowFn = Date.now,
+            // #9: намерения из вывода КАЖДОГО запуска дочернего процесса, включая упёршийся
+            // в лимит и фолбэк: блок, напечатанный сессией перед повтором, иначе пропал бы.
+            // Повтор того же блока следующим запуском не задваивается — сверка по `seen`.
+            collectIntentsFn = collectSessionIntents,
         }: {
             pushEventFn?: typeof pushEvent;
             cfg?: RalphConfig;
@@ -1324,9 +1389,13 @@ export function createOrchestrator(env: OrchestratorEnv) {
             ensureTunnelFn?: typeof ensureTunnel;
             sleepFn?: typeof sleep;
             coderRuntimeRunForFn?: typeof coderRuntimeRunFor;
-            onOutput?: (output: string) => void;
+            // Фаза 16: вторым аргументом — исход последнего запуска. По нему вызывающий
+            // отличает «не уложилась в бюджет ходов» от падения и обрыв прокси от
+            // проваленного ревью — текст вывода для этого больше не читается.
+            onOutput?: (output: string, endReason: SessionEndReason) => void;
             keyRing?: TKeyRing | null;
             nowFn?: () => number;
+            collectIntentsFn?: (output: string, opts: { seen: Set<string> }) => void;
         } = {},
     ): number {
         // #92: единая точка всех claude-сессий (кодер-итерации И шаги сдачи) — здесь же
@@ -1376,6 +1445,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // имеющей. Документированное «ждать не более N раз» обязано значить ровно это, а
         // не «N минус число транзиентов».
         let attempt = 0;
+        // Строки намерений, уже собранные с запусков этого вызова (докблок collectSessionIntents).
+        const seenIntents = new Set<string>();
         // Задача 96: ротация читается один раз на вызов и нормализуется — после рестарта
         // активным не останется ключ, о котором уже известно, что он упёрся.
         let rot: TKeyRotation | null = null;
@@ -1386,25 +1457,26 @@ export function createOrchestrator(env: OrchestratorEnv) {
         for (;;) {
             const runOpts =
                 keyRing && rot ? { ...opts, authToken: keyRing.keys[rot.active] } : opts;
-            const { code, output, failureKind, systemErrorCode } = runClaudeOnceFn(prompt, runOpts);
+            const run = runClaudeOnceFn(prompt, runOpts);
+            const { code, output, failureKind, systemErrorCode } = run;
+            const endReason = sessionEndReasonOf(run);
+            collectIntentsFn(output, { seen: seenIntents });
             // #611: 'arg-too-long' — детерминированный отказ ЗАПУСКА (argv/env превысили
             // MAX_ARG_STRLEN), НЕ транзиент. Причина уже названа в логе на границе spawn
             // (spawnClaude/spawnCodex) — здесь просто честно возвращаем код БЕЗ повтора:
             // повторный запуск с тем же argv упрётся в тот же предел ядра, ожидание его не
             // лечит (в отличие от 'runtime-unavailable' ниже).
             if (failureKind === 'arg-too-long') {
-                onOutput(output);
+                onOutput(output, endReason);
                 return code;
             }
             // #611: структурная классификация (res.error.code === 'ENOENT' на границе spawn)
-            // — источник истины. Текстовая isRuntimeUnavailable(code, output) остаётся
-            // ВТОРЫМ, более широким условием (code 127 от шелл-обёртки, либо рантаймы вне
-            // spawnClaude/spawnCodex, которых эта классификация не касается) — оба пути ведут
-            // к одному и тому же повтору с backoff, ни один не заменяет другой целиком.
-            if (
-                failureKind === 'runtime-unavailable' ||
-                isRuntimeUnavailable(code, output, failureKind)
-            ) {
+            // — источник истины. Второе условие — код 127 («command not found») от
+            // ШЕЛЛ-ОБЁРТКИ: она стартовала и упала, граница spawn видит обычный
+            // `session-failed`, и это ровно инцидент 18.08 (#606). Оба — коды, не текст:
+            // прежняя текстовая эвристика по ENOENT в выводе снята (Фаза 16) — она ловила
+            // и цитату модели, а боевые рантаймы класс отказа называют сами.
+            if (failureKind === 'runtime-unavailable' || code === 127) {
                 const remainingMs = runtimeUnavailMaxWaitMs - runtimeUnavailElapsedMs;
                 if (remainingMs <= 0) {
                     // Честный fail-closed стоп, но с пушем, который НАЗЫВАЕТ причину:
@@ -1420,7 +1492,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         ),
                         cfg,
                     );
-                    onOutput(output);
+                    onOutput(output, endReason);
                     // Ревью #612: код НОРМАЛИЗУЕТСЯ в 127. Наружу из runClaude уходит голое
                     // число, а разбор падения кодер-итерации (handleCrashedCoderSession)
                     // отличает отказ СРЕДЫ от отказа сессии именно по номеру — `127 || 126`
@@ -1444,10 +1516,12 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 sleepFn(waitMs);
                 continue;
             }
-            const limitHit = code !== 0 && API_LIMIT_RE.test(output);
+            // Фаза 16: лимит — это исход `api-limit`, названный адаптером, а не слово в
+            // выводе. `code !== 0` остаётся вторым замком: успешная сессия лимитом не бывает.
+            const limitHit = code !== 0 && endReason === 'api-limit';
             if (!limitHit) {
-                onOutput(output);
-                return code;
+                onOutput(output, endReason);
+                return settledCode(code, endReason);
             }
             // Задача 96: сначала своя подписка. Упёрся активный ключ — он помечается временем
             // сброса, и сессия сразу идёт на следующем свободном: ни ожидания, ни фолбэка,
@@ -1457,7 +1531,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             let keyStep: TKeyLimitStep | null = null;
             if (keyRing && rot) {
                 const now = nowFn();
-                keyStep = onKeyLimit(rot, now, now + apiLimitWaitMs(output, cfg));
+                keyStep = onKeyLimit(rot, now, now + apiLimitWaitMs(run.retryAfterMs, cfg));
                 rot = keyStep.rot;
                 keyRing.save(rot);
                 if (keyStep.kind === 'rotate') {
@@ -1499,18 +1573,19 @@ export function createOrchestrator(env: OrchestratorEnv) {
                             ? fallbackRoute.provider
                             : opts.modelProvider,
                     });
+                    collectIntentsFn(fb.output, { seen: seenIntents });
                     // ТОЛЬКО чистый успех (code 0) завершает вызов. Любой ненулевой код —
                     // это может быть собственный лимит фолбэка, НО РАВНО и «бинарь не
-                    // установлен / ключ невалиден / опечатка в модели»: API_LIMIT_RE матчит
-                    // лишь формулировку Claude, лимит Kimi/OpenAI под неё не подойдёт
-                    // (research, риск №1), так что отличить лимит от поломки по выводу
-                    // ненадёжно. Поэтому ЛЮБОЙ ненулевой код фолбэка = переходим к штатному
+                    // установлен / ключ невалиден / опечатка в модели», и исход чужого
+                    // рантайма фолбэка здесь сознательно не различается: фолбэк — разовая
+                    // попытка «вместо ожидания», а не новый цикл политики. Поэтому ЛЮБОЙ ненулевой код фолбэка = переходим к штатному
                     // ожиданию основного провайдера, а НЕ отдаём чужой код как итог итерации
                     // (иначе один кривой фолбэк превращал бы переживаемый лимит в провал
                     // итерации, а в шагах сдачи — в стоп фазы).
                     if (fb.code === 0) {
-                        onOutput(fb.output);
-                        return fb.code;
+                        const fbEnd = sessionEndReasonOf(fb);
+                        onOutput(fb.output, fbEnd);
+                        return settledCode(fb.code, fbEnd);
                     }
                     log(
                         `⚠ Фолбэк-провайдер "${fallbackRoute.provider}" вернул ненулевой код ${fb.code} ` +
@@ -1520,17 +1595,17 @@ export function createOrchestrator(env: OrchestratorEnv) {
             }
             // Ожидание выключено оператором — после попытки фолбэка честно возвращаем код лимита.
             if (cfg.waitOnApiLimit === false) {
-                onOutput(output);
+                onOutput(output, endReason);
                 return code;
             }
             if (attempt >= maxWaits) {
-                onOutput(output);
+                onOutput(output, endReason);
                 return code;
             }
             const waitMs =
                 keyStep?.kind === 'wait'
                     ? Math.max(0, keyStep.waitUntilMs - nowFn())
-                    : apiLimitWaitMs(output, cfg);
+                    : apiLimitWaitMs(run.retryAfterMs, cfg);
             const limitMsg =
                 keyRing && keyStep?.kind === 'wait'
                     ? allKeysExhaustedMessage(waitMs, attempt, maxWaits, keyRing.keys.length)
@@ -1608,11 +1683,26 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // стоимость) и строка 💰 в лог. Тариф читается из конфига на КАЖДЫЙ вызов и копируется в
     // запись: это и есть «тариф момента вызова». Отказ записи журнала попытку не роняет —
     // приёмники журнала сами называют отказ (event-journal.ts).
+    // #113: та же запись несёт фактическую версию CLI, профиль и исход сессии — поэтому она
+    // пишется ПОСЛЕ классификации исхода, а не сразу за spawn.
     function recordAttempt(
-        runtimeName: string,
-        code: number,
-        parsed: ReturnType<typeof parseClaudeJsonResult>,
-        unknownReason?: string,
+        {
+            runtime: runtimeName,
+            code,
+            parsed,
+            unknownReason,
+            session,
+        }: {
+            runtime: string;
+            code: number;
+            parsed: ReturnType<typeof parseClaudeJsonResult>;
+            unknownReason?: string;
+            session: {
+                profile: RuntimeProfile;
+                cliVersion: CliVersion;
+                endReason: SessionEndReason;
+            };
+        },
         {
             emitFn = emitEvent,
             logFn = log,
@@ -1623,6 +1713,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             runtime: runtimeName,
             code,
             parsed,
+            session,
             // Немой failFn безопасен только потому, что битую секцию observability уже
             // отверг preflight на старте: сюда доходит проверенный конфиг. Без preflight
             // он глотал бы ошибку конфига и молча давал бы стоимость рантайма.
@@ -1632,6 +1723,97 @@ export function createOrchestrator(env: OrchestratorEnv) {
         emitFn('attempt', rec);
         logFn(attemptLogLine(rec));
         return rec;
+    }
+
+    // #113 (R13): фактическая версия CLI перед сессией. CLI обновляются сами и меняют
+    // поведение между итерациями; без версии в записи попытки дефект ядра неотличим от смены
+    // инструмента. Спрашиваем бинарь, а не конфиг: ожидаемая версия ничего не говорит о том,
+    // что исполнилось. Разбор ответа — у адаптера (`adapters/runtime-profile.ts`): формат
+    // строки версии — свойство CLI.
+    //
+    // Не бросает никогда: версия — наблюдение, а не барьер. Отказ любого рода (сигнал, бинаря
+    // нет, ненулевой код, непохожий ответ) — `unknown` с причиной; готовность рантайма
+    // проверяет `checkAvailable`, а недоступный посреди прогона бинарь назовёт сам spawn сессии.
+    function readCliVersion(
+        bin: string,
+        parse: (output: string) => CliVersion,
+        spawnFn: typeof spawnSync = spawnSync,
+    ): CliVersion {
+        if (spawnFn === spawnSync) guardSideEffect(`readCliVersion(${bin} --version)`);
+        const unknown = (why: string): CliVersion => ({
+            version: CLI_VERSION_UNKNOWN,
+            unknownReason: `\`${bin} --version\` ${why}`,
+        });
+        let res: ReturnType<typeof spawnSync>;
+        try {
+            res = spawnFn(bin, ['--version'], {
+                stdio: ['ignore', 'pipe', 'pipe'],
+                shell: false,
+                timeout: 30 * 1000,
+                encoding: 'utf-8',
+            });
+        } catch (e) {
+            return unknown(`не запустился: ${(e as Error).message}`);
+        }
+        if (res.signal) return unknown(`убит сигналом ${res.signal}`);
+        if (res.error) {
+            const code = (res.error as NodeJS.ErrnoException).code;
+            return unknown(`не запустился: ${code ?? res.error.message}`);
+        }
+        if (res.status !== 0) return unknown(`вернул код ${res.status}`);
+        return parse(String(res.stdout ?? ''));
+    }
+
+    // Последняя ИЗВЕСТНАЯ версия по бинарю — в памяти прогона. Ключ — бинарь, а не рантайм:
+    // у claude и kimi он один, и обновление касается обоих. `unknown` версию не затирает и
+    // сменой не считается: «не прочиталась» — не то же, что «стала другой», и ложное событие
+    // смены отправило бы человека искать обновление, которого не было. Рестарт память
+    // сбрасывает — первая попытка нового прогона сравнивать не с чем, и это не событие.
+    const lastCliVersions = new Map<string, string>();
+    function noteCliVersion(
+        bin: string,
+        v: CliVersion,
+        { emitFn = emitEvent, logFn = log }: { emitFn?: typeof emitEvent; logFn?: LogFn } = {},
+    ): void {
+        if (v.version === CLI_VERSION_UNKNOWN) return;
+        const prev = lastCliVersions.get(bin);
+        lastCliVersions.set(bin, v.version);
+        if (prev === undefined || prev === v.version) return;
+        emitFn('cli-version-changed', { bin, from: prev, to: v.version });
+        // Маркер 🧩 нейтрален для deadman: режим петли он не меняет.
+        logFn(`🧩 Версия CLI \`${bin}\` сменилась между попытками: ${prev} → ${v.version}.`);
+    }
+
+    // Версия перед сессией рантайма по его ключу реестра: прочитать и сверить с прошлой.
+    // Это боевое умолчание параметра `cliVersionFn` у run*Once; тесты подменяют его целиком.
+    function sessionCliVersion(
+        runtime: string,
+        readFn: typeof readCliVersion = readCliVersion,
+        noteFn: typeof noteCliVersion = noteCliVersion,
+    ): CliVersion {
+        const id = RUNTIME_IDENTITIES[runtime];
+        if (!id) {
+            return {
+                version: CLI_VERSION_UNKNOWN,
+                unknownReason: `рантайм '${runtime}' без записи в RUNTIME_IDENTITIES`,
+            };
+        }
+        const v = readFn(id.bin, id.parseVersion);
+        noteFn(id.bin, v);
+        return v;
+    }
+
+    // Контекст попытки, который spawn-путь кладёт в её запись. Умолчание — для вызова мимо
+    // run*Once (юниты границы spawn): версия не читалась, и это сказано словом, а не пропуском.
+    type TAttemptContext = { profile: RuntimeProfile; cliVersion: CliVersion };
+    function unreadAttemptContext(runtime: string): TAttemptContext {
+        return {
+            profile: { ...runtimeProfile(runtime), model: CLI_VERSION_UNKNOWN },
+            cliVersion: {
+                version: CLI_VERSION_UNKNOWN,
+                unknownReason: 'версия перед сессией не читалась',
+            },
+        };
     }
 
     // #607/#611: правила классификации отказа запуска и тексты причин живут в
@@ -1673,6 +1855,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         spawnFn: typeof spawnSync = spawnSync,
         env?: NodeJS.ProcessEnv,
         runtimeName = 'claude',
+        attempt: TAttemptContext = unreadAttemptContext(runtimeName),
     ): RunResult {
         // Дефолт — настоящий spawnSync: забытый мок запустил бы живую claude-сессию
         // (это уже случалось, см. докблок выше). Guard делает промах громким.
@@ -1715,8 +1898,22 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // модулем spawn-failure.ts; лог получает готовые строки, называющие причину прямо.
         const { result, logLines } = resolveSpawnResult('claude', res, output, timeoutMs);
         for (const line of logLines) log(line);
-        recordAttempt(runtimeName, result.code, parsed);
-        return result;
+        // Фаза 16: исход называет адаптер по СЫРОМУ выводу — в JSON-результате у него
+        // структурный `subtype`, которого переведённый текст уже не несёт.
+        const end = classifyClaudeSessionEnd({
+            code: result.code,
+            stdout: res.stdout || '',
+            stderr: res.stderr || '',
+            signal: res.signal ?? null,
+            failureKind: result.failureKind,
+        });
+        recordAttempt({
+            runtime: runtimeName,
+            code: result.code,
+            parsed,
+            session: { ...attempt, endReason: end.endReason },
+        });
+        return { ...result, ...end };
     }
 
     // Задача 96: env Claude-сессии под ротацией. Подменяется ровно одна переменная — та, что
@@ -1830,6 +2027,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
     function runClaudeOnce(
         prompt: string,
         { model, maxTurns, fallbackModel, authToken }: ClaudeOpts,
+        cliVersionFn: (runtime: string) => CliVersion = (rt) => sessionCliVersion(rt),
     ): RunResult {
         // Работает кроссплатформенно, т.к. `claude` — нативный бинарник (claude.exe на
         // Windows, бинарь/симлинк на Linux), а НЕ npm .cmd-shim (тот без shell даёт ENOENT).
@@ -1842,12 +2040,15 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // timeout (M3): зависший claude (сетевой столл) иначе блокирует синхронный
         // loop навсегда — AFK-прогон молча стоит до утра.
         const timeout = config.claudeTimeoutMs || 2 * 60 * 60 * 1000;
+        // #113: версия — перед сессией, ПОСЛЕ проверки DRY: сухой прогон бинарь не трогает.
         return spawnClaude(
             cmdArgs,
             prompt,
             timeout,
             spawnSync,
             withSkillGuard(claudeSessionEnv(authToken)),
+            'claude',
+            { profile: runtimeProfile('claude', model), cliVersion: cliVersionFn('claude') },
         );
     }
 
@@ -1951,6 +2152,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         prompt: string,
         { model, maxTurns, modelProvider }: ClaudeOpts,
         spawnFn: typeof spawnSync = spawnSync,
+        cliVersionFn: (runtime: string) => CliVersion = (rt) => sessionCliVersion(rt),
     ): RunResult {
         // Провайдер-гейт: чужую (не-kimi) модель к Moonshot не пускаем — резолвер тогда
         // возьмёт kimiRuntime.model.
@@ -1980,7 +2182,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // token гарантированно не-null при !DRY (requireToken выше). Секрет — только в env
         // процесса (buildKimiSpawnEnv), НЕ в argv (иначе виден в /proc/*/cmdline).
         const env = withSkillGuard(buildKimiSpawnEnv(baseUrl, token as string, process.env));
-        return spawnClaude(cmdArgs, prompt, timeout, spawnFn, env, 'kimi');
+        return spawnClaude(cmdArgs, prompt, timeout, spawnFn, env, 'kimi', {
+            profile: runtimeProfile('kimi', resolvedModel),
+            cliVersion: cliVersionFn('kimi'),
+        });
     }
 
     // ── Рантайм OpenAI (#374, фаза 6) ────────────────────────────────────────
@@ -1996,21 +2201,29 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // падает, поэтому «не спрашивать» — единственный рабочий режим (research §permission).
     const CODEX_APPROVAL = 'never';
 
-    // Построение argv для `codex exec` (чистая функция, как buildClaudeArgs). Промпт —
-    // ПОЗИЦИОННЫЙ, идёт последним ПОСЛЕ `--`: разделитель останавливает разбор флагов, так
-    // что промпт, начинающийся с `-`, не будет истолкован как флаг (тот же класс защиты, что
-    // ведущий `-` в SAFE_BRANCH_RE, инвариант №7). Аргументы — массивом (spawn без shell),
-    // спецсимволы промпта проходят дословно одним элементом (anti-RCE, как у Claude-пути).
+    // Построение argv для `codex exec` (чистая функция, как buildClaudeArgs).
+    //
+    // #8: ПРОМПТА В ARGV НЕТ — тот же фикс, что #607 у Claude-пути. Раньше промпт шёл
+    // позиционным элементом после `--`, и у одного элемента argv в Linux предел
+    // MAX_ARG_STRLEN (131072 байта): длинный дифф с лентой комментариев PR давал E2BIG,
+    // сессия не стартовала вовсе, и повтор ничего бы не изменил. Теперь хвост argv — `-- -`:
+    // `-` — документированная форма «промпт со stdin» (`codex exec --help`: «If not provided
+    // as an argument (or if `-` is used), instructions are read from stdin»), а сам промпт
+    // уходит через `input` (spawnCodex). `-` выбран явным, а не пустым хвостом: argv сам
+    // говорит, откуда промпт, и не зависит от того, как CLI трактует пустой позиционный.
+    // `--` остаётся — после него `-` гарантированно позиционный, а не флаг. Длина argv
+    // фиксирована (флаги и имя модели), функция промпта не видит вовсе.
     // maxTurns у Codex аналога не имеет (это Claude-бюджет ходов) — в argv не тащим (research,
     // риск #3: чужой CLI на неизвестный флаг упал бы). fallback-model — тоже Claude-only, нет.
-    function buildCodexArgs(
-        prompt: string,
-        {
-            model,
-            sandboxMode,
-            authMode = 'apiKey',
-        }: { model?: string; sandboxMode: string; authMode?: 'apiKey' | 'subscription' },
-    ): string[] {
+    function buildCodexArgs({
+        model,
+        sandboxMode,
+        authMode = 'apiKey',
+    }: {
+        model?: string;
+        sandboxMode: string;
+        authMode?: 'apiKey' | 'subscription';
+    }): string[] {
         // Порядок критичен: `-a` — ГЛОБАЛЬНЫЙ флаг codex и обязан стоять ДО подкоманды.
         // `codex exec -a never …` CLI 0.147.0 отвергает (`unexpected argument '-a'`, exit 2) —
         // то есть OpenAI-рантайм не запускался вовсе, и юниты этого не ловили, потому что
@@ -2038,7 +2251,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // вместо одного честного стопа.
         if (authMode === 'subscription') cmdArgs.push('-c', 'forced_login_method="chatgpt"');
         if (model) cmdArgs.push('-m', model);
-        cmdArgs.push('--', prompt);
+        cmdArgs.push('--', '-');
         return cmdArgs;
     }
 
@@ -2106,15 +2319,27 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // поэтому Claude-spawn остаётся дословно прежним, а Codex-путь живёт рядом. spawnFn —
     // инжектируемая точка вызова (как у spawnClaude); guardSideEffect делает забытый мок
     // громким (иначе юнит запустил бы живой `codex`).
+    //
+    // #8: промпт — отдельным параметром и через `input` (stdin), argv его не несёт (см.
+    // докблок buildCodexArgs). Читает ли `codex exec` stdin, проверено ЖИВЫМ запуском, а не
+    // фейком (фейк подтвердил бы только, что промпт лёг в `opts.input`): CLI 0.163.0 с
+    // `-- -` и с пустым хвостом, промпт 200 КБ с ведущим `-` на stdin, endpoint подменён
+    // локальным `openai_base_url` — тело запроса к модели несло промпт целиком, от первого
+    // маркера до последнего. `stdio: ['pipe', …]` явно — по той же причине, что у
+    // spawnClaude: молчаливое перекрытие 'ignore' опцией `input` оборвёт stdin при первой
+    // же правке опций.
     function spawnCodex(
         cmdArgs: string[],
+        prompt: string,
         timeoutMs: number,
         spawnFn: typeof spawnSync = spawnSync,
         env?: NodeJS.ProcessEnv,
+        attempt: TAttemptContext = unreadAttemptContext('openai'),
     ): RunResult {
         if (spawnFn === spawnSync) guardSideEffect('spawnCodex(codex)');
         const res = spawnFn('codex', cmdArgs, {
-            stdio: ['ignore', 'pipe', 'pipe'],
+            stdio: ['pipe', 'pipe', 'pipe'],
+            input: prompt,
             shell: false,
             timeout: timeoutMs,
             encoding: 'utf-8',
@@ -2125,19 +2350,27 @@ export function createOrchestrator(env: OrchestratorEnv) {
         if (res.stdout) process.stdout.write(res.stdout);
         if (res.stderr) process.stderr.write(res.stderr);
         // #611: та же граничная классификация, что у spawnClaude — оба spawn-пути обязаны
-        // классифицировать res.error одинаково (codex-argv тоже несёт промпт позиционным
-        // элементом, buildCodexArgs, и подвержен тому же классу отказов запуска). Ревью
+        // классифицировать res.error одинаково (до #8 codex-argv нёс промпт позиционным
+        // элементом и был подвержен E2BIG; ENOENT и таймаут у него остаются). Ревью
         // #612: одинаковость держится ОДНИМ вызовом общего модуля, а не копией трёх веток
         // логирования — разъехавшись, копии дали бы разный диагноз одному отказу.
         const { result, logLines } = resolveSpawnResult('codex', res, output, timeoutMs);
         for (const line of logLines) log(line);
-        recordAttempt(
-            'codex',
-            result.code,
-            null,
-            'рантайм codex расход токенов в выводе не отдаёт',
-        );
-        return result;
+        const end = classifyCodexSessionEnd({
+            code: result.code,
+            stdout: res.stdout || '',
+            stderr: res.stderr || '',
+            signal: res.signal ?? null,
+            failureKind: result.failureKind,
+        });
+        recordAttempt({
+            runtime: 'codex',
+            code: result.code,
+            parsed: null,
+            unknownReason: 'рантайм codex расход токенов в выводе не отдаёт',
+            session: { ...attempt, endReason: end.endReason },
+        });
+        return { ...result, ...end };
     }
 
     // Фактический канал входа codex (ревью Codex по !104). Чистка `OPENAI_API_KEY` из
@@ -2431,6 +2664,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         { model, modelProvider }: ClaudeOpts,
         spawnFn: typeof spawnSync = spawnSync,
         readFileFn: (path: string, encoding: 'utf8') => string = fs.readFileSync,
+        cliVersionFn: (runtime: string) => CliVersion = (rt) => sessionCliVersion(rt),
     ): RunResult {
         // Провайдер-гейт: чужую (не-openai) модель к codex `-m` не пускаем — резолвер тогда
         // возьмёт openaiRuntime.model.
@@ -2445,7 +2679,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             requireToken: !DRY,
             model: routedModel,
         });
-        const cmdArgs = buildCodexArgs(prompt, { model: resolvedModel, sandboxMode, authMode });
+        const cmdArgs = buildCodexArgs({ model: resolvedModel, sandboxMode, authMode });
         log(
             `▶ openai (codex exec) "${prompt.slice(0, 80)}…" -m ${resolvedModel} -s ${sandboxMode}`,
         );
@@ -2471,7 +2705,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
             assertNoConflictingForcedLogin(readFileFn, fail, 'chatgpt', env);
             assertCodexLoginChannel(spawnFn, env, fail, 'chatgpt');
         }
-        return spawnCodex(cmdArgs, timeout, spawnFn, env);
+        return spawnCodex(cmdArgs, prompt, timeout, spawnFn, env, {
+            profile: runtimeProfile('openai', resolvedModel),
+            cliVersion: cliVersionFn('openai'),
+        });
     }
 
     // ── Issues ───────────────────────────────────────────────────────────────
@@ -3465,6 +3702,76 @@ export function createOrchestrator(env: OrchestratorEnv) {
         }
     }
 
+    // #9: намерения сессии приходят блоком в её выводе, а файл намерений пишет раннер —
+    // харнесс запись сессией в очередь команд оркестратора режет, и режет по делу (докблок
+    // канала в `session-requests.ts`). Строки блока дописываются в хвост: в файле может
+    // лежать неприменённый хвост прошлого батча или метка начатого намерения, и их порядок
+    // перед новыми сохраняется. Битый блок пишется строкой отказа ВМЕСТО своих строк — разбор
+    // отвергнет весь батч с этой причиной, а текст блока уже в логе.
+    //
+    // Совместимость на одну версию: файл, записанный сессией напрямую, по-прежнему читается
+    // применением — промпт этого канала больше не называет, но сессия на старом промпте или
+    // на рантайме без защиты файла ещё может его писать.
+    //
+    // `seen` — строки, уже собранные с прошлых запусков ТОГО ЖЕ вызова runClaude. Повтор после
+    // лимита, ротации ключа или моргнувшего CLI идёт той же командой с тем же промптом, и
+    // сессия, успевшая напечатать блок до отказа, печатает его снова: без сверки в файл уехали
+    // бы два `close` и два `pr-comment`. Сверка — только с прошлыми запусками: одинаковые
+    // строки внутри одного блока — воля сессии, и раннер её не правит.
+    function collectSessionIntents(
+        output: string,
+        {
+            readFn = readSessionRequests,
+            writeFn = writeSessionRequests,
+            logFn = log,
+            dry = DRY,
+            seen,
+        }: {
+            readFn?: () => string | null;
+            writeFn?: (text: string) => void;
+            logFn?: typeof log;
+            dry?: boolean;
+            seen?: Set<string>;
+        } = {},
+    ): void {
+        const block = extractIntentBlock(output);
+        if (block.kind === 'none') return;
+        let lines: string[];
+        if (block.kind === 'rejected') {
+            logFn(
+                `⛔ Блок намерений в выводе сессии отвергнут — ${block.why}. Батч не применится ` +
+                    `целиком. Текст блока:\n${block.raw}`,
+            );
+            lines = [serializeRejectedBlock(block.why)];
+        } else {
+            lines = block.lines;
+        }
+        if (seen) {
+            const fresh = lines.filter((l) => !seen.has(l));
+            if (fresh.length < lines.length) {
+                logFn(
+                    `♻ ${String(lines.length - fresh.length)} строк намерений повторили вывод ` +
+                        'прошлого запуска этой же сессии (повтор после отказа) — не дописаны второй раз.',
+                );
+            }
+            for (const l of lines) seen.add(l);
+            lines = fresh;
+        }
+        if (lines.length === 0) return;
+        if (dry) {
+            logFn(
+                `[dry-run] ${String(lines.length)} строк намерений из вывода сессии не записаны.`,
+            );
+            return;
+        }
+        const prev = readFn() ?? '';
+        const sep = prev === '' || prev.endsWith('\n') ? '' : '\n';
+        writeFn(`${prev}${sep}${lines.join('\n')}\n`);
+        logFn(
+            `📥 Намерения из вывода сессии: ${String(lines.length)} строк дописаны в ${RUNTIME.requests}.`,
+        );
+    }
+
     // #86: метка начатого намерения на старте — раннер убит между эффектом на форже и
     // записью «применено». Проверка стоит ДО первой сессии, а не только в применении:
     // иначе после рестарта отработала бы целая сессия (кодер или ревью), чтобы на её
@@ -4301,6 +4608,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             commitLeftoversFn = commitLeftovers,
             turnRetriesLeft = 0,
             secretEnvNamesFn = () => adapters.taskSource.secretEnvNames(),
+            endReason,
         }: {
             shFn?: ShFn;
             logFn?: LogFn;
@@ -4315,6 +4623,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
             // ведёт вызывающий (runLoop): попытки тратятся ПОДРЯД на одну карточку, а
             // функция вызывается по одной сессии за раз и истории между ними не помнит.
             turnRetriesLeft?: number;
+            // Фаза 16: исход сессии от адаптера. Нет его (рестарт после доведённой сессии —
+            // вывод и исход рестарт не пережили) — бюджет ходов не узнаётся, как и раньше.
+            endReason?: SessionEndReason;
         } = {},
     ): { stop: boolean; turnLimitRetry?: boolean } {
         const sessionPath = path.join(RUNTIME.sessions, `${issue.number}-${Date.now()}.log`);
@@ -4367,6 +4678,19 @@ export function createOrchestrator(env: OrchestratorEnv) {
             pushEventFn(envMsg, cfg);
             return { stop: true };
         }
+        // Фаза 16: вход отвергнут — тоже отказ среды, и тоже до git status. Повтор его не
+        // лечит, а следующая итерация на той же карточке упрётся в тот же отказ: петля жгла
+        // итерации до брейкера серии, и тот стопил с причиной «карточка не сдаётся», а не
+        // «вход отвергнут» — человек чинил бы карточку вместо входа (правило 4 корня).
+        if (endReason === 'auth') {
+            const authMsg =
+                `⛔ Рантайм отверг вход (исход auth, код ${code}) на Issue #${issue.number} — стоп: повтор и ` +
+                'ожидание не помогут. Проверь вход или ключ рантайма (/login, токен подписки, ключ провайдера) и перезапусти loop.\n' +
+                `${sessionOutputLine}`;
+            logFn(authMsg);
+            pushEventFn(authMsg, cfg);
+            return { stop: true };
+        }
         let dirtyNow: string;
         try {
             dirtyNow = shFn('git status --porcelain');
@@ -4394,13 +4718,14 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // первый же боевой прогон (28.08.2026, Issue #4) встал на карточке, чья работа
         // была полностью годной — гейт на том самом грязном дереве прошёл целиком.
         //
-        // Механизм разведения этих двух случаев в ядре уже был (#594, TURN_LIMIT_RE), но
+        // Механизм разведения этих двух случаев в ядре уже был (#594), но
         // стоял ТОЛЬКО в подсистеме ревью: путь кодер-сессии ветвился мимо него. Здесь тот
         // же разбор появляется и в этой ветке — с одним отличием, которого нет в ревью:
         // там сессия свою работу УЖЕ закоммитила, а тут дерево грязное, и продолжать
         // поверх чужой полу-работы нельзя (M2). Поэтому остаток коммитим — тем же
         // commitLeftovers, что чинит эту ситуацию на границе итерации.
-        if (TURN_LIMIT_RE.test(output)) {
+        // Фаза 16: «не успела» — это исход `turn-limit` от адаптера, а не строка в выводе.
+        if (endReason === 'turn-limit') {
             if (turnRetriesLeft > 0) {
                 if (
                     commitLeftoversFn(`кодер-сессия Issue #${issue.number}, бюджет ходов`, {
@@ -6617,8 +6942,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         // с двумя {branch} молча оставила бы плейсхолдер в промпте.
                         .replaceAll('{milestone}', phase.milestone)
                         .replaceAll('{branch}', phase.branch) +
-                    // Задача 122: путь намерений — от раннера, а не текстом ralph.md.
-                    buildCoderIntentsNote(RUNTIME.requests) +
+                    // Задача 122, #9: канал намерений называет раннер, а не текст ralph.md.
+                    buildCoderIntentsNote() +
                     issueContext;
                 // #376: рантайм — по резолву pickRuntimeFn, а не статический
                 // adapters.coderRuntime.run (дефолт runClaude). При провайдере без явного
@@ -6631,6 +6956,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 // подменяет runClaudeOnceFn (сохраняет ссылку из реестра coderRuntime как
                 // есть — иначе identity-тесты #376 на `depsOverride.runClaudeOnceFn` сломались бы).
                 let lastOutput = '';
+                let lastEndReason: SessionEndReason | undefined;
                 let code: number;
                 if (stageDone('session')) {
                     // #92: код — из исхода сессии в журнале; её вывод рестарт не пережил, и
@@ -6657,8 +6983,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         },
                         {
                             runClaudeOnceFn: coderRuntimeRunFor(issueProvider),
-                            onOutput: (output: string) => {
+                            onOutput: (output: string, endReason: SessionEndReason) => {
                                 lastOutput = output;
+                                lastEndReason = endReason;
                             },
                         },
                     );
@@ -6701,6 +7028,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         let crashNote = '';
                         if (code !== 0) {
                             handleCrashedCoderSessionFn(next, code, lastOutput, {
+                                endReason: lastEndReason,
                                 shFn,
                                 logFn,
                                 pushEventFn: ((msg: string) => {
@@ -6815,6 +7143,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         code,
                         lastOutput,
                         {
+                            endReason: lastEndReason,
                             shFn,
                             logFn,
                             pushEventFn,
@@ -7215,12 +7544,14 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 ): {
                     code: number;
                     output: string;
+                    endReason?: SessionEndReason;
                     intentsBroken: boolean;
                     branchLost: boolean;
                     promptLost?: boolean;
                 } => {
                     let code = 0;
                     let output = '';
+                    let endReason: SessionEndReason | undefined;
                     for (let attempt = 0; ; attempt++) {
                         // Задача 71: повтор — тоже пишущая сессия. Первую проводит
                         // вызывающий; каждую следующую — здесь, иначе она стартовала бы
@@ -7239,10 +7570,16 @@ export function createOrchestrator(env: OrchestratorEnv) {
                             };
                         }
                         output = '';
+                        endReason = undefined;
                         code = runClaudeFn(
                             prompt,
                             { model: cfg.model, maxTurns },
-                            { onOutput: (text: string) => (output = text) },
+                            {
+                                onOutput: (text: string, end: SessionEndReason) => {
+                                    output = text;
+                                    endReason = end;
+                                },
+                            },
                         );
                         // Задача 71: страж — ДО намерений, как у кодер-итерации. Сессия, ушедшая
                         // с ветки, могла попросить блок или комментарий о работе, которой в
@@ -7257,13 +7594,13 @@ export function createOrchestrator(env: OrchestratorEnv) {
                             return { code, output, intentsBroken: true, branchLost: false };
                         }
                         if (code === 0) break;
-                        if (!TURN_LIMIT_RE.test(output) || attempt >= retries) break;
+                        if (endReason !== 'turn-limit' || attempt >= retries) break;
                         logFn(
                             `⏭ Шаг «${what}» исчерпал бюджет ходов (${maxTurns}) — разбор не окончен, ` +
                                 `продолжаю новой сессией (попытка ${attempt + 2} из ${retries + 1}).`,
                         );
                     }
-                    return { code, output, intentsBroken: false, branchLost: false };
+                    return { code, output, endReason, intentsBroken: false, branchLost: false };
                 };
                 // #594: счётчик повторов ОБЩИЙ для обоих шагов разбора (правки по ревью и
                 // blocked) — один ключ конфига, один расчёт. Два независимых чтения ключа
@@ -7446,14 +7783,16 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         const reviewPrompt = buildReviewPrompt({
                             branch: phase.branch,
                             diffContext,
-                            requestsPath: RUNTIME.requests,
                         });
                         let reviewCode = 0;
-                        let reviewOutput = '';
+                        // Фаза 16: исход прохода от адаптера, а не его вывод: «сбой прокси» —
+                        // это `interrupted`, названный рантаймом, текст ядро не читает.
+                        let reviewEnd = 'completed' as SessionEndReason;
                         let verdict: ReturnType<typeof reviewVerdict> = null;
                         let reviewIntentsApplied = true;
                         // Задача 78: сбой прокси моделей (`No upstream account`, overload)
-                        // приходит С КОДОМ 0 и без единого намерения. Это транзиент, а не
+                        // приходит С КОДОМ 0 и без единого намерения; адаптер называет его
+                        // исходом `interrupted`. Это транзиент, а не
                         // вердикт: повтор с паузой здесь же, в шаге сдачи, — итерации
                         // кодера (state.count) он не тратит. Повторяется только проход, не
                         // оставивший НИ ОДНОГО намерения: сессия, записавшая сводку и
@@ -7462,7 +7801,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         // комментарии уже легли в PR, повтор их задвоил бы. Такой проход —
                         // обычный обрыв без вердикта, стоп `review-no-verdict` ниже.
                         for (let attempt = 0; ; attempt++) {
-                            reviewOutput = '';
+                            reviewEnd = 'completed' as SessionEndReason;
                             reviewCode = runClaudeFn(
                                 reviewPrompt,
                                 // #221: fallbackModel — явный override (не noFallback:true из M8).
@@ -7474,7 +7813,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
                                     maxTurns: positiveIntOrDefault(cfg.review?.maxTurns, maxTurns),
                                     fallbackModel: reviewFallback,
                                 },
-                                { onOutput: (text: string) => (reviewOutput = text) },
+                                {
+                                    onOutput: (_text: string, end: SessionEndReason) =>
+                                        (reviewEnd = end),
+                                },
                             );
 
                             // #45: намерения ревью применяем СРАЗУ после сессии. Ревью в форж не
@@ -7487,7 +7829,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                             }
                             verdict = reviewVerdict(lastPrFindings, lastPrBlocked);
                             if (verdict || lastPrFindings.length > 0) break;
-                            if (!isModelProxyUnavailable(reviewOutput)) break;
+                            if (reviewEnd !== 'interrupted') break;
                             if (attempt >= MODEL_PROXY_RETRIES) break;
                             const waitMs = modelProxyRetryWaitMs(attempt + 1);
                             logFn(
@@ -7516,8 +7858,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                             // Повторов не было, если проход оставил находки: «после N
                             // повторов» в диагнозе тогда соврало бы.
                             const proxyDown =
-                                lastPrFindings.length === 0 &&
-                                isModelProxyUnavailable(reviewOutput);
+                                lastPrFindings.length === 0 && reviewEnd === 'interrupted';
                             pushEventFn(
                                 `⛔ Ralph: фаза "${phase.milestone}" не сдана — ` +
                                     formatStopMessage({
@@ -7574,7 +7915,6 @@ export function createOrchestrator(env: OrchestratorEnv) {
                                     : commentsContext;
                                 if (comments === null) return null;
                                 return buildFixByReviewPrompt({
-                                    requestsPath: RUNTIME.requests,
                                     branch: phase.branch,
                                     allowNames,
                                     gateCmdList: fixGateCmdList,
@@ -7625,7 +7965,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         }
                         if (fix.code !== 0) {
                             pushEventFn(
-                                TURN_LIMIT_RE.test(fix.output)
+                                fix.endReason === 'turn-limit'
                                     ? `⛔ Ralph: шаг правок по ревью фазы "${phase.milestone}" не уложился в бюджет ходов за ${fixTurnRetries + 1} попыток — сдача фазы остановлена (fail-closed). Похоже, фаза великовата: разбери остаток руками или разрежь milestone.`
                                     : `⛔ Ralph: шаг правок по ревью фазы "${phase.milestone}" упал (код ${fix.code}) — сдача фазы остановлена (fail-closed). Перезапусти loop.`,
                                 cfg,
@@ -7997,7 +8337,6 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         );
                         const arbCode = runClaudeFn(
                             buildFixArbiterPrompt({
-                                requestsPath: RUNTIME.requests,
                                 branch: phase.branch,
                                 fixDiffContext: arbiterDiffContext(),
                                 severityFloor: backlogSeverityFloor,
@@ -8252,7 +8591,6 @@ export function createOrchestrator(env: OrchestratorEnv) {
                             }
                             const fixReviewCode = runClaudeFn(
                                 buildFixReviewPrompt({
-                                    requestsPath: RUNTIME.requests,
                                     branch: phase.branch,
                                     allowNames,
                                     fixDiffContext,
@@ -8402,7 +8740,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                             }
                             if (again.code !== 0) {
                                 pushEventFn(
-                                    TURN_LIMIT_RE.test(again.output)
+                                    again.endReason === 'turn-limit'
                                         ? `⛔ Ralph: правки по ревью правок фазы "${phase.milestone}" не уложились в бюджет ходов за ${fixTurnRetries + 1} попыток — сдача остановлена (fail-closed).`
                                         : `⛔ Ralph: правки по ревью правок фазы "${phase.milestone}" упали (код ${again.code}) — сдача остановлена (fail-closed). Перезапусти loop.`,
                                     cfg,
@@ -8827,7 +9165,6 @@ export function createOrchestrator(env: OrchestratorEnv) {
                                 : blockedComments;
                             if (comments === null) return null;
                             return buildBlockedFixPrompt({
-                                requestsPath: RUNTIME.requests,
                                 branch: phase.branch,
                                 allowNames: cfg.authorAllowlist.join(', '),
                                 gateCmdList: bGateCmdList,
@@ -8843,7 +9180,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         // перезапуском, «не уложилась в бюджет» — нет: рестарт прогонит тот же
                         // разбор с тем же потолком, дело в объёме блокеров, а не в сбое.
                         pushEventFn(
-                            TURN_LIMIT_RE.test(blocked.output)
+                            blocked.endReason === 'turn-limit'
                                 ? `⛔ Ralph: разбор blocked фазы "${phase.milestone}" не уложился в бюджет ходов за ${fixTurnRetries + 1} попыток — стоп (fail-closed). Похоже, блокеров больше, чем влезает в бюджет: разбери руками или разрежь milestone.`
                                 : `⛔ Ralph: сессия разбора blocked фазы "${phase.milestone}" упала (код ${blocked.code}) — стоп, перезапусти loop.`,
                             cfg,
@@ -9002,7 +9339,6 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     });
                     const rCode = runClaudeFn(
                         buildReReviewPrompt({
-                            requestsPath: RUNTIME.requests,
                             branch: phase.branch,
                             allowNames: cfg.authorAllowlist.join(', '),
                             diffContext: bDiffContext,
@@ -9475,7 +9811,6 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         .join(', ');
                     const healCode = runClaudeFn(
                         buildGateHealPrompt({
-                            requestsPath: RUNTIME.requests,
                             branch: phase.branch,
                             checkName: healTarget.name,
                             checkCmd: healTarget.cmd,
@@ -10315,6 +10650,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     fs.rmSync(p, { force: true });
                 },
                 sizeFn: (p: string) => fs.statSync(p).size,
+                tailFn: fileTailHash,
                 // Время идёт параметром, а не Date.now() внутри протокола: журнал переезда
                 // читают глазами, и недетерминированный тест на него читать перестали бы.
                 now: () => new Date().toISOString(),
@@ -10353,10 +10689,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 if (MIGRATE || MIGRATE_ROLLBACK) setLogTarget(RUNTIME.log);
                 if (MIGRATE_ROLLBACK) {
                     const rolled = rollbackRuntime(roots.runtimeDir, migrationDeps);
-                    log(
-                        `↩️  Состояние возвращено в ${rolled.from} (файлов: ${rolled.files.length}). ` +
-                            `Убери секцию roots из конфига — иначе следующий запуск встанет на несоответствии.`,
-                    );
+                    log(describeRollback(rolled));
                     return;
                 }
                 if (MIGRATE) {
@@ -10752,6 +11085,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
         phasePrBody,
         // #40: то же — у всех четырёх свой DI-хук на argv, контракт проверяет боевые.
         applySessionRequests,
+        // #9: разбор вывода сессии в файл намерений — свой DI на чтение и запись.
+        collectSessionIntents,
         stopOnInFlightIntent,
         // #67: порог брейкера серии — валидатор конфига, проверяемый отдельно.
         resolveMaxSameIssue,
@@ -10767,7 +11102,6 @@ export function createOrchestrator(env: OrchestratorEnv) {
         syncProjectBoard,
         recordReviewFindings,
         formatExcerpt,
-        parseResetWaitMs,
         apiLimitWaitMs,
         apiLimitMessage,
         safeBranch,
@@ -10788,10 +11122,12 @@ export function createOrchestrator(env: OrchestratorEnv) {
         strongerReviewModel,
         removeBlockedLabel,
         addBlockedLabel,
-        API_LIMIT_RE,
         spawnClaude,
         claudeSessionEnv,
         recordAttempt,
+        readCliVersion,
+        noteCliVersion,
+        sessionCliVersion,
         runClaude,
         subscriptionKeyRing,
         // #373 (фаза 6): рантайм Kimi (тот же `claude` + endpoint Moonshot). Экспорт —

@@ -51,6 +51,7 @@
 | `launcher-crash-windows.test.ts`    | обрыв на каждом шаге update, rollback, активации: прежняя ревизия рабочая, повтор доводит |
 | `crash-world.ts`                    | мир процесса для матриц убийства: после смерти диск, форж и чат молчат                    |
 | `adapters-contract.test.ts`         | реализации швов соответствуют интерфейсам                                                 |
+| `session-end-purity.test.ts`        | в `core/` нет регулярок по выводу сессии: о повторе решает исход от адаптера              |
 | `protection-policy.ts` / `.test.ts` | политика ревью требует человека на путях из `core/protected-paths.ts`, маски — дословно   |
 | `__fixtures__/foreign-project/`     | конфиг синтетического чужого проекта                                                      |
 

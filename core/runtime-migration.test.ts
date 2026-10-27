@@ -8,7 +8,10 @@
 // Побочек здесь нет ни одной: файловая система целиком инжектируется (existsFn/readFn/
 // writeFn/renameFn/removeFn), поэтому тест проверяет ПРОТОКОЛ — порядок шагов и поведение
 // при обрыве, — а не то, что fs умеет копировать файлы.
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterAll } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
     planRuntimeMigration,
     migrateRuntime,
@@ -18,6 +21,9 @@ import {
     MIGRATION_JOURNAL,
     MIGRATED_MARKER,
     runnerLegacyDir,
+    describeRollback,
+    LOG_TAIL_BYTES,
+    fileTailHash,
 } from './runtime-migration.ts';
 
 const FROM = '/app/.ralph/core';
@@ -49,6 +55,7 @@ function fakeFs(initial: Record<string, string> = {}) {
                 files.delete(p);
             },
             sizeFn: (p: string) => (files.get(p) ?? '').length,
+            tailFn: (p: string) => (files.get(p) ?? '').slice(-LOG_TAIL_BYTES),
             now: () => NOW,
         },
     };
@@ -271,8 +278,103 @@ describe('rollbackRuntime — возврат к прежней раскладк�
         expect(fs.files.has(`${TO}/ralph.state.json`)).toBe(false);
     });
 
+    it('повтор переезда, оборванного до первого переименования, доводит его', () => {
+        // Копия уже лежит, парковки нет: годность копии решает схема, оригинал копируется заново.
+        const fs = fakeFs({ [`${FROM}/ralph.state.json`]: VALID_STATE });
+        const plan = planRuntimeMigration(FROM, TO, fs.deps.existsFn);
+        const dying = {
+            ...fs.deps,
+            renameFn: () => {
+                throw new Error('обрыв');
+            },
+        };
+        expect(() => migrateRuntime(plan, dying)).toThrow(/обрыв/);
+        fs.files.set(`${TO}/ralph.state.json`, 'усечено');
+        expect(migrateRuntime(plan, fs.deps).status).toBe('done');
+        expect(fs.files.get(`${TO}/ralph.state.json`)).toBe(VALID_STATE);
+    });
+
+    it('#152: оригинал и копия обе есть и расходятся — стоп, а не выбор молча', () => {
+        const fs = fakeFs({ [`${FROM}/ralph.state.json`]: VALID_STATE });
+        migrateRuntime(planRuntimeMigration(FROM, TO, fs.deps.existsFn), fs.deps);
+        fs.files.set(`${TO}/ralph.state.json`, JSON.stringify({ count: 4, milestone: 'Фаза 2' }));
+        fs.files.set(`${FROM}/ralph.state.json`, VALID_STATE);
+        expect(() => rollbackRuntime(TO, fs.deps)).toThrow(/не выбирает между двумя/);
+        // Ни один из двух файлов не тронут.
+        expect(fs.files.get(`${FROM}/ralph.state.json`)).toBe(VALID_STATE);
+        expect(fs.files.has(`${TO}/ralph.state.json`)).toBe(true);
+    });
+
+    it('#152: изменились только логи — строка называет файлы, а не фазу', () => {
+        const fs = fakeFs({
+            [`${FROM}/ralph.state.json`]: VALID_STATE,
+            [`${FROM}/ralph.log`]: 'лог',
+        });
+        migrateRuntime(planRuntimeMigration(FROM, TO, fs.deps.existsFn), fs.deps);
+        fs.files.set(`${TO}/ralph.log`, 'лог и ещё');
+        const rolled = rollbackRuntime(TO, fs.deps);
+        expect(rolled.rollback).toEqual({
+            changed: ['ralph.log'],
+            snapshots: { 'ralph.log': `${FROM}/ralph.log.pre-rollback` },
+        });
+        expect(describeRollback(rolled)).toMatch(
+            /изменились ralph\.log — возвращаются текущие файлы/,
+        );
+        expect(fs.files.get(`${FROM}/ralph.log`)).toBe('лог и ещё');
+        expect(fs.files.get(`${FROM}/ralph.state.json`)).toBe(VALID_STATE);
+    });
+
+    it('#152: лог того же размера с другим содержимым — изменился, текущий едет с копией', () => {
+        const fs = fakeFs({
+            [`${FROM}/ralph.state.json`]: VALID_STATE,
+            [`${FROM}/ralph.log`]: 'лог-а',
+        });
+        migrateRuntime(planRuntimeMigration(FROM, TO, fs.deps.existsFn), fs.deps);
+        fs.files.set(`${TO}/ralph.log`, 'лог-б');
+        const rolled = rollbackRuntime(TO, fs.deps);
+        expect(rolled.rollback?.changed).toEqual(['ralph.log']);
+        expect(fs.files.get(`${FROM}/ralph.log`)).toBe('лог-б');
+        expect(fs.files.get(`${FROM}/ralph.log.pre-rollback`)).toBe('лог-а');
+    });
+
+    it('#152: state без числового count в отчёт не попадает, веха null названа', () => {
+        const fs = fakeFs({ [`${FROM}/ralph.state.json`]: VALID_STATE });
+        migrateRuntime(planRuntimeMigration(FROM, TO, fs.deps.existsFn), fs.deps);
+        fs.files.set(`${TO}/ralph.state.json`, 'не json');
+        expect(rollbackRuntime(TO, fs.deps).rollback?.state).toBeUndefined();
+        expect(fs.files.get(`${FROM}/ralph.state.json`)).toBe('не json');
+
+        const other = fakeFs({ [`${FROM}/ralph.state.json`]: VALID_STATE });
+        migrateRuntime(planRuntimeMigration(FROM, TO, other.deps.existsFn), other.deps);
+        other.files.set(`${TO}/ralph.state.json`, JSON.stringify({ count: 0, milestone: null }));
+        const rolled = rollbackRuntime(TO, other.deps);
+        expect(describeRollback(rolled)).toMatch(/веха не задана, count 0/);
+    });
+
     it('откатывать нечего — отказ, а не тихое «готово»', () => {
         const fs = fakeFs();
         expect(() => rollbackRuntime(TO, fs.deps)).toThrow(/журнал/i);
+    });
+});
+
+describe('fileTailHash — отпечаток хвоста лога без чтения целиком', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ralph-tail-'));
+    afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+    it('одинаковый хвост — один хеш, другой при той же длине — другой', () => {
+        const head = 'x'.repeat(LOG_TAIL_BYTES);
+        writeFileSync(join(dir, 'a'), `${head}хвост-1`);
+        writeFileSync(join(dir, 'b'), `y${head.slice(1)}хвост-1`);
+        writeFileSync(join(dir, 'c'), `${head}хвост-2`);
+        // Расхождение раньше хвоста не видно — это предел, названный в докблоке sameFile.
+        expect(fileTailHash(join(dir, 'a'))).toBe(fileTailHash(join(dir, 'b')));
+        expect(fileTailHash(join(dir, 'a'))).not.toBe(fileTailHash(join(dir, 'c')));
+    });
+
+    it('файл короче хвоста хешируется целиком, пустой — тоже', () => {
+        writeFileSync(join(dir, 'short'), 'лог');
+        writeFileSync(join(dir, 'empty'), '');
+        expect(fileTailHash(join(dir, 'short'))).toMatch(/^[0-9a-f]{64}$/);
+        expect(fileTailHash(join(dir, 'empty'))).not.toBe(fileTailHash(join(dir, 'short')));
     });
 });

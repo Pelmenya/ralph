@@ -23,9 +23,11 @@ import {
     rollbackRuntime,
     assertMigrationSettled,
     assertLegacyNotMigrated,
+    describeRollback,
     MIGRATED_MARKER,
     MIGRATED_SUFFIX,
     type TMigrationDeps,
+    LOG_TAIL_BYTES,
 } from '../core/runtime-migration.ts';
 import { runtimePathsIn } from '../core/runtime-paths.ts';
 import { stripComments } from './strip-comments.ts';
@@ -61,6 +63,7 @@ function world(initial: Record<string, string>) {
         },
         removeFn: (p) => void files.delete(p),
         sizeFn: (p) => (files.get(p) ?? '').length,
+        tailFn: (p) => (files.get(p) ?? '').slice(-LOG_TAIL_BYTES),
         now: () => NOW,
     };
     return { files, deps };
@@ -348,6 +351,133 @@ describe('#146: state в дереве раннера, лог в дереве з�
                 runnerDir: RUNNER,
             }).files,
         ).toEqual([]);
+    });
+});
+
+// ── Задача #152: откат возвращает ТЕКУЩЕЕ состояние, а не снимок на момент переезда ──────
+// Репетиция отката: после переезда петля сдала фазу 4 и сделала итерацию фазы 5, а откат
+// воскресил припаркованный снимок (фаза 4) и удалил state новой раскладки без копии.
+describe('#152: откат после работы на новой раскладке', () => {
+    const NEXT_STATE = JSON.stringify({
+        count: 1,
+        milestone: 'Ralph R0 · Фаза 5',
+        submitted: false,
+        noProgress: 0,
+    });
+
+    it('в старую раскладку едет НОВЫЙ state, снимок сохранён под другим именем', () => {
+        const w = world(before());
+        migrateRuntime(planRuntimeMigration(LEGACY, RUNTIME_DIR, w.deps.existsFn), w.deps);
+        // Петля поработала на новой раскладке: новый state, лог дописан.
+        w.files.set(`${RUNTIME_DIR}/ralph.state.json`, NEXT_STATE);
+        w.files.set(`${RUNTIME_DIR}/ralph.log`, 'старый лог\nновые строки');
+        const rolled = rollbackRuntime(RUNTIME_DIR, w.deps);
+
+        expect(w.files.get(`${LEGACY}/ralph.state.json`)).toBe(NEXT_STATE);
+        expect(w.files.get(`${LEGACY}/ralph.log`)).toBe('старый лог\nновые строки');
+        expect(w.files.get(`${LEGACY}/.deps-lock.sha`)).toBe('abc123');
+        // Снимок на момент переезда не воскрешён и не удалён молча.
+        expect(w.files.get(`${LEGACY}/ralph.state.json.pre-rollback`)).toBe(LIVE_STATE);
+        expect(w.files.get(`${LEGACY}/ralph.log.pre-rollback`)).toBe('старый лог');
+        expect(w.files.has(`${LEGACY}/ralph.state.json${MIGRATED_SUFFIX}`)).toBe(false);
+        expect(w.files.has(`${RUNTIME_DIR}/ralph.state.json`)).toBe(false);
+        // Журнал отката называет, что изменилось и что именно едет назад.
+        expect(rolled.rollback?.changed).toEqual(['ralph.state.json', 'ralph.log']);
+        expect(rolled.rollback?.state).toEqual({ milestone: 'Ralph R0 · Фаза 5', count: 1 });
+        expect(rolled.rollback?.snapshots).toEqual({
+            'ralph.state.json': `${LEGACY}/ralph.state.json.pre-rollback`,
+            'ralph.log': `${LEGACY}/ralph.log.pre-rollback`,
+        });
+        // Неизменённый файл снимка не получает: копия и парковка совпадают.
+        expect(w.files.has(`${LEGACY}/.deps-lock.sha.pre-rollback`)).toBe(false);
+        expect(describeRollback(rolled)).toMatch(
+            /возвращается текущее состояние: Ralph R0 · Фаза 5, count 1/,
+        );
+    });
+
+    it('от противного: откат сразу после переезда — результат прежний, без изменений', () => {
+        const w = world(before());
+        migrateRuntime(planRuntimeMigration(LEGACY, RUNTIME_DIR, w.deps.existsFn), w.deps);
+        const rolled = rollbackRuntime(RUNTIME_DIR, w.deps);
+        expect(w.files.get(`${LEGACY}/ralph.state.json`)).toBe(LIVE_STATE);
+        expect(w.files.get(`${LEGACY}/ralph.log`)).toBe('старый лог');
+        expect(w.files.has(`${RUNTIME_DIR}/ralph.state.json`)).toBe(false);
+        expect(rolled.rollback?.changed).toEqual([]);
+        expect([...w.files.keys()].some((k) => k.endsWith('.pre-rollback'))).toBe(false);
+        expect(describeRollback(rolled)).not.toMatch(/текущее состояние/);
+    });
+
+    it('state из дерева раннера (#146) возвращается текущим туда же', () => {
+        const RUNNER = '/path/to/app-ralph/.claude/ralph';
+        const w = world({
+            [`${LEGACY}/ralph.log`]: 'лог до chdir',
+            [`${RUNNER}/ralph.state.json`]: LIVE_STATE,
+        });
+        migrateRuntime(
+            planRuntimeMigration(LEGACY, RUNTIME_DIR, w.deps.existsFn, { runnerDir: RUNNER }),
+            w.deps,
+        );
+        w.files.set(`${RUNTIME_DIR}/ralph.state.json`, NEXT_STATE);
+        rollbackRuntime(RUNTIME_DIR, w.deps);
+        expect(w.files.get(`${RUNNER}/ralph.state.json`)).toBe(NEXT_STATE);
+        expect(w.files.get(`${RUNNER}/ralph.state.json.pre-rollback`)).toBe(LIVE_STATE);
+        expect(w.files.has(`${LEGACY}/ralph.state.json`)).toBe(false);
+    });
+
+    it('ни одного удаления файла состояния без копии на месте', () => {
+        const w = world(before());
+        migrateRuntime(planRuntimeMigration(LEGACY, RUNTIME_DIR, w.deps.existsFn), w.deps);
+        w.files.set(`${RUNTIME_DIR}/ralph.state.json`, NEXT_STATE);
+        const removed: string[] = [];
+        rollbackRuntime(RUNTIME_DIR, {
+            ...w.deps,
+            removeFn: (p) => {
+                const name = p.slice(p.lastIndexOf('/') + 1);
+                // К моменту удаления копия уже лежит в старой раскладке с тем же содержимым.
+                if (p.startsWith(RUNTIME_DIR) && name !== MIGRATED_MARKER) {
+                    expect(w.files.get(`${LEGACY}/${name}`)).toBe(w.files.get(p));
+                }
+                removed.push(p);
+                w.deps.removeFn(p);
+            },
+        });
+        expect(removed).toContain(`${RUNTIME_DIR}/ralph.state.json`);
+    });
+
+    it('обрыв посреди отката доводится повтором, снимок не затирается текущим', () => {
+        const w = world(before());
+        migrateRuntime(planRuntimeMigration(LEGACY, RUNTIME_DIR, w.deps.existsFn), w.deps);
+        w.files.set(`${RUNTIME_DIR}/ralph.state.json`, NEXT_STATE);
+        let removes = 0;
+        const dying: TMigrationDeps = {
+            ...w.deps,
+            removeFn: (p) => {
+                if (++removes === 1) throw new Error('обрыв');
+                w.deps.removeFn(p);
+            },
+        };
+        expect(() => rollbackRuntime(RUNTIME_DIR, dying)).toThrow(/обрыв/);
+        rollbackRuntime(RUNTIME_DIR, w.deps);
+        expect(w.files.get(`${LEGACY}/ralph.state.json`)).toBe(NEXT_STATE);
+        expect(w.files.get(`${LEGACY}/ralph.state.json.pre-rollback`)).toBe(LIVE_STATE);
+        expect(w.files.has(`${RUNTIME_DIR}/ralph.state.json`)).toBe(false);
+    });
+
+    it('снимок прошлого цикла переезд→откат не затирается', () => {
+        const w = world({
+            ...before(),
+            [`${LEGACY}/ralph.state.json.pre-rollback`]: 'снимок прошлого цикла',
+        });
+        migrateRuntime(planRuntimeMigration(LEGACY, RUNTIME_DIR, w.deps.existsFn), w.deps);
+        w.files.set(`${RUNTIME_DIR}/ralph.state.json`, NEXT_STATE);
+        const rolled = rollbackRuntime(RUNTIME_DIR, w.deps);
+        expect(w.files.get(`${LEGACY}/ralph.state.json.pre-rollback`)).toBe(
+            'снимок прошлого цикла',
+        );
+        expect(w.files.get(`${LEGACY}/ralph.state.json.pre-rollback.1`)).toBe(LIVE_STATE);
+        expect(rolled.rollback?.snapshots['ralph.state.json']).toBe(
+            `${LEGACY}/ralph.state.json.pre-rollback.1`,
+        );
     });
 });
 

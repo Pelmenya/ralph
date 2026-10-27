@@ -3,81 +3,18 @@
 // orchestrator.ts: retry-цикл внутри runClaude покрыт своими тестами в orchestrator.test.ts.
 import { describe, it, expect } from 'vitest';
 import {
-    RUNTIME_UNAVAILABLE_RE,
-    isRuntimeUnavailable,
     runtimeUnavailableWaitMs,
     runtimeUnavailableMessage,
     runtimeUnavailableExhaustedMessage,
     DEFAULT_RUNTIME_UNAVAILABLE_MAX_WAIT_MS,
     DEFAULT_RUNTIME_UNAVAILABLE_RETRY_DELAY_MS,
-    isModelProxyUnavailable,
     modelProxyRetryWaitMs,
     MODEL_PROXY_RETRIES,
 } from './runtime-availability.ts';
 
-describe('isRuntimeUnavailable — детекция транзиентной недоступности CLI', () => {
-    it.each([
-        [127, ''],
-        [127, 'что угодно'],
-        [1, '/usr/local/bin/claude: line 70: /usr/bin/claude: No such file or directory'],
-        [1, 'spawn claude ENOENT'],
-        [1, 'bash: claude: ENOENT'],
-    ])('код %i, вывод "%s" → транзиент', (code, output) => {
-        expect(isRuntimeUnavailable(code, output)).toBe(true);
-    });
-
-    it.each([
-        [1, 'просто упало'],
-        [1, 'Error: тест не прошёл, ожидали 3 получили 4'],
-        [1, ''],
-        [2, 'permission denied'],
-    ])('код %i, вывод "%s" → НЕ транзиент (настоящий крах сессии)', (code, output) => {
-        expect(isRuntimeUnavailable(code, output)).toBe(false);
-    });
-
-    // Ревью #612 (blocker): регекс матчит ЛЮБОЙ текст, включая вывод УСПЕШНОЙ сессии,
-    // процитировавшей чужую ошибку. Без барьера по коду такая сессия перезапускалась бы до
-    // исчерпания бюджета, каждый раз заново делая побочки (коммиты, `gh pr create`,
-    // повторная запись файла намерений → дубли комментариев в PR).
-    it.each([
-        [0, 'починил падавший тест: cat: x: No such file or directory'],
-        [0, 'spawn claude ENOENT — упоминание в отчёте сессии'],
-        [0, ''],
-    ])('код 0 (успех), вывод "%s" → НЕ транзиент, чем бы сессия ни цитировала', (code, output) => {
-        expect(isRuntimeUnavailable(code, output)).toBe(false);
-    });
-
-    it('структурный session-failed глушит текстовую эвристику: процесс стартовал и упал сам', () => {
-        expect(
-            isRuntimeUnavailable(
-                1,
-                'тест падал с No such file or directory — починил',
-                'session-failed',
-            ),
-        ).toBe(false);
-    });
-
-    it('код 127 — транзиент ДАЖЕ при session-failed: так приходит отказ от шелл-обёртки', () => {
-        // Инцидент 18.08: `/usr/local/bin/claude: line 70: /usr/bin/claude: No such file or
-        // directory`. Обёртка стартовала и вернула 127 — граница spawn честно видит
-        // session-failed, но это ровно тот транзиент, ради которого модуль и написан.
-        expect(
-            isRuntimeUnavailable(
-                127,
-                '/usr/local/bin/claude: line 70: /usr/bin/claude: No such file or directory',
-                'session-failed',
-            ),
-        ).toBe(true);
-    });
-
-    it('без структурного класса (сторонний рантайм) текст остаётся defense-in-depth', () => {
-        expect(isRuntimeUnavailable(1, 'spawn claude ENOENT', undefined)).toBe(true);
-    });
-
-    it('RUNTIME_UNAVAILABLE_RE не матчит осмысленный вывод модели', () => {
-        expect(RUNTIME_UNAVAILABLE_RE.test('Все тесты прошли, PR готов к ревью')).toBe(false);
-    });
-});
+// Детект недоступности — коды на границе spawn и в runClaude (orchestrator.test.ts); текстовой
+// эвристики больше нет (Фаза 16). Обрыв прокси моделей — исход `interrupted` от адаптера,
+// его фикстуры — в adapters/session-end.test.ts.
 
 describe('runtimeUnavailableWaitMs — линейный backoff', () => {
     it('растёт линейно от базы (дефолт 10с)', () => {
@@ -132,28 +69,6 @@ describe('тексты сообщений — формулировка прич�
 // Задача 78: прокси моделей отвечает «No upstream account» или overload, а `claude -p`
 // выходит с кодом 0. По коду такую сессию от честной не отличить, поэтому детект идёт по
 // тексту — и применяется только к проходу БЕЗ вердикта (см. оркестратор).
-describe('isModelProxyUnavailable — сбой прокси моделей в выводе', () => {
-    it('ловит строку прокси из инцидента 16.10', () => {
-        expect(isModelProxyUnavailable('No upstream account is currently available')).toBe(true);
-    });
-
-    it('ловит overload API', () => {
-        expect(isModelProxyUnavailable('API Error: 529 {"type":"overloaded_error"}')).toBe(true);
-        expect(isModelProxyUnavailable('API Error: 529')).toBe(true);
-        expect(isModelProxyUnavailable('{"type":"overloaded_error"}')).toBe(true);
-    });
-
-    it('слово overloaded в прозе ревью сбоем не считается', () => {
-        expect(isModelProxyUnavailable('Overloaded')).toBe(false);
-        expect(isModelProxyUnavailable('функция overloaded для двух сигнатур TS')).toBe(false);
-    });
-
-    it('осмысленный вывод сбоем не считается', () => {
-        expect(isModelProxyUnavailable('Ревью готово, сводка записана')).toBe(false);
-        expect(isModelProxyUnavailable('')).toBe(false);
-    });
-});
-
 describe('modelProxyRetryWaitMs — пауза перед повтором', () => {
     it('растёт линейно от минуты', () => {
         expect(modelProxyRetryWaitMs(1)).toBe(60_000);

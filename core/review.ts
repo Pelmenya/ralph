@@ -12,7 +12,8 @@
 // - REVIEW_MODEL_STRENGTH/reviewModelRank/strongerReviewModel — планка модели повторного
 //   ревью (#217): повторное ревью не судится моделью слабее поставившей блок;
 // - assertKnownReviewModels — fail-closed на старте: модели ревью конфига известны планке,
-//   фолбэк не слабее default (#221/#223);
+//   фолбэк не слабее default (#221/#223), эскалация строго сильнее default и фолбэк не
+//   равен default (#46);
 // - recordReviewFindings — best-effort вызов журнала находок (#169) сразу после мерджа.
 //
 // TS-модуль без билд-шага: исполняется нативным type stripping Node 24 (erasable-only
@@ -178,8 +179,13 @@ export function createReviewModule(env: ReviewEnv) {
         // трактует «нет модели» как «ревью за супервизором» и пропускает ревью ЦЕЛИКОМ
         // — fail-open ровно на самых опасных фазах (находка ревью PR #132). Поэтому
         // деградируем на default: полноценное ревью, просто не усиленное.
+        // #46: лог различает эскалацию и обычный проход названием обеих моделей — строка
+        // «ревью эскалировано» без них уже раз подтверждала барьер, который шёл вхолостую.
         const escalatedModel = () => {
-            if (review.escalated) return review.escalated;
+            if (review.escalated) {
+                logFn(`🔺 Эскалация ревью: модель ${review.escalated} вместо ${review.default}.`);
+                return review.escalated;
+            }
             logFn(
                 '⚠ review.escalated не задан — эскалация невозможна, ревьюю моделью по умолчанию.',
             );
@@ -219,6 +225,7 @@ export function createReviewModule(env: ReviewEnv) {
             logFn(`🔺 Ревью эскалировано: дифф фазы трогает зону риска (${hit}).`);
             return escalatedModel();
         }
+        logFn(`Ревью без эскалации: модель по умолчанию ${review.default}.`);
         return review.default;
     }
 
@@ -366,6 +373,37 @@ export function createReviewModule(env: ReviewEnv) {
                         `Добавь модель в review.modelStrength своего конфига или поправь конфиг. Известные: ${strength.join(', ')}.`,
                 );
             }
+        }
+        // #46: эскалация, не усиливающая ревью, — барьер, который отрабатывает вхолостую.
+        // Конфиг с escalated === default прожил на путях ядра незамеченным: лог честно
+        // писал «ревью эскалировано», а модель была та же — отказ тихий и выглядит как
+        // успех. Поэтому escalated обязан быть СТРОГО сильнее default по действующему
+        // modelStrength; default на вершине списка — значит эскалировать некуда, и ключ
+        // escalated надо убрать (pickReviewModel скажет об этом вслух на зоне риска).
+        const escalated = review.escalated;
+        if (
+            escalated !== undefined &&
+            escalated !== null &&
+            escalated !== 'none' &&
+            review.default &&
+            reviewModelRank(escalated, cfg as ReviewCfg) <=
+                reviewModelRank(review.default, cfg as ReviewCfg)
+        ) {
+            return failFn(
+                `ralph.config.json (профиль "${profileName}"): review.escalated = "${escalated}" не сильнее review.default = "${review.default}". ` +
+                    `Эскалация ревью (#46) обязана менять модель на более сильную — иначе она выполняется вхолостую, а лог показывает усиленное ревью. ` +
+                    `Поставь в review.escalated модель правее default в списке: ${strength.join(', ')}.`,
+            );
+        }
+        // #46: фолбэк, совпадающий с default, не страхует ни от чего — при недоступности
+        // основной модели он предлагает её же. Явное совпадение — стоп; осознанные формы
+        // названы в отказе: 'none' (honest-стоп) или отсутствие ключа (дефолт #221).
+        if (review.fallback !== undefined && review.default && review.fallback === review.default) {
+            return failFn(
+                `ralph.config.json (профиль "${profileName}"): review.fallback = review.default = "${review.default}". ` +
+                    `Фолбэк ревью (#46) нужен на недоступность основной модели, и та же модель его не заменяет. ` +
+                    `Поставь другую модель не слабее default, 'none' (осознанный отказ от фолбэка) или убери ключ (фолбэк по умолчанию — review.default, #221).`,
+            );
         }
         // #221: фолбэк ревью не может ослаблять ревью ниже review.default. Без этой
         // проверки overload тихо перевёл бы ревью на модель слабее базовой — ровно

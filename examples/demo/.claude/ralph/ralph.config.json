@@ -40,7 +40,7 @@
             ],
             "default": "claude-opus-5-5",
             "escalated": "claude-fable-5-1",
-            "fallback": "claude-opus-5-5",
+            "fallback": "claude-fable-5-1",
             "escalateOn": [],
             "escalateOnPaths": [],
             "maxTurns": 20,

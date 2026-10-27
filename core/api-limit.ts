@@ -1,13 +1,13 @@
 // Модуль детекции и ожидания API-лимита (#361, трек «Фреймворк ralph», фаза 2).
 // Вынесен из ralph.js по тому же приёму, что ralph-util.ts (#232): чистые
 // преобразования вход→выход без побочек — идея из frankbria/ralph-claude-code.
-// Claude CLI при упирании в 5-часовое окно / usage limit пишет об этом в вывод и
-// завершается с ошибкой. Без обработки AFK-итерация фейлится, breaker сжигает
+// Рантайм при упирании в 5-часовое окно / usage limit завершается с ошибкой, и адаптер
+// называет этот исход `api-limit`. Без обработки AFK-итерация фейлится, breaker сжигает
 // оставшиеся попытки об ту же стену и ночной прогон умирает. Вместо этого:
-// распознать маркер → распарсить время сброса → доспать до него → повторить.
+// исход `api-limit` → время сброса от адаптера → доспать до него → повторить.
 // Сам цикл ожидания/повтора (спит и вызывает claude заново) остаётся в ralph.js
-// (runClaude) — он не чистый (sleep, spawn, pushEvent); здесь — только парсинг и
-// расчёт длительности паузы плюс текст события.
+// (runClaude) — он не чистый (sleep, spawn, pushEvent); здесь — только расчёт
+// длительности паузы плюс текст события.
 //
 // TS-модуль без билд-шага: исполняется нативным type stripping Node 24 (erasable-only
 // синтаксис — только аннотации типов, ни enum, ни namespace, ни parameter properties).
@@ -15,35 +15,10 @@
 // не трогает диск/сеть/процессы), поэтому, как и ralph-util.ts, это набор standalone-
 // экспортов, а не фабрика с DI.
 
-// Боевой пример (2026-07-19): «You've hit your session limit · resets 1:20pm» —
-// первая версия ждала только «usage limit» и промахнулась; ловим шире.
-export const API_LIMIT_RE =
-    /(usage limit|session limit|rate.?limit|5-hour limit|hit your .{0,20}limit|limit (?:reached|exceeded)|limit will reset|resets? at)/i;
-
-// #594: сессия, упёршаяся в --max-turns, завершается ненулевым кодом с «Reached max turns
-// (N)». Это не отказ, а «не успела»: работа сделана частично и закоммичена. Отдельный
-// маркер нужен именно чтобы НЕ путать два случая — настоящее падение остаётся стопом
-// fail-closed, а исчерпание ходов вызывающий вправе продолжить новой сессией.
-// Формулировка ловится узко (max turns), чтобы не цеплять живую речь модели про «turns».
-export const TURN_LIMIT_RE = /(reached max turns|max turns (?:reached|exceeded))/i;
-
-// «resets 3am» / «reset at 7:30pm» → мс до сброса (локальное время; прошедшее
-// время суток = завтра). Не распарсилось → null, вызывающий возьмёт fallback.
-export function parseResetWaitMs(text: string): number | null {
-    const m = /reset[s]?(?:\s+at)?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i.exec(text);
-    if (!m) return null;
-    let h = parseInt(m[1], 10);
-    const min = m[2] ? parseInt(m[2], 10) : 0;
-    const ap = m[3] ? m[3].toLowerCase() : null;
-    if (ap === 'pm' && h < 12) h += 12;
-    if (ap === 'am' && h === 12) h = 0;
-    if (h > 23 || min > 59) return null;
-    const now = new Date();
-    const target = new Date(now);
-    target.setHours(h, min, 0, 0);
-    if (target <= now) target.setDate(target.getDate() + 1);
-    return target.getTime() - now.getTime();
-}
+// Признаки лимита — маркер в выводе и время сброса окна — распознаёт адаптер рантайма
+// (`adapters/session-end.ts`, Фаза 16): ядро получает исход `api-limit` и, если CLI его
+// назвал, `retryAfterMs`. Регулярок по выводу сессии здесь больше нет — их формулировки
+// принадлежат конкретному CLI, а не петле.
 
 // #130: запас был захардкожен как 2 минуты и оказался слишком тонким — окно
 // сбрасывается не мгновенно, и повтор рискует уйти в ту же стену, сжигая попытку
@@ -62,13 +37,18 @@ export function minutesOrDefault(value: unknown, dflt: number): number {
     return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : dflt;
 }
 
+// retryAfterMs — время до сброса, названное адаптером; нет его (или оно битое) — fallback.
 export function apiLimitWaitMs(
-    output: string,
+    retryAfterMs: number | undefined,
     cfg: { apiLimitFallbackWaitMin?: number; apiLimitGraceMin?: number },
 ): number {
     const fallbackMs = minutesOrDefault(cfg.apiLimitFallbackWaitMin, 30) * 60 * 1000;
     const graceMs = minutesOrDefault(cfg.apiLimitGraceMin, 5) * 60 * 1000;
-    return (parseResetWaitMs(output) ?? fallbackMs) + graceMs;
+    const resetMs =
+        typeof retryAfterMs === 'number' && Number.isFinite(retryAfterMs) && retryAfterMs >= 0
+            ? retryAfterMs
+            : fallbackMs;
+    return resetMs + graceMs;
 }
 
 // Текст события API-лимитной паузы — ЕДИНСТВЕННЫЙ источник правды его формата. deadman.ts

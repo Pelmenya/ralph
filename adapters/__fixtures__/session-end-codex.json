@@ -1,0 +1,86 @@
+{
+    "cli": "codex-cli 0.163.0",
+    "unsupported": {
+        "turn-limit": "бюджета ходов у codex exec нет: maxTurns для него best-effort (docs/harness-adapters.md)"
+    },
+    "cases": [
+        {
+            "reason": "completed",
+            "code": 0,
+            "stdout": "diff --git a/f b/f\n+добавлено\n",
+            "stderr": "",
+            "source": "код 0 `codex exec`"
+        },
+        {
+            "reason": "api-limit",
+            "code": 1,
+            "stdout": "",
+            "stderr": "ERROR: You’ve hit your usage limit. Upgrade to Plus to continue using Codex (https://chatgpt.com/explore/plus), or try again at Oct 27th, 2026 3:05 PM.\n",
+            "source": "формулировка — из строк бинаря codex-cli 0.163.0, дата подставлена по его формату"
+        },
+        {
+            "reason": "api-limit",
+            "code": 1,
+            "stdout": "",
+            "stderr": "ERROR: exceeded retry limit, last status: 429 Too Many Requests\n",
+            "source": "формулировка — из строк бинаря codex-cli 0.163.0"
+        },
+        {
+            "reason": "auth",
+            "code": 1,
+            "stdout": "",
+            "stderr": "ERROR: Your access token could not be refreshed. Please log out and sign in again.\n",
+            "source": "формулировка — из строк бинаря codex-cli 0.163.0"
+        },
+        {
+            "reason": "auth",
+            "code": 1,
+            "stdout": "",
+            "stderr": "ERROR: unexpected status 401 Unauthorized: Missing bearer or basic authentication in header\n",
+            "source": "формулировка статуса — HTTP 401 из строк бинаря; хвост собран"
+        },
+        {
+            "reason": "interrupted",
+            "code": 1,
+            "stdout": "",
+            "stderr": "ERROR: stream disconnected before completion: Incomplete response returned, reason: content_filter\n",
+            "source": "формулировка — из строк бинаря codex-cli 0.163.0"
+        },
+        {
+            "reason": "interrupted",
+            "code": 1,
+            "stdout": "",
+            "stderr": "ERROR: exceeded retry limit, last status: 503 Service Unavailable\n",
+            "source": "формулировка — из строк бинаря codex-cli 0.163.0"
+        },
+        {
+            "reason": "timeout",
+            "code": 1,
+            "signal": "SIGTERM",
+            "stdout": "",
+            "stderr": "",
+            "source": "spawnSync по сроку: status null, signal SIGTERM"
+        },
+        {
+            "reason": "unknown",
+            "code": 1,
+            "stdout": "",
+            "stderr": "ERROR: sandbox error: permission denied\n",
+            "source": "формулировка `sandbox error:` — из строк бинаря codex-cli 0.163.0"
+        },
+        {
+            "reason": "unknown",
+            "code": 1,
+            "stdout": "Поправил обработку 401 Unauthorized и rate limit: после usage limit клиент просит sign in again.\n",
+            "stderr": "ERROR: sandbox error: permission denied\n",
+            "source": "проза модели в stdout собрана; stderr — строка бинаря codex-cli 0.163.0. Исход по прозе не читается"
+        },
+        {
+            "reason": "unknown",
+            "code": 1,
+            "stdout": "",
+            "stderr": "Reconnecting... 1/5 (stream disconnected before completion: error sending request)\nERROR: sandbox error: permission denied\n",
+            "source": "строка ретрая и итог — из строк бинаря codex-cli 0.163.0, связка собрана. Ретрай — не итог"
+        }
+    ]
+}

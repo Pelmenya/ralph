@@ -8,9 +8,15 @@ import {
     parseClaudeJsonResult,
     priceModel,
 } from './attempt-cost.ts';
-import { TURN_LIMIT_RE } from './api-limit.ts';
 // @ts-expect-error — JS-entry раннера без деклараций типов.
 import ralph from '../ralph.js';
+
+// #113: у каждой записи — профиль, версия CLI и исход; здесь они фон, проверяются ниже.
+const SESSION = {
+    profile: { harness: 'claude-code', provider: 'anthropic', model: 'model-a' },
+    cliVersion: { version: '2.1.311' },
+    endReason: 'completed' as const,
+};
 
 const SUCCESS = JSON.stringify({
     type: 'result',
@@ -79,13 +85,12 @@ describe('parseClaudeJsonResult — JSON-результат обратно в т
         ]);
     });
 
-    it('исчерпание ходов распознаётся тем же TURN_LIMIT_RE, что и текстовый режим', () => {
-        // От противного: сырой JSON маркера текстового режима не содержит — без перевода
-        // продолжение по бюджету ходов стало бы стопом «сессия упала».
-        expect(TURN_LIMIT_RE.test(MAX_TURNS)).toBe(false);
+    it('исчерпание ходов: текст несёт формулировку CLI и сырой JSON, маркер не синтезируется', () => {
+        // Исход `turn-limit` называет адаптер по `subtype` сырого JSON (Фаза 16,
+        // adapters/session-end.test.ts); перевод в текст — для лога и разбора падения.
         const r = parseClaudeJsonResult(MAX_TURNS);
-        expect(TURN_LIMIT_RE.test(r?.text ?? '')).toBe(true);
         expect(r?.text).toContain('Error: Reached maximum number of turns (1)');
+        expect(r?.text).not.toContain('Reached max turns (');
         // Ошибочный результат несёт и сырой JSON — на случай форм ошибки, не виденных живьём.
         expect(r?.text).toContain(MAX_TURNS);
     });
@@ -140,6 +145,7 @@ describe('priceModel / attemptRecord — стоимость по тарифу м
             code: 0,
             parsed: parseClaudeJsonResult(SUCCESS),
             pricing,
+            session: SESSION,
         });
         pricing['model-a'].outputPerMTok = 1000;
         expect(rec.models[0].tariff?.outputPerMTok).toBe(25);
@@ -161,6 +167,7 @@ describe('priceModel / attemptRecord — стоимость по тарифу м
                 models: [{ ...usage, reportedCostUsd: null }, usage],
             },
             pricing: null,
+            session: SESSION,
         });
         expect(rec.models[0].costBasis).toBe('unknown');
         // Частичная сумма выглядела бы полной.
@@ -169,7 +176,13 @@ describe('priceModel / attemptRecord — стоимость по тарифу м
     });
 
     it('вывод не разобрался — запись есть, токены неизвестны, причина названа', () => {
-        const rec = attemptRecord({ runtime: 'claude', code: 1, parsed: null, pricing: null });
+        const rec = attemptRecord({
+            runtime: 'claude',
+            code: 1,
+            parsed: null,
+            pricing: null,
+            session: SESSION,
+        });
         expect(rec).toMatchObject({ tokens: null, costUsd: null });
         expect(rec.usageUnknown).toMatch(/не разобрался/);
         expect(attemptLogLine(rec)).toMatch(/💰 Попытка \(claude\): расход неизвестен/);
@@ -181,10 +194,51 @@ describe('priceModel / attemptRecord — стоимость по тарифу м
             code: 0,
             parsed: parseClaudeJsonResult(SUCCESS),
             pricing: { 'model-a': TARIFF },
+            session: SESSION,
         });
         expect(attemptLogLine(rec)).toBe(
-            '💰 Попытка (claude): 22413 токенов (из них кеш 22408), $0.1401 (тариф: config-tariff).',
+            '💰 Попытка (claude): 22413 токенов (из них кеш 22408), $0.1401 (тариф: config-tariff).' +
+                ' Профиль claude-code/anthropic/model-a, CLI 2.1.311, исход completed.',
         );
+    });
+});
+
+describe('attemptRecord — версия CLI, профиль и исход у каждой записи (#113)', () => {
+    it('известная версия: поля версии, профиля и исхода, причины нет', () => {
+        const rec = attemptRecord({
+            runtime: 'claude',
+            code: 0,
+            parsed: parseClaudeJsonResult(SUCCESS),
+            pricing: null,
+            session: SESSION,
+        });
+        expect(rec).toMatchObject({
+            profile: SESSION.profile,
+            cliVersion: '2.1.311',
+            endReason: 'completed',
+        });
+        expect('cliVersionUnknown' in rec).toBe(false);
+    });
+
+    it('нечитаемая версия — unknown с причиной, и у записи без токенов тоже', () => {
+        const rec = attemptRecord({
+            runtime: 'codex',
+            code: 1,
+            parsed: null,
+            pricing: null,
+            session: {
+                ...SESSION,
+                cliVersion: { version: 'unknown', unknownReason: '`codex --version` вернул код 2' },
+                endReason: 'unknown',
+            },
+        });
+        expect(rec).toMatchObject({
+            cliVersion: 'unknown',
+            cliVersionUnknown: '`codex --version` вернул код 2',
+            endReason: 'unknown',
+            tokens: null,
+        });
+        expect(attemptLogLine(rec)).toMatch(/CLI unknown, исход unknown\.$/);
     });
 });
 
@@ -198,19 +252,33 @@ describe('проводка в раннере: spawnClaude и recordAttempt', () 
         expect(res.output.trim()).toBe('да');
     });
 
-    it('spawnClaude на исчерпании ходов: маркер бюджета виден детекту', () => {
+    it('spawnClaude на исчерпании ходов: исход turn-limit называет адаптер по сырому JSON', () => {
         const res = ralph.spawnClaude(['-p'], 'промпт', 1000, spawnWith(MAX_TURNS, 1));
-        expect(TURN_LIMIT_RE.test(res.output)).toBe(true);
+        expect(res.endReason).toBe('turn-limit');
+    });
+
+    it('spawnClaude на успехе: исход completed', () => {
+        expect(ralph.spawnClaude(['-p'], 'промпт', 1000, spawnWith(SUCCESS)).endReason).toBe(
+            'completed',
+        );
     });
 
     it('recordAttempt кладёт в журнал токены, тариф снимком и стоимость, в лог — строку 💰', () => {
         const emitFn = vi.fn();
         const logs: string[] = [];
-        const rec = ralph.recordAttempt('claude', 0, parseClaudeJsonResult(SUCCESS), undefined, {
-            emitFn,
-            logFn: (m: string) => logs.push(m),
-            cfg: { observability: { pricing: { 'model-a': TARIFF } } },
-        });
+        const rec = ralph.recordAttempt(
+            {
+                runtime: 'claude',
+                code: 0,
+                parsed: parseClaudeJsonResult(SUCCESS),
+                session: SESSION,
+            },
+            {
+                emitFn,
+                logFn: (m: string) => logs.push(m),
+                cfg: { observability: { pricing: { 'model-a': TARIFF } } },
+            },
+        );
         expect(emitFn).toHaveBeenCalledWith('attempt', rec);
         const [, payload] = emitFn.mock.calls[0];
         expect(payload.tokens).toEqual({ input: 2, output: 3, cacheRead: 0, cacheWrite: 22408 });
@@ -221,11 +289,16 @@ describe('проводка в раннере: spawnClaude и recordAttempt', () 
 
     it('recordAttempt у рантайма без токенов — запись с причиной, а не пропуск', () => {
         const emitFn = vi.fn();
-        ralph.recordAttempt('codex', 0, null, 'рантайм codex расход токенов в выводе не отдаёт', {
-            emitFn,
-            logFn: () => {},
-            cfg: {},
-        });
+        ralph.recordAttempt(
+            {
+                runtime: 'codex',
+                code: 0,
+                parsed: null,
+                unknownReason: 'рантайм codex расход токенов в выводе не отдаёт',
+                session: SESSION,
+            },
+            { emitFn, logFn: () => {}, cfg: {} },
+        );
         expect(emitFn.mock.calls[0][1]).toMatchObject({
             runtime: 'codex',
             tokens: null,

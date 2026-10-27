@@ -1,0 +1,126 @@
+{
+    "cli": "Claude Code CLI 2.1.311",
+    "unsupported": {},
+    "cases": [
+        {
+            "reason": "completed",
+            "code": 0,
+            "stdout": "{\"type\": \"result\", \"subtype\": \"success\", \"is_error\": false, \"duration_ms\": 1571, \"num_turns\": 1, \"result\": \"да\", \"total_cost_usd\": 0}",
+            "stderr": "",
+            "source": "живой `claude -p --output-format json`, CLI 2.1.311 (тот же ответ, что в core/attempt-cost.test.ts)"
+        },
+        {
+            "reason": "completed",
+            "code": 0,
+            "stdout": "{\"type\": \"result\", \"subtype\": \"success\", \"is_error\": false, \"duration_ms\": 1571, \"num_turns\": 1, \"result\": \"Ревью: классификатор узнаёт «No upstream account is currently available» и «API Error: 503».\", \"total_cost_usd\": 0}",
+            "stderr": "",
+            "source": "конверт живого успеха CLI 2.1.311, текст ревью собран: цитата обрыва в прозе — не обрыв"
+        },
+        {
+            "reason": "api-limit",
+            "code": 1,
+            "stdout": "{\"type\": \"result\", \"subtype\": \"success\", \"is_error\": true, \"duration_ms\": 1571, \"num_turns\": 1, \"result\": \"You've hit your session limit · resets 8:20pm (UTC)\", \"total_cost_usd\": 0}",
+            "stderr": "",
+            "source": "текст — дословно из транскриптов CLI; конверт JSON-результата собран"
+        },
+        {
+            "reason": "api-limit",
+            "code": 1,
+            "stdout": "You've hit your session limit · resets 1:20pm\n",
+            "stderr": "",
+            "source": "текстовый режим, боевой пример 19.07 (докблок прежней регулярки ядра)"
+        },
+        {
+            "reason": "api-limit",
+            "code": 1,
+            "stdout": "{\"type\": \"result\", \"subtype\": \"success\", \"is_error\": true, \"duration_ms\": 1571, \"num_turns\": 1, \"result\": \"API Error: 429 {\\\"error\\\":{\\\"message\\\":\\\"Your account request reached organization TPD, please try again after 1 seconds\\\",\\\"type\\\":\\\"exceeded_current_quota_error\\\"}}\", \"total_cost_usd\": 0}",
+            "stderr": "",
+            "source": "Kimi: форма `API Error: <код> <тело>` CLI, тело Moonshot собрано по форме его ошибок; живьём не снято"
+        },
+        {
+            "reason": "auth",
+            "code": 1,
+            "stdout": "{\"type\": \"result\", \"subtype\": \"success\", \"is_error\": true, \"duration_ms\": 1571, \"num_turns\": 1, \"result\": \"Not logged in · Please run /login\", \"total_cost_usd\": 0}",
+            "stderr": "",
+            "source": "формулировка — из строк бинаря CLI 2.1.311; конверт собран"
+        },
+        {
+            "reason": "auth",
+            "code": 1,
+            "stdout": "{\"type\": \"result\", \"subtype\": \"success\", \"is_error\": true, \"duration_ms\": 1571, \"num_turns\": 1, \"result\": \"Failed to authenticate: OAuth token revoked. Please log in again or contact your administrator.\", \"total_cost_usd\": 0}",
+            "stderr": "",
+            "source": "формулировка — из строк бинаря CLI 2.1.311; конверт собран"
+        },
+        {
+            "reason": "turn-limit",
+            "code": 1,
+            "stdout": "{\"type\": \"result\", \"subtype\": \"error_max_turns\", \"is_error\": true, \"num_turns\": 2, \"result\": null, \"errors\": [\"Reached maximum number of turns (1)\"]}",
+            "stderr": "",
+            "source": "живой JSON-результат CLI 2.1.311 (core/attempt-cost.test.ts), токены вырезаны"
+        },
+        {
+            "reason": "turn-limit",
+            "code": 1,
+            "stdout": "Error: Reached max turns (200)\n",
+            "stderr": "",
+            "source": "текстовый режим (#594, первый боевой прогон 28.08)"
+        },
+        {
+            "reason": "interrupted",
+            "code": 0,
+            "stdout": "No upstream account is currently available\n",
+            "stderr": "",
+            "source": "инцидент 16.10: прокси моделей, `claude -p` вышел с кодом 0"
+        },
+        {
+            "reason": "interrupted",
+            "code": 0,
+            "stdout": "{\"type\": \"result\", \"subtype\": \"success\", \"is_error\": false, \"duration_ms\": 8012, \"num_turns\": 1, \"result\": \"No upstream account is currently available\", \"total_cost_usd\": 0}",
+            "stderr": "",
+            "source": "инцидент 16.10 в JSON-форме боевого spawn: текст — дословно ответ прокси, конверт успеха собран; живьём в JSON-режиме не снято"
+        },
+        {
+            "reason": "interrupted",
+            "code": 1,
+            "stdout": "{\"type\": \"result\", \"subtype\": \"success\", \"is_error\": true, \"duration_ms\": 1571, \"num_turns\": 1, \"result\": \"API Error: 524 {\\\"title\\\":\\\"Error 524: A timeout occurred\\\",\\\"status\\\":524}\", \"total_cost_usd\": 0}",
+            "stderr": "",
+            "source": "текст — дословно из транскриптов CLI (хвост JSON ошибки обрезан); конверт собран"
+        },
+        {
+            "reason": "interrupted",
+            "code": 1,
+            "stdout": "{\"type\": \"result\", \"subtype\": \"success\", \"is_error\": true, \"duration_ms\": 1571, \"num_turns\": 1, \"result\": \"API Error: Connection lost mid-response. The response above may be incomplete.\", \"total_cost_usd\": 0}",
+            "stderr": "",
+            "source": "текст — дословно из транскриптов CLI; конверт собран"
+        },
+        {
+            "reason": "interrupted",
+            "code": 1,
+            "stdout": "{\"type\": \"result\", \"subtype\": \"success\", \"is_error\": true, \"duration_ms\": 1571, \"num_turns\": 1, \"result\": \"API Error: Server is temporarily limiting requests (not your usage limit)\", \"total_cost_usd\": 0}",
+            "stderr": "",
+            "source": "формулировка — из строк бинаря CLI 2.1.311; прежняя регулярка ядра читала её лимитом"
+        },
+        {
+            "reason": "timeout",
+            "code": 1,
+            "signal": "SIGTERM",
+            "stdout": "",
+            "stderr": "",
+            "source": "spawnSync по сроку: status null, signal SIGTERM (ревью #612, проверено прямым запуском)"
+        },
+        {
+            "reason": "unknown",
+            "code": 1,
+            "stdout": "",
+            "stderr": "TypeError: undefined is not a function\n",
+            "source": "ненулевой код без признака исхода"
+        },
+        {
+            "reason": "unknown",
+            "code": 2,
+            "stdout": "",
+            "stderr": "",
+            "source": "ненулевой код без вывода"
+        }
+    ]
+}

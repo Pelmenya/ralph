@@ -12,13 +12,17 @@
 //      означать «на той стороне раннер стартует», а не «байты скопированы»;
 //   3. **старое не удаляется, а переименовывается** (`*.migrated`) — откат обязан быть
 //      возможен, а старт по прежней раскладке невозможен: иначе второй экземпляр поедет
-//      на старом состоянии, ради чего протокол и написан;
+//      на старом состоянии, ради чего протокол и написан. Откат тоже ничего не удаляет без
+//      копии: он возвращает ТЕКУЩИЕ файлы новой раскладки, а снимок на момент переезда
+//      откладывает под `*.pre-rollback` (#152);
 //   4. **всё через инъекцию fs.** Модуль не знает про диск: он знает про порядок шагов,
 //      а тесты проверяют именно порядок и поведение при обрыве.
 //
 // Каталоги модуль не создаёт: `runtimeDir` создаёт `main()` до лока (единственная запись,
 // разрешённая до него), а переезд идёт уже внутрь готового каталога.
 
+import { createHash } from 'node:crypto';
+import fs from 'node:fs';
 import { runtimePathsIn } from './runtime-paths.ts';
 
 /** Имя журнала переезда в НОВОЙ раскладке: он про её появление, там ему и место. */
@@ -56,7 +60,19 @@ export type TMigrationJournal = {
     origins?: Record<string, string>;
     startedAt: string;
     finishedAt?: string;
+    /** Что откат вернул (#152): файлы, изменившиеся после переезда, куда отложен снимок на
+     *  момент переезда и фаза, которая едет назад. Пишется только откатом. */
+    rollback?: TRollbackReport;
 };
+
+export type TRollbackReport = {
+    changed: string[];
+    snapshots: Record<string, string>;
+    state?: { milestone: string | null; count: number };
+};
+
+/** Суффикс снимка на момент переезда, отложенного откатом вместо воскрешения (#152). */
+export const PRE_ROLLBACK_SUFFIX = '.pre-rollback';
 
 export type TMigrationDeps = {
     existsFn: (p: string) => boolean;
@@ -67,10 +83,44 @@ export type TMigrationDeps = {
     // Размер файла — отдельным примитивом: сверять растущие логи по СОДЕРЖИМОМУ значило бы
     // держать в памяти две их полные копии (ревью Codex, !23), а лог не ротируется.
     sizeFn: (p: string) => number;
+    // Отпечаток хвоста — sha256 последних `LOG_TAIL_BYTES` байт. Один размер не отличает
+    // два РАЗНЫХ лога одной длины, а откат по «не изменился» удаляет текущий без копии;
+    // хвост ловит запись после переезда, не читая лог целиком.
+    tailFn: (p: string) => string;
     // Время — параметром, а не `Date.now()` в коде: иначе журнал недетерминирован, а тест
     // на него — мигающий. Тот же приём, что у остального ядра.
     now: () => string;
 };
+
+/** Сколько байт хвоста лога сверяется вместе с размером (`tailFn`). */
+export const LOG_TAIL_BYTES = 64 * 1024;
+
+/** Боевой `tailFn`: sha256 последних `LOG_TAIL_BYTES` байт файла без чтения его целиком. */
+export function fileTailHash(p: string): string {
+    const fd = fs.openSync(p, 'r');
+    try {
+        const size = fs.fstatSync(fd).size;
+        const n = Math.min(size, LOG_TAIL_BYTES);
+        const buf = Buffer.alloc(n);
+        fs.readSync(fd, buf, 0, n, size - n);
+        return createHash('sha256').update(buf).digest('hex');
+    } finally {
+        fs.closeSync(fd);
+    }
+}
+
+/**
+ * Совпадение двух экземпляров одного файла описи. Логи — по размеру И хвосту: размер ловит
+ * усечение, хвост — другой лог той же длины (дописанный после переезда и усечённый, чужой
+ * файл на месте копии). Совпасть оба могут только у логов, разошедшихся раньше последних
+ * 64 КиБ при равной длине, — у файла, который только дописывается, такого не бывает.
+ * Остальные файлы малы по устройству и сверяются побайтно.
+ */
+function sameFile(name: string, a: string, b: string, deps: TMigrationDeps): boolean {
+    return LOGS.has(name)
+        ? deps.sizeFn(a) === deps.sizeFn(b) && deps.tailFn(a) === deps.tailFn(b)
+        : deps.readFn(a) === deps.readFn(b);
+}
 
 /** Путь в каталоге — своей склейкой, а не `path.join`: модуль оперирует уже готовыми
  *  адресами из описи, и единственное, что ему нужно, — приписать имя к каталогу. */
@@ -319,14 +369,11 @@ export function migrateRuntime(plan: TMigrationPlan, deps: TMigrationDeps): TMig
         // Но сверяются они по-разному, и разница вынужденная: логи растут неограниченно
         // (`ralph.log` не ротируется), и сравнение по содержимому держало бы в памяти две
         // их полные копии — на большом логе это отказ по памяти, из которого повтор не
-        // выводит. Для них сверяется РАЗМЕР: он ловит усечение, единственный отказ, который
-        // тут вообще возможен (лог только дописывается). Остальные файлы малы по устройству
-        // — состояние, маркер зависимостей, очередь намерений, — и сверяются побайтно, что
-        // ловит ещё и устаревшую копию от прошлой попытки.
-        const sameAsParked = () =>
-            LOGS.has(name)
-                ? deps.sizeFn(to) === deps.sizeFn(parked)
-                : deps.readFn(to) === deps.readFn(parked);
+        // выводит. Для них сверяются РАЗМЕР и хеш хвоста (`sameFile`): размер ловит усечение,
+        // хвост — другой файл той же длины. Остальные файлы малы по устройству — состояние,
+        // маркер зависимостей, очередь намерений, — и сверяются побайтно, что ловит ещё и
+        // устаревшую копию от прошлой попытки.
+        const sameAsParked = () => sameFile(name, to, parked, deps);
         const copyOk = deps.existsFn(parked)
             ? deps.existsFn(to) && sameAsParked()
             : deps.existsFn(to) && (!isState || isValidState(deps.readFn(to)));
@@ -428,9 +475,25 @@ export function assertLegacyNotMigrated(
 }
 
 /**
- * Откат к прежней раскладке — без окна, в котором живы два состояния: сначала возвращается
- * оригинал, потом исчезает копия. Работает и по ПРЕРВАННОЙ миграции (журнал in-progress):
- * именно она и нуждается в откате чаще завершённой.
+ * Откат к прежней раскладке — без окна, в котором живы два состояния: сначала файл ложится
+ * в старую раскладку, потом исчезает копия. Работает и по ПРЕРВАННОЙ миграции (журнал
+ * in-progress): именно она и нуждается в откате чаще завершённой.
+ *
+ * Возвращается ТЕКУЩЕЕ состояние `runtimeDir`, а не снимок на момент переезда (#152,
+ * репетиция отката). После завершённого переезда петля на новой раскладке успевает сдать
+ * фазу и начать следующую, и воскрешённый `*.migrated` вернул бы state с устаревшими
+ * `mergeInFlight` и `submitStages`, а текущий удалил бы без копии. Поэтому:
+ *
+ *   • копия не изменилась — парковка возвращается на место, как раньше: ровно тот же файл;
+ *   • изменилась — снимок откладывается под `*.pre-rollback` (имя не затирает снимок
+ *     прошлого цикла), а в старую раскладку пишется текущий файл и только потом удаляется
+ *     копия. Что изменилось и какая фаза едет назад — в журнале (`rollback`) и в логе;
+ *   • журнал in-progress — петля по нему не стартовала (`assertMigrationSettled`), и копия
+ *     может быть усечена обрывом: истина там — оригинал или парковка, копия удаляется,
+ *     только если они есть.
+ *
+ * Повтор после обрыва доводит откат: оригинал, совпавший с копией, — уже записанный шаг;
+ * разошедшийся — стоп, выбирать между двумя состояниями молча откат не вправе.
  */
 export function rollbackRuntime(to: string, deps: TMigrationDeps): TMigrationJournal {
     const journal = readMigrationJournal(to, deps);
@@ -440,17 +503,88 @@ export function rollbackRuntime(to: string, deps: TMigrationDeps): TMigrationJou
                 `«готово» здесь означало бы, что состояние трогали неизвестно как.`,
         );
     }
+    const report: TRollbackReport = { changed: [], snapshots: {} };
+    const settled = journal.status !== 'in-progress';
     for (const name of journal.files) {
         const original = at(originOf(journal, name), name);
         const parked = `${original}${MIGRATED_SUFFIX}`;
-        if (deps.existsFn(parked)) deps.renameFn(parked, original);
-        if (deps.existsFn(at(journal.to, name))) deps.removeFn(at(journal.to, name));
+        const current = at(journal.to, name);
+        const same = (a: string, b: string) => sameFile(name, a, b, deps);
+        const hasCurrent = deps.existsFn(current);
+        const hasParked = deps.existsFn(parked);
+        const hasOriginal = deps.existsFn(original);
+        const currentWins = hasCurrent && (settled || (!hasParked && !hasOriginal));
+        if (!currentWins || (hasParked && !hasOriginal && same(current, parked))) {
+            // Копии нет, она не изменилась после переезда или переезд не завершён: на место
+            // едет парковка, копия удаляется уже ПОСЛЕ — её содержимое лежит в оригинале.
+            if (hasParked && !hasOriginal) deps.renameFn(parked, original);
+            if (hasCurrent) deps.removeFn(current);
+            continue;
+        }
+        if (hasOriginal && !same(original, current)) {
+            throw new Error(
+                `Откат не выбирает между двумя состояниями: ${original} и ${current} оба есть ` +
+                    `и расходятся. Разбери руками, какой из них настоящий, и повтори откат.`,
+            );
+        }
+        report.changed.push(name);
+        if (hasParked) {
+            const snapshot = freeName(`${original}${PRE_ROLLBACK_SUFFIX}`, deps.existsFn);
+            deps.renameFn(parked, snapshot);
+            report.snapshots[name] = snapshot;
+        }
+        const text = deps.readFn(current);
+        if (!hasOriginal) deps.writeFn(original, text);
+        if (isStateName(name)) report.state = stateSummary(text);
+        deps.removeFn(current);
     }
     for (const dir of legacyDirsOf(journal)) {
         const marker = at(dir, MIGRATED_MARKER);
         if (deps.existsFn(marker)) deps.removeFn(marker);
     }
-    const rolled: TMigrationJournal = { ...journal, status: 'rolled-back', finishedAt: deps.now() };
+    if (!report.state) delete report.state;
+    const rolled: TMigrationJournal = {
+        ...journal,
+        status: 'rolled-back',
+        finishedAt: deps.now(),
+        rollback: report,
+    };
     writeJournal(to, rolled, deps);
     return rolled;
+}
+
+/** Первое свободное имя: снимок прошлого цикла «переезд → откат» не затирается. */
+function freeName(base: string, existsFn: (p: string) => boolean): string {
+    if (!existsFn(base)) return base;
+    let n = 1;
+    while (existsFn(`${base}.${n}`)) n++;
+    return `${base}.${n}`;
+}
+
+function stateSummary(text: string): TRollbackReport['state'] {
+    try {
+        const s = JSON.parse(text) as { milestone?: unknown; count?: unknown };
+        if (typeof s.count !== 'number') return undefined;
+        const milestone = typeof s.milestone === 'string' ? s.milestone : null;
+        return { milestone, count: s.count };
+    } catch {
+        return undefined;
+    }
+}
+
+/** Строка лога об откате: что именно едет назад, если после переезда петля работала. */
+export function describeRollback(rolled: TMigrationJournal): string {
+    const head = `↩️  Состояние возвращено в ${rolled.from} (файлов: ${rolled.files.length}).`;
+    const r = rolled.rollback;
+    const tail = `Убери секцию roots из конфига — иначе следующий запуск встанет на несоответствии.`;
+    if (!r || r.changed.length === 0) return `${head} ${tail}`;
+    const state = r.state
+        ? `возвращается текущее состояние: ${r.state.milestone ?? 'веха не задана'}, count ${r.state.count}`
+        : `возвращаются текущие файлы новой раскладки`;
+    const snaps = Object.values(r.snapshots);
+    return (
+        `${head} После переезда изменились ${r.changed.join(', ')} — ${state}.` +
+        (snaps.length > 0 ? ` Снимок на момент переезда отложен: ${snaps.join(', ')}.` : '') +
+        ` ${tail}`
+    );
 }

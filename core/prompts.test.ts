@@ -8,7 +8,6 @@
 // Канал намерений в промпте — фактический путь прогона (канон, задача 22): раньше он
 // был зашит константой, и после переезда состояния сессия писала бы намерения в один файл,
 // а раннер читал другой — молча, без единого красного.
-const REQUESTS = '/path/to/runtime/ralph.requests.jsonl';
 
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -25,19 +24,19 @@ import {
     buildReReviewPrompt,
     buildReviewPrompt,
 } from './prompts.ts';
+import { INTENTS_BEGIN, INTENTS_END, extractIntentBlock } from './session-requests.ts';
 
 const BRANCH = 'feature/m1';
 const GATE = 'npm run lint, npm run test';
 
 const ALL: Array<[string, string]> = [
-    ['ревью', buildReviewPrompt({ branch: BRANCH, diffContext: '<дифф>', requestsPath: REQUESTS })],
+    ['ревью', buildReviewPrompt({ branch: BRANCH, diffContext: '<дифф>' })],
     [
         'правки по ревью',
         buildFixByReviewPrompt({
             branch: BRANCH,
             allowNames: 'owner',
             gateCmdList: GATE,
-            requestsPath: REQUESTS,
         }),
     ],
     [
@@ -46,7 +45,6 @@ const ALL: Array<[string, string]> = [
             branch: BRANCH,
             allowNames: 'owner',
             gateCmdList: GATE,
-            requestsPath: REQUESTS,
         }),
     ],
     [
@@ -55,13 +53,11 @@ const ALL: Array<[string, string]> = [
             branch: BRANCH,
             allowNames: 'owner',
             diffContext: '<дифф>',
-            requestsPath: REQUESTS,
         }),
     ],
     [
         'ревью правок',
         buildFixReviewPrompt({
-            requestsPath: REQUESTS,
             branch: BRANCH,
             allowNames: 'owner',
             fixDiffContext: '<дифф правок>',
@@ -74,13 +70,11 @@ const ALL: Array<[string, string]> = [
         buildFixArbiterPrompt({
             branch: BRANCH,
             fixDiffContext: '<дифф правок>',
-            requestsPath: REQUESTS,
         }),
     ],
     [
         'самолечение гейта',
         buildGateHealPrompt({
-            requestsPath: REQUESTS,
             branch: BRANCH,
             checkName: 'test',
             checkCmd: 'npm run test',
@@ -92,7 +86,6 @@ const ALL: Array<[string, string]> = [
 
 describe('#269: чини-сессия по красному чеку ПЛОЩАДКИ', () => {
     const params = {
-        requestsPath: REQUESTS,
         branch: BRANCH,
         checkName: 'test',
         checkCmd: 'куб «test» прогона 356 на площадке',
@@ -161,9 +154,7 @@ describe('промпты сессий: подстановка параметро
     });
 
     it('ревью получает контекст диффа, а не собирает его сам', () => {
-        expect(
-            buildReviewPrompt({ branch: BRANCH, diffContext: '<дифф>', requestsPath: REQUESTS }),
-        ).toContain('<дифф>');
+        expect(buildReviewPrompt({ branch: BRANCH, diffContext: '<дифф>' })).toContain('<дифф>');
     });
 
     // #66: правило коммита — профилактика к барьеру в коде (раннер коммитит остаток сам).
@@ -190,7 +181,6 @@ describe('промпты сессий: подстановка параметро
                 branch: BRANCH,
                 allowNames: 'o',
                 gateCmdList: GATE,
-                requestsPath: REQUESTS,
             }),
         ).toContain(GATE);
         expect(
@@ -198,7 +188,6 @@ describe('промпты сессий: подстановка параметро
                 branch: BRANCH,
                 allowNames: 'o',
                 gateCmdList: GATE,
-                requestsPath: REQUESTS,
             }),
         ).toContain(GATE);
     });
@@ -208,7 +197,6 @@ describe('промпты сессий: подстановка параметро
     // в потолок снова — повтор становится холостым.
     it('resumed → сессия знает, что продолжает прерванный разбор, и смотрит историю ветки', () => {
         const prompt = buildFixByReviewPrompt({
-            requestsPath: REQUESTS,
             branch: BRANCH,
             allowNames: 'owner',
             gateCmdList: GATE,
@@ -224,7 +212,6 @@ describe('промпты сессий: подстановка параметро
                 branch: BRANCH,
                 allowNames: 'owner',
                 gateCmdList: GATE,
-                requestsPath: REQUESTS,
             }),
         ).not.toMatch(/ПРОДОЛЖЕНИЕ прерванного разбора/);
     });
@@ -233,7 +220,6 @@ describe('промпты сессий: подстановка параметро
     // блокеры), опечатка в нём не ловится тестами buildFixByReviewPrompt выше.
     it('resumed у разбора blocked → та же пометка продолжения и взгляд в историю ветки', () => {
         const prompt = buildBlockedFixPrompt({
-            requestsPath: REQUESTS,
             branch: BRANCH,
             allowNames: 'owner',
             gateCmdList: GATE,
@@ -249,7 +235,6 @@ describe('промпты сессий: подстановка параметро
                 branch: BRANCH,
                 allowNames: 'owner',
                 gateCmdList: GATE,
-                requestsPath: REQUESTS,
             }),
         ).not.toMatch(/ПРОДОЛЖЕНИЕ прерванного разбора/);
     });
@@ -260,19 +245,16 @@ describe('промпты сессий: подстановка параметро
                 branch: BRANCH,
                 allowNames: 'owner',
                 gateCmdList: GATE,
-                requestsPath: REQUESTS,
             }),
             buildBlockedFixPrompt({
                 branch: BRANCH,
                 allowNames: 'owner',
                 gateCmdList: GATE,
-                requestsPath: REQUESTS,
             }),
             buildReReviewPrompt({
                 branch: BRANCH,
                 allowNames: 'owner',
                 diffContext: '',
-                requestsPath: REQUESTS,
             }),
         ]) {
             expect(prompt).toContain('owner');
@@ -324,21 +306,18 @@ describe('данные форжа в промпте: карточка и ком�
         const ctx = buildCommentsContext([{ body: '🟠 [major] край', author: 'dev' }]);
         for (const prompt of [
             buildFixByReviewPrompt({
-                requestsPath: REQUESTS,
                 branch: BRANCH,
                 allowNames: 'dev',
                 gateCmdList: GATE,
                 commentsContext: ctx,
             }),
             buildBlockedFixPrompt({
-                requestsPath: REQUESTS,
                 branch: BRANCH,
                 allowNames: 'dev',
                 gateCmdList: GATE,
                 commentsContext: ctx,
             }),
             buildReReviewPrompt({
-                requestsPath: REQUESTS,
                 branch: BRANCH,
                 allowNames: 'dev',
                 diffContext: '',
@@ -376,11 +355,17 @@ describe('промпты сессий: намерение вместо спос�
         expect(prompt).toMatch(/не мерджи|не пушь в main/i);
     });
 
-    it('каждый промпт отправляет за способом в файл намерений', () => {
+    it('каждый промпт отправляет за способом в блок намерений', () => {
         // #46: промпта создания PR в наборе больше нет — PR заводит раннер, и сессии,
-        // оставшиеся в цикле, все до одной работают через намерения.
+        // оставшиеся в цикле, все до одной работают через намерения. #9: канал — блок в
+        // финальном сообщении; файл пишет раннер, и промпт его не называет.
         for (const [, prompt] of ALL) {
-            expect(prompt).toContain('ralph.requests.jsonl');
+            expect(prompt).toContain(INTENTS_BEGIN);
+            expect(prompt).toContain(INTENTS_END);
+            expect(prompt).not.toContain('ralph.requests.jsonl');
+            // Ограда кода внутри блока отвергает весь батч, а модели заворачивают JSONL в
+            // неё почти рефлекторно — запрет обязан стоять в самом промпте, не только в ralph.md.
+            expect(prompt).toMatch(/без ограды кода/);
         }
     });
 
@@ -388,7 +373,6 @@ describe('промпты сессий: намерение вместо спос�
         const prompt = buildReviewPrompt({
             branch: BRANCH,
             diffContext: '',
-            requestsPath: REQUESTS,
         });
         expect(prompt).toMatch(/pr-comment/);
         expect(prompt).toMatch(/path/);
@@ -403,7 +387,6 @@ describe('промпты сессий: намерение вместо спос�
         const prompt = buildReviewPrompt({
             branch: BRANCH,
             diffContext: '',
-            requestsPath: REQUESTS,
         });
         expect(prompt).toMatch(/ВЕРДИКТ/);
         expect(prompt).toMatch(/не засчит/i);
@@ -416,7 +399,6 @@ describe('промпты сессий: намерение вместо спос�
                 branch: BRANCH,
                 allowNames: 'o',
                 gateCmdList: GATE,
-                requestsPath: REQUESTS,
             }),
         ).toMatch(/снять ты не можешь/i);
     });
@@ -427,7 +409,6 @@ describe('промпты сессий: намерение вместо спос�
 // предыдущих проходов). Оба — в промпте, поэтому проверяются здесь.
 describe('лестница ревью правок: предмет прохода и независимость арбитра (#625)', () => {
     const fixReview = buildFixReviewPrompt({
-        requestsPath: REQUESTS,
         branch: BRANCH,
         allowNames: 'owner',
         fixDiffContext: '<дифф правок>',
@@ -457,7 +438,6 @@ describe('лестница ревью правок: предмет проход�
     describe('обещание про карточки идёт от действующего порога (#110)', () => {
         const withFloor = (severityFloor: 'minor' | 'nit') =>
             buildFixReviewPrompt({
-                requestsPath: REQUESTS,
                 branch: BRANCH,
                 allowNames: 'owner',
                 fixDiffContext: '<дифф правок>',
@@ -484,7 +464,6 @@ describe('лестница ревью правок: предмет проход�
 
         it('арбитр обещает ровно то же самое — он тоже размечает мелочь', () => {
             const arbiter = buildFixArbiterPrompt({
-                requestsPath: REQUESTS,
                 branch: BRANCH,
                 fixDiffContext: '<дифф правок>',
                 severityFloor: 'minor',
@@ -496,7 +475,6 @@ describe('лестница ревью правок: предмет проход�
 
     it('арбитр не получает ни комментариев, ни выводов прошлых проходов — только дифф', () => {
         const arbiter = buildFixArbiterPrompt({
-            requestsPath: REQUESTS,
             branch: BRANCH,
             fixDiffContext: '<дифф правок>',
         });
@@ -509,38 +487,43 @@ describe('лестница ревью правок: предмет проход�
     });
 });
 
-describe('канал намерений в промпте — фактический путь прогона (канон, задача 22)', () => {
-    it('промпт называет переданный путь, а не зашитую константу', () => {
-        // Зашитый путь означал бы, что сессия пишет намерения в один файл, а раннер читает
-        // другой: сессия отработала, файл создан, а закрытия, метки и замечания ревью просто
-        // не применились — молча, без единого красного.
-        const custom = '/path/to/state/prod-1/ralph.requests.jsonl';
-        const prompt = buildReviewPrompt({
-            branch: 'feature/x',
-            diffContext: '',
-            requestsPath: custom,
-        });
-        expect(prompt).toContain(custom);
-        expect(prompt).not.toContain('.claude/ralph/ralph.requests.jsonl');
+describe('канал намерений в промпте — блок в выводе, а не файл (задачи 22, 122, #9)', () => {
+    // Задача 22 и 122 чинили адрес файла: сессия писала по зашитому пути, раннер читал
+    // другой. #9 снимает класс целиком — файл пишет раннер, и путь сессии не нужен вовсе.
+    it('промпт сдачи не называет файл намерений ни в какой раскладке', () => {
+        const prompt = buildReviewPrompt({ branch: 'feature/x', diffContext: '' });
+        expect(prompt).not.toMatch(/ralph\.requests\.jsonl/);
+        expect(prompt).toMatch(/финальном сообщении/);
     });
 
-    // Задача 122: промпт кодера собирается из конфига, и путь намерений в нём не называл
-    // никто — сессия брала зашитый путь из ralph.md и писала мимо `runtimeDir`.
-    it('кодер получает путь прогона отдельной строкой', () => {
-        const custom = '/path/to/state/prod-1/ralph.requests.jsonl';
-        const note = buildCoderIntentsNote(custom);
-        expect(note).toContain(`Файл намерений этого прогона — ${custom}`);
-        expect(note).not.toContain('.claude/ralph/ralph.requests.jsonl');
+    it('кодер получает канал отдельной строкой', () => {
+        const note = buildCoderIntentsNote();
+        expect(note).toContain('Канал намерений этого прогона');
+        expect(note).toContain(INTENTS_BEGIN);
+        expect(note).toContain(INTENTS_END);
+        expect(note).toMatch(/без ограды кода/);
+        expect(note).not.toMatch(/ralph\.requests\.jsonl/);
     });
 
     it('ralph.md не называет путь буквально и отсылает к заданию раннера', () => {
         const contract = readFileSync(resolve(import.meta.dirname, '..', 'ralph.md'), 'utf8');
         expect(contract).not.toMatch(/[\w./-]*\/ralph\.requests\.jsonl/);
-        expect(contract).toContain('Файл намерений этого прогона');
+        expect(contract).toContain('Канал намерений этого прогона');
+        expect(contract).toContain(INTENTS_BEGIN);
+        expect(contract).toContain(INTENTS_END);
     });
 
     it('от противного: зашитый путь в контракте скан бы увидел', () => {
         const planted = 'дописывая строку в файл `.claude/ralph/ralph.requests.jsonl` (JSON Lines';
         expect(planted).toMatch(/[\w./-]*\/ralph\.requests\.jsonl/);
+    });
+
+    it('маркеры в ralph.md — те же, что разбирает раннер: блок из примера извлекается', () => {
+        const contract = readFileSync(resolve(import.meta.dirname, '..', 'ralph.md'), 'utf8');
+        const sample = contract.slice(contract.indexOf(INTENTS_BEGIN));
+        const r = extractIntentBlock(
+            sample.slice(0, sample.indexOf(INTENTS_END) + INTENTS_END.length),
+        );
+        expect(r.kind).toBe('block');
     });
 });

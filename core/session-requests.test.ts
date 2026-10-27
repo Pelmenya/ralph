@@ -14,12 +14,17 @@ import {
     intentFailureText,
     classifySessionRequests,
     inFlightEntry,
+    inFlightRequest,
     inFlightMarker,
     parseSessionRequests,
     quarantinePath,
     reconcileInFlight,
     withIntentMark,
     serializeSessionRequest,
+    INTENTS_BEGIN,
+    INTENTS_END,
+    extractIntentBlock,
+    serializeRejectedBlock,
 } from './session-requests.ts';
 
 const ALLOWLIST = ['complexity:low', 'complexity:high', 'area:devops'];
@@ -561,6 +566,12 @@ describe('#94 метка намерения и сверка', () => {
         });
     });
 
+    it('начатое намерение строкой для текстов; нет метки или файла — null', () => {
+        expect(inFlightRequest(`${inFlightMarker('intent-0001')}\n${started}\n`)).toBe(started);
+        expect(inFlightRequest(`${started}\n`)).toBeNull();
+        expect(inFlightRequest(null)).toBeNull();
+    });
+
     it('метка с landed: comment — комментарий лёг по записи раннера, иное landed — порча', () => {
         const raw = `${inFlightMarker('intent-0001', 'comment')}\n${started}\n`;
         expect(inFlightEntry(raw)).toMatchObject({ id: 'intent-0001', landed: 'comment' });
@@ -645,5 +656,85 @@ describe('quarantinePath (#124)', () => {
         expect(quarantinePath('/s/r.jsonl', now, (p) => taken.has(p))).toBe(
             '/s/r.jsonl.rejected-2026-10-27T01-02-03-004Z-2',
         );
+    });
+});
+
+// #9: канал намерений развёрнут — сессия печатает блок в свой вывод, файл пишет раннер.
+// Харнесс защищает файл очереди команд оркестратора от записи сессией, и защищает по
+// делу; поэтому разбор вывода — граница, где форма блока решает всё, и неожиданная
+// форма здесь — отказ всего батча, а не «возьмём, что разобралось».
+describe('extractIntentBlock: блок намерений в выводе сессии (#9)', () => {
+    const close = line({ kind: 'close', issue: 9, comment: 'сделано' });
+    const block = (...inner: string[]): string => [INTENTS_BEGIN, ...inner, INTENTS_END].join('\n');
+
+    it('вывод без маркеров — намерений нет, не отказ', () => {
+        expect(extractIntentBlock('Готово, тесты зелёные.')).toEqual({ kind: 'none' });
+        expect(extractIntentBlock('')).toEqual({ kind: 'none' });
+    });
+
+    it('строки блока — как есть, пустые пропускаются, текст вокруг не мешает', () => {
+        const out = `Отчёт сессии.\n\n${block(close, '', '  ' + close + '  ')}\r\nКонец.`;
+        expect(extractIntentBlock(out)).toEqual({ kind: 'block', lines: [close, close] });
+    });
+
+    it('пустой блок — блок без намерений', () => {
+        expect(extractIntentBlock(block())).toEqual({ kind: 'block', lines: [] });
+    });
+
+    it('маркер посреди строки прозы маркером не считается', () => {
+        expect(extractIntentBlock(`печатаю блок ${INTENTS_BEGIN} в конце`)).toEqual({
+            kind: 'none',
+        });
+    });
+
+    it.each([
+        ['начало без конца', `${INTENTS_BEGIN}\n${close}`, /не закрыт/],
+        ['конец без начала', `${close}\n${INTENTS_END}`, /без начала/],
+        ['конец раньше начала', `${INTENTS_END}\n${INTENTS_BEGIN}`, /без начала/],
+        ['два блока', `${block(close)}\n${block(close)}`, /блок.* один/],
+        ['вложенное начало', `${INTENTS_BEGIN}\n${block(close)}`, /внутри блока/],
+        [
+            'служебная метка раннера внутри',
+            block(inFlightMarker('abcdef12-0000'), close),
+            /служебн/,
+        ],
+        [
+            'служебная строка с пробелами',
+            block('{ "ralph" : "rejected-block", "why": "x" }'),
+            /служебн/,
+        ],
+    ])('от противного: %s — отказ с причиной и сырым текстом', (_, out, why) => {
+        const r = extractIntentBlock(out);
+        expect(r.kind).toBe('rejected');
+        if (r.kind !== 'rejected') return;
+        expect(r.why).toMatch(why);
+        expect(r.raw).toMatch(new RegExp(`${INTENTS_BEGIN}|${INTENTS_END}`));
+    });
+
+    it('мусор внутри блока проходит дальше и отвергается парсером с номером строки', () => {
+        const r = extractIntentBlock(block(close, 'не json'));
+        expect(r).toEqual({ kind: 'block', lines: [close, 'не json'] });
+        if (r.kind !== 'block') return;
+        expect(() => parseSessionRequests(r.lines.join('\n'), opts)).toThrow(/строка 2/);
+    });
+});
+
+describe('serializeRejectedBlock: отказ блока доезжает до разбора батча (#9)', () => {
+    it('строка отказа валит батч целиком и называет причину', () => {
+        const raw = [
+            line({ kind: 'close', issue: 9, comment: 'сделано' }),
+            serializeRejectedBlock('блок не закрыт'),
+        ].join('\n');
+        expect(() => parseSessionRequests(raw, opts)).toThrow(
+            /строка 2.*блок намерений в выводе сессии отвергнут.*блок не закрыт/,
+        );
+    });
+
+    it('строку отказа не принять за метку начатого намерения', () => {
+        expect(inFlightEntry(serializeRejectedBlock('x'))).toBeNull();
+    });
+
+    it('другая служебная строка в батче — тоже отказ, а не неизвестный kind', () => {
+        expect(() => parseSessionRequests('{"ralph":"что-то"}', opts)).toThrow(/служебн/);
     });
 });

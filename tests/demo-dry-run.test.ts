@@ -80,7 +80,7 @@ describe('демо: конфиг проходит настоящий цикл я
         expect(openIssuesCalls).toEqual([milestone]);
         expect(runClaudeCalls).toHaveLength(1);
         // Промпт обязан назвать переносимую половину контракта: без неё сессия не знает
-        // про файл намерений и закрыть карточку не сможет.
+        // про блок намерений и закрыть карточку не сможет.
         expect(runClaudeCalls[0].prompt).toContain('ralph.md');
         expect(runClaudeCalls[0].prompt).toContain('ralph.project.md');
     });

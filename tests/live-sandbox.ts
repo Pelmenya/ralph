@@ -27,6 +27,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { coreIsRepoRoot } from './core-repo.ts';
+import { INTENTS_BEGIN, INTENTS_END } from '../core/session-requests.ts';
 
 /** Каталог продукта — то самое дерево, чистоту которого сторожит барьер. */
 export const PRODUCT_ROOT = path.resolve(import.meta.dirname, '..');
@@ -162,7 +163,7 @@ function sandboxConfig(sb: LiveSandbox): unknown {
             review: {
                 default: 'claude-opus-4-8',
                 escalated: 'claude-fable-5',
-                fallback: 'claude-opus-4-8',
+                fallback: 'claude-fable-5',
                 escalateOn: [],
                 escalateOnPaths: [],
                 maxTurns: 5,
@@ -232,11 +233,13 @@ esac
  * останавливался бы на ней, не дойдя до гейта, — то есть сценарий проверял бы меньше,
  * чем обещает его название.
  *
- * Ревью фазы шим отвечает сводкой прохода в файл намерений: проход без вердикта — стоп
- * (задача 78), и цикл сдачи иначе не доходил бы до гейта. Путь файла песочница знает сама
- * (`runtimeDir` — её же конфиг) и вшивает его в шим при сборке, а не выкусывает из текста
- * промпта: переформулировка промпта оставила бы сводку незаписанной, и живой цикл встал бы
- * на `review-no-verdict` — стопом, который выглядит дефектом ядра, а не песочницы.
+ * Ревью фазы шим отвечает сводкой прохода блоком намерений в своём выводе: проход без
+ * вердикта — стоп (задача 78), и цикл сдачи иначе не доходил бы до гейта. Блок, а не запись
+ * файла (#9): файл намерений пишет раннер из вывода сессии, и живой цикл доказывает именно
+ * этот путь — сводка дошла до форжа, только если раннер её разобрал. Маркеры шим берёт из
+ * ядра при сборке, а не из текста промпта: переформулировка промпта оставила бы сводку
+ * ненапечатанной, и живой цикл встал бы на `review-no-verdict` — стопом, который выглядит
+ * дефектом ядра, а не песочницы.
  *
  * На `--version` шим отвечает версией и выходит, ничего не трогая: этим вызовом раннер
  * проверяет готовность рантайма на старте (#44), ДО пробы барьера. Без ответа проба
@@ -250,7 +253,7 @@ SANDBOX_PRODUCT_ROOT="${sb.productRoot}"
 cat > "${sb.root}/coder-prompt.txt"
 ${extra}
 if grep -q 'проведи детальное code review' "${sb.root}/coder-prompt.txt"; then
-  echo '{"kind":"pr-comment","comment":"⚪ [nit] сводка прохода песочницы"}' >> "${path.join(sb.runtimeDir, 'ralph.requests.jsonl')}"
+  printf '%s\n' '${INTENTS_BEGIN}' '{"kind":"pr-comment","comment":"⚪ [nit] сводка прохода песочницы"}' '${INTENTS_END}'
 fi
 branch=$(git symbolic-ref --quiet --short HEAD) && git push --quiet origin "HEAD:refs/heads/$branch" >/dev/null 2>&1
 echo "кодер-сессия песочницы отработала"

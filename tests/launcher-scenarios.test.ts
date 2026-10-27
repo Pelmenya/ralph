@@ -104,7 +104,7 @@ function config(w: TWorld, maxIterations: number, productRoot?: string | null): 
             review: {
                 default: 'claude-opus-4-8',
                 escalated: 'claude-fable-5',
-                fallback: 'claude-opus-4-8',
+                fallback: 'claude-fable-5',
                 escalateOn: [],
                 escalateOnPaths: [],
                 maxTurns: 5,

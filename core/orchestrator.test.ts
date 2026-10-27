@@ -51,9 +51,32 @@ import type { AdapterRegistries, AdapterConfig } from '../adapters/adapters-impl
 import type { ReviewComment } from '../adapters/adapters.ts';
 import type { DeployOutcome } from './deploy-check.ts';
 import type { RalphState } from './state-lock.ts';
-import { COMMENT_NOTICE_THRESHOLD, IN_FLIGHT_PREFIX } from './session-requests.ts';
+import {
+    COMMENT_NOTICE_THRESHOLD,
+    IN_FLIGHT_PREFIX,
+    INTENTS_BEGIN,
+    INTENTS_END,
+    inFlightMarker,
+} from './session-requests.ts';
 import { attachSubmitJournal, finishStage, startStage } from './submit-journal.ts';
 import { MODEL_PROXY_RETRIES } from './runtime-availability.ts';
+import { classifyClaudeSessionEnd } from '../adapters/session-end.ts';
+
+// Фаза 16: исход сессии называет адаптер рантайма, ядро текста не читает. Фейк рантайма
+// с выводом Claude получает исход тем же классификатором, что боевой spawnClaude, — тест
+// проверяет политику ядра по исходу, а не угадывание исхода по тексту.
+const claudeRun = (code: number, output: string) => ({
+    code,
+    output,
+    ...classifyClaudeSessionEnd({ code, stdout: output, stderr: '' }),
+});
+// Фейк runClaudeFn отдаёт вывод и исход тем же каналом, что боевой runClaude: onOutput
+// вторым аргументом несёт исход последнего запуска.
+const emitOutput = (d: Record<string, unknown> | undefined, text: string, code = 1): void =>
+    (d?.onOutput as ((o: string, end: string) => void) | undefined)?.(
+        text,
+        claudeRun(code, text).endReason,
+    );
 
 // #204: состав чеков гейта переехал в ralph.config.json. gateChecksFor и tryMergePhase
 // читают ФАБРИЧНЫЙ config, который в проде ставит main() (в юнит-тестах не запускаемая).
@@ -138,6 +161,9 @@ const {
 // «пустой кортеж не имеет элемента n». Дженерик восстанавливает форму аргументов, не
 // меняя реализацию мока (она по-прежнему игнорирует аргументы).
 type SpawnSyncFn = typeof import('node:child_process').spawnSync;
+// #113: версия CLI перед сессией читается отдельным коллаборатором (`cliVersionFn`), а не
+// фейком spawn: тесты ниже считают вызовы spawnFn, и лишний `--version` сдвигал бы их.
+const VERSION_UNREAD = () => ({ version: 'unknown', unknownReason: 'тест: версия не читается' });
 // Фейк spawnSync-коллаборатора (spawnClaude/runKimiOnce/runOpenAIOnce): поля opts
 // неопциональны, чтобы ассерты `opts.env.X` не спотыкались о possibly-undefined; к
 // боевому `typeof spawnSync` фейк приводится точечным `as unknown as SpawnSyncFn` в
@@ -145,7 +171,12 @@ type SpawnSyncFn = typeof import('node:child_process').spawnSync;
 type SpawnFake = (
     bin: string,
     argv: string[],
-    opts: { shell: boolean; timeout: number; env: Record<string, string | undefined> },
+    opts: {
+        shell: boolean;
+        timeout: number;
+        env: Record<string, string | undefined>;
+        input?: string;
+    },
 ) => { status: number | null; stdout: string; stderr: string; signal: string | null };
 // Фейк runClaudeOnce-подобного DI-коллаборатора (runClaudeFn/fallbackRun): читаются
 // prompt (arg0) и opts.model/opts.fallbackModel (arg1); возврат не важен → unknown.
@@ -378,6 +409,7 @@ describe('spawnClaude — фактический вызов spawn-функции
         expect(spawnClaude(['-p', '--max-turns', '1'], 'x', 1000, spawnFn)).toEqual({
             code: 0,
             output: 'done\n',
+            endReason: 'completed',
         });
     });
 
@@ -390,6 +422,7 @@ describe('spawnClaude — фактический вызов spawn-функции
             code: 2,
             output: '\nboom',
             failureKind: 'session-failed',
+            endReason: 'unknown',
         });
     });
 
@@ -515,7 +548,12 @@ describe('spawnClaude — фактический вызов spawn-функции
 
         const result = spawnClaude(['-p', '--max-turns', '1'], 'x', 60_000, spawnFn);
 
-        expect(result).toEqual({ code: 1, output: '\n', failureKind: 'session-failed' });
+        expect(result).toEqual({
+            code: 1,
+            output: '\n',
+            failureKind: 'session-failed',
+            endReason: 'timeout',
+        });
         const logged = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
         expect(logged).toMatch(/убит по сигналу SIGTERM/);
         expect(logged).not.toMatch(/не запустился/);
@@ -534,7 +572,7 @@ describe('spawnClaude — фактический вызов spawn-функции
 
         const result = spawnClaude(['-p', '--max-turns', '1'], 'x', 1000, spawnFn);
 
-        expect(result).toEqual({ code: 0, output: 'много букв\n' });
+        expect(result).toEqual({ code: 0, output: 'много букв\n', endReason: 'completed' });
         expect(logSpy.mock.calls.map((c) => String(c[0])).join('\n')).toMatch(/ENOBUFS/);
     });
 
@@ -706,9 +744,14 @@ describe('Kimi-рантайм (#373) — Claude-spawn + env Moonshot', () => {
                 'тестовая задача',
                 { maxTurns: 5 },
                 spawnFn as unknown as SpawnSyncFn,
+                VERSION_UNREAD,
             );
 
-            expect(res).toEqual({ code: 0, output: 'diff --git a/f b/f\n+добавлено\n' });
+            expect(res).toEqual({
+                code: 0,
+                output: 'diff --git a/f b/f\n+добавлено\n',
+                endReason: 'completed',
+            });
             expect(spawnFn).toHaveBeenCalledTimes(1);
             const [bin, argv, opts] = spawnFn.mock.calls[0];
             expect(bin).toBe('claude');
@@ -731,7 +774,12 @@ describe('Kimi-рантайм (#373) — Claude-spawn + env Moonshot', () => {
                 signal: null,
             }));
             // REAL_CONFIG.fallbackModel = claude-opus-4-8 — он не должен утечь в argv Kimi.
-            runtime.runKimiOnce('x', { maxTurns: 1 }, spawnFn as unknown as SpawnSyncFn);
+            runtime.runKimiOnce(
+                'x',
+                { maxTurns: 1 },
+                spawnFn as unknown as SpawnSyncFn,
+                VERSION_UNREAD,
+            );
             const [, argv] = spawnFn.mock.calls[0];
             expect(argv).not.toContain('--fallback-model');
         });
@@ -751,6 +799,7 @@ describe('Kimi-рантайм (#373) — Claude-spawn + env Moonshot', () => {
                 'сессия сдачи',
                 { model: 'claude-opus-4-8', maxTurns: 5 },
                 spawnFn as unknown as SpawnSyncFn,
+                VERSION_UNREAD,
             );
             const [, argv] = spawnFn.mock.calls[0];
             expect(argv[argv.indexOf('--model') + 1]).toBe('kimi-k2-0711-preview');
@@ -770,6 +819,7 @@ describe('Kimi-рантайм (#373) — Claude-spawn + env Moonshot', () => {
                 'кодер-итерация',
                 { model: 'kimi-k2-turbo-preview', maxTurns: 5, modelProvider: 'kimi' },
                 spawnFn as unknown as SpawnSyncFn,
+                VERSION_UNREAD,
             );
             const [, argv] = spawnFn.mock.calls[0];
             expect(argv[argv.indexOf('--model') + 1]).toBe('kimi-k2-turbo-preview');
@@ -788,6 +838,7 @@ describe('Kimi-рантайм (#373) — Claude-spawn + env Moonshot', () => {
                 'x',
                 { model: 'gpt-5-codex', maxTurns: 5, modelProvider: 'openai' },
                 spawnFn as unknown as SpawnSyncFn,
+                VERSION_UNREAD,
             );
             const [, argv] = spawnFn.mock.calls[0];
             expect(argv[argv.indexOf('--model') + 1]).toBe('kimi-k2-0711-preview');
@@ -808,8 +859,8 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
     describe('buildCodexArgs — построение argv для `codex exec` (чистая функция)', () => {
         const { buildCodexArgs } = ralph;
 
-        it('exec + аппрув never + песочница + модель + `--` перед промптом', () => {
-            const argv = buildCodexArgs('задача', {
+        it('exec + аппрув never + песочница + модель + `-- -` (промпт со stdin)', () => {
+            const argv = buildCodexArgs({
                 model: 'gpt-5-codex',
                 sandboxMode: 'danger-full-access',
             });
@@ -827,30 +878,28 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
                 '-m',
                 'gpt-5-codex',
                 '--',
-                'задача',
+                '-',
             ]);
         });
 
-        it('промпт — последний позиционный элемент, ПОСЛЕ `--` (не истолкуется как флаг)', () => {
-            // Промпт, начинающийся с дефиса, — ровно тот класс, ради которого стоит `--`:
-            // без разделителя codex принял бы его за неизвестный флаг и упал.
-            const argv = buildCodexArgs('-rf уничтожить', {
+        it('#8: промпта в argv нет — последний элемент `-` после `--`, «читай stdin»', () => {
+            // `-` после `--` — документированная форма `codex exec` «промпт со stdin»
+            // (`codex exec --help`, CLI 0.163.0), проверено живым запуском. Промпт в argv
+            // упирался в MAX_ARG_STRLEN (131072 байта) так же, как Claude-путь до #607.
+            const argv = buildCodexArgs({
                 model: 'gpt-5-codex',
                 sandboxMode: 'workspace-write',
             });
-            const sep = argv.indexOf('--');
-            expect(sep).toBeGreaterThan(-1);
-            expect(argv[sep + 1]).toBe('-rf уничтожить');
-            expect(argv[argv.length - 1]).toBe('-rf уничтожить');
+            expect(argv.slice(-2)).toEqual(['--', '-']);
         });
 
         it('без модели пара -m не добавляется (резолв всё равно её требует — fail-closed выше)', () => {
-            const argv = buildCodexArgs('x', { sandboxMode: 'read-only' });
+            const argv = buildCodexArgs({ sandboxMode: 'read-only' });
             expect(argv).not.toContain('-m');
         });
 
         it('НЕ содержит Claude-специфичных флагов --max-turns/--fallback-model (риск #3)', () => {
-            const argv = buildCodexArgs('x', {
+            const argv = buildCodexArgs({
                 model: 'gpt-5-codex',
                 sandboxMode: 'danger-full-access',
             });
@@ -858,13 +907,15 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
             expect(argv).not.toContain('--fallback-model');
         });
 
-        it('anti-RCE: спецсимволы промпта проходят ОДНИМ дословным элементом argv', () => {
-            const evil = 'вывод: `rm -rf /` и $(whoami) и "кавычки" ; echo pwned';
-            const argv = buildCodexArgs(evil, {
+        it('#8: argv фиксированной длины — от промпта не зависит вовсе', () => {
+            // Промпт сюда больше не передаётся: функция его не видит, поэтому и в argv он
+            // не попадёт ни целиком, ни куском. Общая длина — флаги и имя модели.
+            const argv = buildCodexArgs({
                 model: 'gpt-5-codex',
                 sandboxMode: 'danger-full-access',
+                authMode: 'subscription',
             });
-            expect(argv[argv.length - 1]).toBe(evil);
+            expect(argv.join(' ').length).toBeLessThan(512);
         });
     });
 
@@ -875,7 +926,7 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
             // Ревью Codex (3-й проход) + живая проверка: `codex exec -a never` даёт
             // `unexpected argument '-a'` и exit 2 на CLI 0.147.0 — то есть OpenAI-рантайм не
             // запускался вовсе. Верный порядок: `codex -a never exec …`.
-            const argv = buildCodexArgs('задача', {
+            const argv = buildCodexArgs({
                 model: 'gpt-5-codex',
                 sandboxMode: 'read-only',
             });
@@ -889,7 +940,7 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
             // id, но `openai_base_url` в пользовательском конфиге всё равно перенаправил бы
             // встроенный провайдер. Вектор не теоретический: сессии раннера ходят с
             // danger-full-access и сами могут дописать ~/.codex/config.toml.
-            const argv = buildCodexArgs('задача', {
+            const argv = buildCodexArgs({
                 model: 'gpt-5-codex',
                 sandboxMode: 'read-only',
             });
@@ -902,7 +953,7 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
             // выбор провайдера — пользовательский config.toml мог увести сессию на custom
             // provider со своим env_key/base_url, а `login status` при этом честно показывал бы
             // ChatGPT.
-            const argv = buildCodexArgs('задача', {
+            const argv = buildCodexArgs({
                 model: 'gpt-5-codex',
                 sandboxMode: 'read-only',
             });
@@ -915,7 +966,7 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
             // Ревью Codex (2-й проход): проверка `login status` оставляет TOCTOU между
             // проверкой и exec, а custom provider с ней не связан вовсе. Канал фиксируется
             // на самом вызове.
-            const argv = buildCodexArgs('задача', {
+            const argv = buildCodexArgs({
                 model: 'gpt-5.6-sol',
                 sandboxMode: 'read-only',
                 authMode: 'subscription',
@@ -923,12 +974,13 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
             const i = argv.indexOf('forced_login_method="chatgpt"');
             expect(i).toBeGreaterThan(0);
             expect(argv[i - 1]).toBe('-c');
-            // Промпт остаётся последним аргументом после `--` (anti-RCE, прежний инвариант).
-            expect(argv[argv.length - 1]).toBe('задача');
+            // Хвост argv — `-- -`: промпт идёт stdin'ом (#8), флаг принуждения — до него.
+            expect(argv.slice(-2)).toEqual(['--', '-']);
+            expect(i).toBeLessThan(argv.indexOf('--'));
         });
 
         it('apiKey: флага принуждения нет — чужой канал не навязываем', () => {
-            const argv = buildCodexArgs('задача', {
+            const argv = buildCodexArgs({
                 model: 'gpt-5-codex',
                 sandboxMode: 'danger-full-access',
                 authMode: 'apiKey',
@@ -1423,11 +1475,11 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
 
         it('вызывает spawnFn с бинарём codex, shell:false и тем argv-массивом, что построил buildCodexArgs', () => {
             spawnFn.mockReturnValue({ status: 0, stdout: 'ok', stderr: '', signal: null });
-            const argv = ralph.buildCodexArgs('задача', {
+            const argv = ralph.buildCodexArgs({
                 model: 'gpt-5-codex',
                 sandboxMode: 'danger-full-access',
             });
-            ralph.spawnCodex(argv, 60_000, spawnFn);
+            ralph.spawnCodex(argv, 'задача', 60_000, spawnFn);
             expect(spawnFn).toHaveBeenCalledTimes(1);
             const [bin, calledArgs, opts] = spawnFn.mock.calls[0];
             expect(bin).toBe('codex');
@@ -1436,36 +1488,50 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
             expect(opts.timeout).toBe(60_000);
         });
 
+        it('#8: промпт уходит через stdin — `input` и явный pipe, в argv его нет', () => {
+            // Фейк подтверждает только проводку: промпт лёг в opts.input, stdin — pipe.
+            // Что `codex exec` его оттуда ЧИТАЕТ, проверено живым запуском (докблок spawnCodex).
+            spawnFn.mockReturnValue({ status: 0, stdout: 'ok', stderr: '', signal: null });
+            const argv = ralph.buildCodexArgs({ sandboxMode: 'read-only' });
+            const prompt = `-начинается с дефиса ${'x'.repeat(200_000)} \`rm -rf /\` $(whoami)`;
+            ralph.spawnCodex(argv, prompt, 1000, spawnFn);
+            const [, calledArgs, opts] = spawnFn.mock.calls[0];
+            expect(opts.input).toBe(prompt);
+            expect(opts.stdio).toEqual(['pipe', 'pipe', 'pipe']);
+            expect(calledArgs.some((a: string) => a.includes('whoami'))).toBe(false);
+        });
+
         it('ненулевой exit-код процесса пробрасывается как code; вывод — stdout+stderr', () => {
             spawnFn.mockReturnValue({ status: 2, stdout: '', stderr: 'boom', signal: null });
             // #611: тот же класс, что у spawnClaude — обычное падение сессии без res.error
             // классифицируется как failureKind:'session-failed'.
-            expect(ralph.spawnCodex(['exec'], 1000, spawnFn)).toEqual({
+            expect(ralph.spawnCodex(['exec'], 'x', 1000, spawnFn)).toEqual({
                 code: 2,
                 output: '\nboom',
                 failureKind: 'session-failed',
+                endReason: 'unknown',
             });
         });
 
         it('процесс убит по сигналу (таймаут) → code:1, не бросает исключение', () => {
             spawnFn.mockReturnValue({ status: null, stdout: '', stderr: '', signal: 'SIGTERM' });
-            expect(ralph.spawnCodex(['exec'], 1000, spawnFn).code).toBe(1);
+            expect(ralph.spawnCodex(['exec'], 'x', 1000, spawnFn).code).toBe(1);
         });
 
         it('с env-аргументом опции spawn несут ровно этот env; без него — ключа env нет', () => {
             spawnFn.mockReturnValue({ status: 0, stdout: 'ok', stderr: '', signal: null });
             const env = { PATH: '/usr/bin', OPENAI_API_KEY: 'sk-x' };
-            ralph.spawnCodex(['exec'], 1000, spawnFn, env);
+            ralph.spawnCodex(['exec'], 'x', 1000, spawnFn, env);
             expect(spawnFn.mock.calls[0][2].env).toBe(env);
             spawnFn.mockClear();
-            ralph.spawnCodex(['exec'], 1000, spawnFn);
+            ralph.spawnCodex(['exec'], 'x', 1000, spawnFn);
             expect('env' in spawnFn.mock.calls[0][2]).toBe(false);
         });
 
-        // #611, критерий готовности «оба spawn-пути классифицируют одинаково»: codex-argv
-        // тоже несёт промпт позиционным элементом (buildCodexArgs) и подвержен тому же
-        // классу отказов запуска, что claude-путь до #607 — до этой правки spawnCodex не
-        // читал res.error вовсе.
+        // #611, критерий готовности «оба spawn-пути классифицируют одинаково»: до этой правки
+        // spawnCodex не читал res.error вовсе. Промпт из codex-argv с тех пор ушёл на stdin
+        // (#8), но классификация остаётся: E2BIG даёт и раздутое окружение, а ENOENT и
+        // таймаут от длины промпта не зависят.
         it('#611: {status:null, error:{code:ENOENT}} → failureKind:runtime-unavailable, systemErrorCode:ENOENT', () => {
             const err = Object.assign(new Error('spawnSync codex ENOENT'), { code: 'ENOENT' });
             spawnFn.mockReturnValue({
@@ -1477,7 +1543,7 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
             });
             const logSpy = vi.spyOn(console, 'log');
 
-            const result = ralph.spawnCodex(['exec'], 1000, spawnFn);
+            const result = ralph.spawnCodex(['exec'], 'x', 1000, spawnFn);
 
             expect(result.code).toBe(1);
             expect(result.failureKind).toBe('runtime-unavailable');
@@ -1497,7 +1563,7 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
             });
             const logSpy = vi.spyOn(console, 'log');
 
-            const result = ralph.spawnCodex(['exec'], 1000, spawnFn);
+            const result = ralph.spawnCodex(['exec'], 'x', 1000, spawnFn);
 
             expect(result.code).toBe(1);
             expect(result.failureKind).toBe('arg-too-long');
@@ -1508,7 +1574,7 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
 
         it('#611: успех (status:0) не несёт failureKind вовсе', () => {
             spawnFn.mockReturnValue({ status: 0, stdout: 'ok', stderr: '', signal: null });
-            expect(ralph.spawnCodex(['exec'], 1000, spawnFn).failureKind).toBeUndefined();
+            expect(ralph.spawnCodex(['exec'], 'x', 1000, spawnFn).failureKind).toBeUndefined();
         });
     });
 
@@ -1556,9 +1622,15 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
                 'тестовая задача',
                 { maxTurns: 5 },
                 spawnFn as unknown as SpawnSyncFn,
+                undefined,
+                VERSION_UNREAD,
             );
 
-            expect(res).toEqual({ code: 0, output: 'diff --git a/f b/f\n+добавлено\n' });
+            expect(res).toEqual({
+                code: 0,
+                output: 'diff --git a/f b/f\n+добавлено\n',
+                endReason: 'completed',
+            });
             // Режим apiKey канал не проверяет — процесс ровно один (см. тест ниже про то,
             // почему симметричная проверка ломала «ключ только из env»).
             expect(spawnFn).toHaveBeenCalledTimes(1);
@@ -1574,6 +1646,29 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
             expect(opts.env.OPENAI_API_KEY).toBe('sk-openai-smoke');
         });
 
+        it('#8: промпт больше MAX_ARG_STRLEN доезжает до РЕАЛЬНОЙ сессии stdin-ом, argv короткий', () => {
+            // Проводка целиком, а не только чистые функции: вызов runOpenAIOnce, забывший
+            // передать промпт в spawnCodex, оставил бы юниты выше зелёными.
+            const spawnFn = vi.fn<SpawnFake>(() => ({
+                status: 0,
+                stdout: 'ok',
+                stderr: '',
+                signal: null,
+            }));
+            const prompt = 'дифф '.repeat(40_000); // ≈ 400 КБ в UTF-8, предел элемента — 131072
+            runtime.runOpenAIOnce(
+                prompt,
+                { maxTurns: 5 },
+                spawnFn as unknown as SpawnSyncFn,
+                undefined,
+                VERSION_UNREAD,
+            );
+            const [, argv, opts] = spawnFn.mock.calls[spawnFn.mock.calls.length - 1];
+            expect(opts.input).toBe(prompt);
+            expect(argv.slice(-2)).toEqual(['--', '-']);
+            expect(Math.max(...argv.map((a: string) => Buffer.byteLength(a)))).toBeLessThan(256);
+        });
+
         it('подписка: в env спавна нет OPENAI_API_KEY, хотя ключ лежит в окружении раннера', () => {
             // #83: beforeEach кладёт ключ в process.env — при authMode:'subscription' он не
             // должен доехать до codex, иначе сессия молча уйдёт на платный API.
@@ -1587,7 +1682,13 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
                     ? { status: 0, stdout: 'Logged in using ChatGPT', stderr: '', signal: null }
                     : { status: 0, stdout: 'ok', stderr: '', signal: null },
             );
-            runtime.runOpenAIOnce('x', { maxTurns: 1 }, spawnFn as unknown as SpawnSyncFn);
+            runtime.runOpenAIOnce(
+                'x',
+                { maxTurns: 1 },
+                spawnFn as unknown as SpawnSyncFn,
+                undefined,
+                VERSION_UNREAD,
+            );
             // Первым идёт `codex login status` (проверка канала), последним — сама сессия.
             const [, argv, opts] = spawnFn.mock.calls[spawnFn.mock.calls.length - 1];
             expect('OPENAI_API_KEY' in opts.env).toBe(false);
@@ -1608,7 +1709,13 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
                     ? { status: 0, stdout: 'Logged in using ChatGPT', stderr: '', signal: null }
                     : { status: 0, stdout: 'ok', stderr: '', signal: null },
             );
-            runtime.runOpenAIOnce('x', { maxTurns: 1 }, spawnFn as unknown as SpawnSyncFn);
+            runtime.runOpenAIOnce(
+                'x',
+                { maxTurns: 1 },
+                spawnFn as unknown as SpawnSyncFn,
+                undefined,
+                VERSION_UNREAD,
+            );
 
             const [firstBin, firstArgs] = spawnFn.mock.calls[0];
             expect(firstBin).toBe('codex');
@@ -1641,7 +1748,13 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
                 events.push('session');
                 return { status: 0, stdout: 'ok', stderr: '', signal: null };
             });
-            runtime.runOpenAIOnce('x', { maxTurns: 1 }, spawnFn as unknown as SpawnSyncFn, readFn);
+            runtime.runOpenAIOnce(
+                'x',
+                { maxTurns: 1 },
+                spawnFn as unknown as SpawnSyncFn,
+                readFn,
+                VERSION_UNREAD,
+            );
             // Слоёв конфигурации несколько (пользовательский и системный), поэтому проверяем
             // ПОРЯДОК, а не их количество: любое чтение — до проверки входа, сессия — после.
             expect(events).toContain('read-config');
@@ -1665,7 +1778,13 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
             // Боевой fail() уходит в process.exit — тест ловит именно стоп; текст сообщения
             // проверяется отдельно на чистой assertCodexChatGPTLogin с throwingFail.
             expect(() =>
-                runtime.runOpenAIOnce('x', { maxTurns: 1 }, spawnFn as unknown as SpawnSyncFn),
+                runtime.runOpenAIOnce(
+                    'x',
+                    { maxTurns: 1 },
+                    spawnFn as unknown as SpawnSyncFn,
+                    undefined,
+                    VERSION_UNREAD,
+                ),
             ).toThrow();
             // Ровно один вызов — проверка входа; сама сессия не запускалась.
             expect(spawnFn.mock.calls.length).toBe(1);
@@ -1684,7 +1803,13 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
                 stderr: '',
                 signal: null,
             }));
-            runtime.runOpenAIOnce('x', { maxTurns: 1 }, spawnFn as unknown as SpawnSyncFn);
+            runtime.runOpenAIOnce(
+                'x',
+                { maxTurns: 1 },
+                spawnFn as unknown as SpawnSyncFn,
+                undefined,
+                VERSION_UNREAD,
+            );
             expect(spawnFn.mock.calls.length).toBe(1);
             const [, argv] = spawnFn.mock.calls[0];
             expect(argv).toContain('exec');
@@ -1714,7 +1839,13 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
                           }
                         : { status: 0, stdout: 'ok', stderr: '', signal: null },
                 );
-                runtime.runOpenAIOnce('x', { maxTurns: 1 }, spawnFn as unknown as SpawnSyncFn);
+                runtime.runOpenAIOnce(
+                    'x',
+                    { maxTurns: 1 },
+                    spawnFn as unknown as SpawnSyncFn,
+                    undefined,
+                    VERSION_UNREAD,
+                );
                 const [, , opts] = spawnFn.mock.calls[spawnFn.mock.calls.length - 1];
                 // Ключ ушёл под именем, которое ждёт codex...
                 expect(opts.env.OPENAI_API_KEY).toBe('sk-custom-secret');
@@ -1745,7 +1876,13 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
                     ? { status: 0, stdout: 'Logged in using ChatGPT', stderr: '', signal: null }
                     : { status: 0, stdout: 'ok', stderr: '', signal: null },
             );
-            runtime.runOpenAIOnce('x', { maxTurns: 1 }, spawnFn as unknown as SpawnSyncFn);
+            runtime.runOpenAIOnce(
+                'x',
+                { maxTurns: 1 },
+                spawnFn as unknown as SpawnSyncFn,
+                undefined,
+                VERSION_UNREAD,
+            );
             const [, argv] = spawnFn.mock.calls[spawnFn.mock.calls.length - 1];
             expect(argv).toContain('forced_login_method="chatgpt"');
             // Ревью Codex (5-й проход): проводка проверяется целиком, а не по одному флагу.
@@ -1766,7 +1903,13 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
                       }
                     : { status: 0, stdout: 'ok', stderr: '', signal: null },
             );
-            runtime.runOpenAIOnce('x', { maxTurns: 1 }, spawnFn as unknown as SpawnSyncFn);
+            runtime.runOpenAIOnce(
+                'x',
+                { maxTurns: 1 },
+                spawnFn as unknown as SpawnSyncFn,
+                undefined,
+                VERSION_UNREAD,
+            );
             const [, argv] = spawnFn.mock.calls[spawnFn.mock.calls.length - 1];
             expect(argv.join(' ')).not.toContain('forced_login_method');
         });
@@ -1795,6 +1938,8 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
                 'x',
                 { maxTurns: 1 },
                 spawnFn as unknown as SpawnSyncFn,
+                undefined,
+                VERSION_UNREAD,
             );
             expect(res).toEqual({ code: 0, output: '' });
             expect(spawnFn).not.toHaveBeenCalled();
@@ -1811,7 +1956,13 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
                       }
                     : { status: 0, stdout: 'ok', stderr: '', signal: null },
             );
-            runtime.runOpenAIOnce('x', { maxTurns: 1 }, spawnFn as unknown as SpawnSyncFn);
+            runtime.runOpenAIOnce(
+                'x',
+                { maxTurns: 1 },
+                spawnFn as unknown as SpawnSyncFn,
+                undefined,
+                VERSION_UNREAD,
+            );
             const [, argv] = spawnFn.mock.calls[spawnFn.mock.calls.length - 1];
             expect(argv).not.toContain('--max-turns');
             expect(argv).not.toContain('--fallback-model');
@@ -1835,6 +1986,8 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
                 'сессия сдачи',
                 { model: 'claude-opus-4-8', maxTurns: 5 },
                 spawnFn as unknown as SpawnSyncFn,
+                undefined,
+                VERSION_UNREAD,
             );
             const [, argv] = spawnFn.mock.calls[spawnFn.mock.calls.length - 1];
             expect(argv[argv.indexOf('-m') + 1]).toBe('gpt-5-codex');
@@ -1857,6 +2010,8 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
                 'кодер-итерация',
                 { model: 'gpt-5-codex-mini', maxTurns: 5, modelProvider: 'openai' },
                 spawnFn as unknown as SpawnSyncFn,
+                undefined,
+                VERSION_UNREAD,
             );
             const [, argv] = spawnFn.mock.calls[spawnFn.mock.calls.length - 1];
             expect(argv[argv.indexOf('-m') + 1]).toBe('gpt-5-codex-mini');
@@ -1878,6 +2033,8 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
                 'x',
                 { model: 'kimi-k2-0711-preview', maxTurns: 5, modelProvider: 'kimi' },
                 spawnFn as unknown as SpawnSyncFn,
+                undefined,
+                VERSION_UNREAD,
             );
             const [, argv] = spawnFn.mock.calls[spawnFn.mock.calls.length - 1];
             expect(argv[argv.indexOf('-m') + 1]).toBe('gpt-5-codex');
@@ -2111,7 +2268,7 @@ describe('runClaude — #376 доп.скоуп: кросс-провайдерн�
     const { runClaude } = ralph;
 
     it('лимит основного рантайма → один пробный запуск другим провайдером ДО ожидания; успех — sleep/pushEvent не зовутся', () => {
-        const runClaudeOnceFn = vi.fn(() => ({ code: 1, output: 'session limit resets 11am' }));
+        const runClaudeOnceFn = vi.fn(() => claudeRun(1, 'session limit resets 11am'));
         const fallbackRun = vi.fn<RunClaudeFake>(() => ({ code: 0, output: 'diff from kimi' }));
         const coderRuntimeRunForFn = vi.fn((provider) => {
             expect(provider).toBe('kimi');
@@ -2152,8 +2309,31 @@ describe('runClaude — #376 доп.скоуп: кросс-провайдерн�
         expect(sleepFn).not.toHaveBeenCalled();
     });
 
+    it('успешный фолбэк идёт через settledCode: код 0 с исходом unknown — не успех', () => {
+        const runClaudeOnceFn = vi.fn(() => claudeRun(1, 'session limit resets 11am'));
+        const fallbackRun = vi.fn<RunClaudeFake>(() => ({
+            code: 0,
+            output: 'ok',
+            endReason: 'unknown',
+        }));
+        const code = runClaude(
+            'промпт',
+            {},
+            {
+                pushEventFn: vi.fn(),
+                sleepFn: vi.fn(),
+                ensureTunnelFn: () => true,
+                runClaudeOnceFn,
+                coderRuntimeRunForFn: vi.fn(() => fallbackRun),
+                cfg: { modelRouting: { apiLimitFallback: { provider: 'kimi', model: 'x' } } },
+            },
+        );
+        expect(code).toBe(1);
+        expect(fallbackRun).toHaveBeenCalledTimes(1);
+    });
+
     it('фолбэк тоже упёрся в лимит → переходим к обычному ожиданию основного рантайма (фолбэк пробуется РОВНО раз за вызов)', () => {
-        const runClaudeOnceFn = vi.fn(() => ({ code: 1, output: 'session limit resets 11am' }));
+        const runClaudeOnceFn = vi.fn(() => claudeRun(1, 'session limit resets 11am'));
         const fallbackRun = vi.fn<RunClaudeFake>(() => ({
             code: 1,
             output: 'session limit resets 11am',
@@ -2191,7 +2371,7 @@ describe('runClaude — #376 доп.скоуп: кросс-провайдерн�
         // ожидания. API_LIMIT_RE матчит лишь формулировку Claude → лимит Kimi/OpenAI под
         // неё не подходит, и «фолбэк тоже упёрся в лимит» для них недостижимо. Теперь любой
         // ненулевой код фолбэка → штатное ожидание основного провайдера.
-        const runClaudeOnceFn = vi.fn(() => ({ code: 1, output: 'session limit resets 11am' }));
+        const runClaudeOnceFn = vi.fn(() => claudeRun(1, 'session limit resets 11am'));
         const fallbackRun = vi.fn<RunClaudeFake>(() => ({
             code: 127,
             output: 'codex: command not found',
@@ -2227,7 +2407,7 @@ describe('runClaude — #376 доп.скоуп: кросс-провайдерн�
     it('apiLimitFallback пробуется ДАЖЕ при waitOnApiLimit:false (фолбэк — «вместо ожидания», не часть его); успех завершает', () => {
         // Ревью-thread: return по waitOnApiLimit===false раньше срабатывал ДО фолбэк-ветки.
         // Оператор, выключивший ожидание, всё ещё может хотеть кросс-провайдерную попытку.
-        const runClaudeOnceFn = vi.fn(() => ({ code: 1, output: 'session limit resets 11am' }));
+        const runClaudeOnceFn = vi.fn(() => claudeRun(1, 'session limit resets 11am'));
         const fallbackRun = vi.fn<RunClaudeFake>(() => ({ code: 0, output: 'diff from kimi' }));
         const coderRuntimeRunForFn = vi.fn(() => fallbackRun);
         const sleepFn = vi.fn();
@@ -2255,7 +2435,7 @@ describe('runClaude — #376 доп.скоуп: кросс-провайдерн�
     });
 
     it('фолбэк не помог + waitOnApiLimit:false → честно возвращаем код лимита, без ожидания', () => {
-        const runClaudeOnceFn = vi.fn(() => ({ code: 1, output: 'session limit resets 11am' }));
+        const runClaudeOnceFn = vi.fn(() => claudeRun(1, 'session limit resets 11am'));
         const fallbackRun = vi.fn<RunClaudeFake>(() => ({ code: 127, output: 'codex not found' }));
         const coderRuntimeRunForFn = vi.fn(() => fallbackRun);
         const sleepFn = vi.fn();
@@ -2283,7 +2463,7 @@ describe('runClaude — #376 доп.скоуп: кросс-провайдерн�
     });
 
     it('apiLimitFallback без явного provider (голая строка = тот же провайдер) не пробуется — сразу обычное ожидание', () => {
-        const runClaudeOnceFn = vi.fn(() => ({ code: 1, output: 'session limit resets 11am' }));
+        const runClaudeOnceFn = vi.fn(() => claudeRun(1, 'session limit resets 11am'));
         const coderRuntimeRunForFn = vi.fn();
         const pushEventFn = vi.fn();
         const sleepFn = vi.fn();
@@ -2309,7 +2489,7 @@ describe('runClaude — #376 доп.скоуп: кросс-провайдерн�
     });
 
     it('apiLimitFallback не задан → ветка не выполняется (дефолт, поведение прежнее)', () => {
-        const runClaudeOnceFn = vi.fn(() => ({ code: 1, output: 'session limit resets 11am' }));
+        const runClaudeOnceFn = vi.fn(() => claudeRun(1, 'session limit resets 11am'));
         const coderRuntimeRunForFn = vi.fn();
 
         runClaude(
@@ -2487,7 +2667,7 @@ describe('runClaude — ротация ключей подписки (задач
     it('лимит на ключе 1 → сессия сразу на ключе 2, ожидание не потрачено', () => {
         const runClaudeOnceFn = vi
             .fn<RunClaudeFake>()
-            .mockReturnValueOnce({ code: 1, output: "You've hit your session limit · resets 11am" })
+            .mockReturnValueOnce(claudeRun(1, "You've hit your session limit · resets 11am"))
             .mockReturnValueOnce({ code: 0, output: 'ok' });
         const pushEventFn = vi.fn();
         const sleepFn = vi.fn();
@@ -2516,9 +2696,9 @@ describe('runClaude — ротация ключей подписки (задач
     it('ротация не тратит счётчик ожиданий: при apiLimitMaxWaits=1 после круга ключей ещё есть сон', () => {
         const runClaudeOnceFn = vi
             .fn<RunClaudeFake>()
-            .mockReturnValueOnce({ code: 1, output: 'session limit resets 11am' })
-            .mockReturnValueOnce({ code: 1, output: 'session limit resets 11am' })
-            .mockReturnValueOnce({ code: 1, output: 'session limit resets 11am' })
+            .mockReturnValueOnce(claudeRun(1, 'session limit resets 11am'))
+            .mockReturnValueOnce(claudeRun(1, 'session limit resets 11am'))
+            .mockReturnValueOnce(claudeRun(1, 'session limit resets 11am'))
             .mockReturnValueOnce({ code: 0, output: 'ok' });
         const sleepFn = vi.fn();
         const { ring: keyRing } = ring();
@@ -2544,7 +2724,7 @@ describe('runClaude — ротация ключей подписки (задач
     it('кросс-провайдерный фолбэк — только когда упёрлись все ключи', () => {
         const runClaudeOnceFn = vi
             .fn<RunClaudeFake>()
-            .mockReturnValueOnce({ code: 1, output: 'session limit resets 11am' })
+            .mockReturnValueOnce(claudeRun(1, 'session limit resets 11am'))
             .mockReturnValueOnce({ code: 0, output: 'ok' });
         const fallbackRun = vi.fn<RunClaudeFake>(() => ({ code: 0, output: 'kimi' }));
         const { ring: keyRing } = ring();
@@ -2572,9 +2752,9 @@ describe('runClaude — ротация ключей подписки (задач
         // надо 60 минут и идти на ключе 2, а не 180 до сброса первого по порядку.
         const runClaudeOnceFn = vi
             .fn<RunClaudeFake>()
-            .mockReturnValueOnce({ code: 1, output: 'session limit, try later' })
-            .mockReturnValueOnce({ code: 1, output: 'session limit, try later' })
-            .mockReturnValueOnce({ code: 1, output: 'session limit, try later' })
+            .mockReturnValueOnce(claudeRun(1, 'session limit, try later'))
+            .mockReturnValueOnce(claudeRun(1, 'session limit, try later'))
+            .mockReturnValueOnce(claudeRun(1, 'session limit, try later'))
             .mockReturnValueOnce({ code: 0, output: 'ok' });
         const waits = [180, 60, 120];
         let hit = 0;
@@ -2621,8 +2801,8 @@ describe('runClaude — ротация ключей подписки (задач
         // Файл ротации от прошлого процесса: активным остался ключ 1, и он ещё не сбросился.
         const runClaudeOnceFn = vi
             .fn<RunClaudeFake>()
-            .mockReturnValueOnce({ code: 1, output: 'session limit resets 11am' })
-            .mockReturnValueOnce({ code: 1, output: 'session limit resets 11am' })
+            .mockReturnValueOnce(claudeRun(1, 'session limit resets 11am'))
+            .mockReturnValueOnce(claudeRun(1, 'session limit resets 11am'))
             .mockReturnValueOnce({ code: 0, output: 'ok' });
         const pushes: string[] = [];
         const logged: string[] = [];
@@ -2693,7 +2873,7 @@ describe('runClaude — ротация ключей подписки (задач
         try {
             const runClaudeOnceFn = vi
                 .fn<RunClaudeFake>()
-                .mockReturnValueOnce({ code: 1, output: '429 rate limit exceeded' })
+                .mockReturnValueOnce(claudeRun(1, '429 rate limit exceeded'))
                 .mockReturnValueOnce({ code: 0, output: 'ok' });
             const sleepFn = vi.fn();
             const code = runClaude(
@@ -2727,13 +2907,137 @@ describe('runClaude — ротация ключей подписки (задач
     });
 });
 
+// Фаза 16 (#112): ядро решает о повторе только по исходу, названному адаптером. Тексты
+// ниже нарочно расходятся с исходами: решение обязано идти за исходом, а не за словами.
+describe('runClaude — решение по SessionEndReason, а не по тексту вывода', () => {
+    const { runClaude } = ralph;
+    const deps = (runClaudeOnceFn: unknown, extra: Record<string, unknown> = {}) => ({
+        pushEventFn: vi.fn(),
+        sleepFn: vi.fn(),
+        ensureTunnelFn: () => true,
+        runClaudeOnceFn,
+        keyRing: null,
+        cfg: { apiLimitMaxWaits: 3, apiLimitGraceMin: 0 },
+        ...extra,
+    });
+
+    it('исход api-limit без единого слова о лимите — ожидание и повтор', () => {
+        const runClaudeOnceFn = vi
+            .fn()
+            .mockReturnValueOnce({
+                code: 1,
+                output: 'что угодно',
+                endReason: 'api-limit',
+                retryAfterMs: 60_000,
+            })
+            .mockReturnValueOnce({ code: 0, output: 'ok', endReason: 'completed' });
+        const d = deps(runClaudeOnceFn);
+        expect(runClaude('промпт', {}, d)).toBe(0);
+        expect(runClaudeOnceFn).toHaveBeenCalledTimes(2);
+        // Время до сброса — от адаптера, а не из текста.
+        expect(d.sleepFn).toHaveBeenCalledWith(60_000);
+    });
+
+    it('текст лимита при исходе unknown — НЕ лимит: ни ожидания, ни повтора', () => {
+        const runClaudeOnceFn = vi.fn().mockReturnValue({
+            code: 1,
+            output: "You've hit your session limit · resets 11am",
+            endReason: 'unknown',
+        });
+        const d = deps(runClaudeOnceFn);
+        expect(runClaude('промпт', {}, d)).toBe(1);
+        expect(runClaudeOnceFn).toHaveBeenCalledTimes(1);
+        expect(d.sleepFn).not.toHaveBeenCalled();
+    });
+
+    it('исход без endReason у реализации шва: текст лимита не читается', () => {
+        const runClaudeOnceFn = vi
+            .fn()
+            .mockReturnValue({ code: 1, output: "You've hit your session limit" });
+        const d = deps(runClaudeOnceFn);
+        expect(runClaude('промпт', {}, d)).toBe(1);
+        expect(d.sleepFn).not.toHaveBeenCalled();
+    });
+
+    it('interrupted при коде 0 — успех по коду без повтора, но строкой в логе', () => {
+        const logSpy = vi.spyOn(console, 'log');
+        try {
+            const runClaudeOnceFn = vi.fn().mockReturnValue({
+                code: 0,
+                output: 'No upstream account is currently available',
+                endReason: 'interrupted',
+            });
+            const d = deps(runClaudeOnceFn);
+            expect(runClaude('промпт', {}, d)).toBe(0);
+            expect(runClaudeOnceFn).toHaveBeenCalledTimes(1);
+            expect(d.sleepFn).not.toHaveBeenCalled();
+            const logged = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
+            expect(logged).toMatch(/исход обрывом \(interrupted\).*только у ревью/);
+        } finally {
+            logSpy.mockRestore();
+        }
+    });
+
+    it('неопознанный исход — «прочее» с логом и не успех, даже при коде 0', () => {
+        const logSpy = vi.spyOn(console, 'log');
+        try {
+            const runClaudeOnceFn = vi
+                .fn()
+                .mockReturnValue({ code: 0, output: 'ok', endReason: 'unknown' });
+            expect(runClaude('промпт', {}, deps(runClaudeOnceFn))).toBe(1);
+            const logged = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
+            expect(logged).toMatch(/Исход сессии не опознан.*«прочее», не успех/);
+        } finally {
+            logSpy.mockRestore();
+        }
+    });
+
+    it('auth — без ожидания и повтора, причина в логе', () => {
+        const logSpy = vi.spyOn(console, 'log');
+        try {
+            const runClaudeOnceFn = vi
+                .fn()
+                .mockReturnValue({ code: 1, output: 'usage limit', endReason: 'auth' });
+            const d = deps(runClaudeOnceFn);
+            expect(runClaude('промпт', {}, d)).toBe(1);
+            expect(runClaudeOnceFn).toHaveBeenCalledTimes(1);
+            expect(d.sleepFn).not.toHaveBeenCalled();
+            const logged = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
+            expect(logged).toMatch(/отверг авторизацию/);
+        } finally {
+            logSpy.mockRestore();
+        }
+    });
+
+    it('исход последнего запуска уходит вызывающему вторым аргументом onOutput', () => {
+        const runClaudeOnceFn = vi.fn().mockReturnValue({
+            code: 1,
+            output: 'x',
+            endReason: 'turn-limit',
+        });
+        const onOutput = vi.fn();
+        runClaude('промпт', {}, deps(runClaudeOnceFn, { onOutput }));
+        expect(onOutput).toHaveBeenCalledWith('x', 'turn-limit');
+    });
+
+    it('timeout и interrupted при ненулевом коде — без повтора в runClaude', () => {
+        for (const endReason of ['timeout', 'interrupted']) {
+            const runClaudeOnceFn = vi.fn().mockReturnValue({ code: 1, output: '', endReason });
+            const d = deps(runClaudeOnceFn);
+            expect(runClaude('промпт', {}, d)).toBe(1);
+            expect(runClaudeOnceFn).toHaveBeenCalledTimes(1);
+            expect(d.sleepFn).not.toHaveBeenCalled();
+        }
+    });
+});
+
 describe('runClaude — 4-е событие (#88): API-лимит пушит уведомление и повторяет попытку', () => {
     const { runClaude } = ralph;
 
     it('маркер лимита в выводе → pushEventFn с текстом попытки/ожидания, sleepFn ждёт, повтор runClaudeOnceFn', () => {
         const runClaudeOnceFn = vi
             .fn()
-            .mockReturnValueOnce({ code: 1, output: "You've hit your session limit · resets 11am" })
+            .mockReturnValueOnce(claudeRun(1, "You've hit your session limit · resets 11am"))
             .mockReturnValueOnce({ code: 0, output: 'ok' });
         const pushEventFn = vi.fn();
         const sleepFn = vi.fn();
@@ -2786,9 +3090,7 @@ describe('runClaude — 4-е событие (#88): API-лимит пушит у�
     });
 
     it('лимит попыток исчерпан (apiLimitMaxWaits) — не уходит в вечный цикл, возвращает последний код', () => {
-        const runClaudeOnceFn = vi
-            .fn()
-            .mockReturnValue({ code: 1, output: 'session limit resets 11am' });
+        const runClaudeOnceFn = vi.fn().mockReturnValue(claudeRun(1, 'session limit resets 11am'));
         const pushEventFn = vi.fn();
         const sleepFn = vi.fn();
 
@@ -2812,9 +3114,7 @@ describe('runClaude — 4-е событие (#88): API-лимит пушит у�
     });
 
     it('cfg.waitOnApiLimit === false — маркер лимита есть, но повтор/пуш выключены явно', () => {
-        const runClaudeOnceFn = vi
-            .fn()
-            .mockReturnValue({ code: 1, output: 'session limit resets 11am' });
+        const runClaudeOnceFn = vi.fn().mockReturnValue(claudeRun(1, 'session limit resets 11am'));
         const pushEventFn = vi.fn();
 
         const code = runClaude(
@@ -3000,7 +3300,7 @@ describe('runClaude — #606: транзиентная недоступност�
             .mockReturnValueOnce({ code: 1, output: '', failureKind: 'runtime-unavailable' })
             .mockReturnValueOnce({ code: 1, output: '', failureKind: 'runtime-unavailable' })
             .mockReturnValueOnce({ code: 1, output: '', failureKind: 'runtime-unavailable' })
-            .mockReturnValueOnce({ code: 1, output: "You've hit your session limit · resets 11am" })
+            .mockReturnValueOnce(claudeRun(1, "You've hit your session limit · resets 11am"))
             .mockReturnValueOnce({ code: 0, output: 'ok' });
         const pushEventFn = vi.fn();
         const sleepFn = vi.fn();
@@ -3067,7 +3367,7 @@ describe('runClaude — #606: транзиентная недоступност�
     it('API-лимит и рантайм-недоступность не путаются: маркер лимита не ретраится этой веткой', () => {
         const runClaudeOnceFn = vi
             .fn()
-            .mockReturnValueOnce({ code: 1, output: "You've hit your session limit · resets 11am" })
+            .mockReturnValueOnce(claudeRun(1, "You've hit your session limit · resets 11am"))
             .mockReturnValueOnce({ code: 0, output: 'ok' });
         const pushEventFn = vi.fn();
         const sleepFn = vi.fn();
@@ -5310,6 +5610,41 @@ describe('runLoop — основной while-цикл: итерации коде
         expect(openIssuesFn).toHaveBeenCalledTimes(1);
     });
 
+    it('Фаза 16: исход auth кодер-сессии — стоп петли, вторая сессия не стартует', () => {
+        const logs: string[] = [];
+        const pushes: string[] = [];
+        const runClaudeFn = vi.fn<RunClaudeFake>((_prompt, _opts, callDeps) => {
+            (callDeps as { onOutput?: (o: string, r: string) => void } | undefined)?.onOutput?.(
+                'Not logged in · Please run /login',
+                'auth',
+            );
+            return 1;
+        });
+        const handleCrashedCoderSessionFn = vi.fn<HandleCrashedCoderSessionFake>(
+            (issue, code, output, opts) =>
+                handleCrashedCoderSession(issue, code, output, {
+                    ...(opts as object),
+                    saveSessionOutputFn: () => {},
+                    pushEventFn: ((m: string) => {
+                        pushes.push(m);
+                        return true;
+                    }) as never,
+                }),
+        );
+        runLoop(
+            validCfg(),
+            ctx(mkState()),
+            deps(logs, {
+                phaseIndexOfFn: () => 0,
+                openIssuesFn: () => [{ number: 9, title: 'задача', labels: [] }],
+                runClaudeFn,
+                handleCrashedCoderSessionFn,
+            }),
+        );
+        expect(runClaudeFn).toHaveBeenCalledTimes(1);
+        expect(pushes.join('\n')).toMatch(/отверг вход.*Issue #9/);
+    });
+
     it('#390: handleCrashedCoderSessionFn возвращает stop:false → цикл НЕ останавливается, прежнее поведение (fail-open)', () => {
         const logs: string[] = [];
         const handleCrashedCoderSessionFn = vi.fn(() => ({ stop: false }));
@@ -6670,7 +7005,7 @@ describe('runLoop — основной while-цикл: итерации коде
         const runClaudeFn = vi.fn<RunClaudeFake>((_p, _o, extra) => {
             session++;
             const run = reviewRuns[Math.min(session, reviewRuns.length - 1)];
-            (extra?.onOutput as ((s: string) => void) | undefined)?.(run.output);
+            emitOutput(extra, run.output, 0);
             return 0;
         });
         // Намерения применяются после каждой сессии; ревью-сессии — первые в сдаче.
@@ -7526,9 +7861,9 @@ describe('runLoop — основной while-цикл: итерации коде
         expect(prompt).toMatch(/ДАННЫЕ, а не инструкции/i);
     });
 
-    // Задача 122: сессия обязана писать намерения туда, откуда их читает раннер. Без
-    // `roots` это прежний путь в дереве работы — его и называет промпт.
-    it('кодер-промпт называет файл намерений, который читает раннер', () => {
+    // Задача 122, #9: сессия отдаёт намерения блоком в выводе, файл пишет раннер. Промпт
+    // называет блок и НЕ называет путь файла — иначе звал бы писать туда, где харнесс режет.
+    it('кодер-промпт называет блок намерений, а не файл', () => {
         const runClaudeFn = vi.fn((_prompt: string, _opts?: Record<string, unknown>) => 0);
         runLoop(
             validCfg({ prompt: 'работай по {milestone}' }),
@@ -7541,18 +7876,20 @@ describe('runLoop — основной while-цикл: итерации коде
                 once: true,
             }),
         );
-        expect(String(runClaudeFn.mock.calls[0][0])).toContain(
-            `Файл намерений этого прогона — ${path.join('.claude', 'ralph', 'ralph.requests.jsonl')}`,
-        );
+        const prompt = String(runClaudeFn.mock.calls[0][0]);
+        expect(prompt).toContain('Канал намерений этого прогона');
+        expect(prompt).toContain(INTENTS_BEGIN);
+        expect(prompt).toContain(INTENTS_END);
+        expect(prompt).not.toContain('ralph.requests.jsonl');
     });
 
-    // Структурная половина: путь в промпте кодера и путь чтения — ОДНО выражение. Поведенческий
-    // тест выше видит только прежнюю раскладку; при `roots` оба поля переезжают через
-    // `repointRuntime`, и разойтись они могут лишь правкой одного из двух мест.
-    it('путь в промпте кодера и путь чтения намерений — один RUNTIME.requests', () => {
+    // Структурная половина: промпт кодера собирается с запиской о канале, а вывод сессии
+    // разбирается в тот файл, который читает применение, — одно выражение RUNTIME.requests.
+    it('промпт кодера несёт канал, разбор вывода и чтение — один RUNTIME.requests', () => {
         const src = fs.readFileSync(path.join(import.meta.dirname, 'orchestrator.ts'), 'utf8');
-        expect(src).toContain('buildCoderIntentsNote(RUNTIME.requests)');
+        expect(src).toContain('buildCoderIntentsNote()');
         expect(src).toMatch(/readFileSync\(RUNTIME\.requests, 'utf8'\)/);
+        expect(src).toMatch(/collectIntentsFn = collectSessionIntents/);
     });
 
     it('НЕГАТИВНЫЙ: карточка не прочиталась → стоп с пушем, сессия не запускается', () => {
@@ -7615,9 +7952,7 @@ describe('runLoop — основной while-цикл: итерации коде
         const runClaudeFn = vi.fn<RunClaudeFake>((_prompt, _opts, d) => {
             calls++;
             if (calls === 1) {
-                (d?.onOutput as ((o: string) => void) | undefined)?.(
-                    'Error: Reached max turns (200)',
-                );
+                emitOutput(d, 'Error: Reached max turns (200)');
                 return 1;
             }
             return 0;
@@ -7647,9 +7982,7 @@ describe('runLoop — основной while-цикл: итерации коде
         const logs: string[] = [];
         const state = mkState();
         const runClaudeFn = vi.fn<RunClaudeFake>((_prompt, _opts, d) => {
-            (d?.onOutput as ((o: string) => void) | undefined)?.(
-                'TypeError: undefined is not a function',
-            );
+            emitOutput(d, 'TypeError: undefined is not a function');
             return 1;
         });
         runLoop(
@@ -7673,7 +8006,7 @@ describe('runLoop — основной while-цикл: итерации коде
         const logs: string[] = [];
         const state = mkState();
         const runClaudeFn = vi.fn<RunClaudeFake>((_prompt, _opts, d) => {
-            (d?.onOutput as ((o: string) => void) | undefined)?.('Error: Reached max turns (200)');
+            emitOutput(d, 'Error: Reached max turns (200)');
             return 1;
         });
         runLoop(
@@ -7700,9 +8033,7 @@ describe('runLoop — основной while-цикл: итерации коде
     it('#97: продолжение по ходам перечитывает комментарии PR — видит оставленное первой', () => {
         const runClaudeFn = vi.fn<RunClaudeFake>((_prompt, _opts, d) => {
             if (runClaudeFn.mock.calls.length === 1) {
-                (d?.onOutput as ((o: string) => void) | undefined)?.(
-                    'Error: Reached max turns (200)',
-                );
+                emitOutput(d, 'Error: Reached max turns (200)');
                 return 1;
             }
             return 0;
@@ -7742,7 +8073,7 @@ describe('runLoop — основной while-цикл: итерации коде
         const state = mkState();
         const pushEventFn = vi.fn();
         const runClaudeFn = vi.fn<RunClaudeFake>((_prompt, _opts, d) => {
-            (d?.onOutput as ((o: string) => void) | undefined)?.('Error: Reached max turns (200)');
+            emitOutput(d, 'Error: Reached max turns (200)');
             return 1;
         });
         let reads = 0;
@@ -7834,7 +8165,7 @@ describe('runLoop — основной while-цикл: итерации коде
         const logs: string[] = [];
         const state = mkState();
         const runClaudeFn = vi.fn<RunClaudeFake>((_prompt, _opts, d) => {
-            (d?.onOutput as ((o: string) => void) | undefined)?.('Error: Reached max turns (200)');
+            emitOutput(d, 'Error: Reached max turns (200)');
             return 1;
         });
         runLoop(
@@ -7860,7 +8191,7 @@ describe('runLoop — основной while-цикл: итерации коде
         const logs: string[] = [];
         const state = mkState();
         const runClaudeFn = vi.fn<RunClaudeFake>((_prompt, _opts, d) => {
-            (d?.onOutput as ((o: string) => void) | undefined)?.('Error: Reached max turns (200)');
+            emitOutput(d, 'Error: Reached max turns (200)');
             return 1;
         });
         runLoop(
@@ -8070,9 +8401,7 @@ describe('runLoop — основной while-цикл: итерации коде
         const runClaudeFn = vi.fn<RunClaudeFake>((_prompt, _opts, d) => {
             calls++;
             if (calls === 1) {
-                (d?.onOutput as ((o: string) => void) | undefined)?.(
-                    'Error: Reached max turns (200)',
-                );
+                emitOutput(d, 'Error: Reached max turns (200)');
                 return 1;
             }
             return 0;
@@ -8100,7 +8429,7 @@ describe('runLoop — основной while-цикл: итерации коде
         const logs: string[] = [];
         const state = mkState({ submitted: true, blockedHeals: 0, lastReviewModel: 'claude-rev' });
         const runClaudeFn = vi.fn<RunClaudeFake>((_prompt, _opts, d) => {
-            (d?.onOutput as ((o: string) => void) | undefined)?.('Error: Reached max turns (200)');
+            emitOutput(d, 'Error: Reached max turns (200)');
             return 1;
         });
         runLoop(
@@ -9104,15 +9433,11 @@ describe('runLoop — основной while-цикл: итерации коде
                     trace.push('branch');
                     return { kind: 'switched' as const, branch: 'feature/m1', sha: 'a'.repeat(40) };
                 },
-                runClaudeFn: (
-                    _p: string,
-                    _o: unknown,
-                    { onOutput }: { onOutput?: (t: string) => void } = {},
-                ) => {
+                runClaudeFn: (_p: string, _o: unknown, d: { onOutput?: unknown } = {}) => {
                     trace.push('session');
                     sessions += 1;
                     if (sessions === 1) {
-                        onOutput?.('Error: Reached max turns (80)');
+                        emitOutput(d, 'Error: Reached max turns (80)');
                         return 1;
                     }
                     return 0;
@@ -10500,6 +10825,28 @@ describe('handleCrashedCoderSession — падение кодер-сессии: 
         expect(pushEventFn).toHaveBeenCalledTimes(1);
     });
 
+    // Фаза 16: отозванный вход — отказ среды. Без стопа петля шла бы следующей итерацией на
+    // ту же карточку, и брейкер серии остановил бы её с причиной «не сдаётся».
+    it('исход auth → stop:true до git status, причина «вход» в лог и пуш', () => {
+        const logs: string[] = [];
+        const pushEventFn = vi.fn();
+        const shFn = vi.fn(() => ' M src/a.ts');
+        const result = handleCrashedCoderSession(issue, 1, 'Not logged in', {
+            shFn,
+            logFn: (m: string) => logs.push(m),
+            pushEventFn,
+            saveSessionOutputFn: () => {},
+            cfg: {} as unknown,
+            endReason: 'auth',
+        });
+        expect(result).toEqual({ stop: true });
+        expect(shFn).not.toHaveBeenCalled();
+        expect(logs.join('\n')).toMatch(/отверг вход/);
+        expect(logs.join('\n')).toMatch(/ключ рантайма/);
+        expect(pushEventFn).toHaveBeenCalledTimes(1);
+        expect(pushEventFn.mock.calls[0][0]).toMatch(/Issue #42/);
+    });
+
     it('чистое дерево после падения → stop:false, прежнее поведение (fail-open), пуш не зовётся', () => {
         const logs: string[] = [];
         const pushEventFn = vi.fn();
@@ -10816,14 +11163,32 @@ describe('handleCrashedCoderSession — падение кодер-сессии: 
     // том же грязном дереве прошёл целиком (build, lint, typecheck, 3246 тестов). То есть
     // остановка стоила ручного вмешательства и не спасла ни от чего.
     //
-    // Механизм на этот случай в ядре был с #594, но `TURN_LIMIT_RE` проверялся ТОЛЬКО в
+    // Механизм на этот случай в ядре был с #594, но бюджет ходов проверялся ТОЛЬКО в
     // подсистеме ревью (шаги правок и разбора blocked), а ветка кодер-сессии осталась на
     // прежнем «грязно → стоп». Здесь тот же разбор появляется и в ней.
+    it('Фаза 16: «Reached max turns» в выводе без исхода turn-limit — не бюджет ходов, стоп', () => {
+        const commitLeftoversFn = vi.fn(() => true);
+        const result = handleCrashedCoderSession(issue, 1, 'Reached max turns (200)', {
+            endReason: 'unknown',
+            shFn: () => ' M src/a.ts',
+            logFn: () => {},
+            pushEventFn: vi.fn(),
+            saveSessionOutputFn: () => {},
+            cfg: {} as unknown,
+            commitLeftoversFn,
+            turnRetriesLeft: 1,
+        });
+        expect(result.stop).toBe(true);
+        expect(result.turnLimitRetry).toBeUndefined();
+        expect(commitLeftoversFn).not.toHaveBeenCalled();
+    });
+
     it('#20: бюджет ходов исчерпан + грязное дерево + попытки есть → остаток коммитится, цикл НЕ встаёт', () => {
         const logs: string[] = [];
         const pushEventFn = vi.fn();
         const commitLeftoversFn = vi.fn(() => true);
         const result = handleCrashedCoderSession(issue, 1, 'Reached max turns (200)', {
+            endReason: 'turn-limit',
             shFn: () => ' M src/a.ts\n?? tmp.log',
             logFn: (m: string) => logs.push(m),
             pushEventFn,
@@ -10866,6 +11231,7 @@ describe('handleCrashedCoderSession — падение кодер-сессии: 
         const pushEventFn = vi.fn();
         const commitLeftoversFn = vi.fn(() => true);
         const result = handleCrashedCoderSession(issue, 1, 'Reached max turns (200)', {
+            endReason: 'turn-limit',
             shFn: () => ' M src/a.ts',
             logFn: (m: string) => logs.push(m),
             pushEventFn,
@@ -10885,6 +11251,7 @@ describe('handleCrashedCoderSession — падение кодер-сессии: 
     it('#20: остаток не удалось закоммитить → стоп fail-closed (состояние дерева неизвестно)', () => {
         const logs: string[] = [];
         const result = handleCrashedCoderSession(issue, 1, 'Reached max turns (200)', {
+            endReason: 'turn-limit',
             shFn: () => ' M src/a.ts',
             logFn: (m: string) => logs.push(m),
             pushEventFn: vi.fn(),
@@ -10902,6 +11269,7 @@ describe('handleCrashedCoderSession — падение кодер-сессии: 
     it('#20: чистое дерево после исчерпания ходов → прежнее поведение (продолжаем, коммитить нечего)', () => {
         const commitLeftoversFn = vi.fn(() => true);
         const result = handleCrashedCoderSession(issue, 1, 'Reached max turns (200)', {
+            endReason: 'turn-limit',
             shFn: () => '',
             logFn: () => {},
             pushEventFn: vi.fn(),
@@ -13668,12 +14036,10 @@ describe('createOrchestrator: API-поверхность', () => {
         'sliceWholeChars',
         'formatExcerpt',
         // api-limit
-        'parseResetWaitMs',
         'apiLimitWaitMs',
         'apiLimitMessage',
         'minutesOrDefault',
         'positiveIntOrDefault',
-        'API_LIMIT_RE',
         // туннель/пуши
         'tunnelHealthy',
         'ensureTunnel',
@@ -16064,5 +16430,214 @@ describe('барьер скиллов без roots — переключател�
         expect(noRoots - on).toBeLessThan(100);
         expect(src).toMatch(/withSkillGuard\(claudeSessionEnv\(authToken\)\)/);
         expect(src).toMatch(/withSkillGuard\(buildKimiSpawnEnv\(/);
+    });
+});
+
+// #9: канал намерений — вывод сессии. Сессия больше не пишет файл очереди команд
+// оркестратора (харнесс эту запись режет); раннер разбирает вывод своего дочернего процесса
+// и дописывает файл сам. Дальше — прежнее применение, поэтому сценарии ниже идут сквозь
+// него: «доехало до форжа» проверяется вызовами шва, а не содержимым файла.
+describe('collectSessionIntents: намерения из вывода сессии пишет раннер (#9)', () => {
+    const CFG = { issueLabels: ['complexity:low'] };
+    const line = (o: unknown) => JSON.stringify(o);
+    const comment = line({ kind: 'comment', issue: 9, comment: 'что сделано' });
+    const close = line({ kind: 'close', issue: 9, comment: 'закрываю' });
+    const block = (...inner: string[]) => [INTENTS_BEGIN, ...inner, INTENTS_END].join('\n');
+
+    // Файл намерений в памяти: раннер — единственный, кто в него пишет.
+    const memFile = (initial: string | null = null) => {
+        let text = initial;
+        return {
+            read: () => text,
+            write: (t: string) => {
+                text = t;
+            },
+            remove: () => {
+                text = null;
+            },
+            get text() {
+                return text;
+            },
+        };
+    };
+    const taskSource = () => {
+        const calls: string[] = [];
+        return {
+            calls,
+            ts: {
+                commentOnIssue: (n: number, body: string) =>
+                    calls.push(`comment:${n}:${body.replace(/\n\n<!-- ralph-intent:.* -->$/, '')}`),
+                closeIssue: (n: number) => calls.push(`close:${n}`),
+                blockIssue: () => {},
+                createIssue: () => 1,
+                listIssueComments: () => [],
+            },
+        };
+    };
+    const collect = (output: string, file: ReturnType<typeof memFile>, logFn = vi.fn()) =>
+        ralph.collectSessionIntents(output, {
+            readFn: file.read,
+            writeFn: file.write,
+            logFn,
+            dry: false,
+        });
+    const apply = (file: ReturnType<typeof memFile>, ts: object, logFn = vi.fn()) => {
+        const pushEventFn = vi.fn();
+        const quarantined: string[] = [];
+        const res = ralph.applySessionRequests({
+            cfg: CFG,
+            currentMilestone: 'Фаза',
+            dry: false,
+            readFn: file.read,
+            writeFn: file.write,
+            removeFn: file.remove,
+            taskSource: ts,
+            logFn,
+            pushEventFn,
+            sleepFn: () => {},
+            intentIdFn: () => 'abcdef12-0000',
+            quarantineFn: () => {
+                quarantined.push(String(file.text));
+                file.remove();
+                return '/path/to/state/ralph.requests.jsonl.rejected-x';
+            },
+        });
+        return { res, pushEventFn, quarantined };
+    };
+
+    it('блок в выводе доезжает до форжа без записи файла сессией', () => {
+        const file = memFile();
+        collect(`Работа сделана.\n${block(comment, close)}\n`, file);
+        const { ts, calls } = taskSource();
+        const { res } = apply(file, ts);
+        expect(res.failed).toBe(false);
+        expect(calls).toEqual(['comment:9:что сделано', 'comment:9:закрываю', 'close:9']);
+        expect(file.text).toBeNull();
+    });
+
+    it('вывод без блока файл не трогает вовсе', () => {
+        const write = vi.fn();
+        const read = vi.fn(() => null);
+        ralph.collectSessionIntents('просто отчёт', { readFn: read, writeFn: write, dry: false });
+        expect(read).not.toHaveBeenCalled();
+        expect(write).not.toHaveBeenCalled();
+    });
+
+    it('строки дописываются за неприменённым хвостом, а не затирают его', () => {
+        const file = memFile(comment);
+        collect(block(close), file);
+        expect(file.text).toBe(`${comment}\n${close}\n`);
+    });
+
+    it('совместимость: файл, записанный сессией по-старому, всё ещё применяется', () => {
+        const file = memFile(`${comment}\n`);
+        const { ts, calls } = taskSource();
+        expect(apply(file, ts).res.failed).toBe(false);
+        expect(calls).toEqual(['comment:9:что сделано']);
+    });
+
+    it('dry-run: блок назван в логе, файл не пишется', () => {
+        const write = vi.fn();
+        const logFn = vi.fn();
+        ralph.collectSessionIntents(block(close), {
+            readFn: () => null,
+            writeFn: write,
+            logFn,
+            dry: true,
+        });
+        expect(write).not.toHaveBeenCalled();
+        expect(String(logFn.mock.calls[0][0])).toMatch(/dry-run/);
+    });
+
+    // Критерий карточки «от противного»: битый блок → батч не применяется ЦЕЛИКОМ, даже его
+    // корректные строки и даже хвост, лежавший в файле до сессии, и причина — в логе.
+    it.each([
+        ['незакрытый блок', `${INTENTS_BEGIN}\n${comment}\n${close}`, /не закрыт/],
+        ['мусор внутри блока', block(comment, 'это не json', close), /не разобралось как JSON/],
+        ['подделанная метка раннера', block(inFlightMarker('abcdef12-9999'), close), /служебн/],
+    ])('от противного: %s — ничего не применено, причина в логе', (_, output, why) => {
+        const file = memFile(`${comment}\n`);
+        const logFn = vi.fn();
+        collect(output, file, logFn);
+        const { ts, calls } = taskSource();
+        const { res, pushEventFn, quarantined } = apply(file, ts, logFn);
+        expect(calls).toEqual([]);
+        expect(res.failed).toBe(true);
+        expect(res.closedIssues).toEqual([]);
+        expect(quarantined).toHaveLength(1);
+        expect(String(pushEventFn.mock.calls[0][0])).toMatch(why);
+        // Боевой pushEvent пишет строку и в лог — здесь он подменён, поэтому склеиваем.
+        const logged = [...logFn.mock.calls, ...pushEventFn.mock.calls]
+            .map((c) => String(c[0]))
+            .join('\n');
+        expect(logged).toMatch(why);
+        // Текст отвергнутого — в логе целиком: последняя воля сессии не теряется молча.
+        expect(logFn.mock.calls.map((c) => String(c[0])).join('\n')).toContain(close);
+    });
+
+    it('runClaude разбирает вывод каждого запуска, включая упёршийся в лимит', () => {
+        const outputs: string[] = [];
+        const runClaudeOnceFn = vi
+            .fn()
+            .mockReturnValueOnce(claudeRun(1, "You've hit your session limit · resets 11am"))
+            .mockReturnValueOnce({ code: 0, output: block(close) });
+        ralph.runClaude(
+            'промпт',
+            {},
+            {
+                pushEventFn: vi.fn(),
+                sleepFn: vi.fn(),
+                ensureTunnelFn: () => true,
+                runClaudeOnceFn,
+                cfg: { apiLimitMaxWaits: 3, apiLimitGraceMin: 0 },
+                collectIntentsFn: (o: string) => outputs.push(o),
+            },
+        );
+        expect(outputs).toEqual(["You've hit your session limit · resets 11am", block(close)]);
+    });
+
+    it('лимит после блока → повтор с тем же блоком → одно намерение в файле', () => {
+        const file = memFile();
+        const logFn = vi.fn();
+        const runClaudeOnceFn = vi
+            .fn()
+            .mockReturnValueOnce({
+                ...claudeRun(1, `${block(comment, close)}\nYou've hit your session limit`),
+            })
+            .mockReturnValueOnce({ code: 0, output: block(comment, close) });
+        ralph.runClaude(
+            'промпт',
+            {},
+            {
+                pushEventFn: vi.fn(),
+                sleepFn: vi.fn(),
+                ensureTunnelFn: () => true,
+                runClaudeOnceFn,
+                cfg: { apiLimitMaxWaits: 3, apiLimitGraceMin: 0 },
+                collectIntentsFn: (o: string, opts: { seen: Set<string> }) =>
+                    ralph.collectSessionIntents(o, {
+                        readFn: file.read,
+                        writeFn: file.write,
+                        logFn,
+                        dry: false,
+                        ...opts,
+                    }),
+            },
+        );
+        expect(runClaudeOnceFn).toHaveBeenCalledTimes(2);
+        expect(file.text).toBe(`${comment}\n${close}\n`);
+        expect(logFn.mock.calls.map((c) => String(c[0])).join('\n')).toMatch(/не дописаны второй/);
+    });
+
+    it('одинаковые строки внутри одного блока — воля сессии, сверка их не трогает', () => {
+        const file = memFile();
+        ralph.collectSessionIntents(block(comment, comment), {
+            readFn: file.read,
+            writeFn: file.write,
+            logFn: vi.fn(),
+            dry: false,
+            seen: new Set<string>(),
+        });
+        expect(file.text).toBe(`${comment}\n${comment}\n`);
     });
 });

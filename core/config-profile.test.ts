@@ -953,13 +953,24 @@ describe('resolveProfile — review.fallback не может быть слабе
         ).toThrow(/review\.fallback.*claude-haiku-4-5-20251001.*слабее.*review\.default/s);
     });
 
-    it('review.fallback той же силы, что review.default — конфиг принимается', () => {
-        const cfg = resolveProfile(
-            rawWithReview({ default: 'claude-opus-4-8', fallback: 'claude-opus-4-8' }),
-            null,
-            boom,
-        );
-        expect(cfg.review.fallback).toBe('claude-opus-4-8');
+    it('review.fallback равен review.default — стоп: такой фолбэк не страхует (#46)', () => {
+        expect(() =>
+            resolveProfile(
+                rawWithReview({ default: 'claude-opus-4-8', fallback: 'claude-opus-4-8' }),
+                null,
+                boom,
+            ),
+        ).toThrow(/review\.fallback = review\.default/);
+    });
+
+    it('review.escalated равен review.default — стоп на резолве профиля (#46)', () => {
+        expect(() =>
+            resolveProfile(
+                rawWithReview({ default: 'claude-opus-4-8', escalated: 'claude-opus-4-8' }),
+                null,
+                boom,
+            ),
+        ).toThrow(/review\.escalated.*не сильнее/);
     });
 
     it('review.fallback сильнее review.default — конфиг принимается', () => {
