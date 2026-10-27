@@ -110,6 +110,22 @@ export function classifyMergeFailure(message: string): MergeFailureKind {
     return 'unknown';
 }
 
+// Класс отказа мерджа словами — одна формулировка на лог гейта и стоп петли (#123):
+// пока каждое место писало свою, тексты расходились при первой правке.
+export function describeMergeFailure(
+    kind: MergeFailureKind,
+    { attempts, retryMaxMs }: { attempts: number; retryMaxMs: number },
+): string {
+    if (kind === 'refusal') return 'отказ форжа по существу, повтором не лечится';
+    if (kind === 'transient') {
+        return (
+            `транзиентные отказы форжа дольше предела ${String(Math.round(retryMaxMs / 60000))} мин ` +
+            `(${String(attempts)} попыток)`
+        );
+    }
+    return 'отказ форжа не распознан и после повтора';
+}
+
 // Предел по времени на повторы транзиента — от первого отказа. Десять минут — порядок
 // окна, в котором слоистый сбой площадки на памяти проходил, и всё ещё меньше одного
 // повторного гейта с e2e.

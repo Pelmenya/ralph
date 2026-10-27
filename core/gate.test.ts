@@ -796,7 +796,7 @@ describe('tryMergePhase — повтор мерджа по классу отка
             parkFn: park,
             ...(mergeRetryMaxMs === undefined ? {} : { mergeRetryMaxMs }),
         });
-        return { res, mergePrFn, pauses, logs, park };
+        return { res, mergePrFn, pauses, logs, park, g };
     }
 
     it('транзиент 503 → повторы с растущей паузой, успех на 4-й попытке = мердж', () => {
@@ -843,6 +843,44 @@ describe('tryMergePhase — повтор мерджа по классу отка
         const stop = logs.find((l) => l.startsWith('⛔')) ?? '';
         expect(stop).toContain('дольше предела 10 мин');
         expect(stop).toContain('оставлен человеку');
+    });
+
+    // #123: класс отказа и строка форжа уходят геттером — иначе пуш человеку на
+    // `not-merged` шёл катч-оллом «причина не установлена», а причина жила только в логе.
+    it('#123: исчерпанный предел → геттер отдаёт класс transient, строку форжа и число попыток', () => {
+        const { res, mergePrFn, g } = run(['GraphQL: Something went wrong (HTTP 503)'], {
+            alwaysFail: true,
+            mergeRetryMaxMs: 10 * 60 * 1000,
+        });
+        expect(res).toBe('not-merged');
+        expect(g.getLastMergeFailure()).toEqual({
+            pr: 9,
+            kind: 'transient',
+            line: 'GraphQL: Something went wrong (HTTP 503)',
+            attempts: mergePrFn.mock.calls.length,
+            retryMaxMs: 10 * 60 * 1000,
+        });
+    });
+
+    it('#123: отказ по существу → геттер отдаёт refusal и первую строку ответа, а не команду', () => {
+        const { g } = run(['Pull request #9 is not mergeable: conflict.\nвторая строка']);
+        const mf = g.getLastMergeFailure();
+        expect(mf?.kind).toBe('refusal');
+        expect(mf?.line).toBe('Pull request #9 is not mergeable: conflict.');
+        expect(mf?.attempts).toBe(1);
+    });
+
+    it('#123: следующий проход гейта сбрасывает причину прошлого отказа', () => {
+        const { g } = run(['Pull request #9 is not mergeable: conflict.']);
+        expect(g.getLastMergeFailure()).not.toBeNull();
+        expect(tryMergeWith(g, phase, { dry: true })).toBe('not-merged');
+        expect(g.getLastMergeFailure()).toBeNull();
+    });
+
+    it('#123: успешный мердж причины отказа не оставляет', () => {
+        const { res, g } = run(['HTTP 503']);
+        expect(res).toBe('merged');
+        expect(g.getLastMergeFailure()).toBeNull();
     });
 
     it('предел берётся из конфига (mergeRetryMaxMs)', () => {

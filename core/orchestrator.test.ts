@@ -4385,6 +4385,7 @@ describe('runLoop — основной while-цикл: итерации коде
                 // не предмет теста, поэтому коммит «не удался» — цикл выходит сразу, как и был.
                 commitLeftoversFn: () => false,
                 monitorConfigPath: '/tmp/ralph.config.json',
+                monitorExecutionRoot: '/path/to/work-tree',
                 ensureMonitorAliveFn,
             }),
         );
@@ -4394,6 +4395,8 @@ describe('runLoop — основной while-цикл: итерации коде
             expect.objectContaining({
                 profile: 'prod',
                 configPath: '/tmp/ralph.config.json',
+                // #126: переподнятый монитор показывает то же дерево работы, что и первый.
+                executionRoot: '/path/to/work-tree',
                 logFn: expect.any(Function),
             }),
         );
@@ -5697,6 +5700,134 @@ describe('runLoop — основной while-цикл: итерации коде
             const msg = String(pushEventFn.mock.calls[0][0]);
             expect(msg).toMatch(/Issue #7 взят 3 итерации подряд/);
             expect(msg).not.toMatch(/батч намерений|выбыло/);
+        });
+
+        // #124: отказ разбора детерминирован. Без карантина следующая сессия дописывала
+        // свои намерения в тот же файл, разбор отвергал его из-за старой строки, и close
+        // не применялся до брейкера серии — итерации сгорали гарантированно впустую.
+        describe('#124: отвергнутый разбором батч не отравляет следующую сессию', () => {
+            // Файл намерений в памяти и НАСТОЯЩЕЕ применение поверх него: проверяется
+            // связка «разбор → карантин → следующий батч», а не заглушка шва.
+            const intentFile = (quarantineFails = false) => {
+                const f = { text: null as string | null, quarantined: [] as string[] };
+                const closed: number[] = [];
+                const quarantineFn = vi.fn(() => {
+                    if (quarantineFails) throw new Error('EACCES');
+                    f.quarantined.push(f.text ?? '');
+                    f.text = null;
+                    return '/state/ralph.requests.jsonl.rejected-1';
+                });
+                const apply = (a: Record<string, unknown>) =>
+                    ralph.applySessionRequests({
+                        ...(a as Parameters<typeof ralph.applySessionRequests>[0]),
+                        readFn: () => f.text,
+                        writeFn: (t: string) => (f.text = t),
+                        removeFn: () => (f.text = null),
+                        sleepFn: () => {},
+                        taskSource: {
+                            commentOnIssue: () => {},
+                            closeIssue: (n: number) => closed.push(n),
+                        } as never,
+                    });
+                const append = (line: string) => (f.text = `${f.text ?? ''}${line}\n`);
+                return { f, closed, quarantineFn, apply, append };
+            };
+            const sessions = (append: (l: string) => void) => {
+                let n = 0;
+                return vi.fn(() => {
+                    n++;
+                    // Первая сессия пишет битую строку (issue строкой), вторая — верный close.
+                    append(
+                        n === 1
+                            ? '{"kind":"close","issue":"7","comment":"готово"}'
+                            : '{"kind":"close","issue":7,"comment":"готово"}',
+                    );
+                    return 0;
+                });
+            };
+
+            it('битый файл после первой сессии, верный close второй — close применён', () => {
+                const { f, closed, quarantineFn, apply, append } = intentFile();
+                const pushEventFn = vi.fn();
+                const runClaudeFn = sessions(append);
+                const logs: string[] = [];
+                runLoop(
+                    validCfg({ maxIterations: 2 }),
+                    { ...ctx(mkState()), maxIterations: 2 },
+                    deps(logs, {
+                        phaseIndexOfFn: () => 0,
+                        openIssuesFn: () =>
+                            closed.includes(7) ? [] : [{ number: 7, title: 't', labels: [] }],
+                        shFn: movingHead(),
+                        runClaudeFn,
+                        applySessionRequestsFn: apply,
+                        quarantineSessionRequestsFn: quarantineFn,
+                        pushEventFn,
+                    }),
+                );
+                expect(runClaudeFn).toHaveBeenCalledTimes(2);
+                expect(closed).toEqual([7]);
+                expect(quarantineFn).toHaveBeenCalledTimes(1);
+                // В карантин ушла ровно отвергнутая строка, а не close второй сессии.
+                expect(f.quarantined).toEqual([
+                    '{"kind":"close","issue":"7","comment":"готово"}\n',
+                ]);
+                const first = String(pushEventFn.mock.calls[0][0]);
+                expect(first).toContain('/state/ralph.requests.jsonl.rejected-1');
+                expect(first).not.toContain('оставлен как есть');
+                // Текст отвергнутого батча — в логе: карантинный файл могут убрать.
+                expect(logs.join('\n')).toContain('"issue":"7"');
+            });
+
+            it('карантин не удался — стоп после первого отказа, а не через maxSameIssue', () => {
+                const { quarantineFn, apply, append, closed } = intentFile(true);
+                const pushEventFn = vi.fn();
+                const runClaudeFn = sessions(append);
+                const state = mkState();
+                runLoop(
+                    validCfg(),
+                    ctx(state),
+                    deps([], {
+                        phaseIndexOfFn: () => 0,
+                        openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                        shFn: movingHead(),
+                        runClaudeFn,
+                        applySessionRequestsFn: apply,
+                        quarantineSessionRequestsFn: quarantineFn,
+                        pushEventFn,
+                    }),
+                );
+                expect(runClaudeFn).toHaveBeenCalledTimes(1);
+                expect(closed).toEqual([]);
+                expect(pushEventFn).toHaveBeenCalledTimes(1);
+                const msg = String(pushEventFn.mock.calls[0][0]);
+                expect(msg).toContain('(intent-rejected)');
+                expect(msg).toContain('EACCES');
+                expect(msg).not.toContain('(breaker)');
+            });
+
+            it('от противного: без карантина круг доходит до брейкера серии', () => {
+                const { apply, append, closed } = intentFile();
+                const pushEventFn = vi.fn();
+                const runClaudeFn = sessions(append);
+                runLoop(
+                    validCfg(),
+                    ctx(mkState()),
+                    deps([], {
+                        phaseIndexOfFn: () => 0,
+                        openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                        shFn: movingHead(),
+                        runClaudeFn,
+                        // Проводка карантина снята: применение получает quarantineFn undefined.
+                        applySessionRequestsFn: (a: Record<string, unknown>) =>
+                            apply({ ...a, quarantineFn: undefined }),
+                        pushEventFn,
+                    }),
+                );
+                expect(runClaudeFn).toHaveBeenCalledTimes(3);
+                expect(closed).toEqual([]);
+                expect(String(pushEventFn.mock.calls.at(-1)?.[0])).toContain('(breaker)');
+            });
         });
 
         it('порог из конфига (maxSameIssue)', () => {
@@ -9392,6 +9523,116 @@ describe('runLoop — основной while-цикл: итерации коде
         expect(state.gateHeals).toBe(0);
     });
 
+    // #123: мердж не удался после вызова — класс отказа и строку форжа гейт знает, а пуш
+    // раньше уходил катч-оллом «причина не установлена (unknown)».
+    it('#123: исчерпанный предел повторов мерджа — пуш с классом отказа и строкой форжа', () => {
+        const state = mkState({ submitted: true, gateHeals: 1 });
+        const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+        const pushEventFn = vi.fn((msg: string) => msg.length > 0);
+        runLoop(
+            validCfg({ gateHealAttempts: 2 }),
+            ctx(state),
+            deps([], {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => false,
+                tryMergePhaseFn: () => 'not-merged',
+                getLastMergeFailure: () => ({
+                    pr: 7,
+                    kind: 'transient' as const,
+                    line: 'GraphQL: Something went wrong (HTTP 503)',
+                    attempts: 8,
+                    retryMaxMs: 10 * 60 * 1000,
+                }),
+                runClaudeFn,
+                pushEventFn,
+            }),
+        );
+        expect(runClaudeFn).not.toHaveBeenCalled();
+        expect(pushEventFn).toHaveBeenCalledTimes(1);
+        const stopText = String(pushEventFn.mock.calls[0][0]);
+        expect(stopText).toContain('(merge-failed)');
+        expect(stopText).toContain('GraphQL: Something went wrong (HTTP 503)');
+        expect(stopText).toContain('транзиент');
+        expect(stopText).toContain('10 мин');
+        expect(stopText).toContain('PR #7');
+        expect(stopText).not.toContain('(unknown)');
+        expect(state.gateHeals).toBe(0);
+    });
+
+    it('#123: отказ форжа по существу — пуш называет класс refusal, а не unknown', () => {
+        const pushEventFn = vi.fn((msg: string) => msg.length > 0);
+        runLoop(
+            validCfg(),
+            ctx(mkState({ submitted: true })),
+            deps([], {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => false,
+                tryMergePhaseFn: () => 'not-merged',
+                getLastMergeFailure: () => ({
+                    pr: 7,
+                    kind: 'refusal' as const,
+                    line: 'Pull request #7 is not mergeable',
+                    attempts: 1,
+                    retryMaxMs: 600_000,
+                }),
+                pushEventFn,
+            }),
+        );
+        const stopText = String(pushEventFn.mock.calls[0][0]);
+        expect(stopText).toContain('(merge-failed)');
+        expect(stopText).toContain('по существу');
+        expect(stopText).toContain('Pull request #7 is not mergeable');
+    });
+
+    it('#123: нераспознанный отказ после повтора — пуш называет класс unknown-отказа форжа', () => {
+        const pushEventFn = vi.fn((msg: string) => msg.length > 0);
+        runLoop(
+            validCfg(),
+            ctx(mkState({ submitted: true })),
+            deps([], {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => false,
+                tryMergePhaseFn: () => 'not-merged',
+                getLastMergeFailure: () => ({
+                    pr: 7,
+                    kind: 'unknown' as const,
+                    line: 'something odd',
+                    attempts: 2,
+                    retryMaxMs: 600_000,
+                }),
+                pushEventFn,
+            }),
+        );
+        const stopText = String(pushEventFn.mock.calls[0][0]);
+        expect(stopText).toContain('(merge-failed)');
+        expect(stopText).toContain('не распознан и после повтора');
+        expect(stopText).toContain('something odd');
+    });
+
+    // `not-merged` без вызова мерджа (dry, грязное дерево, PR не найден) записи об отказе
+    // не несёт — для него катч-олл остаётся честным: причину гейт не устанавливал.
+    it('#123: not-merged без записи об отказе мерджа — по-прежнему катч-олл unknown', () => {
+        const pushEventFn = vi.fn((msg: string) => msg.length > 0);
+        runLoop(
+            validCfg(),
+            ctx(mkState({ submitted: true })),
+            deps([], {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => false,
+                tryMergePhaseFn: () => 'not-merged',
+                getLastMergeFailure: () => null,
+                pushEventFn,
+            }),
+        );
+        const stopText = String(pushEventFn.mock.calls[0][0]);
+        expect(stopText).toContain('(unknown)');
+        expect(stopText).not.toContain('(merge-failed)');
+    });
+
     // #269-ревью: соседний стоп «бюджет исчерпан» сбрасывает счётчик и прямо обещает это
     // в логе, а `forge-env` не сбрасывал. Сценарий: forge-red → одна чини-сессия → OOM
     // на следующем круге, и человеку, починившему память контейнера, остаётся одна попытка
@@ -11095,6 +11336,25 @@ describe('startMonitor — авто-спавн панели прогресса (
         // Панель относительный путь не принимает: он резолвился бы от места ЕЁ запуска.
         expect(path.isAbsolute(argv[at + 1])).toBe(true);
         expect(argv[at + 1]).toBe(path.resolve('.claude/ralph'));
+    });
+
+    // #126: строка `git:` панели показывает дерево, в котором работает раннер. Вывести его
+    // сама панель не может: подъём от каталога ядра уводил выше корня, а ядро исполняется
+    // из установки, у которой своя ветка.
+    it('дерево работы уходит монитору флагом --execution-root', () => {
+        const d = deps({ executionRoot: '/path/to/work-tree' });
+        startMonitor(d);
+        const [, argv] = d.spawnFn.mock.calls[0];
+        const at = argv.indexOf('--execution-root');
+        expect(at, '--execution-root не передан монитору').toBeGreaterThan(0);
+        expect(argv[at + 1]).toBe('/path/to/work-tree');
+    });
+
+    it('main передаёт монитору дерево сессий — при спавне и для переподнятия', () => {
+        const src = fs.readFileSync(path.join(import.meta.dirname, 'orchestrator.ts'), 'utf8');
+        const body = src.slice(src.indexOf('📂 Рабочее дерево раннера'));
+        expect(body).toMatch(/startMonitor\(\{[^}]*executionRoot: sessionTree/);
+        expect(body).toMatch(/monitorExecutionRoot: sessionTree/);
     });
 
     itPosix('без профиля (прямой вызов) лишних флагов нет — кроме адреса экземпляра', () => {
@@ -13269,6 +13529,27 @@ describe('applySessionRequests: намерения сессии применяе
     };
 
     const line = (o: unknown) => JSON.stringify(o);
+
+    // #124: dry read-only (C1) — отвергнутый батч не переезжает в карантин и в dry.
+    it('#124 dry: отвергнутый батч в карантин не снимается, файл оставлен как есть', () => {
+        const quarantineFn = vi.fn(() => '/x');
+        const pushEventFn = vi.fn();
+        const res = ralph.applySessionRequests({
+            cfg: CFG,
+            dry: true,
+            readFn: () => line({ kind: 'close', issue: '7', comment: 'x' }),
+            writeFn: () => {},
+            removeFn: () => {},
+            taskSource: fakeTaskSource().ts,
+            logFn: () => {},
+            pushEventFn,
+            quarantineFn,
+        });
+        expect(quarantineFn).not.toHaveBeenCalled();
+        expect(res.failed).toBe(true);
+        expect(res.rejected).toBeUndefined();
+        expect(String(pushEventFn.mock.calls[0][0])).toContain('оставлен как есть');
+    });
 
     // #603: предел на батч намерений теперь считается раздельно по классам (мутации vs
     // комментарии) — здесь проверяется ПРОВОДКА до пуша/лога, сами пределы и разбор — в

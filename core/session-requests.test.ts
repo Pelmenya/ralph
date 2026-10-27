@@ -16,6 +16,7 @@ import {
     inFlightEntry,
     inFlightMarker,
     parseSessionRequests,
+    quarantinePath,
     reconcileInFlight,
     withIntentMark,
     serializeSessionRequest,
@@ -625,5 +626,24 @@ describe('#94 метка намерения и сверка', () => {
             verdict: 'unknown',
             why: expect.stringContaining('HTTP 502'),
         });
+    });
+});
+
+// #124: имя карантина — от переданных часов, занятое имя не затирается.
+describe('quarantinePath (#124)', () => {
+    const now = Date.UTC(2026, 9, 27, 1, 2, 3, 4);
+    it('имя — от переданного времени, без двоеточий и точек', () => {
+        expect(quarantinePath('/s/r.jsonl', now, () => false)).toBe(
+            '/s/r.jsonl.rejected-2026-10-27T01-02-03-004Z',
+        );
+    });
+    it('занятое имя получает первый свободный номер, а не затирается', () => {
+        const taken = new Set([
+            '/s/r.jsonl.rejected-2026-10-27T01-02-03-004Z',
+            '/s/r.jsonl.rejected-2026-10-27T01-02-03-004Z-1',
+        ]);
+        expect(quarantinePath('/s/r.jsonl', now, (p) => taken.has(p))).toBe(
+            '/s/r.jsonl.rejected-2026-10-27T01-02-03-004Z-2',
+        );
     });
 });

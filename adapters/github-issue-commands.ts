@@ -269,6 +269,31 @@ export function createGithubIssueCommands(env: GithubIssueCommandsEnv) {
         runArgvFn('gh', ['issue', 'comment', String(issue), '--body', body]);
     }
 
+    // #125: лента комментариев карточки — для сверки начатого намерения по метке (#94).
+    // Те же `issues/N/comments`, что у первой поверхности ленты PR (`prComments`): у GitHub
+    // карточка и PR делят этот маршрут. `--paginate` склеивает страницы в один массив —
+    // метка давнего прохода могла уехать за первую сотню.
+    //
+    // Fail-closed: ответ не массивом — отказ, а не пустая лента. Пустую сверка прочла бы
+    // как «не лёг» и опубликовала бы комментарий вторым.
+    function issueComments(
+        issue: number,
+        { ghJsonFn = ghJson }: { ghJsonFn?: GhJsonFn } = {},
+    ): string[] {
+        const endpoint = `repos/{owner}/{repo}/issues/${String(issue)}/comments`;
+        const items = ghJsonFn<unknown>(`gh api ${endpoint} --paginate`);
+        if (!Array.isArray(items)) {
+            throw new Error(
+                `gh api ${endpoint} вернул не массив — формат ответа неожиданный ` +
+                    `(получено: ${JSON.stringify(items).slice(0, 200)}).`,
+            );
+        }
+        return items.map((raw) => {
+            const body = (raw as { body?: unknown } | null)?.body;
+            return typeof body === 'string' ? body : '';
+        });
+    }
+
     function closeIssue(
         issue: number,
         { runArgvFn = shArgv }: { runArgvFn?: ShArgvFn } = {},
@@ -382,6 +407,7 @@ export function createGithubIssueCommands(env: GithubIssueCommandsEnv) {
         milestoneLabels,
         issueDetails,
         commentOnIssue,
+        issueComments,
         closeIssue,
         blockIssue,
         closeMilestoneByTitle,

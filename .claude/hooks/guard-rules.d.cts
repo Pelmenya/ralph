@@ -10,8 +10,15 @@ export type TGuardDecision = {
     reason: string | null;
 };
 
-/** Подмена окружения правила про kill (#196) — только для тестов. */
+/** Контур потребителя: разобранный `.claude/ralph/hooks.json` (`consumer-data.cjs`). */
+export type TGuardContour = {
+    mcp: { writeAllowed: Set<string>; neverExceptions: Set<string> };
+};
+
+/** Данные контура и подмена окружения правила про kill (#196) — только для тестов. */
 export type TGuardDecideOptions = {
+    contour?: TGuardContour;
+    loop?: boolean | (() => boolean);
     processInfo?: (
         pid: number,
     ) => { comm: string; ppid: number; cwd: string; cmdline: string } | null;
@@ -25,7 +32,7 @@ export declare function decide(
     options?: TGuardDecideOptions,
 ): TGuardDecision;
 
-export declare function mcpAllowed(toolName: string): boolean;
+export declare function mcpAllowed(toolName: string, mcp?: TGuardContour['mcp']): boolean;
 
 export declare const ENV_FILE_RE: RegExp;
 export declare const CMD_ENV_RE: RegExp;

@@ -8,9 +8,11 @@
  * правка файла, за который отвечает скилл, блокируется, пока в транскрипте ЭТОЙ сессии
  * нет вызова `Skill` с нужным именем.
  *
- * В каноне ряд один — тесты и `vitest` (скилл лежит в `.claude/skills/vitest`): канон —
- * библиотека на Node, и других типов файлов со своим скиллом у него нет. Новый ряд —
- * вместе со скиллом в том же PR, иначе барьер требовал бы то, чего нет.
+ * Таблица «файл или команда → скилл» — данные потребителя (`.claude/ralph/hooks.json`,
+ * раздел `skills`; разбор — `consumer-data.cjs`), а не код хука (#99): исполняемая часть
+ * едет с ядром, а какие скиллы есть у проекта, ядро знать не обязано. У канона ряд один —
+ * тесты и `vitest`. Новый ряд — вместе со скиллом в том же PR, иначе барьер требовал бы
+ * то, чего нет.
  *
  * Input (stdin): JSON { tool_name, tool_input, transcript_path, session_id }.
  * Exit 2 + stderr — инструмент заблокирован, текст уходит агенту; exit 0 — разрешено.
@@ -21,43 +23,55 @@
  *    heredoc'ом, `python3 -` и `sed -i` (у потребителя: 54 записи через Bash, ноль через
  *    `Edit` за одну сессию). Поэтому Bash-команда с путём целевого файла И признаком
  *    записи считается правкой.
- * 2. **Сессия петли узнаётся по транскрипту, а не по окружению.** Первое сообщение
- *    пользователя в сессии раннера — проектный промпт из конфига, и он отсылает к файлу
- *    контракта `ralph.md`: у потребителя — `.claude/ralph/ralph.md`, у канона — в корне.
- *    Обе формы узнаются одним правилом. В сессии человека барьер не вмешивается.
- *    Переключатель на случай проверки руками: `RALPH_SKILL_GUARD=on|off`.
+ * 2. **Сессия петли узнаётся по контракту запуска.** Раннер передаёт сессии
+ *    `RALPH_CORE_SHA` (`core-revision.cjs`), и хук сверяет с этой ревизией ядра себя:
+ *    разошёлся, ревизия недоступна, сверка упала — блок. Прежний признак — строка
+ *    `ralph.md` в первом сообщении транскрипта — при внешней установке ломался бы молча
+ *    (путь контракта другой, неопознанная сессия пропускается). Он остаётся ПЕРЕХОДНЫМ
+ *    запасным признаком, пока раннер не передаёт контракт сессиям: без него барьер в
+ *    петле сегодня не узнал бы никого. В сессии человека барьер не вмешивается.
+ *    Переключатель на случай проверки руками: `RALPH_SKILL_GUARD=on|off`. Контракт
+ *    сильнее переключателя: при заявленной петле `off` не действует — иначе переменная,
+ *    унаследованная из окружения раннера или env-файла, молча снимала бы барьер в его
+ *    сессиях.
  * 3. **Транскрипт назван, но не читается — блокировка, не пропуск**: барьер, отчитавшийся
  *    «нарушений нет», не заглянув в файл, — тот же тихий отказ. Транскрипт не назван
- *    вовсе — разрешено: без него сессию петли не отличить, а ложная блокировка сессии
- *    человека стоит дороже.
+ *    вовсе — разрешено, если петля не заявлена контрактом: без него сессию петли не
+ *    отличить, а ложная блокировка сессии человека стоит дороже. Петля заявлена, а
+ *    транскрипта нет — блок: проверить вызов `Skill` нечем.
  *
  * Факт «скилл загружен» кэшируется маркером в tmpdir по `session_id`: транскрипт только
  * растёт, а барьер стоит на каждом вызове Bash.
+ *
+ * Ревизия сверяется ДО загрузки соседних модулей (`consumer-data.cjs` грузится только
+ * после вердикта): правленый сосед, исполненный первым, подменял сверщик. И сверка идёт
+ * на любом вызове, а не только там, где нужен скилл, — это второй, независимый от guard'а
+ * сверщик каталога: правленый `guard.cjs` снимает сверку у себя, но не здесь. Цена —
+ * несколько миллисекунд на вызов (git-процесс и хеши `*.cjs`); кэш ожидаемых хешей в
+ * tmpdir её снял бы, но он стал бы источником правды, который сессия может подложить.
  */
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+// Только сверщик: он без соседей. Данные потребителя — после вердикта ревизии, в main().
+// Переходный признак петли (п. 2 докблока) — там же: им пользуется и guard.
+const {
+    checkCoreRevision,
+    describeError,
+    expectedSha,
+    firstUserPrompt,
+    isLoopPrompt,
+    LOOP_PROMPT_RE,
+} = require('./core-revision.cjs');
 
 const EXIT_BLOCKED = 2;
-// Ссылка на файл контракта как на ПУТЬ: начало строки, пробел, слэш, кавычка или скобка
-// перед именем. Так `.claude/ralph/ralph.md` и `ralph.md` узнаются, а `myralph.md` — нет.
-const LOOP_PROMPT_RE = /(?:^|[\s/`'"(])ralph\.md\b/;
-
-/** Что за файл → какой скилл обязан быть загружен до его правки. */
-const RULES = [
-    {
-        test: (p) => /\.test\.m?tsx?$/.test(p),
-        skills: ['vitest'],
-        why: 'тест — моки, фикстуры и покрытие по скиллу vitest',
-    },
-];
 
 /**
- * Ряды, которые узнаются по команде, а не по файлу. У потребителя здесь стоит коммит →
- * `git-commit`; у канона своего скилла коммита нет, поэтому список пуст, но механизм
- * остаётся — ряд приезжает вместе со скиллом.
+ * Таблица скиллов: `files` — что за файл → какой скилл обязан быть загружен до его
+ * правки; `commands` — ряды, которые узнаются по команде (у потребителя — коммит →
+ * `git-commit`). Без данных потребителя таблица пуста.
  */
-const COMMAND_RULES = [];
+const NO_RULES = { files: [], commands: [] };
 
 /** Признаки, по которым Bash-команда считается ЗАПИСЬЮ в файл, а не чтением. */
 const WRITE_MARKERS = [
@@ -97,7 +111,7 @@ function targetsOf(toolName, toolInput) {
 }
 
 /** Скиллы, обязательные для набора путей и команды, с причиной — для текста отказа. */
-function requiredSkills(targets, command = '') {
+function requiredSkills(targets, command = '', rules = NO_RULES) {
     const required = new Map();
     const add = (rule, target) => {
         for (const skill of rule.skills) {
@@ -105,9 +119,9 @@ function requiredSkills(targets, command = '') {
         }
     };
     for (const target of targets) {
-        for (const rule of RULES) if (rule.test(target)) add(rule, target);
+        for (const rule of rules.files) if (rule.test(target)) add(rule, target);
     }
-    for (const rule of COMMAND_RULES) if (rule.test(command)) add(rule, 'команда');
+    for (const rule of rules.commands) if (rule.test(command)) add(rule, 'команда');
     return required;
 }
 
@@ -117,32 +131,14 @@ function commandOf(toolName, toolInput) {
     return toolName === 'Bash' && typeof input.command === 'string' ? input.command : '';
 }
 
-/** Первое сообщение пользователя из транскрипта — строкой, как его прислал раннер. */
-function firstUserPrompt(lines) {
-    for (const line of lines) {
-        if (!line.includes('"type":"user"')) continue;
-        let record;
-        try {
-            record = JSON.parse(line);
-        } catch {
-            continue;
-        }
-        if (record.type !== 'user') continue;
-        const content = record.message && record.message.content;
-        if (typeof content === 'string') return content;
-        if (Array.isArray(content)) {
-            const text = content.find((b) => b && b.type === 'text' && typeof b.text === 'string');
-            return text ? text.text : '';
-        }
-        return '';
-    }
-    return '';
-}
-
 function isLoopTranscript(lines, env = process.env) {
+    // Контракт запуска сильнее и переключателя, и транскрипта: раннер заявил петлю —
+    // ни `RALPH_SKILL_GUARD=off`, ни промпт её не отменяют.
+    if (expectedSha(env) !== '') return true;
     if (env.RALPH_SKILL_GUARD === 'on') return true;
     if (env.RALPH_SKILL_GUARD === 'off') return false;
-    return LOOP_PROMPT_RE.test(firstUserPrompt(lines));
+    if (lines === null) return false;
+    return isLoopPrompt(lines);
 }
 
 /** Имена скиллов, вызванных инструментом `Skill` за сессию. */
@@ -173,13 +169,33 @@ function markerDir(sessionId) {
 }
 
 /** Вердикт по вызову: {blocked, reason}. Чистая функция — транскрипт приходит строками. */
-function decide({ toolName, toolInput, transcriptLines, env = process.env, cached = new Set() }) {
-    const required = requiredSkills(targetsOf(toolName, toolInput), commandOf(toolName, toolInput));
+function decide({
+    toolName,
+    toolInput,
+    transcriptLines,
+    env = process.env,
+    cached = new Set(),
+    rules = NO_RULES,
+}) {
+    const required = requiredSkills(
+        targetsOf(toolName, toolInput),
+        commandOf(toolName, toolInput),
+        rules,
+    );
     if (required.size === 0) return { blocked: false };
-    if (transcriptLines === null) return { blocked: false }; // транскрипт не назван
+    // Транскрипт не назван: без контракта запуска сессию петли не отличить, а ложная
+    // блокировка сессии человека стоит дороже. С контрактом — судить о скиллах нечем.
     if (!isLoopTranscript(transcriptLines, env)) return { blocked: false };
     const missing = [...required].filter(([skill]) => !cached.has(skill));
     if (missing.length === 0) return { blocked: false, loaded: [...required.keys()] };
+    if (transcriptLines === null) {
+        return {
+            blocked: true,
+            reason:
+                '[skill-barrier.cjs] Сессия петли заявлена контрактом запуска, а транскрипт ' +
+                'не назван — проверить вызов Skill нечем, правка заблокирована fail-closed.',
+        };
+    }
     const loaded = loadedSkills(transcriptLines);
     const stillMissing = missing.filter(([skill]) => !loaded.has(skill));
     if (stillMissing.length === 0) return { blocked: false, loaded: [...required.keys()] };
@@ -217,12 +233,39 @@ async function main() {
     try {
         input = JSON.parse((await readStdin()) || '{}');
     } catch (error) {
-        block(`[skill-barrier.cjs] Вход не разобрался (${String(error)}) — вызов заблокирован.`);
+        block(
+            `[skill-barrier.cjs] Вход не разобрался (${describeError(error)}) — вызов заблокирован.`,
+        );
     }
     const toolName = input.tool_name || '';
     const toolInput = input.tool_input || {};
-    if (requiredSkills(targetsOf(toolName, toolInput), commandOf(toolName, toolInput)).size === 0)
-        return;
+
+    // Ревизия — до всего остального и на любом вызове: хук не той ревизии не судит ни о
+    // чём, в том числе о том, нужен ли тут скилл.
+    let revision;
+    try {
+        revision = checkCoreRevision();
+    } catch (error) {
+        revision = { error: describeError(error) };
+    }
+    if (revision.error) {
+        block(
+            `[skill-barrier.cjs] Ревизия хука не сверилась с ядром: ${revision.error} ` +
+                'Вызов заблокирован: хук не той ревизии — не тот барьер, который ревьюили.',
+        );
+    }
+
+    let rules;
+    try {
+        rules = require('./consumer-data.cjs').loadConsumerData().skills;
+    } catch (error) {
+        block(
+            `[skill-barrier.cjs] Таблица скиллов не загрузилась (${describeError(error)}) — ` +
+                'вызов заблокирован fail-closed.',
+        );
+    }
+    const targets = targetsOf(toolName, toolInput);
+    if (requiredSkills(targets, commandOf(toolName, toolInput), rules).size === 0) return;
 
     let transcriptLines = null;
     if (typeof input.transcript_path === 'string' && input.transcript_path !== '') {
@@ -231,7 +274,7 @@ async function main() {
         } catch (error) {
             block(
                 `[skill-barrier.cjs] Транскрипт ${input.transcript_path} не читается ` +
-                    `(${String(error)}) — судить о сессии нечем, вызов заблокирован fail-closed.`,
+                    `(${describeError(error)}) — судить о сессии нечем, вызов заблокирован fail-closed.`,
             );
         }
     }
@@ -243,7 +286,7 @@ async function main() {
     } catch {
         /* маркеров ещё нет */
     }
-    const verdict = decide({ toolName, toolInput, transcriptLines, cached });
+    const verdict = decide({ toolName, toolInput, transcriptLines, cached, rules });
     if (verdict.blocked) block(verdict.reason);
     if (verdict.loaded) {
         try {
@@ -256,8 +299,7 @@ async function main() {
 }
 
 module.exports = {
-    RULES,
-    COMMAND_RULES,
+    NO_RULES,
     LOOP_PROMPT_RE,
     targetsOf,
     requiredSkills,
@@ -270,6 +312,7 @@ module.exports = {
 if (require.main === module) {
     main().then(
         () => process.exit(0),
-        (error) => block(`[skill-barrier.cjs] Ошибка барьера: ${String(error)} — заблокировано.`),
+        (error) =>
+            block(`[skill-barrier.cjs] Ошибка барьера: ${describeError(error)} — заблокировано.`),
     );
 }

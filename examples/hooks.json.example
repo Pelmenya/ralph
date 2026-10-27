@@ -1,0 +1,27 @@
+{
+    "$comment": "Шаблон данных хуков ядра: копируется в <проект>/.claude/ralph/hooks.json без .example. Ключи — закрытый перечень: незнакомый ключ блокирует каждый вызов. Файла нет — самый строгий контур: ни одной MCP-мутации, ни одного обязательного скилла. Правка файла меняет барьер — держи её под ревью человека, как сами хуки.",
+    "mcp": {
+        "writeAllowed": [
+            "mcp__your-forge__CreateIssue",
+            "mcp__your-forge__CreateIssueComment",
+            "mcp__your-forge__AddLabels",
+            "mcp__your-forge__RemoveLabels",
+            "mcp__your-forge__CreatePullRequest",
+            "mcp__your-forge__CreatePullRequestComment"
+        ],
+        "neverExceptions": [],
+        "notes": {
+            "mcp__your-forge__CreatePullRequest": "Обоснование каждой записи — здесь, рядом с ней: почему мутация нужна рабочему циклу и чем отменяется. Одобрение ревью (approve) сюда не вносится: с ним агент одобрял бы собственный PR."
+        }
+    },
+    "skills": {
+        "files": [
+            {
+                "pattern": "\\.test\\.m?tsx?$",
+                "skills": ["vitest"],
+                "why": "тест — моки, фикстуры и покрытие по скиллу vitest"
+            }
+        ],
+        "commands": []
+    }
+}

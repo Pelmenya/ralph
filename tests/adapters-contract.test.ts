@@ -160,6 +160,9 @@ const ALLOWLIST = ['ok-author'];
 const PR_NUMBER = 42;
 const FINDING = '🔴 [blocker] находка к месту в диффе';
 const SUMMARY = '🟡 [minor] сводка прохода — дублирует находки выше';
+// #125: комментарий карточки с невидимой меткой намерения — то, что ищет сверка (#94).
+const ISSUE_WITH_NOTE = 7;
+const ISSUE_NOTE = 'что выяснилось\n\n<!-- ralph-intent:intent-0001 -->';
 
 // Общий фильтр «готовые issues» — используется ОБОИМИ флейворами для listReadyIssues/
 // listAllOpenIssues, так как ни одна боевая реализация не даёт независимого DI-хука на
@@ -280,6 +283,11 @@ function buildFakeTaskSource(): { adapter: TaskSourceAdapter; calls: string[] } 
         commentOnIssue: (issue, body) => {
             if (mutationFails) throw new Error('форж отверг мутацию');
             calls.push(`comment:${issue}:${body}`);
+        },
+        // #125: лента карточки. Отказ — общим флагом чтения комментариев.
+        listIssueComments: (issue) => {
+            if (commentsThrow) throw new Error('форж не отдал комментарии карточки');
+            return issue === ISSUE_WITH_NOTE ? ['первый', ISSUE_NOTE] : [];
         },
         closeIssue: (issue) => {
             if (mutationFails) throw new Error('форж отверг мутацию');
@@ -476,6 +484,9 @@ function buildRealTaskSource(): { adapter: TaskSourceAdapter; gateEnv: GateEnv }
         // #40: боевые функции с DI-хуком на argv — мутации идут БЕЗ шелла (C3).
         commentOnIssue: (issue: number, body: string) =>
             ralph.commentOnIssue(issue, body, { runArgvFn: mutationArgv }),
+        // #125: лента карточки — боевая функция, подменено только чтение gh.
+        issueComments: (issue: number): string[] =>
+            ralph.issueComments(issue, { ghJsonFn: (cmd: string) => ghJsonImpl(cmd) }),
         closeIssue: (issue: number) => ralph.closeIssue(issue, { runArgvFn: mutationArgv }),
         blockIssue: (issue: number) => ralph.blockIssue(issue, { runArgvFn: mutationArgv }),
         createIssue: (input: {
@@ -678,6 +689,37 @@ function registerTaskSourceContract(
             // Молчаливая пустая лента дала бы журналу нули: «ревью прошло, находок нет» —
             // ровно то, чем выглядит и недоступный форж.
             expect(() => adapter.listPullRequestComments(PR_NUMBER)).toThrow();
+        });
+
+        // #125: лента карточки для сверки начатого намерения (#94). Метод в шве
+        // необязательный, но у реализаций канона он обязан быть: без него неизвестный
+        // исход комментария карточки — стоп, а не сверка.
+        it('listIssueComments отдаёт тела ленты карточки по порядку, метку намерения — как есть', () => {
+            const { adapter } = build();
+            const hook = adapter as unknown as TaskSourceHook;
+            hook.__setGhJson?.((cmd) =>
+                cmd.includes(`/issues/${String(ISSUE_WITH_NOTE)}/comments`)
+                    ? [
+                          { body: 'первый', user: { login: 'ok-author' } },
+                          { body: ISSUE_NOTE, user: { login: 'ok-author' } },
+                      ]
+                    : [],
+            );
+            expect(typeof adapter.listIssueComments).toBe('function');
+            expect(adapter.listIssueComments?.(ISSUE_WITH_NOTE)).toEqual(['первый', ISSUE_NOTE]);
+            expect(adapter.listIssueComments?.(ISSUE_WITH_NOTE + 1)).toEqual([]);
+        });
+
+        it('НЕГАТИВНЫЙ: listIssueComments fail-closed — пустая лента ≠ отказ форжа', () => {
+            const { adapter } = build();
+            const hook = adapter as unknown as TaskSourceHook;
+            hook.__setCommentsThrow?.(true);
+            hook.__setGhJson?.(() => {
+                throw new Error('gh api упал');
+            });
+            // Пустая лента вместо отказа читалась бы сверкой как «эффект не лёг» — и
+            // комментарий опубликовался бы вторым.
+            expect(() => adapter.listIssueComments?.(ISSUE_WITH_NOTE)).toThrow();
         });
 
         // #45: ревью-сессия в форж не ходит — замечание ставит петля этим методом. Общее
@@ -1158,6 +1200,20 @@ function buildSourcecraftTaskSource(): { adapter: TaskSourceAdapter; calls: stri
                     { body: SUMMARY, author: { slug: 'ok-author' } },
                     { body: '   ', author: { slug: 'ok-author' } },
                 ],
+            };
+        }
+        // #125: лента карточки — ключ `issue_comments` (сверен живым ответом площадки).
+        if (/\/issues\/\d+\/comments\?/.test(path) && method === 'GET') {
+            if (commentsThrow) throw new Error('SourceCraft: комментарии карточки не отдались');
+            const hit = path.includes(`/issues/${String(ISSUE_WITH_NOTE)}/comments`);
+            return {
+                issue_comments: hit
+                    ? [
+                          { body: 'первый', author: { slug: 'ok-author' } },
+                          { body: ISSUE_NOTE, author: { slug: 'ok-author' } },
+                      ]
+                    : [],
+                next_page_token: '',
             };
         }
         // Голова PR — поле `source.sha` (сверено с OpenAPI площадки).

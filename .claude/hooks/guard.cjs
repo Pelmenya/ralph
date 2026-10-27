@@ -14,8 +14,16 @@
  * Это МИНИМАЛЬНЫЙ барьер канона (задача 6): ровно то, без чего петлю нельзя пускать
  * на собственный репозиторий под `bypassPermissions`. Правила о номерах чужого трекера
  * в тексте для площадки сюда не переехали: у канона «чужие» — это потребители, а их
- * имён в публичном дереве быть не может (`tests/project-traces.ts`). Барьер как часть
- * продукта с настраиваемыми правилами — отдельная задача Фазы 11.
+ * имён в публичном дереве быть не может (`tests/project-traces.ts`).
+ *
+ * **Барьер — часть продукта (#99, Фаза 11).** Исполняемая часть едет с ядром, правила
+ * контура — данные потребителя (`.claude/ralph/hooks.json`, разбор — `consumer-data.cjs`).
+ * Сессия петли заявлена контрактом запуска `RALPH_CORE_SHA`, и тогда хук сверяет себя с
+ * этой ревизией ядра (`core-revision.cjs`): хук из дерева, которое правит PR, не тот,
+ * который ревьюили, — несовпадение, недоступность ревизии или ошибка сверки блокируют
+ * вызов. Сверка идёт ДО загрузки правил: `require` исполняет их код, и правленые правила,
+ * загруженные первыми, подменяли сверщик. Чего самосверка не держит (правку самого
+ * сверщика и этого файла), названо в докблоке `core-revision.cjs`.
  *
  * Перед первой сессией раннер проверяет, что барьер вообще держит:
  * `core/guard-probe.ts` подаёт хукам заведомо запрещённые вызовы и не стартует, если
@@ -41,6 +49,8 @@
  * петлю. Условие пересмотра: если ложные блокировки станут регулярными, барьер
  * пересматривается отдельным PR, а не послаблением по ходу работы.
  */
+
+const fs = require('node:fs');
 
 /** Единственный код выхода, который у PreToolUse действительно блокирует вызов. */
 const EXIT_BLOCKED = 2;
@@ -99,10 +109,28 @@ function describeError(error) {
 }
 
 let decide;
+let contour;
+let revision = { loop: false, error: null };
+let checkCoreRevision;
+let isLoopPrompt;
 let rulesError = null;
 try {
-    decide = withSealedExit(() => require('./guard-rules.cjs').decide);
-    if (typeof decide !== 'function') throw new Error('decide не функция');
+    // Сверщик — первым: он не зависит ни от одного соседа, и до его вердикта ни строчки
+    // сверяемого кода не исполняется. Не загрузился — та же неисправность, что правила.
+    ({ checkCoreRevision, isLoopPrompt } = withSealedExit(() => require('./core-revision.cjs')));
+    try {
+        revision = withSealedExit(() => checkCoreRevision());
+    } catch (error) {
+        revision = { loop: true, error: describeError(error) };
+    }
+    // Хук не той ревизии не грузит правил вовсе: их код уже не тот, что ревьюили.
+    if (!revision.error) {
+        decide = withSealedExit(() => require('./guard-rules.cjs').decide);
+        if (typeof decide !== 'function') throw new Error('decide не функция');
+        // Данные потребителя — в том же try: битые данные — та же неисправность, что не
+        // загрузившиеся правила.
+        contour = withSealedExit(() => require('./consumer-data.cjs').loadConsumerData());
+    }
 } catch (error) {
     rulesError = describeError(error);
 }
@@ -133,6 +161,24 @@ function readStdin() {
         process.stdin.on('error', () => resolve(''));
         setTimeout(() => resolve(data), 5000);
     });
+}
+
+/**
+ * Переходный признак петли по транскрипту (`core-revision.cjs`): раннер контракт сессиям
+ * пока не передаёт, и забор данных контура по одному `revision.loop` не действовал бы ни
+ * в одной настоящей сессии петли (ревью Фазы 11). Транскрипт читается лениво — только
+ * когда вызов трогает данные. Назван, но не читается — считаем петлёй: заблокирована
+ * будет одна правка данных, а пропуск открыл бы канал.
+ */
+function loopByTranscript(transcriptPath) {
+    if (typeof transcriptPath !== 'string' || transcriptPath === '') return false;
+    let lines;
+    try {
+        lines = fs.readFileSync(transcriptPath, 'utf-8').split('\n');
+    } catch {
+        return true;
+    }
+    return isLoopPrompt(lines);
 }
 
 async function main() {
@@ -174,9 +220,21 @@ async function main() {
         );
     }
 
+    if (revision.error) {
+        block(
+            `[guard.cjs] Ревизия хука не сверилась с ядром: ${revision.error} Вызов ` +
+                'заблокирован: хук не той ревизии — не тот барьер, который ревьюили.',
+        );
+    }
+
     let verdict;
     try {
-        verdict = withSealedExit(() => decide(toolName, toolInput));
+        verdict = withSealedExit(() =>
+            decide(toolName, toolInput, {
+                contour,
+                loop: revision.loop || (() => loopByTranscript(input.transcript_path)),
+            }),
+        );
         // Вердикт не того вида — та же неисправность, что исключение: барьер ничего не
         // сказал о вызове. Без этой проверки `decide: () => ({})` пропускал всё (поле
         // `blocked` равно undefined), а `() => undefined` бросал НИЖЕ, вне try, и снова

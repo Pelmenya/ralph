@@ -10,18 +10,20 @@ export type TSkillRule = {
 
 export type TSkillVerdict = { blocked: boolean; reason?: string; loaded?: string[] };
 
-export declare const RULES: TSkillRule[];
-export declare const COMMAND_RULES: TSkillRule[];
+export type TSkillRules = { files: TSkillRule[]; commands: TSkillRule[] };
+
+export declare const NO_RULES: TSkillRules;
 export declare const LOOP_PROMPT_RE: RegExp;
 
 export declare function targetsOf(toolName: string, toolInput: unknown): string[];
 export declare function requiredSkills(
     targets: string[],
     command?: string,
+    rules?: TSkillRules,
 ): Map<string, { why: string; target: string }>;
 export declare function firstUserPrompt(lines: string[]): string;
 export declare function isLoopTranscript(
-    lines: string[],
+    lines: string[] | null,
     env?: Record<string, string | undefined>,
 ): boolean;
 export declare function loadedSkills(lines: string[]): Set<string>;
@@ -31,4 +33,5 @@ export declare function decide(input: {
     transcriptLines: string[] | null;
     env?: Record<string, string | undefined>;
     cached?: Set<string>;
+    rules?: TSkillRules;
 }): TSkillVerdict;

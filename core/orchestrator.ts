@@ -115,7 +115,7 @@ import {
 type TPhaseBranchStopKind = Extract<TStopReason, 'tree-dirty' | 'main-conflict' | 'unknown'>;
 import { createReviewModule, reviewVerdict } from './review.ts';
 import { createGateRunner, resolveGateChecks, resolveGatePolicy } from './gate.ts';
-import { resolveMergeRetryMaxMs } from './merge-retry.ts';
+import { describeMergeFailure, resolveMergeRetryMaxMs } from './merge-retry.ts';
 import { resolveObservability } from './observability.ts';
 import {
     checkIssueFormat,
@@ -143,6 +143,7 @@ import {
     inFlightStopMessage,
     intentFailureText,
     parseSessionRequests,
+    quarantinePath,
     reconcilableKind,
     reconcileInFlight,
     serializeInFlight,
@@ -2506,6 +2507,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         pushEventFn = pushEvent,
         sleepFn = sleep,
         intentIdFn = randomUUID,
+        quarantineFn,
     }: {
         cfg: RalphConfig;
         // #45: контекст фазы нужен намерениям по PR — сам PR они не называют (сессия не
@@ -2539,6 +2541,12 @@ export function createOrchestrator(env: OrchestratorEnv) {
         sleepFn?: typeof sleep;
         // #94: идентификатор попытки намерения — в метку на диске и в тело эффекта.
         intentIdFn?: () => string;
+        // #124: отказ разбора детерминирован — повтор его не лечит, а следующая сессия
+        // дописала бы свои намерения в тот же файл, и он отвергался бы снова уже из-за
+        // старой строки. Задан — отвергнутый батч уезжает в карантин (файл рядом, путь
+        // возвращается), и очередь следующей сессии разбирается отдельно. Не задан —
+        // файл остаётся как есть: сдача на отказе встаёт, и разбирает его человек.
+        quarantineFn?: () => string;
     }): {
         applied: number;
         failed: boolean;
@@ -2558,6 +2566,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // #41: намерения, выбывшие по отказу форжа по существу, — вид, «что» и причина.
         // Необязательное по той же причине, что и `outcomeUnknown`.
         dropped?: TDroppedIntent[];
+        // #124: батч отвергнут разбором; `quarantined` — куда он снят, `null` — снять не
+        // вышло, и файл на месте. Без `quarantineFn` поля нет.
+        rejected?: { quarantined: string | null };
     } {
         const raw = readFn();
         if (!raw || raw.trim() === '')
@@ -2634,13 +2645,52 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 }),
             });
         } catch (e) {
+            const why = (e as Error).message;
+            const failed = {
+                applied: 0,
+                failed: true,
+                closedIssues: [],
+                prFindings: [],
+                prBlocked: false,
+            };
+            if (!quarantineFn || dry) {
+                pushEventFn(
+                    `⛔ Ralph: запрос кодер-сессии не разобрался — ${why}. ` +
+                        `Ничего не применено, файл ${RUNTIME.requests} оставлен как есть для разбора.`,
+                    cfg,
+                    { logFn },
+                );
+                return failed;
+            }
+            // #124: текст — в лог до снятия: карантинный файл могут убрать, а лог остаётся.
+            logFn(`Отвергнутый батч намерений:\n${raw}`);
+            let quarantined: string | null = null;
+            let moveError = '';
+            try {
+                quarantined = quarantineFn();
+            } catch (err) {
+                moveError = (err as Error).message;
+            }
             pushEventFn(
-                `⛔ Ralph: запрос кодер-сессии не разобрался — ${(e as Error).message}. ` +
-                    `Ничего не применено, файл ${RUNTIME.requests} оставлен как есть для разбора.`,
+                quarantined !== null
+                    ? `⛔ Ralph: запрос кодер-сессии не разобрался — ${why}. Ничего не ` +
+                          `применено; батч снят в карантин ${quarantined}, текст — в логе. ` +
+                          'Намерения следующей сессии разберутся отдельно.'
+                    : `⛔ Ralph: ${formatStopMessage({
+                          reason: 'intent-rejected',
+                          diagnosis:
+                              `запрос кодер-сессии не разобрался — ${why}; снять батч в ` +
+                              `карантин не вышло (${moveError}), файл ${RUNTIME.requests} ` +
+                              'остался, и каждая следующая сессия дописала бы свои намерения ' +
+                              'к отвергнутым — ни одно не применилось бы',
+                          question:
+                              `разбери файл ${RUNTIME.requests} (текст — в логе), убери битые ` +
+                              'строки или файл целиком и перезапусти loop',
+                      })}`,
                 cfg,
                 { logFn },
             );
-            return { applied: 0, failed: true, closedIssues: [], prFindings: [], prBlocked: false };
+            return { ...failed, rejected: { quarantined } };
         }
         if (requests.length === 0)
             return {
@@ -3343,6 +3393,17 @@ export function createOrchestrator(env: OrchestratorEnv) {
     function removeSessionRequests(): void {
         guardSideEffect(`removeSessionRequests(${RUNTIME.requests})`);
         fs.rmSync(RUNTIME.requests, { force: true });
+    }
+
+    // #124: карантин батча, отвергнутого разбором, — переименование в файл рядом, а не
+    // удаление: человеку есть что разобрать, а раннер этот файл больше не читает. Метка
+    // времени в имени — у двух отказов подряд свои файлы; занятое имя получает номер
+    // (`quarantinePath`), и второй не затирает первый даже в ту же миллисекунду.
+    function quarantineSessionRequests(nowMs: number): string {
+        guardSideEffect(`quarantineSessionRequests(${RUNTIME.requests})`);
+        const target = quarantinePath(RUNTIME.requests, nowMs, fs.existsSync);
+        fs.renameSync(RUNTIME.requests, target);
+        return target;
     }
 
     // ── Роутинг моделей по сложности ─────────────────────────────────────────
@@ -4337,6 +4398,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         milestoneLabels,
         issueDetails,
         commentOnIssue,
+        issueComments,
         closeIssue,
         blockIssue,
         closeMilestoneByTitle,
@@ -4374,6 +4436,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         getLastGatePr: gateGetLastGatePr,
         getLastForgeRedCheck: gateGetLastForgeRedCheck,
         getLastForgeStop: gateGetLastForgeStop,
+        getLastMergeFailure: gateGetLastMergeFailure,
         getLastToolFailure: gateGetLastToolFailure,
         getLastMainSyncStop: gateGetLastMainSyncStop,
         getLastHeadDivergence: gateGetLastHeadDivergence,
@@ -4531,6 +4594,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 closeMilestoneByTitle,
                 syncProjectBoard,
                 commentOnIssue,
+                issueComments,
                 closeIssue,
                 blockIssue,
                 createIssue,
@@ -5299,6 +5363,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
         getLastForgeRedCheck?: typeof gateGetLastForgeRedCheck;
         // #269-ревью: причина стопа на чеке форжа БЕЗ вердикта — тем же геттер-приёмом.
         getLastForgeStop?: typeof gateGetLastForgeStop;
+        // #123: мердж вызван и не удался — класс отказа и строка форжа, тем же геттер-приёмом.
+        getLastMergeFailure?: typeof gateGetLastMergeFailure;
         // Задача 81: чек, упавший на ИНСТРУМЕНТЕ, — тем же геттер-приёмом.
         getLastToolFailure?: typeof gateGetLastToolFailure;
         // #66: ветка фазы не подтянута к main — файлы конфликта или причина сбоя.
@@ -5322,12 +5388,16 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // Снятие устаревших намерений при отказе стража: побочка по fs, поэтому швом.
         readSessionRequestsFn?: typeof readSessionRequests;
         removeSessionRequestsFn?: typeof removeSessionRequests;
+        // #124: карантин батча, отвергнутого разбором после кодер-сессии.
+        quarantineSessionRequestsFn?: typeof quarantineSessionRequests;
         stopRequestedFn?: () => boolean;
         clearStopRequestFn?: () => void;
         // #92: журнал этапов кодер-попытки. Умолчание — в памяти, по той же причине, что
         // у stopRequestedFn: чтение боевого файла в тесте — побочка; main передаёт боевой.
         stageJournal?: TStageJournal;
         monitorConfigPath?: string;
+        /** #126: дерево работы для строки `git:` переподнятого монитора — как monitorConfigPath. */
+        monitorExecutionRoot?: string;
     };
 
     // runLoop: весь основной while-цикл (итерации кодера, цикл сдачи, гейт, self-heal,
@@ -5426,6 +5496,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             getLastGatePr = gateGetLastGatePr,
             getLastForgeRedCheck = gateGetLastForgeRedCheck,
             getLastForgeStop = gateGetLastForgeStop,
+            getLastMergeFailure = gateGetLastMergeFailure,
             getLastToolFailure = gateGetLastToolFailure,
             getLastMainSyncStop = gateGetLastMainSyncStop,
             getLastHeadDivergence = gateGetLastHeadDivergence,
@@ -5445,6 +5516,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             checkOnPhaseBranchFn = checkOnPhaseBranch,
             readSessionRequestsFn = readSessionRequests,
             removeSessionRequestsFn = removeSessionRequests,
+            quarantineSessionRequestsFn = quarantineSessionRequests,
             // #88: запрос мягкой остановки. Дефолт «запроса нет», а боевое чтение файла
             // main() передаёт явно (как monitorConfigPath): чтение боевого файла в тесте —
             // побочка, а `runLoop` без этих двух зовут полторы сотни тестов. Что main их
@@ -5453,6 +5525,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             clearStopRequestFn = () => {},
             stageJournal = createStageJournal(memoryStageJournalStore()),
             monitorConfigPath,
+            monitorExecutionRoot,
         }: RunLoopDeps = {},
     ): void {
         // ── Main loop ────────────────────────────────────────────────────────
@@ -5895,6 +5968,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 ensureMonitorAliveFn({
                     profile: cfg.profileName,
                     configPath: monitorConfigPath,
+                    executionRoot: monitorExecutionRoot,
                     logFn,
                 });
 
@@ -6427,7 +6501,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 // гейт, ставь blocked» она могла ровно перед тем, как умереть по maxTurns.
                 // Отказ применения петлю здесь не роняет (внутри — лог и пуш): issue
                 // остался открытым, его подберёт следующая итерация, а хвост запроса
-                // сохранён и повторится.
+                // сохранён и повторится. Кроме отказа РАЗБОРА (#124): повтор его не лечит,
+                // поэтому батч снимается в карантин, а не снялся — стоп.
                 //
                 // #92: продолжение посреди применения не спавнит новую сессию — файл
                 // намерений прошлой лежит на месте, и применяется он, а не намерения
@@ -6437,12 +6512,16 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         !journal('начало применения намерений', () => stageJournal.start('intents'))
                     )
                         break;
+                    // #124: отвергнутый разбором батч снимается в карантин — иначе
+                    // следующая сессия дописала бы к нему свои намерения, и разбор
+                    // отвергал бы их снова до брейкера серии.
                     const intents = applySessionRequestsFn({
                         cfg,
                         currentMilestone: phase.milestone,
                         dry,
                         logFn,
                         pushEventFn,
+                        quarantineFn: () => quarantineSessionRequestsFn(nowFn()),
                     });
                     // `?? []` — не тихий дефолт, а совместимость шва: подменённая реализация
                     // (тест, чужой taskSource) может не знать про поле. Потеря фильтра здесь
@@ -6454,6 +6533,15 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     // сессия дописала бы свои намерения в файл, который не применится никогда,
                     // и закрытая по существу карточка крутилась бы до брейкера.
                     if (intents.outcomeUnknown === true) {
+                        journal('исход применения намерений', () =>
+                            stageJournal.finish('intents', 'stop'),
+                        );
+                        break;
+                    }
+                    // #124: снять отвергнутый батч не вышло — стоп сразу (пуш ушёл изнутри):
+                    // файл отравил бы каждую следующую сессию, и итерации до брейкера серии
+                    // сгорели бы гарантированно впустую.
+                    if (intents.rejected?.quarantined === null) {
                         journal('исход применения намерений', () =>
                             stageJournal.finish('intents', 'stop'),
                         );
@@ -8908,6 +8996,35 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     saveStateFn(state);
                     break;
                 }
+                // #123: мердж вызван и не удался — отказ форжа по существу, транзиенты дольше
+                // предела повторов или нераспознанный отказ после своего повтора. Класс и
+                // строку ответа гейт знает точно, а пуш уходил катч-оллом «причина не
+                // установлена», и разбор начинался с ralph.log. `not-merged` без записи
+                // (dry, грязное дерево, PR не найден) — мимо: там мердж не вызывался.
+                const mergeFailure = gate === 'not-merged' ? getLastMergeFailure() : null;
+                if (mergeFailure) {
+                    const kindText = describeMergeFailure(mergeFailure.kind, mergeFailure);
+                    const stopMsg =
+                        `⛔ Ralph: мердж фазы "${phase.milestone}" не удался — PR оставлен человеку. ` +
+                        formatStopMessage({
+                            reason: 'merge-failed',
+                            diagnosis:
+                                `мердж PR #${String(mergeFailure.pr)}: ${kindText}; ` +
+                                `ответ форжа: ${mergeFailure.line}`,
+                            question:
+                                mergeFailure.kind === 'refusal'
+                                    ? 'устрани причину отказа на PR (конфликт, закрыт, голова уехала) и перезапусти loop — ' +
+                                      'сдача не повторится, пойдёт сразу гейт'
+                                    : 'проверь доступность форжа и что PR не влит; затем перезапусти loop — ' +
+                                      'сдача не повторится, пойдёт сразу гейт',
+                        });
+                    pushEventFn(stopMsg, cfg, { logFn });
+                    // Тот же сброс, что у остальных стопов, отдающих PR человеку.
+                    state.gateHeals = 0;
+                    state.forgeHealedRunId = null;
+                    saveStateFn(state);
+                    break;
+                }
                 // Топливо чини-сессии приходит с одной из двух сторон: локальный красный чек
                 // либо красный куб площадки. Ветка ОДНА — бюджет попыток, эскалация модели,
                 // сброс лестницы ревью и возврат на полную сдачу у них общие; различаются
@@ -9114,7 +9231,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     continue;
                 }
                 // #289: последний катч-олл — сюда доходят исходы гейта без собственного
-                // именованного стопа выше (`not-merged`, а также `red-checks`/`forge-red`
+                // именованного стопа выше (`not-merged` без вызова мерджа, а также `red-checks`/`forge-red`
                 // без диагноза — healTarget оказался пуст). Причина в этих случаях НЕ
                 // установлена диагностикой гейта, поэтому честно `unknown`, а не догадка.
                 // Ревью #289, второй проход: хвост «Разберись/смерджи вручную, затем
@@ -9173,6 +9290,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
         ppidFn?: (pid: number, readFn?: ReadFileFn) => number | null;
         profile?: string;
         configPath?: string;
+        /** Дерево, в котором раннер работает: строка `git:` панели показывает его (#126). */
+        executionRoot?: string;
     };
 
     // Сигнал 0 — только проверка существования процесса, ничего ему не шлёт. Имя generic
@@ -9371,6 +9490,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             adoptFn = adoptMonitor,
             profile,
             configPath,
+            executionRoot,
         } = deps;
 
         // Защита от двойного спавна остаётся и здесь: main() подбирает сироту до preflight,
@@ -9399,6 +9519,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
             // от места её запуска).
             monitorArgv.push('--runtime-dir', instanceRuntimeDir());
             if (configPath) monitorArgv.push('--config', configPath);
+            // #126: дерево работы называет раннер — он один знает, куда переехал. Панель
+            // выводила его подъёмом от каталога ядра и показывала пустую строку git: ядро
+            // исполняется из `productRoot`, работа идёт в другом дереве.
+            if (executionRoot) monitorArgv.push('--execution-root', executionRoot);
             const child = spawnFn(process.execPath, monitorArgv, {
                 detached: true, // своя группа процессов
                 stdio: ['ignore', out, out],
@@ -9955,7 +10079,11 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // и обнулял monitor.out от прошлого прогона. И только для живых прогонов: --dry-run
         // живёт секунды, а спавн процесса плохо вяжется с read-only (C1).
         if (!DRY && !monitor)
-            monitor = startMonitor({ profile: config.profileName, configPath: runnerConfigPath });
+            monitor = startMonitor({
+                profile: config.profileName,
+                configPath: runnerConfigPath,
+                executionRoot: sessionTree,
+            });
 
         // #151: monitorConfigPath — единственный dep, который прод обязан передать явно
         // (тот же runnerConfigPath, что уходил монитору выше при спавне): ensureMonitorAlive
@@ -9973,6 +10101,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
 
         runLoop(config, ctx, {
             monitorConfigPath: runnerConfigPath,
+            monitorExecutionRoot: sessionTree,
             stopRequestedFn: stopRequested,
             clearStopRequestFn: clearStopRequest,
             stageJournal: createStageJournal(stageJournalStore, { where: RUNTIME.stages }),
@@ -10083,6 +10212,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // #88: барьер деплоя на старте — его зовёт и рестарт матрицы «убить до / после».
         stopOnDeployBlock,
         commentOnIssue,
+        // #125: лента карточки — боевая функция для контрактного сьюта.
+        issueComments,
         closeIssue,
         blockIssue,
         createIssue,
@@ -10202,6 +10333,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         getLastGatePr: gateGetLastGatePr,
         getLastForgeRedCheck: gateGetLastForgeRedCheck,
         getLastForgeStop: gateGetLastForgeStop,
+        getLastMergeFailure: gateGetLastMergeFailure,
         getLastToolFailure: gateGetLastToolFailure,
         getLastMainSyncStop: gateGetLastMainSyncStop,
         getLastHeadDivergence: gateGetLastHeadDivergence,

@@ -153,6 +153,7 @@ describe('createGithubTaskSource — раскладка функций форж�
             closeMilestoneByTitle: spy('closeMilestoneByTitle') as never,
             syncProjectBoard: spy('syncProjectBoard') as never,
             commentOnIssue: spy('commentOnIssue') as never,
+            issueComments: spy('issueComments', ['раз']) as never,
             closeIssue: spy('closeIssue') as never,
             blockIssue: spy('blockIssue') as never,
             createIssue: spy('createIssue', 101) as never,
@@ -176,6 +177,7 @@ describe('createGithubTaskSource — раскладка функций форж�
         ts.closeMilestone('MS');
         ts.syncBoard();
         ts.commentOnIssue(7, 'текст');
+        expect(ts.listIssueComments?.(7)).toEqual(['раз']);
         ts.closeIssue(7);
         ts.blockIssue(9);
         expect(ts.createIssue({ title: 'т', body: 'б', labels: ['area:devops'] })).toBe(101);
@@ -199,6 +201,7 @@ describe('createGithubTaskSource — раскладка функций форж�
             'closeMilestoneByTitle:["MS"]',
             'syncProjectBoard:[]',
             'commentOnIssue:[7,"текст"]',
+            'issueComments:[7]',
             'closeIssue:[7]',
             'blockIssue:[9]',
             'createIssue:[{"title":"т","body":"б","labels":["area:devops"]}]',
@@ -231,6 +234,7 @@ describe('createGithubTaskSource — раскладка функций форж�
             closeMilestoneByTitle: (() => {}) as never,
             syncProjectBoard: (() => {}) as never,
             commentOnIssue: (() => {}) as never,
+            issueComments: (() => []) as never,
             closeIssue: (() => {}) as never,
             blockIssue: (() => {}) as never,
             createIssue: (() => null) as never,
@@ -313,6 +317,7 @@ function fakeRegistries(): AdapterRegistries {
         createPr: () => 7,
         getIssue: () => ({ number: 7, title: 'задача', body: 'тело задачи' }),
         commentOnIssue: () => {},
+        issueComments: () => [],
         closeIssue: () => {},
         blockIssue: () => {},
         createIssue: () => null,

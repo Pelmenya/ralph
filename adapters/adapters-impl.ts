@@ -220,6 +220,8 @@ export type GithubTaskSourceFns = {
     // интерфейса — сдвига здесь нет, и это не повод их не перечислять: маппер обязан
     // ломаться компиляцией, когда шов обзавёлся методом, а реализация нет.
     commentOnIssue: (issue: number, body: string) => void;
+    // #125: лента карточки для сверки намерения (#94).
+    issueComments: (issue: number) => string[];
     closeIssue: (issue: number) => void;
     blockIssue: (issue: number) => void;
     createIssue: (input: {
@@ -257,6 +259,7 @@ export function createGithubTaskSource(fns: GithubTaskSourceFns): TaskSourceAdap
         closeMilestone: fns.closeMilestoneByTitle,
         syncBoard: fns.syncProjectBoard,
         commentOnIssue: fns.commentOnIssue,
+        listIssueComments: fns.issueComments,
         closeIssue: fns.closeIssue,
         blockIssue: fns.blockIssue,
         createIssue: fns.createIssue,

@@ -357,6 +357,23 @@ export function parseSessionRequests(
 }
 
 /**
+ * Имя карантина отвергнутого батча (#124): `<файл>.rejected-<время>`, а занятое имя —
+ * с номером. `rename` на занятую цель молча затирает её, и два отказа в одну
+ * миллисекунду оставили бы на разбор только второй батч. Время — параметром: имя, взятое
+ * из `new Date()` внутри, тест не проверил бы детерминированно.
+ */
+export function quarantinePath(
+    file: string,
+    nowMs: number,
+    existsFn: (p: string) => boolean,
+): string {
+    const base = `${file}.rejected-${new Date(nowMs).toISOString().replace(/[:.]/g, '-')}`;
+    let target = base;
+    for (let n = 1; existsFn(target); n++) target = `${base}-${String(n)}`;
+    return target;
+}
+
+/**
  * Сериализует намерение обратно в строку JSONL — так, как его читает `parseSessionRequests`.
  *
  * Нужна, потому что хвост неприменённого батча пишется на диск и читается СЛЕДУЮЩИМ
@@ -583,10 +600,9 @@ export type TReconcile =
 // карточка не сверяется НИКАК: поиска карточки по метке в шве нет, и неизвестный исход
 // заведения — стоп.
 //
-// `listIssueComments` в контракте `TaskSourceAdapter` пока НЕ объявлен: объявление метода
-// шва правит барьер `tests/seam-defaults.test.ts` и требует ship человека, поэтому оно
-// едет отдельной карточкой вместе с реализациями адаптеров. До неё боевой шов метода не
-// имеет, и неизвестный исход `comment`/`close`/`block` — стоп, а не повтор вслепую.
+// `listIssueComments` в контракте `TaskSourceAdapter` объявлен НЕОБЯЗАТЕЛЬНЫМ (#125): обе
+// реализации канона ленту карточки читают, но шов без неё законен — у такого шва
+// неизвестный исход `comment`/`close`/`block` остаётся стопом, а не повтором вслепую.
 export type TReconcileSource = {
     listIssueComments?: (issue: number) => string[];
     listPullRequestComments: (pr: number) => Array<{ body: string }>;
@@ -605,8 +621,8 @@ export function unreconcilableWhy(kind: TSessionRequest['kind'], source: object)
 }
 
 /** Можно ли вообще сверить начатое намерение этого вида с этим швом — без похода в форж. */
-// Источник — `object`, а не тип с одним необязательным полем: боевой шов метода пока не
-// объявляет (см. выше), и TypeScript отверг бы его как «слабый тип» без общих полей.
+// Источник — `object`, а не тип с одним необязательным полем: шов, у которого метода нет
+// (см. выше), TypeScript отверг бы как «слабый тип» без общих полей.
 export function reconcilableKind(kind: TSessionRequest['kind'], source: object): boolean {
     if (kind === 'pr-comment' || kind === 'pr-block') return true;
     if (kind === 'new-issue') return false;

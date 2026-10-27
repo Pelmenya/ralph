@@ -6,12 +6,13 @@
 // нечитаемом файле. Проводка в settings.json сверяется отдельно: хук, не подключённый
 // там, лежит в репозитории нетронутым и не вызывается.
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { parseConsumerData } from './consumer-data.cjs';
 import * as hook from './skill-barrier.cjs';
 
 type TVerdict = { blocked: boolean; reason?: string; loaded?: string[] };
@@ -21,24 +22,37 @@ type TDecideInput = {
     transcriptLines: string[] | null;
     env?: Record<string, string | undefined>;
     cached?: Set<string>;
+    rules?: TRules;
 };
-type TRule = { skills: string[] };
+type TRules = { files: { skills: string[] }[]; commands: { skills: string[] }[] };
 const targetsOf = hook.targetsOf as (toolName: string, toolInput: unknown) => string[];
-const requiredSkills = hook.requiredSkills as (
+const requiredSkillsOf = hook.requiredSkills as (
     targets: string[],
     command?: string,
+    rules?: TRules,
 ) => Map<string, unknown>;
 const isLoopTranscript = hook.isLoopTranscript as (
-    lines: string[],
+    lines: string[] | null,
     env?: Record<string, string | undefined>,
 ) => boolean;
 const loadedSkills = hook.loadedSkills as (lines: string[]) => Set<string>;
-const decide = hook.decide as (input: TDecideInput) => TVerdict;
-const RULES = hook.RULES as TRule[];
-const COMMAND_RULES = hook.COMMAND_RULES as TRule[];
+const decideOf = hook.decide as (input: TDecideInput) => TVerdict;
 
 const ROOT = path.resolve(import.meta.dirname, '..', '..');
 const HOOK = path.join(ROOT, '.claude/hooks/skill-barrier.cjs');
+
+/**
+ * Таблица скиллов — данные потребителя (#99): тесты гоняют барьер на данных канона как
+ * потребителя, `.claude/ralph/hooks.json`, а не на таблице, зашитой в хук.
+ */
+const RULES = parseConsumerData(
+    readFileSync(path.join(ROOT, '.claude/ralph/hooks.json'), 'utf-8'),
+).skills;
+const requiredSkills = (targets: string[], command?: string) =>
+    requiredSkillsOf(targets, command, RULES);
+const decide = (input: TDecideInput) => decideOf({ rules: RULES, ...input });
+/** Контракт запуска петли: ожидаемая ревизия ядра. Значение здесь — только форма SHA. */
+const CORE_SHA = 'a'.repeat(40);
 
 const userPrompt = (content: string) =>
     JSON.stringify({ type: 'user', message: { role: 'user', content } });
@@ -120,9 +134,22 @@ describe('какой скилл обязателен для какого фай�
         expect(requiredSkills([], 'git add -A && git commit -F msg.txt').size).toBe(0);
     });
 
+    it('без данных потребителя таблица пуста — хук своих рядов не держит', () => {
+        expect(requiredSkillsOf([TEST]).size).toBe(0);
+        expect(
+            decideOf({
+                toolName: 'Edit',
+                toolInput: { file_path: TEST },
+                transcriptLines: [LOOP_PROMPT],
+            }),
+        ).toEqual({
+            blocked: false,
+        });
+    });
+
     // Барьер, требующий скилл, которого нет в дереве, блокировал бы правку навсегда:
     // `Skill` с этим именем вызвать нечем. Ряд и скилл обязаны ехать одним PR.
-    it.each([...RULES, ...COMMAND_RULES].flatMap((rule) => rule.skills))(
+    it.each([...RULES.files, ...RULES.commands].flatMap((rule) => rule.skills))(
         'скилл %s лежит в .claude/skills канона',
         (skill) => {
             expect(existsSync(path.join(ROOT, '.claude/skills', skill, 'SKILL.md'))).toBe(true);
@@ -149,9 +176,29 @@ describe('сессия петли узнаётся по первому сооб�
         expect(isLoopTranscript([userPrompt('Открой myralph.md')], {})).toBe(false);
     });
 
+    it('контракт запуска узнаёт петлю без строки ralph.md в промпте (#99)', () => {
+        // При внешней установке путь контракта другой, и строка в промпте не совпала бы:
+        // сессию петли узнаёт заявление раннера, а не текст.
+        expect(isLoopTranscript([HUMAN_PROMPT], { RALPH_CORE_SHA: CORE_SHA })).toBe(true);
+        expect(isLoopTranscript([], { RALPH_CORE_SHA: CORE_SHA })).toBe(true);
+        expect(isLoopTranscript(null, { RALPH_CORE_SHA: CORE_SHA })).toBe(true);
+        expect(isLoopTranscript(null, {})).toBe(false);
+    });
+
     it('переключатель среды сильнее транскрипта — для проверки руками', () => {
         expect(isLoopTranscript([HUMAN_PROMPT], { RALPH_SKILL_GUARD: 'on' })).toBe(true);
         expect(isLoopTranscript([LOOP_PROMPT], { RALPH_SKILL_GUARD: 'off' })).toBe(false);
+    });
+
+    // Петлю заявляет раннер: `off`, унаследованный из его окружения или env-файла, молча
+    // снимал бы барьер скиллов во всех его сессиях.
+    it('контракт запуска сильнее переключателя: off при заявленной петле не действует', () => {
+        expect(
+            isLoopTranscript([HUMAN_PROMPT], {
+                RALPH_CORE_SHA: CORE_SHA,
+                RALPH_SKILL_GUARD: 'off',
+            }),
+        ).toBe(true);
     });
 
     it('битая строка перед промптом не ослепляет распознавание', () => {
@@ -201,6 +248,24 @@ describe('вердикт', () => {
         ).toEqual({ blocked: false });
     });
 
+    it('петля по контракту без ralph.md в промпте: правка теста без vitest заблокирована', () => {
+        const env = { RALPH_CORE_SHA: CORE_SHA };
+        expect(decide({ ...edit, transcriptLines: [HUMAN_PROMPT], env }).blocked).toBe(true);
+        expect(
+            decide({ ...edit, transcriptLines: [HUMAN_PROMPT, skillCall('vitest')], env }),
+        ).toEqual({ blocked: false, loaded: ['vitest'] });
+    });
+
+    it('петля заявлена, а транскрипта нет — блок: проверить вызов Skill нечем', () => {
+        const verdict = decide({
+            ...edit,
+            transcriptLines: null,
+            env: { RALPH_CORE_SHA: CORE_SHA },
+        });
+        expect(verdict.blocked).toBe(true);
+        expect(verdict.reason).toContain('транскрипт');
+    });
+
     it('кэш маркеров заменяет чтение транскрипта', () => {
         expect(decide({ ...edit, transcriptLines: loop, cached: new Set(['vitest']) })).toEqual({
             blocked: false,
@@ -220,7 +285,13 @@ describe('хук процессом: код выхода и fail-closed', () => 
         spawnSync(process.execPath, [HOOK], {
             input: JSON.stringify(payload),
             encoding: 'utf-8',
-            env: { ...process.env, RALPH_SKILL_GUARD: '', TMPDIR: dir || tmpdir() },
+            env: {
+                ...process.env,
+                RALPH_SKILL_GUARD: '',
+                RALPH_CORE_SHA: '',
+                CLAUDE_PROJECT_DIR: ROOT,
+                TMPDIR: dir || tmpdir(),
+            },
         });
 
     it('exit 2 без скилла, exit 0 после его вызова; маркер кэша появляется', () => {
@@ -255,6 +326,19 @@ describe('хук процессом: код выхода и fail-closed', () => 
         });
         expect(result.status).toBe(2);
         expect(result.stderr).toContain('не читается');
+    });
+
+    it('данные потребителя битые — exit 2, а не таблица по умолчанию', () => {
+        dir = mkdtempSync(path.join(tmpdir(), 'skill-barrier-'));
+        mkdirSync(path.join(dir, '.claude/ralph'), { recursive: true });
+        writeFileSync(path.join(dir, '.claude/ralph/hooks.json'), '{ не json');
+        const result = spawnSync(process.execPath, [HOOK], {
+            input: JSON.stringify({ tool_name: 'Edit', tool_input: { file_path: TEST } }),
+            encoding: 'utf-8',
+            env: { ...process.env, RALPH_CORE_SHA: '', CLAUDE_PROJECT_DIR: dir, TMPDIR: dir },
+        });
+        expect(result.status).toBe(2);
+        expect(result.stderr).toContain('Таблица скиллов не загрузилась');
     });
 
     it('транскрипт не назван или файл не целевой — exit 0', () => {

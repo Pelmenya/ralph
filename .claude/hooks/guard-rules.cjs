@@ -73,6 +73,7 @@ const {
 const { touchesHostService } = require('./guard-host-services.cjs');
 const { killsForeignProcess } = require('./guard-process-kill.cjs');
 const { argValues, basenameOf } = require('./shell-calls.cjs');
+const { emptyData } = require('./consumer-data.cjs');
 
 // --- MCP -------------------------------------------------------------------
 //
@@ -107,30 +108,14 @@ const MCP_TOOL_RE = /^mcp__/i;
 // про браузер он не знает). Барьер, который обходится соседним инструментом, — не барьер.
 const MCP_NEVER_RE = /(secret|role|invite|delete|discard|fork|transfer|file_upload|unsafe)/i;
 
-// Точечные вычеты из запрета выше. Список — ПОЛНЫЕ ИМЕНА, а не шаблон: широкий запрет по
-// слову остаётся на месте, из него вынимается ровно одно проверенное имя. Ослабить сам
-// регэксп было бы дешевле и хуже — под `discard` попадают ещё и удаление релизов
-// (`DiscardByTag`/`DiscardByID`), которым здесь делать нечего.
+// Точечные вычеты из запрета выше и мутации рабочего цикла — ДАННЫЕ потребителя, а не код
+// (#99): какой форж у проекта и что из его MCP нужно циклу, ядро знать не обязано.
+// Приезжают из `.claude/ralph/hooks.json` (`consumer-data.cjs`): `mcp.writeAllowed` и
+// `mcp.neverExceptions`. Обоснование каждой записи живёт рядом с ней, в `mcp.notes`.
 //
-// Почему закрытие PR вычтено: критерий барьера — цена ошибки, а не звучание слова.
-// Отменённый PR возвращается (`ReopenPullRequest`), тогда как разрешённый рядом
-// `MergePullRequest` необратим и отправляет код в main. Пропускать необратимое и
-// блокировать обратимое — охранять не то. Нужда живая: squash-мердж ломает стопку PR
-// (ветка от смердженной конфликтует сама с собой), ветку-замену приходится заводить новым
-// PR, а старый висит открытым, и убрать его должен тот, кто его завёл.
-//
-// Обратимость — не слова, а сверка со спекой площадки
-// (https://api.sourcecraft.tech/sourcecraft.swagger.json, проверено 11.08.2026):
-//   • отмена закрытия ЕСТЬ — `POST /repos/{org}/{repo}/pulls/{slug}/reopen`, и
-//     `ReopenPullRequest` разрешён ниже;
-//   • отмены мерджа НЕТ — маршрутов revert/undo/unmerge в спеке не существует, а статус
-//     `merged` у PR терминальный (`draft|open|discarded|merging|merged`). Обратный коммит
-//     в git — это НОВЫЙ коммит, а не отмена: код уже был в main. Разрешить
-// закрытие, оставив отмену за бортом, значило бы обосновать вычет обратимостью и тут же
-// её отнять: агент отменил бы чужой PR и не смог бы вернуть — чинить пришлось бы человеку.
-//
-// Исключение НЕ отменяет второй гейт: имя обязано быть ещё и в MCP_WRITE_ALLOWED.
-const MCP_NEVER_EXCEPTIONS = new Set(['mcp__sourcecraft__DiscardPullRequest']);
+// Вычет — ПОЛНОЕ ИМЯ, а не шаблон: широкий запрет по слову остаётся на месте, из него
+// вынимается ровно одно проверенное имя. И вычет НЕ отменяет второй гейт: имя обязано
+// быть ещё и в `writeAllowed`. Нет данных — нет ни вычетов, ни мутаций: самый строгий контур.
 
 // Чтение у любого сервера: List*/Get* и list_*/get_* — оба стиля именования методов.
 //
@@ -147,75 +132,102 @@ function mcpReadCall(toolName) {
     return parts.length === 3 && /^(list|get)/i.test(parts[2]);
 }
 
-// Мутации, без которых не идёт работа: очередь задач, PR, метки, вехи, прогоны.
-const MCP_WRITE_ALLOWED = new Set([
-    'mcp__sourcecraft__CreateIssue',
-    'mcp__sourcecraft__CreateIssueByID',
-    'mcp__sourcecraft__UpdateIssue',
-    'mcp__sourcecraft__UpdateIssueByID',
-    'mcp__sourcecraft__CreateIssueComment',
-    'mcp__sourcecraft__UpdateIssueComment',
-    'mcp__sourcecraft__CreateIssueLink',
-    'mcp__sourcecraft__AddLabels',
-    'mcp__sourcecraft__AddLabelsByID',
-    'mcp__sourcecraft__RemoveLabels',
-    'mcp__sourcecraft__ReplaceLabels',
-    'mcp__sourcecraft__CreateLabel',
-    'mcp__sourcecraft__UpdateLabel',
-    'mcp__sourcecraft__AddPullRequestLabels',
-    'mcp__sourcecraft__RemovePullRequestLabels',
-    'mcp__sourcecraft__CreatePullRequest',
-    'mcp__sourcecraft__UpdatePullRequest',
-    'mcp__sourcecraft__PublishPullRequest',
-    'mcp__sourcecraft__CreatePullRequestComment',
-    'mcp__sourcecraft__UpdatePullRequestComment',
-    'mcp__sourcecraft__MergePullRequest',
-    // Закрытие PR без мерджа. Разрешено по ОБРАТИМОСТИ, а не по «оно безобидное»:
-    // отменённый PR возвращается (`ReopenPullRequest`), тогда как соседний
-    // `MergePullRequest` необратим и отправляет код в main. Барьер, пропускающий
-    // необратимое и блокирующий обратимое, охраняет не то. Нужда живая: squash-мердж
-    // ломает стопку PR (ветка от смердженной конфликтует сама с собой), и ветку-замену
-    // приходится заводить новым PR — а старый висел бы вечно.
-    'mcp__sourcecraft__DiscardPullRequest',
-    // Отмена закрытия — та самая обратимость, на которой держится вычет выше. Под запрет
-    // по имени не попадает, но без явного разрешения агент мог бы закрыть и не вернуть.
-    'mcp__sourcecraft__ReopenPullRequest',
-    'mcp__sourcecraft__AddLinkedPRs',
-    // Снятие связи issue↔PR. Разрешено по той же ОБРАТИМОСТИ, что и закрытие PR: связь
-    // ставится обратно `AddLinkedPRs`, который разрешён строкой выше, — то есть ошибка
-    // здесь стоит одного вызова, а не разбора человеком.
-    //
-    // Нужда живая и проверена на себе 28.08: площадка вяжет PR к карточке по голому `#N`
-    // в описании, и два документационных PR приехали к Issue #1 просто потому, что в их
-    // тексте стояло «Issue #1». Правка описания связь НЕ убирает — она остаётся
-    // в `linked_issues`. До этой записи чинить было нечем вовсе.
-    //
-    // Барьер против САМОГО промаха при этом остаётся на месте и не ослабляется: текстовое
-    // правило ниже по-прежнему не выпускает наружу `#N` чужого трекера. Разница в том, что
-    // раньше проскочившая связь была вечной, а теперь чинится.
-    'mcp__sourcecraft__RemoveLinkedPRs',
-    // SetDecision НАМЕРЕННО отсутствует: это одобрение ревью (approve/trust/block),
-    // а не мутация рабочего цикла. С 01.08.2026 `review.yaml` требует ship человека
-    // на путях ядра — при `ignore_self_ship: false` и одном активном аккаунте агент,
-    // имея SetDecision, удовлетворял бы требование сам, и барьер сторожил бы пустоту.
-    // Одобрение ставит человек руками в интерфейсе.
-    'mcp__sourcecraft__CreateMilestone',
-    'mcp__sourcecraft__UpdateMilestone',
-    'mcp__sourcecraft__RunWorkflow',
-    'mcp__sourcecraft__AddReaction',
-]);
-
 /** Разрешён ли MCP-вызов. Порядок важен: «никогда» перекрывает чтение. */
-function mcpAllowed(toolName) {
-    if (MCP_NEVER_EXCEPTIONS.has(toolName)) return MCP_WRITE_ALLOWED.has(toolName);
+function mcpAllowed(toolName, mcp = emptyData().mcp) {
+    if (mcp.neverExceptions.has(toolName)) return mcp.writeAllowed.has(toolName);
     if (MCP_NEVER_RE.test(toolName)) return false;
     if (mcpReadCall(toolName)) return true;
-    return MCP_WRITE_ALLOWED.has(toolName);
+    return mcp.writeAllowed.has(toolName);
 }
 
 const ALLOWED = { blocked: false, reason: null };
 
 /** Инструменты, у которых в аргументах — путь к файлу. */
+const WRITE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
+
+// Данные контура (`DATA_PATH`) в пути вызова — с любым началом и разделителем.
+const DATA_PATH_RE = /(^|[\\/])\.claude[\\/]ralph[\\/]hooks\.json$/;
+
+// Имя данных отдельным словом: `hooks.json.example` и `myhooks.json` — другие файлы.
+const DATA_NAME_RE = /(?:^|[^\w.-])hooks\.json(?![\w.-])/;
+// Перенаправление в файл данных: `> hooks.json`, `>> .claude/ralph/hooks.json`.
+const DATA_REDIRECT_RE = />{1,2}\s*["']?[^\s"'|;&<>]*\bhooks\.json(?![\w.-])/;
+// Интерпретатор пишет файл из текста программы — имя в нём и есть адрес записи.
+const INTERPRETERS_RE = /^(?:python[\d.]*|node|perl|ruby|deno|bun)$/;
+// Команды, которые файл только читают: им путь данных в аргументах не страшен.
+const DATA_READERS = new Set([
+    'cat',
+    'head',
+    'tail',
+    'less',
+    'more',
+    'wc',
+    'grep',
+    'rg',
+    'diff',
+    'jq',
+    'ls',
+    'stat',
+    'file',
+    'sha256sum',
+    'md5sum',
+]);
+// У git путь в аргументах меняет дерево только у этих подкоманд; `diff`, `show`, `log`,
+// `add` и текст сообщения `commit -m` файла данных не меняют.
+const GIT_TREE_WRITERS = new Set(['checkout', 'restore', 'mv', 'rm', 'reset', 'apply']);
+
+/** Путь данных среди аргументов: базовое имя ровно `hooks.json` (и `cd …` перед ним). */
+function dataPathArg(args) {
+    return args.some((arg) => basenameOf(arg) === 'hooks.json');
+}
+
+/** Вызов оболочки, который может ПИСАТЬ файл данных, а не только назвать или прочитать. */
+function shellWritesContourData(cmd, calls) {
+    if (DATA_REDIRECT_RE.test(cmd)) return true;
+    for (const call of calls) {
+        const args = argValues(call);
+        if (INTERPRETERS_RE.test(call.name)) {
+            if (args.some((arg) => DATA_NAME_RE.test(arg))) return true;
+            continue;
+        }
+        if (!dataPathArg(args) || DATA_READERS.has(call.name)) continue;
+        if (call.name === 'git') {
+            const sub = args.find((arg) => !arg.startsWith('-'));
+            if (!GIT_TREE_WRITERS.has(sub)) continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Правка данных контура из сессии петли (#99, ревью Фазы 11). Данные читаются из дерева,
+ * которое правит сессия, на каждом вызове: дописанная в `writeAllowed` мутация действовала
+ * бы со следующего вызова, задолго до ship человека на мердже. Файловые инструменты
+ * записи сверяются по пути. Команда оболочки — по ВЫЗОВАМ, а не по упоминанию имени:
+ * забор на любое `hooks.json` в строке блокировал чтение (`cat`, `git diff --`), соседний
+ * `hooks.json.example` и сообщение коммита — обычные шаги петли, которая правит примеры
+ * и доки про этот файл. Блок — перенаправление в файл, интерпретатор с именем в тексте
+ * программы и любая команда вне читающих с аргументом базового имени `hooks.json`: так
+ * `cd .claude/ralph && sed -i … hooks.json` пути не содержит, но остаётся записью.
+ * Это забор по тексту, а не доказательство (путь, собранный по частям, он не видит), и
+ * сказано это в докблоке `consumer-data.cjs`. Сессия человека правит данные как раньше.
+ */
+function touchesContourData(toolName, input) {
+    if (WRITE_TOOLS.has(toolName)) {
+        const paths = [input.file_path, input.notebook_path, input.path];
+        if (Array.isArray(input.edits)) {
+            for (const edit of input.edits) if (edit) paths.push(edit.file_path);
+        }
+        return paths.find((v) => typeof v === 'string' && DATA_PATH_RE.test(v)) || null;
+    }
+    if (toolName === 'Bash') {
+        const cmd = typeof input.command === 'string' ? input.command : '';
+        return shellWritesContourData(cmd, shellCalls(cmd)) ? 'hooks.json' : null;
+    }
+    return null;
+}
+
 const FILE_TOOLS = new Set(['Read', 'Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'Grep']);
 
 /**
@@ -226,20 +238,48 @@ const FILE_TOOLS = new Set(['Read', 'Edit', 'Write', 'MultiEdit', 'NotebookEdit'
  * @returns {{ blocked: boolean, reason: string | null }}
  */
 /**
- * `options` — подмена окружения ТОЛЬКО для тестов правила про kill (#196): таблица
- * процессов, pid хука и дерево сессии. Хук зовёт `decide` двумя аргументами и читает
- * живой `/proc`.
+ * `options.contour` — данные контура потребителя (`consumer-data.cjs`); хук передаёт
+ * загруженные, без них контур пустой — самый строгий. `options.loop` — сессия петли: тогда
+ * данные контура сессии не правятся. Значение — булево или функция: хук узнаёт петлю ещё
+ * и переходным признаком по транскрипту, а читать транскрипт на каждом вызове незачем —
+ * функция зовётся, только когда вызов трогает данные.
+ *
+ * Остальное в `options` — подмена окружения ТОЛЬКО для тестов правила про kill (#196):
+ * таблица процессов, pid хука и дерево сессии. Хук их не передаёт и читает живой `/proc`.
  */
 function decide(toolName, toolInput, options = {}) {
     const input = toolInput || {};
 
-    if (MCP_TOOL_RE.test(toolName) && !mcpAllowed(toolName)) {
+    const mcp = (options.contour || emptyData()).mcp;
+    if (MCP_TOOL_RE.test(toolName) && !mcpAllowed(toolName, mcp)) {
+        // Пустой контур и имя вне непустого — разные советы: при пустых данных не
+        // разрешена ни одна мутация, и обещание «мутаций рабочего цикла» было бы ложью.
+        const contourText =
+            mcp.writeAllowed.size === 0
+                ? 'контур MCP-мутаций проекта пуст — нет данных `.claude/ralph/hooks.json` ' +
+                  'или в них нет mcp.writeAllowed, — разрешено только чтение (List*/Get*, ' +
+                  'кроме секретов). Мутации рабочего цикла проект заявляет в mcp.writeAllowed ' +
+                  'этого файла отдельным PR.'
+                : 'его нет в mcp.writeAllowed данных `.claude/ralph/hooks.json` (или он под ' +
+                  'запретом ядра по слову). Разрешены чтение (List*/Get*, кроме секретов) и ' +
+                  'заявленные там мутации; нужен новый — добавляй его туда отдельным PR с ' +
+                  'обоснованием.';
+        return {
+            blocked: true,
+            reason: `Инструмент ${toolName} не в allowlist MCP: ${contourText}`,
+        };
+    }
+
+    const contourData = touchesContourData(toolName, input);
+    const inLoop = () => (typeof options.loop === 'function' ? options.loop() : !!options.loop);
+    if (contourData && inLoop()) {
         return {
             blocked: true,
             reason:
-                `Инструмент ${toolName} не в allowlist MCP. Разрешены чтение (List*/Get*, ` +
-                'кроме секретов) и мутации рабочего цикла: issues, PR, метки, вехи. ' +
-                'Нужен новый — добавляй в MCP_WRITE_ALLOWED отдельным PR с обоснованием.',
+                `Правка данных контура хуков (${contourData}) из сессии петли заблокирована: ` +
+                'они решают, какие MCP-мутации и скиллы требует барьер, и действовали бы со ' +
+                'следующего вызова — раньше ship человека на мердже. Нужна правка — оставь ' +
+                'намерение с обоснованием, файл правит человек.',
         };
     }
 

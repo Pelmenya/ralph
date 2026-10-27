@@ -52,12 +52,16 @@ type FakeServer = {
     createdIssueSlug?: string;
     // #43: ответ на чтение одной карточки (`GET /issues/{slug}`).
     issue?: unknown;
+    // #125: СЫРЫЕ страницы ленты карточки — форма ответа целиком, чтобы проверить и
+    // дрейф ключа, а не только содержимое.
+    issueCommentPages?: unknown[];
 };
 
 function build(server: FakeServer = {}) {
     const calls: Call[] = [];
     let pageIdx = 0;
     let commentPageIdx = 0;
+    let issueCommentPageIdx = 0;
 
     const api: SourcecraftApi = (method, path, body) => {
         calls.push({ method, path, ...(body === undefined ? {} : { body }) });
@@ -101,6 +105,12 @@ function build(server: FakeServer = {}) {
                 return page;
             }
             return { pull_request_comments: server.prComments ?? [] };
+        }
+        if (method === 'GET' && /\/issues\/\d+\/comments\?/.test(path)) {
+            const pages = server.issueCommentPages ?? [{ issue_comments: [], next_page_token: '' }];
+            const page = pages[Math.min(issueCommentPageIdx, pages.length - 1)];
+            issueCommentPageIdx += 1;
+            return page;
         }
         if (method === 'GET' && /\/issues\/\d+$/.test(path)) return server.issue ?? {};
         if (path.includes('/pulls?')) return { pull_requests: server.pulls ?? [] };
@@ -298,6 +308,81 @@ describe('комментарии PR: один маршрут площадки п
         // иначе значит выкосить обычные комментарии на первой же смене формата ответа.
         const { adapter } = build({ prComments: [{ body: 'живой', author: { slug: 'dev' } }] });
         expect(adapter.listPullRequestComments(55)).toHaveLength(1);
+    });
+});
+
+// #125: ключ `issue_comments` и форма пустой ленты сверены живым ответом площадки
+// 27.10.2026, а не выведены по аналогии с `pull_request_comments`.
+describe('лента комментариев карточки — сверка намерения по метке (#125)', () => {
+    it('читает GET /issues/{slug}/comments и разбирает ключ issue_comments', () => {
+        const { adapter, calls } = build({
+            issueCommentPages: [
+                {
+                    issue_comments: [
+                        { id: 'a', body: 'первый', author: { slug: 'dev' } },
+                        { id: 'b', body: 'с меткой <!-- ralph-intent:x -->' },
+                    ],
+                    next_page_token: '',
+                },
+            ],
+        });
+        expect(adapter.listIssueComments?.(7)).toEqual([
+            'первый',
+            'с меткой <!-- ralph-intent:x -->',
+        ]);
+        expect(
+            calls.some(
+                (c) =>
+                    c.method === 'GET' &&
+                    c.path.includes(`/repos/${ORG}/${REPO}/issues/7/comments?`),
+            ),
+        ).toBe(true);
+    });
+
+    it('лента собирается со ВСЕХ страниц — метка могла уехать за первую', () => {
+        const { adapter } = build({
+            issueCommentPages: [
+                { issue_comments: [{ body: 'страница 1' }], next_page_token: 'p2' },
+                { issue_comments: [{ body: 'страница 2' }], next_page_token: '' },
+            ],
+        });
+        expect(adapter.listIssueComments?.(7)).toEqual(['страница 1', 'страница 2']);
+    });
+
+    it('пустая лента — пустой список: площадка отдаёт ключ с []', () => {
+        const { adapter } = build();
+        expect(adapter.listIssueComments?.(7)).toEqual([]);
+    });
+
+    it('НЕГАТИВНЫЙ: ключа нет (смена формата, чужой ключ) — отказ, а не пустая лента', () => {
+        // Угаданный ключ дал бы ровно это: пустоту на каждой карточке, то есть «эффект не
+        // лёг» и повтор комментария вслепую.
+        const { adapter } = build({
+            issueCommentPages: [{ comments: [{ body: 'с меткой' }], next_page_token: '' }],
+        });
+        expect(() => adapter.listIssueComments?.(7)).toThrow(/issue_comments/);
+    });
+
+    it('НЕГАТИВНЫЙ: ключ пропал на второй странице — отказ, а не половина ленты', () => {
+        const { adapter } = build({
+            issueCommentPages: [
+                { issue_comments: [{ body: 'страница 1' }], next_page_token: 'p2' },
+                { next_page_token: '' },
+            ],
+        });
+        expect(() => adapter.listIssueComments?.(7)).toThrow(/issue_comments/);
+    });
+
+    it('НЕГАТИВНЫЙ: сбой транспорта долетает до вызывающего', () => {
+        const adapter = createSourcecraftTaskSource({
+            api: () => {
+                throw new Error('SourceCraft GET: HTTP 502');
+            },
+            org: ORG,
+            repo: REPO,
+            authorAllowlist: () => ['dev'],
+        });
+        expect(() => adapter.listIssueComments?.(7)).toThrow(/502/);
     });
 });
 

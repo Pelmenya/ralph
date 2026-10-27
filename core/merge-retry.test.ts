@@ -4,6 +4,7 @@ import {
     MERGE_RETRY_BASE_MS,
     MERGE_RETRY_MAX_PAUSE_MS,
     classifyMergeFailure,
+    describeMergeFailure,
     mergeFailureLine,
     mergeRetryPauseMs,
     resolveMergeRetryMaxMs,
@@ -122,6 +123,22 @@ describe('resolveMergeRetryMaxMs (#47)', () => {
     it.each([0, -1, 1.5, '600000', null])('битое значение %j → fail-closed', (v) => {
         expect(() => resolveMergeRetryMaxMs({ mergeRetryMaxMs: v }, boom)).toThrow(
             /mergeRetryMaxMs/,
+        );
+    });
+});
+
+// Одна формулировка класса на лог гейта и стоп петли (#123): копии расходились бы.
+describe('describeMergeFailure (#123)', () => {
+    const at = { attempts: 4, retryMaxMs: 600_000 };
+    it('каждый класс назван словами, транзиент — с пределом и числом попыток', () => {
+        expect(describeMergeFailure('refusal', at)).toBe(
+            'отказ форжа по существу, повтором не лечится',
+        );
+        expect(describeMergeFailure('transient', at)).toBe(
+            'транзиентные отказы форжа дольше предела 10 мин (4 попыток)',
+        );
+        expect(describeMergeFailure('unknown', at)).toBe(
+            'отказ форжа не распознан и после повтора',
         );
     });
 });

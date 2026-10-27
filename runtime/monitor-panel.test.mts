@@ -13,6 +13,7 @@ import { describe, it, expect, afterEach, afterAll, vi } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { execFileSync } from 'node:child_process';
 import {
     evalDeadman,
     readLogTail,
@@ -29,6 +30,8 @@ import {
     issuesProgress,
     panelTaskSource,
     resolveRuntimeDir,
+    resolveExecutionRoot,
+    gitLine,
     type PanelTaskSource,
 } from './monitor-panel.mts';
 import type { Issue, PullRequest } from '../adapters/adapters.ts';
@@ -652,6 +655,110 @@ describe('--runtime-dir: разбор флага fail-closed (ревью !19)', 
         expect(() =>
             resolveRuntimeDir(['--runtime-dir', '/a', '--runtime-dir', '/b'], '/legacy'),
         ).toThrow(/дважды/);
+    });
+});
+
+describe('строка git: дерево работы наблюдаемого экземпляра (#126)', () => {
+    // Панель печатала `git:  @ `: каталог репозитория считался подъёмом выше корня ядра,
+    // git падал, отказ глотался. Дерево теперь называет раннер, а сбой — своя строка.
+    it('флаг раннера важнее roots конфига', () => {
+        const cfg = { rootsResolved: { executionRoot: '/path/to/from-config' } };
+        expect(resolveExecutionRoot(['--execution-root', '/path/to/work'], cfg)).toEqual({
+            dir: '/path/to/work',
+            source: 'флаг раннера',
+        });
+    });
+
+    it('без флага — roots.executionRoot конфига', () => {
+        const cfg = { rootsResolved: { executionRoot: '/path/to/from-config' } };
+        expect(resolveExecutionRoot(['--once'], cfg)).toEqual({
+            dir: '/path/to/from-config',
+            source: 'roots конфига',
+        });
+    });
+
+    it('ни флага, ни roots — отказ словами, а не догадка от каталога модуля', () => {
+        for (const cfg of [null, {}, { rootsResolved: null }]) {
+            const r = resolveExecutionRoot([], cfg);
+            expect(r).toEqual({ error: expect.stringMatching(/не названо/) });
+            expect(gitLine(r, () => 'не должен зваться')).toMatch(
+                /^git: \(дерево работы не названо/,
+            );
+        }
+    });
+
+    it('кривой флаг — отказ: без значения, относительный, дважды', () => {
+        expect(resolveExecutionRoot(['--execution-root'], null)).toEqual({
+            error: expect.stringMatching(/без значения/),
+        });
+        expect(resolveExecutionRoot(['--execution-root', '--once'], null)).toEqual({
+            error: expect.stringMatching(/без значения/),
+        });
+        expect(resolveExecutionRoot(['--execution-root', 'work'], null)).toEqual({
+            error: expect.stringMatching(/относительный/),
+        });
+        expect(
+            resolveExecutionRoot(['--execution-root', '/a', '--execution-root', '/b'], null),
+        ).toEqual({ error: expect.stringMatching(/дважды/) });
+    });
+
+    it('ответ git — ветка, HEAD и чьё это дерево; git зовётся в дереве работы', () => {
+        const calls: Array<[string[], string]> = [];
+        const line = gitLine({ dir: '/path/to/work', source: 'флаг раннера' }, (args, cwd) => {
+            calls.push([args, cwd]);
+            return args.includes('--abbrev-ref') ? 'feature/x' : 'abc1234';
+        });
+        expect(line).toBe('git: feature/x @ abc1234   дерево: /path/to/work (флаг раннера)');
+        expect(calls.every(([, cwd]) => cwd === '/path/to/work')).toBe(true);
+    });
+
+    it('отказ git отличим от пустого ответа — с причиной первой строкой stderr', () => {
+        const failing = () => {
+            throw Object.assign(new Error('Command failed'), {
+                stderr: 'fatal: not a git repository\nвторая строка',
+            });
+        };
+        expect(gitLine({ dir: '/path/to/work', source: 'флаг раннера' }, failing)).toBe(
+            'git: (не прочиталось в /path/to/work: fatal: not a git repository)',
+        );
+        expect(gitLine({ dir: '/path/to/work', source: 'флаг раннера' }, () => '')).toBe(
+            'git: (git ответил пусто в /path/to/work)',
+        );
+    });
+
+    it('без stderr причина берётся из текста исключения', () => {
+        const failing = () => {
+            throw new Error('spawnSync git ENOENT');
+        };
+        expect(gitLine({ dir: '/w', source: 's' }, failing)).toBe(
+            'git: (не прочиталось в /w: spawnSync git ENOENT)',
+        );
+    });
+
+    // Настоящий git на временном репозитории: строка показывает ветку дерева РАБОТЫ, а не
+    // установки ядра, из которой исполняется сама панель.
+    it('настоящий git: ветка дерева работы, а не дерева ядра', () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-panel-git-'));
+        try {
+            const git = (...a: string[]) => execFileSync('git', a, { cwd: dir, stdio: 'ignore' });
+            git('init', '-q', '-b', 'feature/panel-probe');
+            git(
+                '-c',
+                'user.name=t',
+                '-c',
+                'user.email=t@example.com',
+                'commit',
+                '-q',
+                '--allow-empty',
+                '-m',
+                'init',
+            );
+            const line = gitLine(resolveExecutionRoot(['--execution-root', dir], null));
+            expect(line).toMatch(/^git: feature\/panel-probe @ [0-9a-f]{4,} {3}дерево: /);
+            expect(line).toContain(dir);
+        } finally {
+            fs.rmSync(dir, { recursive: true, force: true });
+        }
     });
 });
 

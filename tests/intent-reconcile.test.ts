@@ -6,7 +6,8 @@
 // Теперь тело эффекта несёт невидимую метку с идентификатором попытки, метка на диске —
 // тот же идентификатор, и повтор сначала ищет метку в ленте форжа. Где ленты нет
 // (новая карточка, шов без чтения комментариев карточки), неизвестный исход — стоп с
-// причиной, а не повтор вслепую.
+// причиной, а не повтор вслепую. Ленту карточки боевые адаптеры читают с #125 — это
+// последний сценарий файла, на настоящей сборке шва площадки.
 //
 // Фейк форжа здесь честный в одном важном смысле: «бросил после записи» означает, что
 // эффект в ленте ЕСТЬ, а «бросил до записи» — что его нет. Ровно эту разницу раннер
@@ -17,6 +18,7 @@ import { describe, expect, it } from 'vitest';
 import ralph from '../ralph.js';
 import { IN_FLIGHT_PREFIX, intentMark } from '../core/session-requests.ts';
 import { REASON_TITLES } from '../core/stop-message.ts';
+import { createSourcecraftTaskSource } from '../adapters/sourcecraft-task-source.ts';
 
 const CFG = { issueLabels: ['complexity:low', 'area:core'] };
 const PHASE = { branch: 'feature/m1' };
@@ -305,5 +307,67 @@ describe('#94 критерий 2: неизвестный исход без во�
         const chat: string[] = [];
         expect(run(disk, forge, chat).outcomeUnknown).toBe(true);
         expect(forge.prComments()).toEqual([]);
+    });
+});
+
+// #125: то же «лёг и бросил», но шов — БОЕВАЯ сборка адаптера площадки, а не фейк с
+// методами-заглушками. Фейк выше доказывает логику сверки; здесь доказывается, что
+// настоящий адаптер ленту карточки отдаёт в той форме, в какой сверка ищет метку, и что
+// ядро видит у него метод — то есть транзиент на комментарии карточки больше не стоп.
+describe('#125: комментарий карточки на боевой сборке шва — сверка вместо стопа', () => {
+    function sourcecraftForge() {
+        const comments = new Map<string, string[]>();
+        let dropOnce = true;
+        const api = (method: string, path: string, body?: unknown): unknown => {
+            const m = /\/issues\/(\d+)\/comments/.exec(path);
+            if (!m) throw new Error(`маршрут вне сценария: ${method} ${path}`);
+            if (method === 'POST') {
+                const text = (body as { body: string }).body;
+                comments.set(m[1], [...(comments.get(m[1]) ?? []), text]);
+                // Запрос дошёл и лёг, ответ оборвался — неотличимо от отказа.
+                if (dropOnce) {
+                    dropOnce = false;
+                    throw new Error('SourceCraft POST: curl вернул 52 — пустой ответ сервера');
+                }
+                return {};
+            }
+            // Форма ответа — как у живой площадки (ключ сверен 27.10.2026).
+            return {
+                issue_comments: (comments.get(m[1]) ?? []).map((b) => ({ body: b })),
+                next_page_token: '',
+            };
+        };
+        const ts = createSourcecraftTaskSource({
+            api,
+            org: 'org',
+            repo: 'repo',
+            authorAllowlist: () => [],
+        });
+        return { ts, comments: (n: number) => comments.get(String(n)) ?? [] };
+    }
+
+    it('лёг и бросил — повтор дубля не публикует и петлю не останавливает', () => {
+        const forge = sourcecraftForge();
+        const disk = {
+            file: `${[line({ kind: 'comment', issue: 7, comment: 'что выяснилось' }), line(LATER)].join('\n')}\n` as
+                string | null,
+        };
+        const chat: string[] = [];
+        const asForge = { ts: forge.ts } as unknown as ReturnType<typeof makeForge>;
+
+        const first = run(disk, asForge, chat);
+        expect(first.failed).toBe(true);
+        // Не стоп: боевой шов ленту карточки читает, исход решит сверка.
+        expect(first.outcomeUnknown).toBeUndefined();
+        expect(chat.join('\n')).not.toContain(REASON_TITLES['intent-unknown']);
+        // Метка в тексте ставится — по ней будут искать.
+        expect(forge.comments(7)[0]).toMatch(MARK_RE);
+        expect(startStops(disk, asForge).stopped).toBe(false);
+
+        const second = run(disk, asForge, chat);
+        expect(second.failed).toBe(false);
+        expect(forge.comments(7).map((b) => b.replace(MARK_RE, ''))).toEqual(['что выяснилось']);
+        expect(forge.comments(8).map((b) => b.replace(MARK_RE, ''))).toEqual(['следом']);
+        expect(disk.file).toBeNull();
     });
 });

@@ -40,10 +40,12 @@ import { classifyForgeFailure, waitForForgeChecks } from './forge-checks.ts';
 import {
     MERGE_RETRY_BASE_MS,
     classifyMergeFailure,
+    describeMergeFailure,
     mergeFailureLine,
     mergeRetryPauseMs,
     resolveMergeRetryMaxMs,
 } from './merge-retry.ts';
+import type { MergeFailureKind } from './merge-retry.ts';
 import { errorText, gitNetworkOpts } from '../shared/ralph-util.ts';
 import type { ExecOpts, ShArgvFn } from '../shared/ralph-util.ts';
 import { syncPhaseBranchWithMain } from './main-sync.ts';
@@ -87,6 +89,16 @@ type RedCheck = { name: string; cmd: string; excerpt: string };
 // оказавшийся в нём, ушёл бы на лечение кода, которого никто не ломал.
 type ToolFailure = { name: string; cmd: string; why: string; excerpt: string };
 type ToolFailureSkip = { name: string; cmd: string; why: string };
+// #123: отказ мерджа, с которым гейт вернул `not-merged`: класс (merge-retry.ts), первая
+// строка ответа форжа (не командная строка исключения), сколько попыток сгорело и под каким
+// пределом — всё, из чего цикл собирает диагноз пуша, не пересказывая лог.
+export type MergeFailure = {
+    pr: number;
+    kind: MergeFailureKind;
+    line: string;
+    attempts: number;
+    retryMaxMs: number;
+};
 
 // #269: сигнатуры шва «чек PR у форжа». Обе НЕОБЯЗАТЕЛЬНЫЕ: реализация без них означает
 // прежнее поведение — мердж сразу после локальных чеков, а красный чек форжа отвергает
@@ -456,6 +468,11 @@ export function createGateRunner(env: GateEnv) {
     // что lastForgeRedCheck: цикл читает её ПОСЛЕ возврата статуса `forge-unknown` и
     // кладёт в пуш человеку — иначе ночная остановка выясняется только утром.
     let lastForgeStop: string | null = null;
+    // #123: мердж не удался — класс отказа и строка ответа форжа. Раньше гейт писал их только
+    // логом, и пуш на `not-merged` уходил катч-оллом «причина не установлена», хотя класс
+    // (по существу / транзиент дольше предела / нераспознанный) гейт знал точно. Геттер тем
+    // же приёмом, что lastHeadDivergence: ставится внутри tryMergePhase, читается после.
+    let lastMergeFailure: MergeFailure | null = null;
     // Задача 81: чек последнего прогона, упавший на ИНСТРУМЕНТЕ при `fail-closed` (null —
     // такого не было), и чеки, пропущенные по `fail-open`. Оба ставятся побочкой
     // checksGreen и читаются геттерами — тем же приёмом, что lastRedCheck.
@@ -1031,6 +1048,7 @@ export function createGateRunner(env: GateEnv) {
         // не должен носить красный куб прошлого раунда.
         lastForgeRedCheck = null;
         lastForgeStop = null;
+        lastMergeFailure = null;
         lastMergeProof = null;
         // C1: dry-run строго read-only. Основной guard стоит в цикле ДО вызова гейта;
         // этот — defense in depth: даже если будущая правка цикла потеряет внешний
@@ -1365,14 +1383,20 @@ export function createGateRunner(env: GateEnv) {
                 }
                 logFn(
                     `⛔ Гейт: мердж PR #${pr.number} не удался (${message}) — ` +
-                        (kind === 'refusal'
-                            ? 'отказ форжа по существу, повтором не лечится'
-                            : kind === 'transient'
-                              ? `транзиентные отказы форжа дольше предела ${Math.round(mergeRetryMaxMs / 60000)} мин ` +
-                                `(${attempt} попыток), стоп fail-closed`
-                              : 'отказ не распознан и после повтора') +
+                        describeMergeFailure(kind, {
+                            attempts: attempt,
+                            retryMaxMs: mergeRetryMaxMs,
+                        }) +
+                        (kind === 'transient' ? ', стоп fail-closed' : '') +
                         ' — оставлен человеку.',
                 );
+                lastMergeFailure = {
+                    pr: pr.number,
+                    kind,
+                    line: why,
+                    attempts: attempt,
+                    retryMaxMs: mergeRetryMaxMs,
+                };
                 if (kind === 'refusal' && attempt === 1) onMergeSettledFn();
                 parkFn();
                 return 'not-merged';
@@ -1450,6 +1474,7 @@ export function createGateRunner(env: GateEnv) {
         getLastGatePr: (): number | null => lastGatePr,
         getLastForgeRedCheck: (): ForgeRedCheck | null => lastForgeRedCheck,
         getLastForgeStop: (): string | null => lastForgeStop,
+        getLastMergeFailure: (): MergeFailure | null => lastMergeFailure,
         getLastToolFailure: (): ToolFailure | null => lastToolFailure,
         getToolFailureSkips: (): ToolFailureSkip[] => lastToolSkips,
         getLastMergeProof: (): string | null => lastMergeProof,

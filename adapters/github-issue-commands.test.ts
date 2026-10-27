@@ -230,6 +230,36 @@ describe('намерения кодер-сессии: мутации через 
     });
 });
 
+describe('issueComments — лента карточки для сверки намерения (#125)', () => {
+    it('читает issues/N/comments с --paginate и отдаёт тела по порядку', () => {
+        const ghJsonFn = vi.fn(() => [
+            { body: 'первый', user: { login: 'dev' } },
+            { body: 'с меткой <!-- ralph-intent:x -->' },
+            { user: { login: 'dev' } },
+        ]);
+        expect(make().issueComments(7, { ghJsonFn } as never)).toEqual([
+            'первый',
+            'с меткой <!-- ralph-intent:x -->',
+            '',
+        ]);
+        expect(ghJsonFn).toHaveBeenCalledWith(
+            'gh api repos/{owner}/{repo}/issues/7/comments --paginate',
+        );
+    });
+
+    it('НЕГАТИВНЫЙ: ответ не массивом — отказ, а не пустая лента', () => {
+        const ghJsonFn = () => ({ message: 'Not Found' }) as never;
+        expect(() => make().issueComments(7, { ghJsonFn })).toThrow(/не массив/);
+    });
+
+    it('НЕГАТИВНЫЙ: сбой чтения долетает до вызывающего', () => {
+        const ghJsonFn = () => {
+            throw new Error('gh: HTTP 502');
+        };
+        expect(() => make().issueComments(7, { ghJsonFn })).toThrow(/502/);
+    });
+});
+
 describe('closeMilestoneByTitle — косметика после сдачи, fail-open', () => {
     it('находит открытую веху по заголовку и закрывает её через argv', () => {
         const ghJsonFn = vi.fn(() => [{ number: 4, title: 'Фаза X' }]);

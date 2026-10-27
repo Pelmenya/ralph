@@ -70,6 +70,9 @@ codereview:
               ## вызываться; защищать одно без другого бессмысленно.
               - '.claude/hooks/**'
               - '.claude/settings.json'
+              ## Данные контура хуков: MCP-мутации и таблица скиллов. Строка в этом файле
+              ## открывает вызов так же, как строка в коде хука.
+              - '.claude/ralph/hooks.json'
           reviewers:
               usernames:
                   - 'lyapindm'

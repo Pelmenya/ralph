@@ -1,5 +1,9 @@
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+
 import { describe, expect, it } from 'vitest';
 
+import { parseConsumerData } from './consumer-data.cjs';
 import { decide } from './guard-rules.cjs';
 
 const bash = (command: string) => decide('Bash', { command });
@@ -157,7 +161,12 @@ describe('устройство барьера', () => {
 });
 
 describe('MCP — allowlist, а не blocklist', () => {
-    const mcp = (tool: string) => decide(tool, {});
+    // Мутации рабочего цикла — данные потребителя (#99): набор гоняется на данных канона
+    // как потребителя, `.claude/ralph/hooks.json`.
+    const contour = parseConsumerData(
+        readFileSync(path.join(import.meta.dirname, '..', 'ralph', 'hooks.json'), 'utf-8'),
+    );
+    const mcp = (tool: string) => decide(tool, {}, { contour });
 
     // Проход 5 ревью, проверено прогоном: сервер с подчёркиванием в имени не подходил
     // под класс `[a-z0-9-]+` в MCP_TOOL_RE, значит ветку MCP в decide не открывал вовсе —

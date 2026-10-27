@@ -41,7 +41,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 // Резолв профилей (#71) и примитивы петли — единый источник правды с раннером, чтобы
 // монитор не завёл вторую копию правил мерджа. ralph.js — JS-entry без деклараций типов,
 // поэтому default-импорт с деструктуризацией (ESM не читает именованные экспорты из CJS
@@ -80,12 +80,10 @@ import { summarizeRuntime } from './metric.mts';
 import { evalDisk, freeBytes, maybePushDiskLow } from './disk-watch.ts';
 import { resolveObservability } from '../core/observability.ts';
 
-// monitor-panel.mts живёт в .claude/ralph/runtime/ (#396), поэтому каталог раннера —
-// родитель import.meta.dirname, а не он сам. Служебные файлы (ralph.log/state/config)
-// лежат в .claude/ralph/. import.meta.dirname = каталог, ОТКУДА ЗАГРУЖЕН модуль (дерево
-// раннера), чем и держится семантика «панель читает лог своего дерева» (#404).
+// Каталог ядра — родитель import.meta.dirname (модуль лежит в `runtime/`). От него берутся
+// только умолчания прежней раскладки: служебные файлы рядом с ядром, если раннер не назвал
+// каталог состояния флагом. Дерево РАБОТЫ отсюда не выводится вовсе — см. resolveExecutionRoot.
 const RALPH_DIR = path.resolve(import.meta.dirname, '..');
-const REPO_DIR = path.resolve(RALPH_DIR, '..', '..');
 
 // --runtime-dir <путь> (канон, задача 22): каталог СОСТОЯНИЯ наблюдаемого экземпляра.
 // Раннер прокидывает его при авто-спавне, когда состояние уехало из каталога ядра. Без
@@ -174,6 +172,7 @@ type ResolvedConfig = {
     profileName?: string;
     phases?: PhaseConfig[];
     adapters?: AdapterConfig;
+    rootsResolved?: { executionRoot?: string } | null;
 } | null;
 
 // state фазы (ralph.state.json): milestone === null — штатный конец очереди (#THS8M).
@@ -267,16 +266,74 @@ export function panelTaskSource(
     }
 }
 
-function sh(cmd: string): string {
-    try {
-        return execSync(cmd, {
-            cwd: REPO_DIR,
-            encoding: 'utf8',
-            stdio: ['ignore', 'pipe', 'ignore'],
-        }).trim();
-    } catch {
-        return '';
+// ── Строка git: чьё дерево и что, если git не ответил (#126) ──
+// Каталог репозитория считался подъёмом на два уровня от каталога ядра — остаток раскладки,
+// где модуль жил в `.claude/ralph/runtime/`. После переезда подъём уводил выше корня, git
+// падал, а обёртка глотала отказ: панель печатала `git:  @ ` — пустоту, неотличимую от
+// ответа. И даже верный подъём показал бы не то дерево: ядро исполняется из `productRoot`,
+// а работа идёт в `executionRoot` (`core/roots.ts`), и у них разные ветки.
+//
+// Поэтому дерево работы называет тот, кто его знает: раннер передаёт `--execution-root`
+// (каталог, в котором он работает после переезда в worktree фазы). Ручной запуск без флага
+// берёт `roots.executionRoot` конфига; нет и его — строка говорит, что дерево не названо, а
+// не гадает от места запуска или каталога модуля.
+export type ExecutionRoot = { dir: string; source: string } | { error: string };
+
+export function resolveExecutionRoot(args: string[], config: ResolvedConfig): ExecutionRoot {
+    const idx = args.indexOf('--execution-root');
+    if (idx !== -1) {
+        if (args.indexOf('--execution-root', idx + 1) !== -1) {
+            return {
+                error: '--execution-root передан дважды — какое дерево показывать, не догадка',
+            };
+        }
+        const value = args[idx + 1];
+        if (!value || value.startsWith('--')) return { error: '--execution-root без значения' };
+        if (!path.isAbsolute(value)) {
+            return {
+                error: `--execution-root ${value} относительный — резолвился бы от места запуска панели`,
+            };
+        }
+        return { dir: value, source: 'флаг раннера' };
     }
+    const fromConfig = config?.rootsResolved?.executionRoot;
+    if (typeof fromConfig === 'string' && fromConfig !== '') {
+        return { dir: fromConfig, source: 'roots конфига' };
+    }
+    return {
+        error: 'дерево работы не названо: нет ни --execution-root, ни roots.executionRoot в конфиге',
+    };
+}
+
+// Исполнитель git — параметром: тест подменяет его, не трогая настоящий репозиторий.
+export type GitExecFn = (args: string[], cwd: string) => string;
+
+const gitExec: GitExecFn = (args, cwd) =>
+    execFileSync('git', args, {
+        cwd,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+
+// Строка панели целиком. Три различимых исхода, как у вопросов шву: ответ, «git ответил
+// пусто» и «git не ответил» с причиной — иначе отказ снова выглядел бы пустой веткой.
+export function gitLine(root: ExecutionRoot, execFn: GitExecFn = gitExec): string {
+    if ('error' in root) return `git: (${root.error})`;
+    let branch: string;
+    let head: string;
+    try {
+        branch = execFn(['rev-parse', '--abbrev-ref', 'HEAD'], root.dir);
+        head = execFn(['rev-parse', '--short', 'HEAD'], root.dir);
+    } catch (e) {
+        const err = e as { stderr?: unknown; message?: unknown };
+        const text = String(err?.stderr || err?.message || e)
+            .trim()
+            .split('\n')[0]
+            .slice(0, 160);
+        return `git: (не прочиталось в ${root.dir}: ${text || 'причина не названа'})`;
+    }
+    if (!branch || !head) return `git: (git ответил пусто в ${root.dir})`;
+    return `git: ${branch} @ ${head}   дерево: ${root.dir} (${root.source})`;
 }
 
 function readJSON(p: string): unknown {
@@ -772,8 +829,7 @@ function snapshot(): void {
     const source = panelTaskSource(config);
     const prog = issuesProgress(ms?.phase?.milestone || state?.milestone || null, source);
     const prs = openPhasePRs(config, state, source);
-    const head = sh('git rev-parse --short HEAD');
-    const branch = sh('git rev-parse --abbrev-ref HEAD');
+    const git = gitLine(resolveExecutionRoot(args, config));
 
     const alive =
         lastMtime != null && now - lastMtime < INTERVAL_SEC * 1000 * 3
@@ -814,7 +870,7 @@ function snapshot(): void {
             (ms && ms.idx !== -1 ? `  (${ms.idx + 1}/${ms.total})` : '') +
             `   submitted=${submittedOfState(state) ? 'да' : 'нет'}   iter=${state?.count ?? '?'}`,
     );
-    out.push(`git: ${branch} @ ${head}`);
+    out.push(git);
     // Профиль и статус доставки пушей. Операционный шов: ручной перезапуск монитора без
     // --profile берёт defaultProfile (playground) — и на prod-хосте deadman-пуши молча не
     // доставляются (pushEvent шлёт только в prod). Именно ручной рестарт после смерти

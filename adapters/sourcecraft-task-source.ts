@@ -175,7 +175,11 @@ export function createSourcecraftTaskSource(deps: SourcecraftTaskSourceDeps): Ta
     // Обход страниц. `key` — имя массива в ответе: у issues это `issues`, у PR
     // `pull_requests`, у milestones `items` (у трёх ручек три разных ключа — это факт
     // площадки, проверенный живыми ответами, а не догадка по спеке).
-    const pageThrough = (path: string, key: string): unknown[] => {
+    //
+    // `strict` — ключ обязан прийти массивом на КАЖДОЙ странице, иначе отказ. Нужен там,
+    // где пустой ответ опасен (#125: лента карточки для сверки намерения): `asArray` на
+    // неверном ключе молча отдал бы пустоту, то есть «эффект не лёг» и повтор вслепую.
+    const pageThrough = (path: string, key: string, strict = false): unknown[] => {
         const out: unknown[] = [];
         let token = '';
         for (let page = 0; page < MAX_PAGES; page += 1) {
@@ -184,6 +188,12 @@ export function createSourcecraftTaskSource(deps: SourcecraftTaskSourceDeps): Ta
                 token ? `&page_token=${encodeURIComponent(token)}` : ''
             }`;
             const res = api('GET', `${path}${query}`) as Record<string, unknown> | null;
+            if (strict && !Array.isArray(res?.[key])) {
+                throw new Error(
+                    `SourceCraft: ответ ${path} без массива \`${key}\` — формат ответа ` +
+                        `неожиданный (получено: ${JSON.stringify(res).slice(0, 200)}).`,
+                );
+            }
             out.push(...asArray(res?.[key]));
             const next = String(res?.['next_page_token'] ?? '');
             // ПУСТОЙ токен (или его отсутствие) — сервер сказал «больше нет»: штатный конец.
@@ -695,6 +705,17 @@ export function createSourcecraftTaskSource(deps: SourcecraftTaskSourceDeps): Ta
         // канал шелла в этом пути отсутствует как класс (C3).
         commentOnIssue(issue: number, body: string): void {
             api('POST', `${base}/issues/${String(issue)}/comments`, { body });
+        },
+
+        // #125: лента карточки для сверки начатого намерения по метке (#94). Ключ
+        // `issue_comments` сверен живым ответом 27.10.2026 (пустая лента приходит
+        // `{"issue_comments":[],"next_page_token":""}`, страницы — тем же `page_token`), а не
+        // выведен по аналогии с `pull_request_comments`: угаданный ключ дал бы пустую ленту,
+        // то есть повтор комментария вслепую. Поэтому обход строгий — нет ключа, отказ.
+        listIssueComments(issue: number): string[] {
+            return pageThrough(`${base}/issues/${String(issue)}/comments`, 'issue_comments', true)
+                .map((raw) => (raw as { body?: unknown } | null)?.body)
+                .map((body) => (typeof body === 'string' ? body : ''));
         },
 
         // Статус пишется camelCase-значением (`closed` тут совпадает, но `inProgress` —

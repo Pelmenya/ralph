@@ -1,0 +1,53 @@
+{
+    "$comment": "Данные контракта потребителя для хуков канона: правила контура guard'а и таблица скиллов. Исполняемая часть — .claude/hooks, разбор — consumer-data.cjs. Правка этого файла меняет барьер: она под ship человека, как сами хуки.",
+    "mcp": {
+        "writeAllowed": [
+            "mcp__sourcecraft__CreateIssue",
+            "mcp__sourcecraft__CreateIssueByID",
+            "mcp__sourcecraft__UpdateIssue",
+            "mcp__sourcecraft__UpdateIssueByID",
+            "mcp__sourcecraft__CreateIssueComment",
+            "mcp__sourcecraft__UpdateIssueComment",
+            "mcp__sourcecraft__CreateIssueLink",
+            "mcp__sourcecraft__AddLabels",
+            "mcp__sourcecraft__AddLabelsByID",
+            "mcp__sourcecraft__RemoveLabels",
+            "mcp__sourcecraft__ReplaceLabels",
+            "mcp__sourcecraft__CreateLabel",
+            "mcp__sourcecraft__UpdateLabel",
+            "mcp__sourcecraft__AddPullRequestLabels",
+            "mcp__sourcecraft__RemovePullRequestLabels",
+            "mcp__sourcecraft__CreatePullRequest",
+            "mcp__sourcecraft__UpdatePullRequest",
+            "mcp__sourcecraft__PublishPullRequest",
+            "mcp__sourcecraft__CreatePullRequestComment",
+            "mcp__sourcecraft__UpdatePullRequestComment",
+            "mcp__sourcecraft__MergePullRequest",
+            "mcp__sourcecraft__DiscardPullRequest",
+            "mcp__sourcecraft__ReopenPullRequest",
+            "mcp__sourcecraft__AddLinkedPRs",
+            "mcp__sourcecraft__RemoveLinkedPRs",
+            "mcp__sourcecraft__CreateMilestone",
+            "mcp__sourcecraft__UpdateMilestone",
+            "mcp__sourcecraft__RunWorkflow",
+            "mcp__sourcecraft__AddReaction"
+        ],
+        "neverExceptions": ["mcp__sourcecraft__DiscardPullRequest"],
+        "notes": {
+            "mcp__sourcecraft__DiscardPullRequest": "Закрытие PR без мерджа разрешено по ОБРАТИМОСТИ: его отменяет ReopenPullRequest, тогда как разрешённый MergePullRequest необратим. Squash-мердж ломает стопку PR, и старый PR убирает тот, кто его завёл. Вычет из запрета по слову discard — по полному имени: удаление релизов (DiscardByTag/DiscardByID) остаётся под запретом.",
+            "mcp__sourcecraft__ReopenPullRequest": "Отмена закрытия — та обратимость, на которой держится вычет DiscardPullRequest. Без неё агент закрыл бы и не вернул.",
+            "mcp__sourcecraft__RemoveLinkedPRs": "Площадка вяжет PR к карточке по голому #N в описании; правка описания связь не снимает. Обратимо через AddLinkedPRs.",
+            "mcp__sourcecraft__SetDecision": "НАМЕРЕННО отсутствует: это одобрение ревью. Аккаунт один, ignore_self_ship: false — с SetDecision агент сам удовлетворял бы требование ship человека на путях барьеров."
+        }
+    },
+    "skills": {
+        "files": [
+            {
+                "pattern": "\\.test\\.m?tsx?$",
+                "skills": ["vitest"],
+                "why": "тест — моки, фикстуры и покрытие по скиллу vitest"
+            }
+        ],
+        "commands": []
+    }
+}
