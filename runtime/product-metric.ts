@@ -106,6 +106,11 @@ export const STOP_ROLES: Record<TStopReason, 'barrier' | 'paired' | 'loop'> = {
     'merge-unknown': 'loop',
     // Журнал этапов (#92) повреждён или не пишется: стоп петли, изменение ни при чём.
     'stage-journal': 'loop',
+    // #97: форж или git не прочитались серией — стоп петли, изменение ни при чём.
+    'forge-unreadable': 'loop',
+    // Фаза 10: карточка не по формату потребителя поймана до сессии — строки гейта у этого
+    // барьера нет, он виден только стопом.
+    'issue-format': 'barrier',
     breaker: 'loop',
     deadman: 'loop',
     unknown: 'loop',

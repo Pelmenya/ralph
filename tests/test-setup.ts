@@ -15,6 +15,7 @@
 // security-audit.mjs — они лишь ре-экспортируют тот же массив), сверяем одним afterEach.
 import { afterEach, expect } from 'vitest';
 import { guardSideEffect, sideEffectAttempts } from '../shared/side-effect-guard.ts';
+import { installForgeExecGuard } from './forge-exec-guard.ts';
 
 // Список ключей подписки (задача 96) включает боевое кольцо ротации: при двух ключах
 // runClaude читает файл ротации. На хосте петли переменная задана, и `npm test` из такой
@@ -36,6 +37,13 @@ globalThis.fetch = ((input: Parameters<typeof fetch>[0], init?: Parameters<typeo
     guardSideEffect(`fetch(${url})`, 'Подмени сетевой вызов параметром: прогон идёт без сети.');
     return realFetch(input, init);
 }) as typeof fetch;
+
+// Запуск бинаря форжа — по имени ЗАПУЩЕННОГО, а не по тексту кода (задача 20): имя,
+// собранное в рантайме, скан `core-purity` не видит по конструкции. Подмена стоит на
+// `node:child_process` всего процесса сьюта; граница чека — в докблоке модуля.
+installForgeExecGuard((what) =>
+    guardSideEffect(what, 'Команды форжа зовёт только адаптер, а в тесте — подменённый шов.'),
+);
 
 afterEach(() => {
     const attempts = sideEffectAttempts.splice(0);

@@ -27,6 +27,8 @@ export type TStopReason =
     | 'intent-unknown'
     | 'merge-unknown'
     | 'stage-journal'
+    | 'forge-unreadable'
+    | 'issue-format'
     | 'breaker'
     | 'deadman'
     | 'unknown';
@@ -69,6 +71,11 @@ export const REASON_TITLES: Record<TStopReason, string> = {
     'merge-unknown': 'исход мерджа неизвестен',
     // #92: журнал этапов попытки повреждён или не пишется — продолжать по нему нельзя.
     'stage-journal': 'журнал этапов попытки не читается или не пишется',
+    // #97: чтение, без которого решение петли слепо (прогресс итерации, комментарии PR
+    // для правок), не прошло серией — fail-open на одном сбое, стоп на повторе.
+    'forge-unreadable': 'форж или git не читаются',
+    // Фаза 10: карточка не держит формат, заданный потребителем (`issueFormat`).
+    'issue-format': 'карточка не по формату потребителя',
     breaker: 'circuit breaker',
     deadman: 'тишина лога (deadman)',
     unknown: 'причина не установлена',

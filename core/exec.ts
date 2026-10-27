@@ -7,6 +7,7 @@
 // - log/fail/setLogTarget — лог-строка с ISO-временем в консоль + запись в три приёмника
 //   (лог, журнал событий, heartbeat — задача 95; цель перенаправляется в worktree раннера
 //   ДО chdir, #SiaUB) и fail-closed стоп; emitEvent — событие только для журнала;
+//   ветки записи и режим наблюдателя проверяет `exec-sinks.test.ts` (задача 128);
 // - sh/shArgv — шелл-строка (только чтения, #133) и argv без шелла (мутации, #193/#252),
 //   обе под предохранителем #138;
 // - ghJson — gh-чтения с ретраями и backoff (M3);
@@ -23,6 +24,7 @@
 // функции — те же боевые дефолты-коллабораторы, что раньше жили module-level в ralph.js.
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { execSync, execFileSync } from 'node:child_process';
 import type { StdioOptions } from 'node:child_process';
@@ -54,6 +56,15 @@ export type ExecEnv = {
     // Начальная цель лога (cwd-относительный LOG_PATH); main() оркестратора репойнтит
     // её на абсолютный путь внутри worktree раннера ещё ДО chdir (#SiaUB).
     initialLogTarget: string;
+    // Коллабораторы для тестов (задача 128); боевой вызов их не передаёт. Предохранитель
+    // модульный, и без своего флага ветки записи были недостижимы из сьюта вовсе — в том
+    // числе предохранитель наблюдателя: снятие `logTarget === null` осталось бы зелёным.
+    // Флаг снимают только с целью лога во временном каталоге теста — и это держит
+    // `createExec`, а не текст: снятый под RALPH_NO_SIDE_EFFECTS=1 флаг с целью вне
+    // `os.tmpdir()` бросает (и в `setLogTarget` тоже).
+    noSideEffects?: boolean;
+    sinks?: ReturnType<typeof createLogSinks>;
+    pruneFn?: typeof pruneSessionLogs;
 };
 
 export function loadJson<T>(p: string, fallback: T): T {
@@ -79,7 +90,13 @@ export function chooseLogPath(
 }
 
 export function createExec(env: ExecEnv) {
-    const { guardSideEffect, sleep, initialLogTarget } = env;
+    const {
+        guardSideEffect,
+        sleep,
+        initialLogTarget,
+        noSideEffects = NO_SIDE_EFFECTS,
+        pruneFn = pruneSessionLogs,
+    } = env;
 
     // Куда log() дописывает строки. По умолчанию — cwd-относительный LOG_PATH, но main()
     // репойнтит на АБСОЛЮТНЫЙ путь внутри worktree раннера ещё ДО chdir (#SiaUB): иначе
@@ -90,9 +107,24 @@ export function createExec(env: ExecEnv) {
     // монитора спрашивает трекер через шов, а адаптер пишет свои предупреждения этим же
     // log(). Файлом здесь был бы ralph.log рядом с ядром — а свежесть ralph.log и есть
     // признак жизни петли: строка наблюдателя оживила бы мёртвый раннер.
+    // Задача 128: предохранитель модульный, а параметр снимает его с любого экземпляра.
+    // Правило «снимают только с целью во временном каталоге» — барьер, а не абзац: тест,
+    // снявший флаг с боевой целью, писал бы в живой лог петли (а свежесть лога — признак
+    // её жизни для deadman).
+    const assertSafeTarget = (p: string | null): void => {
+        if (!NO_SIDE_EFFECTS || noSideEffects || p === null) return;
+        const rel = path.relative(os.tmpdir(), path.resolve(p));
+        if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel))
+            throw new Error(
+                `createExec: noSideEffects снят под RALPH_NO_SIDE_EFFECTS=1, а цель лога ${p} ` +
+                    `не во временном каталоге (${os.tmpdir()}) — запись ушла бы в живое дерево.`,
+            );
+    };
+    assertSafeTarget(initialLogTarget);
     let logTarget: string | null = initialLogTarget;
 
     function setLogTarget(p: string | null): void {
+        assertSafeTarget(p);
         logTarget = p;
     }
 
@@ -107,19 +139,19 @@ export function createExec(env: ExecEnv) {
     // Задача 95: строка уходит в три независимых приёмника — лог, журнал событий и
     // heartbeat (`event-journal.ts`). Прежний `catch {}` вокруг одной записи делал отказ
     // диска невидимым, а deadman — слепым: свежесть одного файла и была признаком жизни.
-    const sinks = createLogSinks();
+    const sinks = env.sinks ?? createLogSinks();
 
     function log(msg: string): void {
         const ts = new Date().toISOString();
         console.log(`[${ts}] ${msg}`);
-        if (NO_SIDE_EFFECTS || logTarget === null) return;
+        if (noSideEffects || logTarget === null) return;
         sinks.write(logTarget, msg, ts);
     }
 
     // Событие только для журнала — без строки в человеческом логе (стоимость попытки).
     // Тот же предохранитель, что у log(): в тестах и у наблюдателя журнала нет.
     function emitEvent(kind: string, data: Record<string, unknown>): void {
-        if (NO_SIDE_EFFECTS || logTarget === null) return;
+        if (noSideEffects || logTarget === null) return;
         sinks.emit(logTarget, kind, data, new Date().toISOString());
     }
 
@@ -238,7 +270,7 @@ export function createExec(env: ExecEnv) {
             // никогда, и каталог рос, пока сам не становился причиной полного диска. Только
             // что записанный вывод — самый свежий и под ротацию не попадает. Отказ уборки —
             // строка в лог, а не исключение: разбор падения важнее чистоты каталога.
-            const { errors } = pruneSessionLogs(path.dirname(p), sessionLogsKeep);
+            const { errors } = pruneFn(path.dirname(p), sessionLogsKeep);
             if (errors.length > 0) {
                 log(`⚠ Ротация логов сессий не удалась частично: ${errors.join('; ')}`);
             }

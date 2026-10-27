@@ -438,3 +438,104 @@ describe('sendTelegramMessage — ретраи доставки (#224)', () => {
         expect(sleepFn).toHaveBeenCalledWith(5000);
     });
 });
+
+describe('sendTelegramMessage — разбор отказа curl (#48)', () => {
+    // Форма ошибки execFileSync при ненулевом exit: message начинается со ВСЕЙ
+    // команды, код — в status, stderr — отдельным полем.
+    function curlFailure(status: number | null, stderr: string, extra: object = {}): Error {
+        const err = new Error(
+            `Command failed: curl -s -S --max-time 10 --noproxy api.telegram.org --config - --data-urlencode chat_id=CHAT-SECRET-777 --data-urlencode text=длинный текст события\n${stderr}`,
+        );
+        Object.assign(err, { status, stderr, ...extra });
+        return err;
+    }
+
+    function failOnce(err: Error) {
+        const logFn = vi.fn();
+        const result = sendTelegramMessage('длинный текст события', {
+            token: '1:TOK',
+            chatId: 'CHAT-SECRET-777',
+            execFn: vi.fn().mockImplementation(() => {
+                throw err;
+            }),
+            logFn,
+            attempts: 2,
+            sleepFn: () => {},
+        });
+        const attemptLine = logFn.mock.calls
+            .map(([m]) => m as string)
+            .find((m) => m.includes('попытка 1/2'));
+        return { result, attemptLine: attemptLine ?? '', logFn };
+    }
+
+    it.each([
+        [6, 'DNS'],
+        [7, 'не соединился'],
+        [28, 'таймаут'],
+        [35, 'TLS'],
+    ])('код curl %i доезжает до строки попытки с расшифровкой «%s»', (code, meaning) => {
+        const { result, attemptLine } = failOnce(
+            curlFailure(code, `curl: (${code}) something went wrong\n`),
+        );
+        expect(result).toBe(false);
+        expect(attemptLine).toContain(`код curl ${code}`);
+        expect(attemptLine).toContain(meaning);
+        expect(attemptLine).toContain(`curl: (${code}) something went wrong`);
+    });
+
+    it('в строке ошибки нет ни команды, ни chat_id, ни текста уведомления', () => {
+        const { logFn } = failOnce(curlFailure(28, 'curl: (28) Operation timed out\n'));
+        const errorLines = logFn.mock.calls
+            .map(([m]) => m as string)
+            .filter((m) => !m.startsWith('⚠ ПУШ НЕ ДОСТАВЛЕН'));
+        expect(errorLines.length).toBeGreaterThan(0);
+        for (const line of errorLines) {
+            expect(line).not.toContain('Command failed');
+            expect(line).not.toContain('--data-urlencode');
+            expect(line).not.toContain('CHAT-SECRET-777');
+            expect(line).not.toContain('длинный текст события');
+        }
+    });
+
+    it('stderr обрезается и маскирует chat_id и токен, если они туда попали', () => {
+        const noisy = `curl: (35) TLS failed for chat CHAT-SECRET-777 bot1:TOK ${'x'.repeat(1000)}`;
+        const { attemptLine } = failOnce(curlFailure(35, noisy));
+        expect(attemptLine).not.toContain('CHAT-SECRET-777');
+        expect(attemptLine).not.toContain('1:TOK');
+        expect(attemptLine.length).toBeLessThan(500);
+    });
+
+    // Короткий числовой chat_id маскируется по границе числа: подстрокой `28` съел бы
+    // цифры кода в `curl: (28)`, и причина стала бы нечитаемой.
+    it('короткий числовой chat_id не съедает совпадающие цифры в тексте curl', () => {
+        const logFn = vi.fn();
+        sendTelegramMessage('событие', {
+            token: '1:TOK',
+            chatId: '28',
+            execFn: vi.fn().mockImplementation(() => {
+                throw curlFailure(28, 'curl: (28) Operation timed out after 10028 ms, chat 28\n');
+            }),
+            logFn,
+            attempts: 1,
+            sleepFn: () => {},
+        });
+        const line = logFn.mock.calls.map(([m]) => m as string).join('\n');
+        expect(line).toContain('curl: (28) Operation timed out after 10028 ms, chat ***');
+    });
+
+    it('незнакомый код называется числом, без выдуманной расшифровки', () => {
+        const { attemptLine } = failOnce(curlFailure(52, 'curl: (52) Empty reply from server\n'));
+        expect(attemptLine).toContain('код curl 52');
+        expect(attemptLine).toContain('Empty reply from server');
+    });
+
+    it('curl не запустился (ENOENT) или убит сигналом — причина названа без кода', () => {
+        const spawnErr = Object.assign(new Error('spawnSync curl ENOENT'), { code: 'ENOENT' });
+        expect(failOnce(spawnErr).attemptLine).toContain('ENOENT');
+
+        const killed = curlFailure(null, '', { signal: 'SIGTERM' });
+        const line = failOnce(killed).attemptLine;
+        expect(line).toContain('SIGTERM');
+        expect(line).not.toContain('CHAT-SECRET-777');
+    });
+});

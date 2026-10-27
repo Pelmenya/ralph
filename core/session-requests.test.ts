@@ -244,6 +244,42 @@ describe('parseSessionRequests — разбор намерений кодер-с
         ).toThrow(/тело/i);
     });
 
+    // ── Фаза 10: формат карточки задаёт потребитель ─────────────────────────────
+    describe('формат новой карточки (issueFormat)', () => {
+        const issueFormat = {
+            sections: [
+                { heading: 'Критерии готовности' },
+                { heading: 'Макет', whenLabel: 'area:devops', requireLink: true },
+            ],
+        };
+        const withFormat = { ...opts, issueFormat };
+        const card = (body: string, labels = ['complexity:low']) =>
+            line({ kind: 'new-issue', title: 'т', body, labels });
+
+        it('НЕГАТИВНЫЙ: new-issue без обязательного раздела — отказ с разделом и строкой', () => {
+            expect(() => parseSessionRequests(card('## Что сделать\nтекст'), withFormat)).toThrow(
+                /строка 1: .*не по формату.*нет раздела «Критерии готовности»/,
+            );
+        });
+
+        it('НЕГАТИВНЫЙ: правило по метке — раздел без ссылки отвергается', () => {
+            const body = '## Критерии готовности\n- [ ] x\n## Макет\nсм. в чате';
+            expect(() =>
+                parseSessionRequests(card(body, ['complexity:low', 'area:devops']), withFormat),
+            ).toThrow(/нет ссылки http\(s\) в разделе «Макет»/);
+        });
+
+        it('карточка по формату заводится', () => {
+            const body = '## Критерии готовности\n- [ ] x';
+            expect(parseSessionRequests(card(body), withFormat)).toHaveLength(1);
+        });
+
+        it('формат не задан — new-issue проверяется как раньше', () => {
+            expect(parseSessionRequests(card('б'), opts)).toHaveLength(1);
+            expect(parseSessionRequests(card('б'), { ...opts, issueFormat: null })).toHaveLength(1);
+        });
+    });
+
     // ── #603: пределы раздельно по классам намерений ────────────────────────────
     // Инцидент PR #601: 23 pr-comment (дотошное ревью, ни одной мутации) отвергли батч
     // целиком тем же предохранителем, что ловит сорвавшуюся сессию, штампующую мутации.

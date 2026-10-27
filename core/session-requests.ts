@@ -15,6 +15,7 @@
 // Разбор fail-closed во всём: файл пишет модель, которая читала тело чужого issue (C3),
 // и неожиданная форма данных здесь обязана быть отказом, а не «пропустим эту строку».
 
+import { checkIssueFormat, describeFormatViolations, type TIssueFormat } from './issue-format.ts';
 import { MERGE_TRANSIENT_RE } from './merge-retry.ts';
 import { formatStopMessage } from './stop-message.ts';
 
@@ -243,7 +244,15 @@ function labels(value: unknown, lineNo: number, allowlist: readonly string[]): s
  */
 export function parseSessionRequests(
     raw: string,
-    { labelAllowlist }: { labelAllowlist: readonly string[] },
+    {
+        labelAllowlist,
+        issueFormat = null,
+    }: {
+        labelAllowlist: readonly string[];
+        // Фаза 10: формат карточки, заданный потребителем (`issue-format.ts`). Нет —
+        // new-issue проверяется как раньше.
+        issueFormat?: TIssueFormat | null;
+    },
 ): TSessionRequest[] {
     const lines = raw
         .split('\n')
@@ -273,12 +282,25 @@ export function parseSessionRequests(
         const kind = req['kind'];
 
         if (kind === 'new-issue') {
-            return {
+            const issue = {
                 kind: 'new-issue' as const,
                 title: text(req['title'], no, 'заголовок', MAX_TITLE),
                 body: text(req['body'], no, 'тело карточки', MAX_BODY),
                 labels: labels(req['labels'], no, labelAllowlist),
             };
+            // Карточка не по формату потребителя не заводится: заведённая, она попала бы
+            // в очередь и встала бы стопом preflight уже у человека — а причину лучше
+            // назвать здесь, пока сессия, писавшая тело, ещё названа в логе.
+            if (issueFormat !== null) {
+                const violations = checkIssueFormat(issue, issueFormat);
+                if (violations.length > 0)
+                    fail(
+                        no,
+                        'новая карточка не по формату потребителя (issueFormat) — ' +
+                            describeFormatViolations(violations),
+                    );
+            }
+            return issue;
         }
         // #45: комментарий в PR фазы. Замечание ревью без текста — потерянная находка,
         // поэтому `comment` обязателен так же, как у намерений по карточкам.

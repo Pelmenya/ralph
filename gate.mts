@@ -20,7 +20,9 @@ import { spawnSync } from 'node:child_process';
 const CHECKS: Array<[string, string]> = [
     ['format', 'npm run format:check --silent'],
     ['typecheck', 'npm run typecheck --silent'],
-    ['test', 'npm run test --silent'],
+    // Сьют с замером покрытия (#129): пороги-храповик живут в vitest.config.ts, и
+    // красный по ним — красный этого же чека, а не отдельного прогона сьюта.
+    ['test', 'npm run test --silent -- --coverage'],
 ];
 
 if ((process.env.RALPH_TRACE_DENY ?? '').trim() === '') {

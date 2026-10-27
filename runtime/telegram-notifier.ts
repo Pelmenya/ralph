@@ -98,6 +98,66 @@ export function telegramConfigFromEnv(): TelegramConfig {
     };
 }
 
+// Коды curl, которые различают «сеть моргнула» и «канал перекрыт» (#48). Остальные
+// называются числом: выдуманная расшифровка хуже честного номера.
+const CURL_EXIT_MEANINGS: Record<number, string> = {
+    6: 'DNS не резолвится',
+    7: 'не соединился',
+    28: 'таймаут',
+    35: 'оборвался TLS',
+};
+
+const CURL_STDERR_MAX = 200;
+
+// Причина отказа curl для лога (#48). Раньше в лог шла первая строка e.message —
+// у execFileSync это `Command failed: <вся команда>`: без кода возврата, зато с
+// chat_id и текстом уведомления в открытом виде. Четыре разных отказа (6/7/28/35)
+// выглядели одинаково, и разбор «все три попытки упали» начинался бы с нуля. Теперь
+// берём status и stderr из полей ошибки, а команду не берём вовсе. Секреты
+// (токен, chat_id) маскируются и в stderr: curl их туда не пишет, но лог тейлится
+// монитором и копируется в чат — надеяться на формат чужой утилиты здесь нельзя.
+function describeCurlFailure(e: unknown, secrets: string[]): string {
+    const err = (e && typeof e === 'object' ? e : {}) as Record<string, unknown>;
+    const mask = (s: string): string => {
+        let out = s;
+        // Пустой секрет сюда не доходит (ранний return в sendTelegramMessage), но
+        // пустой шаблон вставил бы маску между каждой буквой — страхуемся. Маска — по
+        // границе числа, а не подстрокой, и код отказа `curl: (N)` она не трогает:
+        // короткий числовой chat_id (`28`, `1`) иначе съел бы цифры внутри текста curl,
+        // и причина стала бы нечитаемой.
+        for (const secret of secrets.filter((x) => x !== '')) {
+            const escaped = secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const re = new RegExp(`(curl: \\(\\d+\\))|(?<!\\d)${escaped}(?!\\d)`, 'g');
+            out = out.replace(re, (_m, code: string | undefined) => code ?? '***');
+        }
+        return out;
+    };
+    const clip = (s: string): string => {
+        const oneLine = s.replace(/\s+/g, ' ').trim();
+        const chars = [...oneLine];
+        return chars.length > CURL_STDERR_MAX
+            ? `${chars.slice(0, CURL_STDERR_MAX).join('')}…`
+            : oneLine;
+    };
+    const stderr = clip(mask(err.stderr == null ? '' : String(err.stderr)));
+    const withStderr = (head: string): string => (stderr ? `${head} — ${stderr}` : head);
+
+    if (typeof err.status === 'number') {
+        const meaning = CURL_EXIT_MEANINGS[err.status];
+        return withStderr(`код curl ${err.status}${meaning ? ` (${meaning})` : ''}`);
+    }
+    if (typeof err.signal === 'string' && err.signal) {
+        return withStderr(`curl убит сигналом ${err.signal}`);
+    }
+    if (typeof err.code === 'string' && err.code) {
+        return withStderr(`curl не запустился (${err.code})`);
+    }
+    // Ни кода, ни сигнала: ошибка не от execFileSync (подменённый исполнитель,
+    // неожиданный бросок). Первая строка message — всё, что есть; маскируем и режем.
+    const message = err.message == null ? String(e) : String(err.message);
+    return clip(mask(message.split('\n')[0]));
+}
+
 // Один HTTP-запрос к Bot API. Не бросает — возвращает {ok, reason}, reason
 // заполнен только при ok=false (для лога попытки/финального отказа).
 function attemptSend({
@@ -118,6 +178,9 @@ function attemptSend({
             'curl',
             [
                 '-s',
+                // -S возвращает в stderr строку ошибки `curl: (N) …`, которую -s глушит:
+                // без неё разбор отказа (#48) знал бы только код, без слов curl.
+                '-S',
                 '--max-time',
                 '10',
                 // api.telegram.org из РФ доступен напрямую (разблокирован с 2020) —
@@ -188,16 +251,10 @@ function attemptSend({
         }
         return { ok: true, reason: '' };
     } catch (e: unknown) {
-        // execFileSync при непустом exit-коде кладёт ПЕРВОЙ строкой e.message всю
-        // команду (`Command failed: curl …`). URL с токеном теперь уходит в stdin, а
-        // не в argv, но редактируем на всякий случай: лог тейлится монитором и
-        // копируется в чат — секрету там не место. Пустой токен сюда не доходит
-        // (ранний return выше в sendTelegramMessage), поэтому replaceAll не схлопнет
-        // всю строку.
-        const firstLine = String((e as Error).message)
-            .split('\n')[0]
-            .replaceAll(finalToken, '***');
-        return { ok: false, reason: `отправка не удалась — ${firstLine}` };
+        return {
+            ok: false,
+            reason: `отправка не удалась — ${describeCurlFailure(e, [finalToken, finalChatId])}`,
+        };
     }
 }
 

@@ -14,6 +14,24 @@
 //
 // Пул форков, а не тредов: тесты правят `process.env` и `process.cwd()`, а часть
 // сценариев ловит попытки спавна — общая память тредов делала бы это флаком.
+//
+// Покрытие (#129). До него «покрыто тестами» значило «у модуля есть тест-файл», и
+// непокрытая ветка проходила гейт молча. Замер включает ГЕЙТ флагом `--coverage`
+// (gate.mts), а не этот конфиг: точечный `vitest run <файл>` покрывает долю дерева и
+// краснел бы на порогах всегда.
+//
+// Пороги — храповик, а не цель: текущие числа каждого каталога, округлённые ВНИЗ до
+// сотых. Точность выбрана под пробу «от противного»: в core одна ветка — 0,02 пункта,
+// и порог с запасом в целый процент пропустил бы удалённый тест молча. Цена — новый
+// код покрывается не хуже среднего по каталогу, иначе красный. Числа детерминированы:
+// два прогона, в том числе с `CI=true` без терминала, совпали до элемента. Опускать
+// нельзя (файл под ship человека, `.sourcecraft/review.yaml`); поднимать — той же
+// правкой, что добавила тесты: проценты печатает отчёт гейта, по каталогам — сводка
+// `json-summary`.
+//
+// Отчёт ложится в `node_modules/.coverage`, а не в `coverage/` корня: каталог в дереве
+// продукта появился бы посреди прогона, и барьер `product-root-purity` честно увидел
+// бы его следом прогона. `node_modules` снимок не берёт, `.gitignore` его накрывает.
 import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
@@ -23,5 +41,33 @@ export default defineConfig({
         setupFiles: ['./tests/test-setup.ts'],
         env: { RALPH_NO_SIDE_EFFECTS: '1' },
         pool: 'forks',
+        coverage: {
+            provider: 'v8',
+            include: [
+                'core/**/*.{ts,mts,js}',
+                'runtime/**/*.{ts,mts,js}',
+                'shared/**/*.{ts,mts,js}',
+                'adapters/**/*.{ts,mts,js}',
+            ],
+            exclude: ['**/*.test.{ts,mts}', '**/*.d.ts', '**/__fixtures__/**'],
+            reporter: ['text-summary', 'json-summary'],
+            reportsDirectory: './node_modules/.coverage',
+            thresholds: {
+                'core/**': { lines: 92.78, statements: 91.63, functions: 89.31, branches: 89.39 },
+                'runtime/**': {
+                    lines: 80.82,
+                    statements: 80.33,
+                    functions: 79,
+                    branches: 74.1,
+                },
+                'shared/**': { lines: 100, statements: 100, functions: 100, branches: 94.11 },
+                'adapters/**': {
+                    lines: 98.06,
+                    statements: 97.81,
+                    functions: 97.45,
+                    branches: 88.23,
+                },
+            },
+        },
     },
 });

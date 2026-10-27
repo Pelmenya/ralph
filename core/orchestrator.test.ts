@@ -3875,6 +3875,108 @@ describe('preflight — валидация конфига/среды и подг
         expect(seamCall).toHaveBeenCalledWith('M1');
     });
 
+    // ── Фаза 10: формат карточки, заданный потребителем ─────────────────────────
+    // Инцидент у потребителя: веху витрины завели без макетов, петля верстала по доводам
+    // ревью и сломала главную на проде. Карточку не по формату петля не берёт, а стоп
+    // называет и карточку, и раздел — иначе человек ищет нарушение по всей вехе.
+    describe('формат карточек фазы (issueFormat)', () => {
+        const issueFormat = { sections: [{ heading: 'Критерии готовности' }] };
+        const card = (number: number) => ({
+            number,
+            title: `Карточка ${String(number)}`,
+            labels: [{ name: 'complexity:low' }],
+            author: { login: 'owner' },
+        });
+        const bodies: Record<number, string> = {
+            1: '## Критерии готовности\n- [ ] тест',
+            2: '## Что сделать\nтекст',
+        };
+        const getIssueFn = (n: number) => ({ number: n, title: 't', body: bodies[n] ?? '' });
+
+        it('карточка без обязательного раздела → стоп называет карточку и раздел', () => {
+            const deps = okDeps({
+                loadStateFn: fakeState,
+                openIssuesFn: () => [card(1), card(2)],
+                getIssueFn,
+            });
+            const run = () => preflight(validCfg({ issueFormat }), deps);
+            expect(run).toThrow(/#2.*нет раздела «Критерии готовности»/);
+            expect(run).not.toThrow(/#1\b/);
+        });
+
+        it('все карточки по формату — старт идёт', () => {
+            const deps = okDeps({
+                loadStateFn: fakeState,
+                openIssuesFn: () => [card(1)],
+                getIssueFn,
+            });
+            expect(() => preflight(validCfg({ issueFormat }), deps)).not.toThrow();
+        });
+
+        it('формат не задан — тела карточек не читаются, старт как раньше', () => {
+            const read = vi.fn(getIssueFn);
+            const deps = okDeps({
+                loadStateFn: fakeState,
+                allOpenIssuesFn: () => [card(2)],
+                getIssueFn: read,
+            });
+            expect(() => preflight(validCfg(), deps)).not.toThrow();
+            expect(read).not.toHaveBeenCalled();
+        });
+
+        it('битая секция issueFormat — стоп на старте с названной причиной', () => {
+            const deps = okDeps({ loadStateFn: fakeState });
+            expect(() => preflight(validCfg({ issueFormat: { sections: [] } }), deps)).toThrow(
+                /issueFormat\.sections/,
+            );
+        });
+
+        // Тот же размен, что у ранней проверки #17: транзиент форжа не стоит ночи AFK, а
+        // второй эшелон есть — карточку проверяет и выбор в цикле, до спавна сессии.
+        it('тело карточки не прочиталось → предупреждение, старт продолжается', () => {
+            const logs: string[] = [];
+            const deps = okDeps({
+                loadStateFn: fakeState,
+                logFn: (m: string) => logs.push(m),
+                openIssuesFn: () => [card(2)],
+                getIssueFn: () => {
+                    throw new Error('форж не ответил');
+                },
+            });
+            expect(() => preflight(validCfg({ issueFormat }), deps)).not.toThrow();
+            expect(logs.join('\n')).toMatch(/#2.*форж не ответил/);
+        });
+        // Ревью: карточка `blocked` или чужого автора в очередь не попадает, и стоп старта
+        // из-за её формата держал бы веху на том, что петлю не касается.
+        it('карточка вне очереди (blocked, чужой автор) формат старта не валит', () => {
+            const read = vi.fn(getIssueFn);
+            const logs: string[] = [];
+            const deps = okDeps({
+                loadStateFn: fakeState,
+                logFn: (m: string) => logs.push(m),
+                allOpenIssuesFn: () => [card(1), card(2)],
+                openIssuesFn: () => [card(1)],
+                getIssueFn: read,
+            });
+            expect(() => preflight(validCfg({ issueFormat }), deps)).not.toThrow();
+            expect(read.mock.calls.map(([n]) => n)).toEqual([1]);
+            expect(logs.join('\n')).toMatch(/формат карточек очереди фазы "M1": 1 точечных чтений/);
+        });
+
+        it('очередь не прочиталась → предупреждение, старт продолжается', () => {
+            const logs: string[] = [];
+            const deps = okDeps({
+                loadStateFn: fakeState,
+                logFn: (m: string) => logs.push(m),
+                openIssuesFn: () => {
+                    throw new Error('форж не ответил');
+                },
+            });
+            expect(() => preflight(validCfg({ issueFormat }), deps)).not.toThrow();
+            expect(logs.join('\n')).toMatch(/очередь фазы "M1" \(форж не ответил\)/);
+        });
+    });
+
     it('git rev-parse падает → fail «Не git-репозиторий»', () => {
         const deps = okDeps({ loadStateFn: fakeState, shFn: shThrowingOn('rev-parse') });
         expect(() => preflight(validCfg(), deps)).toThrow(/Не git-репозиторий/);
@@ -4751,6 +4853,131 @@ describe('runLoop — основной while-цикл: итерации коде
         expect(runClaudeFn).toHaveBeenCalledTimes(1);
     });
 
+    // Фаза 10: второй эшелон формата после preflight — карточка, попавшая в веху посреди
+    // прогона, не берётся: стоп до спавна сессии называет карточку и раздел.
+    describe('формат карточки при выборе (issueFormat)', () => {
+        const issueFormat = {
+            sections: [{ heading: 'Макет', whenLabel: 'area:showcase', requireLink: true }],
+        };
+        const queue = () => [{ number: 5, title: 'витрина', labels: [{ name: 'area:showcase' }] }];
+
+        it('карточка не по формату не берётся — стоп называет карточку и раздел', () => {
+            const logs: string[] = [];
+            const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+            runLoop(
+                validCfg({ issueFormat }),
+                ctx(mkState()),
+                deps(logs, {
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn: queue,
+                    getIssueFn: (number: number) => ({
+                        number,
+                        title: 'витрина',
+                        body: '## Что сделать\nсверстать',
+                    }),
+                    runClaudeFn,
+                }),
+            );
+            expect(runClaudeFn).not.toHaveBeenCalled();
+            expect(logs.join('\n')).toMatch(/не по формату потребителя.*#5: нет раздела «Макет»/);
+        });
+
+        it('карточка по формату берётся', () => {
+            const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+            runLoop(
+                validCfg({ issueFormat }),
+                ctx(mkState()),
+                deps([], {
+                    once: true,
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn: queue,
+                    getIssueFn: (number: number) => ({
+                        number,
+                        title: 'витрина',
+                        body: '## Макет\nhttps://example.com/mockup',
+                    }),
+                    runClaudeFn,
+                }),
+            );
+            expect(runClaudeFn).toHaveBeenCalledTimes(1);
+        });
+
+        // От противного к ревью: первое чтение (выбор) моргнуло, второе (для промпта)
+        // прошло — прежде формат такого тела не проверял никто, и витрина без макета
+        // уходила в работу.
+        it('первое чтение карточки бросило, второе отдало тело не по формату — сессии нет', () => {
+            const logs: string[] = [];
+            const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+            let reads = 0;
+            runLoop(
+                validCfg({ issueFormat }),
+                ctx(mkState()),
+                deps(logs, {
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn: queue,
+                    getIssueFn: (number: number) => {
+                        reads++;
+                        if (reads === 1) throw new Error('форж моргнул');
+                        return { number, title: 'витрина', body: '## Что сделать\nсверстать' };
+                    },
+                    runClaudeFn,
+                }),
+            );
+            expect(reads).toBe(2);
+            expect(runClaudeFn).not.toHaveBeenCalled();
+            expect(logs.join('\n')).toMatch(/#5: нет раздела «Макет»/);
+        });
+
+        it('формат задан, карточка не прочиталась ни разу — стоп, а не сессия без проверки', () => {
+            const logs: string[] = [];
+            const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+            const getIssueFn = vi.fn((): { number: number; title: string; body: string } => {
+                throw new Error('форж не ответил');
+            });
+            runLoop(
+                validCfg({ issueFormat }),
+                ctx(mkState()),
+                deps(logs, {
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn: queue,
+                    getIssueFn,
+                    runClaudeFn,
+                }),
+            );
+            expect(runClaudeFn).not.toHaveBeenCalled();
+            expect(getIssueFn).toHaveBeenCalledTimes(2);
+            expect(logs.join('\n')).toMatch(/#5 .*не прочитать \(форж не ответил\).*не проверен/);
+        });
+
+        it('битая секция issueFormat без preflight — отказ, а не «формата нет»', () => {
+            const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+            expect(() =>
+                runLoop(
+                    validCfg({ issueFormat: { sections: [] } }),
+                    ctx(mkState()),
+                    deps([], { phaseIndexOfFn: () => 0, openIssuesFn: queue, runClaudeFn }),
+                ),
+            ).toThrow(/issueFormat\.sections/);
+            expect(runClaudeFn).not.toHaveBeenCalled();
+        });
+
+        it('формат не задан — та же карточка берётся, как раньше', () => {
+            const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+            runLoop(
+                validCfg(),
+                ctx(mkState()),
+                deps([], {
+                    once: true,
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn: queue,
+                    getIssueFn: (number: number) => ({ number, title: 'витрина', body: 'тело' }),
+                    runClaudeFn,
+                }),
+            );
+            expect(runClaudeFn).toHaveBeenCalledTimes(1);
+        });
+    });
+
     it('кодер-итерация в ONCE: одна claude-сессия нужной моделью и стоп', () => {
         const logs: string[] = [];
         const state = mkState();
@@ -5268,6 +5495,147 @@ describe('runLoop — основной while-цикл: итерации коде
         // Ревью #289: от заголовка диагноз отличается номером карточки — он и остался.
         expect(pushEventFn.mock.calls[0][0]).toMatch(
             /диагноз: 3 итераций подряд без коммита и без закрытого issue \(Issue #7\)/,
+        );
+    });
+
+    // #97: сбой чтения при оценке прогресса раньше засчитывался прогрессом и обнулял
+    // noProgress — сеть прятала стену. Теперь он «неизвестно»: одиночный переживается, серия
+    // длиной maxProgressUnknown — стоп с причиной и пушем.
+    describe('#97: серия «прогресс неизвестен»', () => {
+        // HEAD до сессии читается, после — нет: каждая итерация кончается неизвестным.
+        const headUnreadableAfter = () => {
+            let reads = 0;
+            return (cmd: string) => {
+                if (cmd !== 'git rev-parse HEAD') return '';
+                if (++reads % 2 === 0) throw new Error('git молчит');
+                return 'SAME_HEAD';
+            };
+        };
+
+        it('N подряд «неизвестно» → стоп с причиной и пушем; N — из конфига', () => {
+            const logs: string[] = [];
+            const state = mkState({ noProgress: 1 });
+            const pushEventFn = vi.fn();
+            const runClaudeFn = vi.fn(() => 0);
+            runLoop(
+                validCfg({ maxProgressUnknown: 2 }),
+                ctx(state),
+                deps(logs, {
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                    shFn: headUnreadableAfter(),
+                    runClaudeFn,
+                    pushEventFn,
+                }),
+            );
+            expect(runClaudeFn).toHaveBeenCalledTimes(2);
+            expect(pushEventFn).toHaveBeenCalledTimes(1);
+            const msg = String(pushEventFn.mock.calls[0][0]);
+            expect(msg).toContain('(forge-unreadable)');
+            expect(msg).toMatch(/2 итераций подряд не прочитались HEAD или очередь \(Issue #7\)/);
+            expect(msg).toContain('git молчит');
+            // Неизвестное не засчитано ни в прогресс, ни в «стоим»: серия до сбоя цела.
+            expect(state.noProgress).toBe(1);
+            expect(logs.join('\n')).toMatch(/Прогресс итерации неизвестен \(1\/2 подряд\)/);
+        });
+
+        it('дефолт порога — 3', () => {
+            const pushEventFn = vi.fn();
+            const runClaudeFn = vi.fn(() => 0);
+            runLoop(
+                validCfg(),
+                ctx(mkState()),
+                deps([], {
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                    shFn: headUnreadableAfter(),
+                    runClaudeFn,
+                    pushEventFn,
+                }),
+            );
+            expect(runClaudeFn).toHaveBeenCalledTimes(3);
+            expect(String(pushEventFn.mock.calls[0][0])).toMatch(
+                /3 итераций подряд не прочитались/,
+            );
+        });
+
+        it('от противного: удачное чтение между сбоями обнуляет серию — стопа нет', () => {
+            const pushEventFn = vi.fn();
+            let reads = 0;
+            let sessions = 0;
+            // После каждой сессии нечётной — сбой, чётной — HEAD сдвинулся (прогресс).
+            const shFn = (cmd: string) => {
+                if (cmd !== 'git rev-parse HEAD') return '';
+                reads++;
+                if (reads % 2 === 1) return `H${String(reads)}`;
+                if (sessions % 2 === 1) throw new Error('git молчит');
+                return `MOVED${String(reads)}`;
+            };
+            runLoop(
+                // maxSameIssue выше числа итераций: иначе петлю остановил бы брейкер серии по
+                // карточке раньше, и проба не различила бы, чем кончилась серия.
+                validCfg({ maxProgressUnknown: 2, maxIterations: 4, maxSameIssue: 5 }),
+                { ...ctx(mkState()), maxIterations: 4 },
+                deps([], {
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                    shFn,
+                    runClaudeFn: vi.fn(() => {
+                        sessions++;
+                        return 0;
+                    }),
+                    pushEventFn,
+                }),
+            );
+            // Точное число: петля прошла все итерации, а не встала другим стопом раньше.
+            expect(sessions).toBe(4);
+            // По коду причины, а не по заголовку: заголовок переписать дешевле, чем причину.
+            expect(
+                pushEventFn.mock.calls.some((c) => String(c[0]).includes('(forge-unreadable)')),
+            ).toBe(false);
+        });
+
+        // HEAD не прочитался ДО сессии: прежде блок оценки пропускался целиком, и такая
+        // итерация была невидима и для «стоим», и для серии «неизвестно».
+        it('сбой чтения HEAD до сессии — тоже «неизвестно», серия доходит до стопа', () => {
+            const logs: string[] = [];
+            const state = mkState({ noProgress: 1 });
+            const pushEventFn = vi.fn();
+            const runClaudeFn = vi.fn(() => 0);
+            let reads = 0;
+            runLoop(
+                validCfg({ maxProgressUnknown: 2 }),
+                ctx(state),
+                deps(logs, {
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                    shFn: (cmd: string) => {
+                        if (cmd !== 'git rev-parse HEAD') return '';
+                        if (++reads % 2 === 1) throw new Error('git молчит до сессии');
+                        return 'SAME_HEAD';
+                    },
+                    runClaudeFn,
+                    pushEventFn,
+                }),
+            );
+            expect(runClaudeFn).toHaveBeenCalledTimes(2);
+            expect(pushEventFn).toHaveBeenCalledTimes(1);
+            const msg = String(pushEventFn.mock.calls[0][0]);
+            expect(msg).toContain('(forge-unreadable)');
+            expect(msg).toContain('git молчит до сессии');
+            expect(state.noProgress).toBe(1);
+        });
+
+        it.each([0, -1, 2.5, '3', null])(
+            'битый maxProgressUnknown (%j) — стоп на старте с причиной, а не дефолт',
+            (v) => {
+                const failFn = (msg: string) => {
+                    throw new Error(msg);
+                };
+                expect(() =>
+                    ralph.resolveMaxProgressUnknown({ maxProgressUnknown: v } as never, failFn),
+                ).toThrow(/maxProgressUnknown = .* целое положительное/);
+            },
         );
     });
 
@@ -6966,6 +7334,81 @@ describe('runLoop — основной while-цикл: итерации коде
         expect(runClaudeFn).toHaveBeenCalledTimes(2);
         expect(state.submitted).toBeFalsy();
         expect(logs.join('\n')).toMatch(/не уложился в бюджет ходов за 2 попыток/);
+    });
+
+    // #97/#45: первая сессия правок могла оставить обоснование пропуска намерением
+    // `pr-comment` — продолжение по ходам обязано его видеть, иначе повторит отклонённую
+    // правку. Поэтому продолжение перечитывает комментарии, а не берёт снятые до первой.
+    it('#97: продолжение по ходам перечитывает комментарии PR — видит оставленное первой', () => {
+        const runClaudeFn = vi.fn<RunClaudeFake>((_prompt, _opts, d) => {
+            if (runClaudeFn.mock.calls.length === 1) {
+                (d?.onOutput as ((o: string) => void) | undefined)?.(
+                    'Error: Reached max turns (200)',
+                );
+                return 1;
+            }
+            return 0;
+        });
+        let reads = 0;
+        runLoop(
+            validCfg({ authorAllowlist: ['owner'], review: { fixTurnRetries: 1 } }),
+            ctx(mkState()),
+            deps([], {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                findOpenPrFn: () => ({ number: 55, labels: [] }),
+                prCommentsFn: () => {
+                    reads++;
+                    const base = [
+                        { body: '🟠 [major] замечание', isSummary: false, author: 'owner' },
+                    ];
+                    return reads === 1
+                        ? base
+                        : [
+                              ...base,
+                              { body: 'пропуск обоснован', isSummary: false, author: 'owner' },
+                          ];
+                },
+                pickReviewModelFn: () => 'none',
+                runClaudeFn,
+                tryMergePhaseFn: () => 'merged',
+            }),
+        );
+        expect(runClaudeFn.mock.calls.length).toBeGreaterThanOrEqual(2);
+        expect(String(runClaudeFn.mock.calls[0][0])).not.toContain('пропуск обоснован');
+        expect(String(runClaudeFn.mock.calls[1][0])).toContain('пропуск обоснован');
+    });
+
+    it('#97: комментарии продолжения не прочитались — стоп, второй сессии нет', () => {
+        const logs: string[] = [];
+        const state = mkState();
+        const pushEventFn = vi.fn();
+        const runClaudeFn = vi.fn<RunClaudeFake>((_prompt, _opts, d) => {
+            (d?.onOutput as ((o: string) => void) | undefined)?.('Error: Reached max turns (200)');
+            return 1;
+        });
+        let reads = 0;
+        runLoop(
+            validCfg({ review: { fixTurnRetries: 1 } }),
+            ctx(state),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                findOpenPrFn: () => ({ number: 55, labels: [] }),
+                prCommentsFn: () => {
+                    if (++reads > 1) throw new Error('форж молчит');
+                    return [];
+                },
+                pickReviewModelFn: () => 'none',
+                runClaudeFn,
+                pushEventFn,
+                tryMergePhaseFn: () => 'merged',
+            }),
+        );
+        expect(runClaudeFn).toHaveBeenCalledTimes(1);
+        expect(state.submitted).toBeFalsy();
+        const pushes = pushEventFn.mock.calls.map((c) => String(c[0]));
+        expect(pushes.some((m) => m.includes('(forge-unreadable)'))).toBe(true);
     });
 
     it('#594: fixTurnRetries: 0 → прежнее поведение, исчерпание ходов = стоп без повтора', () => {
@@ -9207,23 +9650,61 @@ describe('runLoop — основной while-цикл: итерации коде
             expect(pushEventFn).not.toHaveBeenCalled();
         });
 
-        it('комментарии PR для промпта правок не прочитались — пуша об этом нет', () => {
+        // #97: прежний fail-open (промпт без комментариев) давал сессии правок пустой
+        // список замечаний — она читала его как «править нечего». Теперь повтор чтения,
+        // затем стоп с причиной и пушем; сессия с пустым списком не стартует.
+        it('комментарии PR не прочитались → повтор, затем стоп; сессия правок не стартует', () => {
             const logs: string[] = [];
             const pushEventFn = vi.fn();
+            const runClaudeFn = vi.fn((_prompt: string, _opts?: Record<string, unknown>) => 0);
+            const prCommentsFn = vi.fn(failing('форж молчит'));
+            const tryMergePhaseFn = vi.fn(() => 'merged' as const);
             runLoop(
                 validCfg(),
                 ctx(mkState()),
                 deps(logs, {
                     pushEventFn,
                     findOpenPrFn: () => ({ number: 5, labels: [] }),
-                    prCommentsFn: failing('форж молчит'),
+                    prCommentsFn,
+                    pickReviewModelFn: () => 'none',
+                    runClaudeFn,
+                    tryMergePhaseFn,
+                }),
+            );
+            // Чтение повторено, прежде чем сдаться.
+            expect(prCommentsFn).toHaveBeenCalledTimes(2);
+            expect(logs.join('\n')).toMatch(/комментарии PR #5 .*попытка 1\/2/);
+            // Сессия правок не запускалась вовсе — ни с пустым списком, ни без него.
+            expect(runClaudeFn).not.toHaveBeenCalled();
+            expect(tryMergePhaseFn).not.toHaveBeenCalled();
+            expect(pushEventFn).toHaveBeenCalledTimes(1);
+            const msg = String(pushEventFn.mock.calls[0][0]);
+            expect(msg).toContain('шаг «правки по ревью» не запущен');
+            expect(msg).toContain('(forge-unreadable)');
+            expect(msg).toContain('форж молчит');
+        });
+
+        it('от противного: сбой первого чтения и удача повтора — сессия правок идёт с замечаниями', () => {
+            const runClaudeFn = vi.fn((_prompt: string, _opts?: Record<string, unknown>) => 0);
+            let reads = 0;
+            runLoop(
+                validCfg({ authorAllowlist: ['owner'] }),
+                ctx(mkState()),
+                deps([], {
+                    findOpenPrFn: () => ({ number: 5, labels: [] }),
+                    prCommentsFn: () => {
+                        if (++reads === 1) throw new Error('форж молчит');
+                        return [
+                            { body: '🟠 [major] замечание', isSummary: false, author: 'owner' },
+                        ];
+                    },
+                    pickReviewModelFn: () => 'none',
+                    runClaudeFn,
                     tryMergePhaseFn: () => 'merged',
                 }),
             );
-            expect(logs.join('\n')).toMatch(/Не смог прочитать комментарии PR #5/);
-            // Единственный пуш — о мердже: сдача прошла, сбой чтения её не остановил.
-            expect(pushEventFn).toHaveBeenCalledTimes(1);
-            expect(String(pushEventFn.mock.calls[0][0])).toMatch(/смерджена в main/);
+            expect(runClaudeFn).toHaveBeenCalled();
+            expect(String(runClaudeFn.mock.calls[0][0])).toContain('замечание');
         });
 
         it('штатное завершение и HITL-стоп пуша не дают — их просил сам человек', () => {
@@ -9571,6 +10052,105 @@ describe('handleCrashedCoderSession — падение кодер-сессии: 
         expect(result).toEqual({ stop: true });
         expect(logs.join('\n')).toMatch(/Не удалось сохранить вывод/);
         expect(pushEventFn).toHaveBeenCalledTimes(1);
+    });
+
+    // #32: путь к выводу считается до записи, и прежде все строки разбора называли его
+    // безусловно. При сбое записи человек открывал из уведомления файл, которого нет, и
+    // читал пустое место как «вывод потерялся», а не как «диск кончился» — хотя второе
+    // объясняет само падение. Проба от противного: запись бросила — в ДОСТАВЛЕННОМ тексте
+    // (пуш, а не только лог) нет пути к файлу, зато есть причина.
+    describe('#32: запись вывода бросила — текст разбора не называет несуществующий файл', () => {
+        const failingSave = () => {
+            throw new Error('ENOSPC: no space left on device');
+        };
+        const SESSION_PATH_RE = /sessions\/42-\d+\.log/;
+        const cases: Array<{
+            name: string;
+            code: number;
+            output: string;
+            shFn: (cmd: string) => string;
+            commitLeftoversFn?: () => boolean;
+            turnRetriesLeft?: number;
+        }> = [
+            { name: 'отказ среды (127)', code: 127, output: 'not found', shFn: () => '' },
+            {
+                name: 'отказ git status',
+                code: 1,
+                output: 'boom',
+                shFn: () => {
+                    throw new Error('fatal: not a git repository');
+                },
+            },
+            { name: 'грязное дерево', code: 1, output: 'boom', shFn: () => ' M src/a.ts' },
+            {
+                name: 'бюджет ходов, повтор',
+                code: 1,
+                output: 'Reached max turns (200)',
+                shFn: () => ' M src/a.ts',
+                commitLeftoversFn: () => true,
+                turnRetriesLeft: 1,
+            },
+            {
+                name: 'бюджет ходов, коммит остатка не удался',
+                code: 1,
+                output: 'Reached max turns (200)',
+                shFn: () => ' M src/a.ts',
+                commitLeftoversFn: () => false,
+                turnRetriesLeft: 1,
+            },
+            {
+                name: 'бюджет ходов, попытки исчерпаны',
+                code: 1,
+                output: 'Reached max turns (200)',
+                shFn: () => ' M src/a.ts',
+            },
+        ];
+        it.each(cases)('$name → в пуше причина вместо пути', (c) => {
+            const logs: string[] = [];
+            const pushEventFn = vi.fn();
+            handleCrashedCoderSession(issue, c.code, c.output, {
+                shFn: c.shFn,
+                logFn: (m: string) => logs.push(m),
+                pushEventFn,
+                saveSessionOutputFn: failingSave,
+                cfg: {} as unknown,
+                commitLeftoversFn: c.commitLeftoversFn ?? (() => true),
+                turnRetriesLeft: c.turnRetriesLeft ?? 0,
+            });
+            expect(pushEventFn).toHaveBeenCalledTimes(1);
+            const pushed = String(pushEventFn.mock.calls[0][0]);
+            expect(pushed).not.toMatch(SESSION_PATH_RE);
+            expect(pushed).toMatch(/Вывод сессии не сохранён: ENOSPC: no space left on device/);
+        });
+
+        it('чистое дерево (только лог) → строка «продолжаем» тоже без пути', () => {
+            const logs: string[] = [];
+            handleCrashedCoderSession(issue, 1, 'boom', {
+                shFn: () => '',
+                logFn: (m: string) => logs.push(m),
+                pushEventFn: vi.fn(),
+                saveSessionOutputFn: failingSave,
+                cfg: {} as unknown,
+            });
+            const cont = logs.find((l) => l.includes('завершился с кодом'));
+            expect(cont).toBeDefined();
+            expect(cont).not.toMatch(SESSION_PATH_RE);
+            expect(cont).toMatch(/Вывод сессии не сохранён: ENOSPC/);
+        });
+
+        it('запись удалась → путь к выводу на месте (контроль: проба не краснеет от пустоты)', () => {
+            const pushEventFn = vi.fn();
+            handleCrashedCoderSession(issue, 1, 'boom', {
+                shFn: () => ' M src/a.ts',
+                logFn: () => {},
+                pushEventFn,
+                saveSessionOutputFn: () => {},
+                cfg: {} as unknown,
+            });
+            const pushed = String(pushEventFn.mock.calls[0][0]);
+            expect(pushed).toMatch(new RegExp(`Вывод сессии: .*${SESSION_PATH_RE.source}`));
+            expect(pushed).not.toMatch(/не сохранён/);
+        });
     });
 
     // #20 (инцидент 28.08.2026, первый боевой прогон, Issue #4 «Button на Gravity»):
@@ -13461,6 +14041,32 @@ describe('applySessionRequests: намерения сессии применяе
         });
         expect(calls).toEqual(['create:Течёт лимит']);
         expect(logs.join('\n')).toMatch(/#77/);
+    });
+
+    // Фаза 10: формат из конфига доходит до разбора — без проводки правило жило бы только
+    // в юните парсера, а боевое применение заводило бы карточку мимо него.
+    it('НЕГАТИВНЫЙ: new-issue не по issueFormat — не заведена, причина в пуше', () => {
+        const { ts, calls } = fakeTaskSource();
+        const pushEventFn = vi.fn();
+        const res = ralph.applySessionRequests({
+            cfg: { ...CFG, issueFormat: { sections: [{ heading: 'Критерии готовности' }] } },
+            dry: false,
+            readFn: () =>
+                line({
+                    kind: 'new-issue',
+                    title: 'Течёт лимит',
+                    body: 'симптом',
+                    labels: ['complexity:low'],
+                }),
+            writeFn: () => {},
+            removeFn: () => {},
+            taskSource: ts,
+            logFn: () => {},
+            pushEventFn,
+        });
+        expect(calls).toEqual([]);
+        expect(res.failed).toBe(true);
+        expect(String(pushEventFn.mock.calls[0][0])).toMatch(/нет раздела «Критерии готовности»/);
     });
 
     it('НЕГАТИВНЫЙ: битый запрос — ничего не применено, пуш, файл НЕ тронут', () => {
