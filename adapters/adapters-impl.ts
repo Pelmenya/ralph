@@ -41,8 +41,10 @@ import type {
     ReviewComment,
     RunOptions,
     RunResult,
+    RuntimeCapabilities,
     TaskSourceAdapter,
 } from './adapters.ts';
+import { capabilitiesProblems } from './runtime-capabilities.ts';
 
 // Версия контракта швов, на которой говорят реализации этого каталога (#37). Ядро требует
 // свою (`CORE_REQUIRES_ADAPTERS` в core/compat.ts) и сверяет их на старте: адаптеры ставятся
@@ -108,12 +110,21 @@ export type AdapterSeam = keyof typeof ADAPTER_DEFAULTS;
 export type AdapterSelection = Record<AdapterSeam, string>;
 
 // Провайдеры, реально зарегистрированные под швом `coderRuntime` в composition root
-// (orchestrator.ts: adapterRegistries.coderRuntime = { claude, kimi, openai }). Источник
-// правды для provider-aware modelRouting (#376, фаза 6): конфиг не может указать
-// провайдера, которого раннер не умеет запускать — validateModelRouting (config-profile.ts)
-// сверяет modelRouting.*.provider против этого списка ДО сборки адаптеров (инвариант №1:
-// опечатка вида "kimy" — fail на старте, а не тихий откат на дефолтный рантайм).
-export const CODER_RUNTIME_PROVIDERS = ['claude', 'kimi', 'openai'] as const;
+// (orchestrator.ts: adapterRegistries.coderRuntime = { claude, kimi, openai, 'kimi-native',
+// opencode }). Источник правды для provider-aware modelRouting (#376, фаза 6): конфиг не
+// может указать провайдера, которого раннер не умеет запускать — validateModelRouting
+// (config-profile.ts) сверяет modelRouting.*.provider против этого списка ДО сборки адаптеров
+// (инвариант №1: опечатка вида "kimy" — fail на старте, а не тихий откат на дефолтный рантайм).
+// `kimi-native` (#120) — Kimi Code CLI родным харнессом, рядом с `kimi` (Claude Code на
+// endpoint Moonshot), а не вместо него. `opencode` (#121) — экспериментальный третий харнесс:
+// только статическим `adapters.coderRuntime` и с `opencodeRuntime.status: "experimental"`.
+export const CODER_RUNTIME_PROVIDERS = [
+    'claude',
+    'kimi',
+    'openai',
+    'kimi-native',
+    'opencode',
+] as const;
 export type CoderRuntimeProvider = (typeof CODER_RUNTIME_PROVIDERS)[number];
 
 // Конфиг-секция выбора реализаций (плоский конфиг ПОСЛЕ resolveProfile). Все ключи
@@ -354,13 +365,17 @@ export function createNoDeployCheck(): DeployCheckAdapter {
 // `checkAvailable` (#44) обязателен, а не опционален: реализация без проверки готовности
 // пропустила бы сломанный рантайм на старте молча — ровно тот исход, ради которого метод
 // заведён.
+//
+// `capabilities` (#118) обязательны по той же причине: рантайм без объявления выглядел бы
+// умеющим всё, и `maxTurns` у харнесса без потолка читался бы гарантией.
 export type CoderRuntimeFns = {
     run: (prompt: string, options: RunOptions) => RunResult;
     checkAvailable: () => void;
+    capabilities: RuntimeCapabilities;
 };
 
 export function createCoderRuntime(fns: CoderRuntimeFns): CoderRuntimeAdapter {
-    return { run: fns.run, checkAvailable: fns.checkAvailable };
+    return { run: fns.run, checkAvailable: fns.checkAvailable, capabilities: fns.capabilities };
 }
 
 // ── Сборка набора швов по выбору из конфига (fail-closed) ─────────────────────
@@ -383,6 +398,17 @@ export function buildAdapters(
     selection: AdapterSelection,
     failFn: FailFn,
 ): RalphAdapters {
+    // #118: реестр рантаймов принимает только реализации с объявленными возможностями —
+    // проверяется ВЕСЬ реестр, а не выбранный ключ: фолбэк и маршруты modelRouting берут
+    // рантаймы мимо `selection`, и рантайм без объявления дошёл бы до сессии в обход сверки.
+    for (const [name, impl] of Object.entries(registries.coderRuntime)) {
+        const problems = capabilitiesProblems((impl as Partial<CoderRuntimeAdapter>).capabilities);
+        if (problems.length)
+            failFn(
+                `adapters.coderRuntime: рантайм '${name}' не объявил возможности — реестр его не ` +
+                    `принимает: ${problems.join('; ')}.`,
+            );
+    }
     function pick<T>(seam: AdapterSeam, registry: Record<string, T>): T {
         const key = selection[seam];
         const impl = registry[key];

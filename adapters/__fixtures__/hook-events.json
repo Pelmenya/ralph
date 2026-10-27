@@ -1,0 +1,61 @@
+{
+    "claude-code": {
+        "source": "Claude Code 2.1.311, стенд Фазы 11, проба block: вход внешнего хука из canon.log. Стенд пишет 400 знаков: хвост после tool_input.command не снят. Пути заменены абстрактными.",
+        "event": {
+            "session_id": "7b5698f5-8ee4-4343-a501-b31c1832d936",
+            "transcript_path": "/path/to/transcript.jsonl",
+            "cwd": "/path/to/loop",
+            "prompt_id": "22476180-ebaa-43fa-980e-a29d144ea6f1",
+            "permission_mode": "bypassPermissions",
+            "effort": { "level": "medium" },
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": "touch ralph-stand-forbidden" }
+        }
+    },
+    "codex": {
+        "source": "codex-cli 0.163.0, стенд Фазы 11, проба block: вход хука из -c hooks.PreToolUse. Обрезка и замена путей — как у claude-code.",
+        "event": {
+            "session_id": "01a17bcc-58ab-7e12-9c6e-783d9cc9a655",
+            "turn_id": "01a17bcc-5a46-76a3-a051-d8172406af59",
+            "transcript_path": "/path/to/rollout.jsonl",
+            "cwd": "/path/to/loop",
+            "hook_event_name": "PreToolUse",
+            "model": "gpt-5.6-sol",
+            "permission_mode": "bypassPermissions",
+            "tool_name": "Bash",
+            "tool_input": { "command": "touch ralph-stand-forbidden" }
+        }
+    },
+    "kimi-code": {
+        "source": "Kimi Code 2.3.2, стенд Фазы 11, проба block: вход хука из [[hooks]] config.toml. Строка снята целиком, заменён только cwd.",
+        "event": {
+            "hook_event_name": "PreToolUse",
+            "session_id": "session_cae6c386-b2c9-4aca-8775-8bc1fef40864",
+            "cwd": "/path/to/loop",
+            "client_type": "kimi_code_cli",
+            "tool_name": "Bash",
+            "tool_input": { "command": "touch ralph-stand-forbidden" },
+            "tool_call_id": "tool_QnNpSejXHrMWNifMXTr6uh7n"
+        }
+    },
+    "opencode": {
+        "source": "OpenCode 1.19.4, живой прогон адаптера 27.10 (#121): аргументы tool.execute.before, записанные вторым плагином рядом с плагином барьера. Сняты целиком, заменён только путь файла.",
+        "event": {
+            "input": {
+                "tool": "bash",
+                "sessionID": "ses_e8196eb7dffemn3rtYv7MmF4Gq",
+                "callID": "toolu_bdrk_01NWAeiSpDLnxVMgxq97Y9q7"
+            },
+            "output": { "args": { "command": "git status --short" } }
+        },
+        "readEvent": {
+            "input": {
+                "tool": "read",
+                "sessionID": "ses_e8196eb7dffemn3rtYv7MmF4Gq",
+                "callID": "toolu_bdrk_01WjJPUnHZytQFXNYjV9PmfH"
+            },
+            "output": { "args": { "filePath": "/path/to/tree/victim/keep" } }
+        }
+    }
+}

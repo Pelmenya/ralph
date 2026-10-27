@@ -30,6 +30,8 @@ export type TRuntimePaths = {
     dryEvents: string;
     dryHeartbeat: string;
     sessionSettings: string;
+    kimiNative: string;
+    opencode: string;
     activations: string;
 };
 
@@ -63,6 +65,13 @@ export function runtimePathsIn(runtimeDir: string): TRuntimePaths {
         // пересобирается перед каждой сессией, и лежит здесь, а не в дереве сессии: файл в
         // дереве, которое правит PR, снова был бы настройкой, которую правит код под проверкой.
         sessionSettings: path.join(runtimeDir, 'ralph.session-settings.json'),
+        // #120: КАТАЛОГ сессии `kimi-native` — дом CLI (`home/`, конфиг с барьером и ссылки на
+        // вход человека) и файл промпта (`prompt/`, промпт в argv не помещается). Как settings
+        // выше, пересобирается перед каждой сессией и в дереве сессии лежать не может.
+        kimiNative: path.join(runtimeDir, 'kimi-native'),
+        // #121: КАТАЛОГ сессии `opencode` — `config/` для `OPENCODE_CONFIG_DIR`: плагин барьера
+        // и настройки сессии. Пересобирается перед каждой сессией, как дом `kimi-native`.
+        opencode: path.join(runtimeDir, 'opencode'),
         // #38: журнал активации ревизий ядра — какая исполнялась, когда, с какой снята.
         activations: path.join(runtimeDir, 'ralph.activations.jsonl'),
     };

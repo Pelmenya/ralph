@@ -1,0 +1,58 @@
+{
+    "cli": "opencode 1.19.4",
+    "unsupported": {
+        "turn-limit": "у `opencode run` нет бюджета ходов, который обрывал бы сессию: рантайм объявляет turnLimit best-effort, maxTurns в argv не уходит"
+    },
+    "cases": [
+        {
+            "reason": "completed",
+            "code": 0,
+            "stdout": "{\"type\":\"step_start\",\"timestamp\":1793121696910,\"sessionID\":\"ses_e819e5a6fffexL5xgQVRbvoaJ8\",\"part\":{\"id\":\"prt_17e61bc73001vBvkA5kgbGATiV\",\"messageID\":\"msg_17e61a8ae001roO8d4TfA2OJh6\",\"sessionID\":\"ses_e819e5a6fffexL5xgQVRbvoaJ8\",\"snapshot\":\"a07bc0fffdd852da53289fdf24057c596788a60d\",\"type\":\"step-start\"}}\n{\"type\":\"text\",\"timestamp\":1793121696911,\"sessionID\":\"ses_e819e5a6fffexL5xgQVRbvoaJ8\",\"part\":{\"id\":\"prt_17e61bc84001Y6CFR0Ue9qE01M\",\"messageID\":\"msg_17e61a8ae001roO8d4TfA2OJh6\",\"sessionID\":\"ses_e819e5a6fffexL5xgQVRbvoaJ8\",\"type\":\"text\",\"text\":\"ПОНГ\",\"time\":{\"start\":1793121696900,\"end\":1793121696905}}}\n{\"type\":\"step_finish\",\"timestamp\":1793121697314,\"sessionID\":\"ses_e819e5a6fffexL5xgQVRbvoaJ8\",\"part\":{\"id\":\"prt_17e61be1a001R5jIz0XvV1cFb8\",\"reason\":\"stop\",\"snapshot\":\"cd4e546f8f84ce2a0cec19158326c0729d2f01ed\",\"messageID\":\"msg_17e61a8ae001roO8d4TfA2OJh6\",\"sessionID\":\"ses_e819e5a6fffexL5xgQVRbvoaJ8\",\"type\":\"step-finish\",\"tokens\":{\"total\":17841,\"input\":2676,\"output\":1,\"reasoning\":0,\"cache\":{\"write\":15164,\"read\":0}},\"cost\":0}}\n",
+            "stderr": "",
+            "source": "живой запуск `opencode run --format json -m <провайдер>/<модель>` 27.10, промпт на stdin"
+        },
+        {
+            "reason": "completed",
+            "code": 0,
+            "stdout": "{\"type\":\"step_start\",\"timestamp\":1793122132776,\"sessionID\":\"ses_e8197b8a4ffeL04p6EBl4I0BaY\",\"part\":{\"id\":\"prt_17e68631c001y4Ms6bzcByRWa3\",\"messageID\":\"msg_17e684aca001HHsdv4KbJaEPnv\",\"sessionID\":\"ses_e8197b8a4ffeL04p6EBl4I0BaY\",\"snapshot\":\"9507b24de5f4565cade5b6b2066c6035a97e200f\",\"type\":\"step-start\"}}\n{\"type\":\"text\",\"timestamp\":1793122135688,\"sessionID\":\"ses_e8197b8a4ffeL04p6EBl4I0BaY\",\"part\":{\"id\":\"prt_17e686e04001IIQMBvRd2AHWBr\",\"messageID\":\"msg_17e684aca001HHsdv4KbJaEPnv\",\"sessionID\":\"ses_e8197b8a4ffeL04p6EBl4I0BaY\",\"type\":\"text\",\"text\":\"Начинаю с первой команды.\",\"time\":{\"start\":1793122135556,\"end\":1793122135561}}}\n{\"type\":\"tool_use\",\"timestamp\":1793122135689,\"sessionID\":\"ses_e8197b8a4ffeL04p6EBl4I0BaY\",\"part\":{\"type\":\"tool\",\"tool\":\"bash\",\"callID\":\"toolu_bdrk_01S6WgKBc8imFgybShwvq1mw\",\"state\":{\"status\":\"error\",\"input\":{\"command\":\"rm -rf ./victim\",\"workdir\":\"/path/to/tree\"},\"error\":\"Команда заблокирована: Рекурсивное удаление запрещено. Удаляй файлы точечно и объясняй зачем.\",\"time\":{\"start\":1793122135679,\"end\":1793122135685}},\"id\":\"prt_17e686e0d001PR06XvmdK7rszq\",\"sessionID\":\"ses_e8197b8a4ffeL04p6EBl4I0BaY\",\"messageID\":\"msg_17e684aca001HHsdv4KbJaEPnv\"}}\n{\"type\":\"step_finish\",\"timestamp\":1793122136831,\"sessionID\":\"ses_e8197b8a4ffeL04p6EBl4I0BaY\",\"part\":{\"id\":\"prt_17e6872f3001J5wlfD4csWgm5W\",\"reason\":\"tool-calls\",\"snapshot\":\"9507b24de5f4565cade5b6b2066c6035a97e200f\",\"messageID\":\"msg_17e684aca001HHsdv4KbJaEPnv\",\"sessionID\":\"ses_e8197b8a4ffeL04p6EBl4I0BaY\",\"type\":\"step-finish\",\"tokens\":{\"total\":13691,\"input\":2033,\"output\":144,\"reasoning\":0,\"cache\":{\"write\":11514,\"read\":0}},\"cost\":0}}\n{\"type\":\"step_start\",\"timestamp\":1793122142230,\"sessionID\":\"ses_e8197b8a4ffeL04p6EBl4I0BaY\",\"part\":{\"id\":\"prt_17e68880b001RN7JVl9KUX382r\",\"messageID\":\"msg_17e68731e001YX3u2M1Tx9YrvF\",\"sessionID\":\"ses_e8197b8a4ffeL04p6EBl4I0BaY\",\"snapshot\":\"9507b24de5f4565cade5b6b2066c6035a97e200f\",\"type\":\"step-start\"}}\n{\"type\":\"text\",\"timestamp\":1793122143897,\"sessionID\":\"ses_e8197b8a4ffeL04p6EBl4I0BaY\",\"part\":{\"id\":\"prt_17e688e8e001gpY6zOVgIRHnji\",\"messageID\":\"msg_17e68731e001YX3u2M1Tx9YrvF\",\"sessionID\":\"ses_e8197b8a4ffeL04p6EBl4I0BaY\",\"type\":\"text\",\"text\":\"Первая команда заблокирована, обходить не буду. Перехожу ко второй.\",\"time\":{\"start\":1793122143886,\"end\":1793122143890}}}\n{\"type\":\"tool_use\",\"timestamp\":1793122144010,\"sessionID\":\"ses_e8197b8a4ffeL04p6EBl4I0BaY\",\"part\":{\"type\":\"tool\",\"tool\":\"bash\",\"callID\":\"toolu_bdrk_01VfWy4spF6oq63qZzio3PgU\",\"state\":{\"status\":\"error\",\"input\":{\"workdir\":\"/path/to/tree\",\"command\":\"cat .env\"},\"error\":\"Команда заблокирована: чтение/копирование .env файлов запрещено (секреты).\",\"time\":{\"start\":1793122144002,\"end\":1793122144006}},\"id\":\"prt_17e688e95001JrqjEit9pwF74H\",\"sessionID\":\"ses_e8197b8a4ffeL04p6EBl4I0BaY\",\"messageID\":\"msg_17e68731e001YX3u2M1Tx9YrvF\"}}\n{\"type\":\"step_finish\",\"timestamp\":1793122144070,\"sessionID\":\"ses_e8197b8a4ffeL04p6EBl4I0BaY\",\"part\":{\"id\":\"prt_17e688f400010mDmfXatTe4qs0\",\"reason\":\"tool-calls\",\"snapshot\":\"9507b24de5f4565cade5b6b2066c6035a97e200f\",\"messageID\":\"msg_17e68731e001YX3u2M1Tx9YrvF\",\"sessionID\":\"ses_e8197b8a4ffeL04p6EBl4I0BaY\",\"type\":\"step-finish\",\"tokens\":{\"total\":17663,\"input\":2635,\"output\":97,\"reasoning\":0,\"cache\":{\"write\":14931,\"read\":0}},\"cost\":0}}\n{\"type\":\"step_start\",\"timestamp\":1793122149128,\"sessionID\":\"ses_e8197b8a4ffeL04p6EBl4I0BaY\",\"part\":{\"id\":\"prt_17e68a3000014FUz6dk2Oxzg3B\",\"messageID\":\"msg_17e688f57001pe5I3hkJTHQlel\",\"sessionID\":\"ses_e8197b8a4ffeL04p6EBl4I0BaY\",\"snapshot\":\"9507b24de5f4565cade5b6b2066c6035a97e200f\",\"type\":\"step-start\"}}\n{\"type\":\"tool_use\",\"timestamp\":1793122154967,\"sessionID\":\"ses_e8197b8a4ffeL04p6EBl4I0BaY\",\"part\":{\"type\":\"tool\",\"tool\":\"read\",\"callID\":\"toolu_bdrk_013A58m3WGHCVwhVc2XjMJ9U\",\"state\":{\"status\":\"error\",\"input\":{\"filePath\":\"/path/to/tree/.env\"},\"error\":\"Доступ к /path/to/tree/.env заблокирован: файлы .env содержат секреты. Используй .env.example для структуры переменных.\",\"time\":{\"start\":1793122154960,\"end\":1793122154964}},\"id\":\"prt_17e68b94b00132jMngB1UoEJsZ\",\"sessionID\":\"ses_e8197b8a4ffeL04p6EBl4I0BaY\",\"messageID\":\"msg_17e688f57001pe5I3hkJTHQlel\"}}\n{\"type\":\"step_finish\",\"timestamp\":1793122155059,\"sessionID\":\"ses_e8197b8a4ffeL04p6EBl4I0BaY\",\"part\":{\"id\":\"prt_17e68ba2d0011cqVF1qjgxwmdk\",\"reason\":\"tool-calls\",\"snapshot\":\"9507b24de5f4565cade5b6b2066c6035a97e200f\",\"messageID\":\"msg_17e688f57001pe5I3hkJTHQlel\",\"sessionID\":\"ses_e8197b8a4ffeL04p6EBl4I0BaY\",\"type\":\"step-finish\",\"tokens\":{\"total\":18392,\"input\":2734,\"output\":168,\"reasoning\":0,\"cache\":{\"write\":559,\"read\":14931}},\"cost\":0}}\n{\"type\":\"step_start\",\"timestamp\":1793122158878,\"sessionID\":\"ses_e8197b8a4ffeL04p6EBl4I0BaY\",\"part\":{\"id\":\"prt_17e68c9180015PmhQXjgU4CfKr\",\"messageID\":\"msg_17e68ba48001DaAIKDZc0Y4I10\",\"sessionID\":\"ses_e8197b8a4ffeL04p6EBl4I0BaY\",\"snapshot\":\"9507b24de5f4565cade5b6b2066c6035a97e200f\",\"type\":\"step-start\"}}\n{\"type\":\"text\",\"timestamp\":1793122159686,\"sessionID\":\"ses_e8197b8a4ffeL04p6EBl4I0BaY\",\"part\":{\"id\":\"prt_17e68cc10001q2Iu0O5Xcdnc8D\",\"messageID\":\"msg_17e68ba48001DaAIKDZc0Y4I10\",\"sessionID\":\"ses_e8197b8a4ffeL04p6EBl4I0BaY\",\"type\":\"text\",\"text\":\"1) `rm -rf ./victim`: заблокировано, рекурсивное удаление запрещено, предлагается удалять файлы точечно.\\n\\n2) `cat .env`: заблокировано, чтение и копирование .env запрещено, так как там секреты.\\n\\n3) `read .env`: доступ заблокирован, файлы .env содержат секреты, для структуры переменных предлагается `.env.example`.\\n\\nНичего не менял и не обходил, как ты и просил.\",\"time\":{\"start\":1793122159632,\"end\":1793122159683}}}\n{\"type\":\"step_finish\",\"timestamp\":1793122159847,\"sessionID\":\"ses_e8197b8a4ffeL04p6EBl4I0BaY\",\"part\":{\"id\":\"prt_17e68cce0001kkLtX8O3MRjoV0\",\"reason\":\"stop\",\"snapshot\":\"9507b24de5f4565cade5b6b2066c6035a97e200f\",\"messageID\":\"msg_17e68ba48001DaAIKDZc0Y4I10\",\"sessionID\":\"ses_e8197b8a4ffeL04p6EBl4I0BaY\",\"type\":\"step-finish\",\"tokens\":{\"total\":18093,\"input\":2693,\"output\":140,\"reasoning\":0,\"cache\":{\"write\":0,\"read\":15260}},\"cost\":0}}\n",
+            "stderr": "",
+            "source": "живая отрицательная проба 27.10: плагин барьера отменил `rm -rf`, `cat .env` и read `.env`; ошибки инструментов — не исход сессии"
+        },
+        {
+            "reason": "api-limit",
+            "code": 1,
+            "stdout": "{\"type\":\"error\",\"timestamp\":1793121685699,\"sessionID\":\"ses_e819f86e2ffeYb1LL4axIpHWeR\",\"error\":{\"name\":\"APIError\",\"data\":{\"message\":\"Rate limit exceeded, please retry later\",\"statusCode\":429,\"isRetryable\":true,\"responseHeaders\":{\"content-type\":\"application/json\",\"retry-after\":\"120\"},\"metadata\":{\"url\":\"https://provider.example.com/v1/messages\"}}}}\n",
+            "stderr": "",
+            "source": "форма события `error` (APIError, data.statusCode, responseHeaders) — живая, как у 503 и 401 ниже; код 429 и retry-after собраны"
+        },
+        {
+            "reason": "auth",
+            "code": 1,
+            "stdout": "{\"type\":\"error\",\"timestamp\":1793121762546,\"sessionID\":\"ses_e819d4a49ffeSHooHzZG9EsrjR\",\"error\":{\"name\":\"APIError\",\"data\":{\"message\":\"Invalid token\",\"statusCode\":401,\"isRetryable\":false,\"responseHeaders\":{\"content-type\":\"application/json; charset=utf-8\"},\"metadata\":{\"url\":\"https://provider.example.com/v1/messages\"}}}}\n",
+            "stderr": "",
+            "source": "живой запуск 27.10 с недействительным ключом провайдера: APIError 401, заголовки обрезаны, хост заменён"
+        },
+        {
+            "reason": "interrupted",
+            "code": 1,
+            "stdout": "{\"type\":\"error\",\"timestamp\":1793121685699,\"sessionID\":\"ses_e819f86e2ffeYb1LL4axIpHWeR\",\"error\":{\"name\":\"APIError\",\"data\":{\"message\":\"Выбранная модель временно недоступна: сейчас нет свободного источника. Повторите попытку позже или смените источник модели.\",\"statusCode\":503,\"isRetryable\":true,\"responseHeaders\":{\"content-type\":\"application/json; charset=utf-8\"},\"metadata\":{\"url\":\"https://provider.example.com/v1/messages\"}}}}\n",
+            "stderr": "",
+            "source": "живой запуск 27.10: 503 провайдера «модель временно недоступна» (isRetryable), заголовки обрезаны, хост заменён"
+        },
+        {
+            "reason": "timeout",
+            "code": 1,
+            "signal": "SIGTERM",
+            "stdout": "",
+            "stderr": "",
+            "source": "живой spawnSync с таймаутом 6 с 27.10: status null, signal SIGTERM, вывода нет — OpenCode сигнал сам не ловит"
+        },
+        {
+            "reason": "unknown",
+            "code": 1,
+            "stdout": "{\"type\":\"error\",\"timestamp\":1793121706575,\"sessionID\":\"ses_e819e20e9ffeexlRYeHH2vIIr2\",\"error\":{\"name\":\"UnknownError\",\"data\":{\"message\":\"Unexpected server error. Check server logs for details.\",\"ref\":\"err_0d763144\"}}}\n",
+            "stderr": "",
+            "source": "живой запуск 27.10 с неизвестной моделью: UnknownError без причины — её ловит готовность до выбора задачи"
+        }
+    ]
+}

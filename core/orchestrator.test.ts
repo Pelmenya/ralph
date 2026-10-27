@@ -1578,6 +1578,10 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
         });
     });
 
+    // Регистрация барьера Codex без дерева сессии — стоп (ревью Фазы 16b); смоук сессии
+    // проверяет argv и env, поэтому регистрация подменяется пустой.
+    const NO_CODEX_GUARD = (): string[] => [];
+
     describe('runOpenAIOnce — смоук: кодер-сессия стартует и выдаёт дифф', () => {
         let runtime: ReturnType<typeof buildRuntime>;
         const savedToken = process.env.OPENAI_API_KEY;
@@ -1624,6 +1628,7 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
                 spawnFn as unknown as SpawnSyncFn,
                 undefined,
                 VERSION_UNREAD,
+                NO_CODEX_GUARD,
             );
 
             expect(res).toEqual({
@@ -1662,6 +1667,7 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
                 spawnFn as unknown as SpawnSyncFn,
                 undefined,
                 VERSION_UNREAD,
+                NO_CODEX_GUARD,
             );
             const [, argv, opts] = spawnFn.mock.calls[spawnFn.mock.calls.length - 1];
             expect(opts.input).toBe(prompt);
@@ -1688,6 +1694,7 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
                 spawnFn as unknown as SpawnSyncFn,
                 undefined,
                 VERSION_UNREAD,
+                NO_CODEX_GUARD,
             );
             // Первым идёт `codex login status` (проверка канала), последним — сама сессия.
             const [, argv, opts] = spawnFn.mock.calls[spawnFn.mock.calls.length - 1];
@@ -1715,6 +1722,7 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
                 spawnFn as unknown as SpawnSyncFn,
                 undefined,
                 VERSION_UNREAD,
+                NO_CODEX_GUARD,
             );
 
             const [firstBin, firstArgs] = spawnFn.mock.calls[0];
@@ -1754,6 +1762,7 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
                 spawnFn as unknown as SpawnSyncFn,
                 readFn,
                 VERSION_UNREAD,
+                NO_CODEX_GUARD,
             );
             // Слоёв конфигурации несколько (пользовательский и системный), поэтому проверяем
             // ПОРЯДОК, а не их количество: любое чтение — до проверки входа, сессия — после.
@@ -1784,6 +1793,7 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
                     spawnFn as unknown as SpawnSyncFn,
                     undefined,
                     VERSION_UNREAD,
+                    NO_CODEX_GUARD,
                 ),
             ).toThrow();
             // Ровно один вызов — проверка входа; сама сессия не запускалась.
@@ -1809,6 +1819,7 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
                 spawnFn as unknown as SpawnSyncFn,
                 undefined,
                 VERSION_UNREAD,
+                NO_CODEX_GUARD,
             );
             expect(spawnFn.mock.calls.length).toBe(1);
             const [, argv] = spawnFn.mock.calls[0];
@@ -1845,6 +1856,7 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
                     spawnFn as unknown as SpawnSyncFn,
                     undefined,
                     VERSION_UNREAD,
+                    NO_CODEX_GUARD,
                 );
                 const [, , opts] = spawnFn.mock.calls[spawnFn.mock.calls.length - 1];
                 // Ключ ушёл под именем, которое ждёт codex...
@@ -1882,6 +1894,7 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
                 spawnFn as unknown as SpawnSyncFn,
                 undefined,
                 VERSION_UNREAD,
+                NO_CODEX_GUARD,
             );
             const [, argv] = spawnFn.mock.calls[spawnFn.mock.calls.length - 1];
             expect(argv).toContain('forced_login_method="chatgpt"');
@@ -1909,6 +1922,7 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
                 spawnFn as unknown as SpawnSyncFn,
                 undefined,
                 VERSION_UNREAD,
+                NO_CODEX_GUARD,
             );
             const [, argv] = spawnFn.mock.calls[spawnFn.mock.calls.length - 1];
             expect(argv.join(' ')).not.toContain('forced_login_method');
@@ -1940,6 +1954,7 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
                 spawnFn as unknown as SpawnSyncFn,
                 undefined,
                 VERSION_UNREAD,
+                NO_CODEX_GUARD,
             );
             expect(res).toEqual({ code: 0, output: '' });
             expect(spawnFn).not.toHaveBeenCalled();
@@ -1962,6 +1977,7 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
                 spawnFn as unknown as SpawnSyncFn,
                 undefined,
                 VERSION_UNREAD,
+                NO_CODEX_GUARD,
             );
             const [, argv] = spawnFn.mock.calls[spawnFn.mock.calls.length - 1];
             expect(argv).not.toContain('--max-turns');
@@ -1988,6 +2004,7 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
                 spawnFn as unknown as SpawnSyncFn,
                 undefined,
                 VERSION_UNREAD,
+                NO_CODEX_GUARD,
             );
             const [, argv] = spawnFn.mock.calls[spawnFn.mock.calls.length - 1];
             expect(argv[argv.indexOf('-m') + 1]).toBe('gpt-5-codex');
@@ -2012,6 +2029,7 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
                 spawnFn as unknown as SpawnSyncFn,
                 undefined,
                 VERSION_UNREAD,
+                NO_CODEX_GUARD,
             );
             const [, argv] = spawnFn.mock.calls[spawnFn.mock.calls.length - 1];
             expect(argv[argv.indexOf('-m') + 1]).toBe('gpt-5-codex-mini');
@@ -2035,6 +2053,7 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
                 spawnFn as unknown as SpawnSyncFn,
                 undefined,
                 VERSION_UNREAD,
+                NO_CODEX_GUARD,
             );
             const [, argv] = spawnFn.mock.calls[spawnFn.mock.calls.length - 1];
             expect(argv[argv.indexOf('-m') + 1]).toBe('gpt-5-codex');
@@ -2054,16 +2073,19 @@ describe('buildAdapters — выбор coderRuntime из config.adapters (#373/#
     // Реестр-заглушка: реальны только coderRuntime.run (их output и сторожит тест), прочие
     // швы — сентинелы { x: 1 }, к выбору coderRuntime не относятся. `as unknown as` — цена
     // намеренно частичного фейка (полный реестр строит adapters-impl.test.ts).
+    const caps = { turnLimit: 'best-effort', fallbackModel: false };
     const fakeRegistries = () =>
         ({
             taskSource: { github: { x: 1 } },
             gate: { npm: { x: 1 } },
             notifier: { telegram: { x: 1 } },
             deployCheck: { 'github-actions': { x: 1 } },
+            // #118: реестр без объявленных возможностей не собирается — объявление
+            // есть и у заглушки.
             coderRuntime: {
-                claude: { run: () => ({ code: 0, output: 'claude' }) },
-                kimi: { run: () => ({ code: 0, output: 'kimi' }) },
-                openai: { run: () => ({ code: 0, output: 'openai' }) },
+                claude: { run: () => ({ code: 0, output: 'claude' }), capabilities: caps },
+                kimi: { run: () => ({ code: 0, output: 'kimi' }), capabilities: caps },
+                openai: { run: () => ({ code: 0, output: 'openai' }), capabilities: caps },
             },
         }) as unknown as AdapterRegistries;
 
@@ -16383,6 +16405,81 @@ describe('sessionSettingsArgs: отказ пробы посреди прогон
 
     it('без раскладки корней — пусто, settings не собирается', () => {
         expect(ralph.sessionSettingsArgs({}, { roots: null })).toEqual([]);
+    });
+});
+
+// #119: барьер сессии Codex — тот же стоп, что у settings Claude, если проба не прошла.
+describe('codexGuardArgsFor: регистрация барьера Codex перед сессией', () => {
+    it('настройки дерева не читаются — стоп guard-probe с причиной и выход кодом 1', () => {
+        const pushes: string[] = [];
+        expect(() =>
+            ralph.codexGuardArgsFor(
+                {
+                    readFileFn: () => {
+                        throw new Error('EACCES: нет прав');
+                    },
+                },
+                {
+                    tree: '/work',
+                    roots: null,
+                    persistFn: null,
+                    pushEventFn: (msg: string) => {
+                        pushes.push(msg);
+                        return false;
+                    },
+                    exitFn: (code: number): never => {
+                        throw new Error(`exit ${String(code)}`);
+                    },
+                },
+            ),
+        ).toThrow('exit 1');
+        expect(pushes).toHaveLength(1);
+        expect(pushes[0]).toMatch(/барьер сессии не прошёл пробу[\s\S]*Codex не собраны: EACCES/);
+    });
+
+    it('проба прошла — аргументы регистрации с флагом доверия хуку', () => {
+        const args = ralph.codexGuardArgsFor(
+            {
+                readFileFn: () => '{}',
+                runHookFn: (_h: unknown, payload: string) => ({
+                    status: payload.includes('git status') ? 0 : 2,
+                    stderr: '',
+                }),
+            },
+            {
+                tree: '/work',
+                roots: {
+                    productRoot: '/core',
+                    humanRoot: '/app',
+                    sessionTree: '/work',
+                    coreSha: '',
+                },
+            },
+        );
+        expect(args).toContain('--dangerously-bypass-hook-trust');
+        expect(args).toContain('hooks');
+    });
+
+    // Ревью Фазы 16b: пустая регистрация пускала codex exec без хука — теперь стоп.
+    it('вне main (дерево не задано) — стоп guard-probe, а не codex exec без хука', () => {
+        const pushes: string[] = [];
+        expect(() =>
+            ralph.codexGuardArgsFor(
+                {},
+                {
+                    tree: null,
+                    persistFn: null,
+                    pushEventFn: (msg: string) => {
+                        pushes.push(msg);
+                        return false;
+                    },
+                    exitFn: (code: number): never => {
+                        throw new Error(`exit ${String(code)}`);
+                    },
+                },
+            ),
+        ).toThrow('exit 1');
+        expect(pushes[0]).toMatch(/Дерево сессии для регистрации барьера Codex не задано/);
     });
 });
 

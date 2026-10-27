@@ -47,6 +47,7 @@
 // TS-модуль без билд-шага (erasable-only), без побочек: чистые функции вход→выход.
 
 import type { SessionEnd, SessionEndReason, SpawnFailureKind } from './adapters.ts';
+import { opencodeErrors } from './opencode.ts';
 
 // Наблюдаемое на границе spawn: всё, по чему адаптер вправе судить об исходе. Вывод — СЫРОЙ
 // (stdout до перевода JSON в текст), иначе классификатор не видел бы структурных полей CLI.
@@ -291,6 +292,93 @@ export function classifyCodexSessionEnd(input: SessionEndInput): SessionEnd {
     return { endReason: 'unknown' };
 }
 
+// ── Kimi Code CLI (`kimi -p --output-format stream-json`, #120) ───────────────────────
+//
+// Признак исхода у Kimi Code структурный: отказ хода CLI печатает в stderr одной строкой
+// «error: failed to run prompt: <код>: <сообщение>», где код — из закрытого списка его
+// ошибок (`provider.rate_limit`, `loop.max_steps_exceeded`, …). Читается только эта строка:
+// stdout — сообщения модели и результаты инструментов, и сессия, читавшая код ретраев,
+// получила бы исход по чужому тексту. Без кода CLI пишет отказы входа словами («No model
+// configured», «has no credential configured») — они узнаются той же строкой.
+//
+// Квота подписки у Kimi — тоже 429, но код CLI для неё `provider.api_error`, а не
+// `provider.rate_limit`: его различает только формулировка, и она взята из списка самого
+// CLI (`KIMI_QUOTA_EXHAUSTED_MESSAGE_PATTERNS`). Время сброса CLI в строку не кладёт —
+// `retryAfterMs` нет, ядро возьмёт `apiLimitFallbackWaitMin`.
+//
+// Срок раннера Kimi переживает по-своему: SIGTERM он ловит, прибирается и выходит кодом 143
+// (`signalExitCode`: 130 — SIGINT, 129 — SIGHUP), так что сигнала у spawnSync нет. Эти коды —
+// `timeout`, как сигнал у остальных CLI: проверено живьём, spawnSync с таймаутом отдал
+// `status: 143, signal: null`.
+
+const KIMI_FAILURE_RE = /^error: failed to run prompt: (.*)$/m;
+const KIMI_SIGNAL_EXIT_CODES: ReadonlySet<number> = new Set([129, 130, 143]);
+const KIMI_AUTH_RE =
+    /^(provider\.auth_error:|No model configured|provider \S+ has no credential configured)/;
+const KIMI_QUOTA_RE =
+    /exceeded your current (?:token )?quota|check your account balance|insufficient balance|recharge your account|please recharge|account (?:is )?in arrears/i;
+
+export function classifyKimiNativeSessionEnd(input: SessionEndInput): SessionEnd {
+    if (input.signal || KIMI_SIGNAL_EXIT_CODES.has(input.code)) return { endReason: 'timeout' };
+    if (input.failureKind && input.failureKind !== 'session-failed') {
+        return { endReason: 'unknown' };
+    }
+    if (input.code === 0) return { endReason: 'completed' };
+    const failure = KIMI_FAILURE_RE.exec(input.stderr)?.[1] ?? '';
+    if (failure.startsWith('loop.max_steps_exceeded:')) return { endReason: 'turn-limit' };
+    if (KIMI_AUTH_RE.test(failure)) return { endReason: 'auth' };
+    if (failure.startsWith('provider.rate_limit:')) return { endReason: 'api-limit' };
+    if (failure.startsWith('provider.api_error:') && KIMI_QUOTA_RE.test(failure))
+        return { endReason: 'api-limit' };
+    if (/^provider\.(?:connection_error|overloaded):/.test(failure))
+        return { endReason: 'interrupted' };
+    return { endReason: 'unknown' };
+}
+
+// ── OpenCode CLI (`opencode run --format json`, #121) ─────────────────────────────────
+//
+// Признак исхода у OpenCode структурный: событие `error` в stdout (не в stderr) с именем
+// ошибки и HTTP-кодом ответа провайдера (`data.statusCode`). Формулировки у провайдеров свои
+// и на любом языке — живой 503 router.cheap пришёл по-русски, — поэтому читаются имя и код,
+// а не текст. Текст модели и результаты инструментов — другие события и не читаются вовсе.
+//
+// Срок раннера OpenCode сам не ловит: spawnSync отдаёт `signal: SIGTERM` (живьём, 1.19.4) —
+// это `timeout`. Бюджета ходов, который обрывал бы сессию, у CLI нет: `turn-limit` не
+// поддержан, рантайм объявляет `turnLimit: 'best-effort'`. Неизвестная модель в сессии —
+// «UnknownError» без причины, то есть `unknown`: её ловит готовность до выбора задачи.
+
+function retryAfterHeaderMs(headers: Record<string, unknown>): number | undefined {
+    const ms = Number(headers['retry-after-ms']);
+    if (Number.isFinite(ms) && ms > 0) return ms;
+    const s = Number(headers['retry-after']);
+    if (Number.isFinite(s) && s > 0) return s * 1000;
+    return undefined;
+}
+
+export function classifyOpencodeSessionEnd(input: SessionEndInput): SessionEnd {
+    if (input.signal) return { endReason: 'timeout' };
+    if (input.failureKind && input.failureKind !== 'session-failed') {
+        return { endReason: 'unknown' };
+    }
+    // Код 0 — сессия доработала, даже если по пути CLI залогировал ошибку: повторяемую 503 или
+    // 429 OpenCode переживает повтором сам, и последнее событие `error` сделало бы выполненную
+    // работу `interrupted` или `api-limit` — ядро ушло бы ждать окно после сделанного (ревью
+    // Фазы 16b). Падение с событием `error` CLI кончает кодом 1 — все живые фикстуры такие.
+    if (input.code === 0) return { endReason: 'completed' };
+    const errs = opencodeErrors(input.stdout);
+    const err = errs[errs.length - 1];
+    if (!err) return { endReason: 'unknown' };
+    if (err.name === 'ProviderAuthError' || err.statusCode === 401 || err.statusCode === 403)
+        return { endReason: 'auth' };
+    if (err.statusCode === 429) {
+        const wait = retryAfterHeaderMs(err.headers);
+        return wait ? { endReason: 'api-limit', retryAfterMs: wait } : { endReason: 'api-limit' };
+    }
+    if ((err.statusCode !== undefined && err.statusCode >= 500) || err.retryable === true)
+        return { endReason: 'interrupted' };
+    return { endReason: 'unknown' };
+}
+
 // Классификатор каждого зарегистрированного рантайма. Ключи — те же, что у реестра
 // `coderRuntime` (`CODER_RUNTIME_PROVIDERS`), и contract suite сверяет совпадение: рантайм
 // без классификатора не прошёл бы сьют, а не уехал бы с исходом «прочее» на всё.
@@ -298,6 +386,8 @@ export const SESSION_END_CLASSIFIERS: Record<string, SessionEndClassifier> = {
     claude: classifyClaudeSessionEnd,
     kimi: classifyClaudeSessionEnd,
     openai: classifyCodexSessionEnd,
+    'kimi-native': classifyKimiNativeSessionEnd,
+    opencode: classifyOpencodeSessionEnd,
 };
 
 export const SESSION_END_REASONS: readonly SessionEndReason[] = [

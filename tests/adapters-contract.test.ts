@@ -43,6 +43,7 @@ import {
     createNpmGate,
     createTelegramNotifier,
 } from '../adapters/adapters-impl.ts';
+import { CLAUDE_CODE_CAPABILITIES } from '../adapters/runtime-capabilities.ts';
 import type { SourcecraftApi } from '../adapters/sourcecraft-task-source.ts';
 import { createSourcecraftTaskSource } from '../adapters/sourcecraft-task-source.ts';
 import type { GateEnv } from '../core/gate.ts';
@@ -1623,6 +1624,7 @@ function buildFakeRuntime(result: { code: number; output: string }): CoderRuntim
     return createCoderRuntime({
         run: () => ({ code: result.code, output: result.output }),
         checkAvailable: () => {},
+        capabilities: CLAUDE_CODE_CAPABILITIES,
     });
 }
 
@@ -1641,6 +1643,7 @@ function buildRealRuntime(spawnResult: {
             return ralph.spawnClaude(argv, prompt, 1000, spawnFn);
         },
         checkAvailable: () => ralph.probeRuntimeBinary('claude', spawnFn),
+        capabilities: CLAUDE_CODE_CAPABILITIES,
     });
 }
 

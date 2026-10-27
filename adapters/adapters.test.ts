@@ -202,6 +202,7 @@ function makeFakeRuntime(result: { code: number; output: string }): {
             return { code: result.code, output: result.output };
         },
         checkAvailable: () => {},
+        capabilities: { turnLimit: 'required', fallbackModel: true },
     };
     return { adapter, runs };
 }

@@ -654,6 +654,13 @@ export type RunResult = {
     retryAfterMs?: number;
 };
 
+// Возможности рантайма (Фаза 16b, #118). `turnLimit: 'required'` — CLI сам обрывает сессию
+// на `maxTurns`; `'best-effort'` — потолка у CLI нет, держат внешние `maxIterations` и
+// тайм-аут. `fallbackModel` — есть ли фолбэк-модель внутри одной сессии. Объявления
+// реализаций и проверка формы — `adapters/runtime-capabilities.ts`.
+export type TurnLimitLevel = 'best-effort' | 'required';
+export type RuntimeCapabilities = { turnLimit: TurnLimitLevel; fallbackModel: boolean };
+
 export type CoderRuntimeAdapter = {
     // Запустить кодер-сессию по промпту в дереве раннера (синхронно). Возвращает код
     // возврата и объединённый вывод. Ожидание API-лимита, ретраи и health туннеля —
@@ -674,6 +681,13 @@ export type CoderRuntimeAdapter = {
     // метод форжа — `TaskSourceAdapter.checkAuth`, и отказы их ядро разводит в тексте:
     // разные причины чинятся разным ремонтом.
     checkAvailable(): void;
+
+    // Что рантайм ИСПОЛНЯЕТ из `RunOptions` (Фаза 16b, #118): гарантирует ли он бюджет ходов,
+    // есть ли у него фолбэк-модель. Ядро сверяет с этим требования конфига до выбора задачи;
+    // параметр, который рантайм не объявил, иначе молча игнорировался бы и выглядел
+    // гарантией. Обязательное: сборка отвергает реализацию без объявления
+    // (`adapters/runtime-capabilities.ts`).
+    capabilities: RuntimeCapabilities;
 };
 
 // ---------------------------------------------------------------------------------

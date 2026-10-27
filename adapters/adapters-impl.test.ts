@@ -23,6 +23,11 @@ import {
     resolveAdapterSelection,
     type AdapterRegistries,
 } from './adapters-impl.ts';
+import {
+    CLAUDE_CODE_CAPABILITIES,
+    CODEX_CAPABILITIES,
+    KIMI_CAPABILITIES,
+} from './runtime-capabilities.ts';
 
 // fail, который бросает (боевой уходит в process.exit) — чтобы тест увидел стоп.
 function throwingFail(msg: string): never {
@@ -294,11 +299,17 @@ describe('мапперы гейта / нотификатора / рантайм�
         const checkAvailable = vi.fn(() => {
             throw new Error('бинарь не найден');
         });
-        const r: CoderRuntimeAdapter = createCoderRuntime({ run, checkAvailable });
+        const r: CoderRuntimeAdapter = createCoderRuntime({
+            run,
+            checkAvailable,
+            capabilities: CODEX_CAPABILITIES,
+        });
         expect(r.run('промпт', { maxTurns: 10 })).toEqual({ code: 0, output: 'diff' });
         expect(run).toHaveBeenCalledWith('промпт', { maxTurns: 10 });
         // #44: отказ проверки доходит до ядра исключением, а не проглатывается маппером.
         expect(() => r.checkAvailable()).toThrow(/бинарь не найден/);
+        // #118: объявление возможностей — та же ссылка, маппер его не переписывает.
+        expect(r.capabilities).toBe(CODEX_CAPABILITIES);
     });
 });
 
@@ -351,6 +362,7 @@ function fakeRegistries(): AdapterRegistries {
     const coderRuntime: CoderRuntimeAdapter = createCoderRuntime({
         run: () => ({ code: 0, output: '' }),
         checkAvailable: () => {},
+        capabilities: CLAUDE_CODE_CAPABILITIES,
     });
     return {
         taskSource: { github: ts },
@@ -380,6 +392,7 @@ describe('buildAdapters — сборка набора швов по выбору
         const secondRuntime: CoderRuntimeAdapter = createCoderRuntime({
             run: () => ({ code: 7, output: 'kimi' }),
             checkAvailable: () => {},
+            capabilities: KIMI_CAPABILITIES,
         });
         reg.coderRuntime.kimi = secondRuntime;
         const sel = resolveAdapterSelection({ coderRuntime: 'kimi' }, throwingFail);

@@ -15,16 +15,21 @@ import {
     RUNTIME_IDENTITIES,
     parseClaudeCliVersion,
     parseCodexCliVersion,
+    parseKimiCodeCliVersion,
+    parseOpencodeCliVersion,
     runtimeProfile,
 } from './runtime-profile.ts';
 // @ts-expect-error — JS-entry раннера без деклараций типов: боевые spawn-пути живут на его
 // поверхности (тот же приём, что session-end.test.ts).
 import ralph from '../ralph.js';
 
-// Ответы `--version` живых CLI на этой ревизии: claude 2.1.311, codex-cli 0.163.0.
+// Ответы `--version` живых CLI на этой ревизии: claude 2.1.311, codex-cli 0.163.0, kimi 2.3.2,
+// opencode 1.19.4.
 const VERSION_OUTPUT: Record<string, string> = {
     claude: '2.1.311 (Claude Code)\n',
     codex: 'codex-cli 0.163.0\n',
+    kimi: '2.3.2\n',
+    opencode: '1.19.4\n',
 };
 
 type TSpawnResult = {
@@ -51,6 +56,27 @@ describe('разбор версии — у адаптера своего CLI', (
 
     it('codex: строка CLI → версия', () => {
         expect(parseCodexCliVersion(VERSION_OUTPUT.codex)).toEqual({ version: '0.163.0' });
+    });
+
+    it('kimi: голый номер CLI → версия; номер внутри строки — не версия', () => {
+        expect(parseKimiCodeCliVersion(VERSION_OUTPUT.kimi)).toEqual({ version: '2.3.2' });
+        expect(parseKimiCodeCliVersion('kimi version 2.3.2').version).toBe(CLI_VERSION_UNKNOWN);
+        expect(parseKimiCodeCliVersion(VERSION_OUTPUT.claude).version).toBe(CLI_VERSION_UNKNOWN);
+    });
+
+    it('opencode: голый номер CLI → версия; баннер с номером — не версия', () => {
+        expect(parseOpencodeCliVersion(VERSION_OUTPUT.opencode)).toEqual({ version: '1.19.4' });
+        expect(parseOpencodeCliVersion('opencode 1.19.4').version).toBe(CLI_VERSION_UNKNOWN);
+    });
+
+    it('opencode: провайдер — из модели provider/model, без префикса — слово реестра', () => {
+        expect(runtimeProfile('opencode', 'prov/m')).toEqual({
+            harness: 'opencode',
+            provider: 'prov',
+            model: 'prov/m',
+        });
+        expect(runtimeProfile('opencode', 'm').provider).toBe('model-provider');
+        expect(runtimeProfile('openai', 'prov/m').provider).toBe('openai');
     });
 
     it('чужая строка — unknown с причиной, а не номер из баннера', () => {
@@ -104,6 +130,10 @@ const SPAWN_OF: Record<string, (spawnFn: unknown, attempt: unknown) => unknown> 
         ralph.spawnClaude(['-p'], 'промпт', 1000, spawnFn, {}, 'kimi', attempt),
     openai: (spawnFn, attempt) =>
         ralph.spawnCodex(['exec'], 'промпт', 1000, spawnFn, undefined, attempt),
+    'kimi-native': (spawnFn, attempt) =>
+        ralph.spawnKimiNative(['-p', 'указатель'], 1000, spawnFn, undefined, attempt),
+    opencode: (spawnFn, attempt) =>
+        ralph.spawnOpencode(['run'], 'промпт', 1000, spawnFn, undefined, attempt),
 };
 
 function attemptLines(logSpy: { mock: { calls: unknown[][] } }): string[] {

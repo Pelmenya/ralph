@@ -236,6 +236,7 @@ import {
 // deploy-check.ts, telegram-notifier.ts, gh-функции, runClaudeOnce) стыкуются здесь, в
 // единой точке сборки (composition root), и попадают в ядро уже как швы.
 import type {
+    CoderRuntimeAdapter,
     GateCheckResult,
     IssueDetails,
     NewPullRequest,
@@ -249,11 +250,51 @@ import type {
     TaskSourceAdapter,
 } from '../adapters/adapters.ts';
 // Фаза 16 (#112): исход сессии называет адаптер рантайма по признакам своего CLI. Ядро
-// зовёт классификатор только в spawn-путях Claude и Codex — реализациях шва, которые пока
-// живут в этом файле, — а решения принимает по одному `endReason`.
-import { classifyClaudeSessionEnd, classifyCodexSessionEnd } from '../adapters/session-end.ts';
+// зовёт классификатор только в spawn-путях Claude, Codex и Kimi Code — реализациях шва,
+// которые пока живут в этом файле, — а решения принимает по одному `endReason`.
+import {
+    classifyClaudeSessionEnd,
+    classifyCodexSessionEnd,
+    classifyKimiNativeSessionEnd,
+    classifyOpencodeSessionEnd,
+} from '../adapters/session-end.ts';
+// #120: Kimi Code родным харнессом — argv, дом CLI, вход и разбор stream-json.
+import {
+    KIMI_NATIVE_BIN,
+    KIMI_NATIVE_STATUS,
+    buildKimiNativeArgs,
+    kimiNativeConfigProblems,
+    kimiNativeAuthProblems,
+    kimiNativeSessionEnv,
+    kimiNativeSkillsDirs,
+    kimiSourceHome,
+    kimiStreamText,
+} from '../adapters/kimi-native.ts';
+// #121: OpenCode — экспериментальный третий харнесс: argv, конфиг эксперимента, модель, текст.
+import {
+    OPENCODE_BIN,
+    OPENCODE_STATUS,
+    buildOpencodeArgs,
+    opencodeConfigProblems,
+    opencodeEventsText,
+    opencodeModelProblems,
+    opencodeAuthFile,
+    opencodeAuthProblems,
+    opencodeSessionEnv,
+    parseOpencodeModel,
+} from '../adapters/opencode.ts';
+// #118: объявленные возможности рантаймов реестра и сверка с ними требований конфига.
+import {
+    CLAUDE_CODE_CAPABILITIES,
+    CODEX_CAPABILITIES,
+    KIMI_CAPABILITIES,
+    KIMI_NATIVE_CAPABILITIES,
+    OPENCODE_CAPABILITIES,
+} from '../adapters/runtime-capabilities.ts';
+import { checkRuntimeRequirements } from './runtime-requirements.ts';
 import {
     CLI_VERSION_UNKNOWN,
+    MODEL_CLI_DEFAULT,
     RUNTIME_IDENTITIES,
     runtimeProfile,
     type CliVersion,
@@ -296,6 +337,9 @@ import { updateConsumerTree } from './consumer-tree.ts';
 import { ensureGuardHolds } from './guard-probe.ts';
 import {
     buildSessionSettings,
+    prepareCodexGuardArgs,
+    prepareKimiNativeHome,
+    prepareOpencodeSession,
     prepareSessionSettings,
     readHumanSettings,
     resolveCoreSha,
@@ -758,6 +802,10 @@ export type RalphConfig = {
     issueFormat?: unknown;
     maxIterations?: number;
     maxTurns?: number;
+    // #118: строгость бюджета ходов — 'best-effort' (ключа нет) или 'required'. Строгое
+    // требование к рантайму, который потолок не гарантирует, — отказ на старте
+    // (runtime-requirements.ts).
+    turnLimit?: unknown;
     maxNoProgress?: number;
     // #67: сколько итераций ПОДРЯД петля вправе взять одну карточку, прежде чем встать с
     // причиной. Целое > 0, дефолт MAX_SAME_ISSUE; не ниже `coderTurnRetries + 1`.
@@ -898,6 +946,32 @@ export type RalphConfig = {
         sandboxMode?: string;
         authTokenEnv?: string;
         authMode?: 'apiKey' | 'subscription';
+    };
+    // #120: рантайм `kimi-native` — Kimi Code CLI родным харнессом (бинарь `kimi`), рядом с
+    // `kimi` (Claude Code на endpoint Moonshot). Ключей в конфиге нет вовсе: вход живёт в
+    // доме CLI человека, раннер на него только ссылается.
+    //   model — алиас модели CLI (`-m`, напр. `kimi-code/kimi-for-coding`). Не задан —
+    //           `default_model` из config.toml дома; нет и его — отказ до выбора задачи.
+    //           Модель маршрута modelRouting (provider:'kimi-native') ПЕРЕОПРЕДЕЛЯЕТ его.
+    //   home — дом CLI человека (конфиг и вход). Не задан — `KIMI_CODE_HOME`, затем
+    //           `~/.kimi-code` от `HOME` окружения раннера, как ищет сам CLI.
+    //   status — только "experimental" и обязателен, когда рантайм достижим: песочницы, которой
+    //           docs/harness-adapters.md требует от kimi-native, нет (ревью Фазы 16b), и маршрут
+    //           modelRouting в него — отказ старта (`checkExperimentalRuntimes`).
+    // Форму секции проверяет резолв конфига: незнакомый ключ и не-строка — стоп.
+    kimiNativeRuntime?: {
+        status?: string;
+        model?: string;
+        home?: string;
+    };
+    // #121: рантайм `opencode` — OpenCode CLI, ЭКСПЕРИМЕНТАЛЬНЫЙ третий харнесс. Секция
+    // обязательна, когда рантайм достижим: эксперимент заявляется в конфиге, а не выводится.
+    //   status — только "experimental": допуска профиля по canary (Фаза 17) нет, и резервом
+    //            или ролью (маршрут modelRouting) OpenCode не назначается — отказ на старте;
+    //   model  — `provider/model`, один провайдер; ключи — в конфиге OpenCode человека.
+    opencodeRuntime?: {
+        status?: string;
+        model?: string;
     };
     tunnelCheck?: {
         enabled?: boolean;
@@ -1982,26 +2056,20 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // уходил `process.exit` без пуша, и ночная петля просто исчезала до срабатывания deadman.
     // Вверх по стеку отказ не возвращается: спавнов сессии десяток, и каждый из них, не
     // разобравший отказ, запустил бы сессию мимо барьера — выход здесь закрывает все разом.
-    function sessionSettingsArgs(
-        deps: TSessionSettingsDeps = {},
+    type TGuardStopDeps = {
+        pushEventFn?: typeof pushEvent;
+        persistFn?: (() => void) | null;
+        exitFn?: (code: number) => never;
+    };
+
+    function stopOnGuardProbe(
+        reason: string,
         {
-            roots = sessionSettingsRoots,
             pushEventFn = pushEvent,
             persistFn = persistBeforeStop,
             exitFn = (code: number): never => process.exit(code),
-        }: {
-            roots?: typeof sessionSettingsRoots;
-            pushEventFn?: typeof pushEvent;
-            persistFn?: (() => void) | null;
-            exitFn?: (code: number) => never;
-        } = {},
-    ): string[] {
-        if (!roots) return [];
-        const prepared = prepareSessionSettings(
-            { ...roots, outPath: path.resolve(RUNTIME.sessionSettings) },
-            deps,
-        );
-        if (prepared.ok) return ['--settings', prepared.path];
+        }: TGuardStopDeps = {},
+    ): never {
         let notSaved = '';
         if (persistFn) {
             try {
@@ -2013,7 +2081,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         pushEventFn(
             `⛔ Ralph: ${formatStopMessage({
                 reason: 'guard-probe',
-                diagnosis: `${prepared.reason}${notSaved}`,
+                diagnosis: `${reason}${notSaved}`,
                 question:
                     'почини хук ядра или настройки дерева человека, названные выше, ' +
                     'и перезапусти loop — сессия не запускалась',
@@ -2022,6 +2090,127 @@ export function createOrchestrator(env: OrchestratorEnv) {
             { logFn: log },
         );
         return exitFn(1);
+    }
+
+    function sessionSettingsArgs(
+        deps: TSessionSettingsDeps = {},
+        {
+            roots = sessionSettingsRoots,
+            ...stop
+        }: { roots?: typeof sessionSettingsRoots } & TGuardStopDeps = {},
+    ): string[] {
+        if (!roots) return [];
+        const prepared = prepareSessionSettings(
+            { ...roots, outPath: path.resolve(RUNTIME.sessionSettings) },
+            deps,
+        );
+        if (prepared.ok) return ['--settings', prepared.path];
+        return stopOnGuardProbe(prepared.reason, stop);
+    }
+
+    // #119: дерево сессий для регистрации барьера не-Claude харнессов. Ставит `main()` рядом
+    // с пробой старта. До этого `null`, и сборка регистрации (`codexGuardArgsFor`,
+    // `kimiNativeHomeFor`, `opencodeConfigDirFor`) — стоп `guard-probe`, а не сессия без
+    // барьера (ревью Фазы 16b): что дерево ставится раньше любого спавна, держал бы только
+    // порядок кода, и новый путь спавна до этой точки пустил бы Codex, Kimi Code или OpenCode
+    // мимо барьера без строки в логе. Claude без `--settings` хотя бы читает settings дерева,
+    // эти CLI — ничего. Юнит-тесты фабрики передают дерево явно.
+    let codexGuardTree: string | null = null;
+
+    function noGuardTree(harness: string, stop: TGuardStopDeps): never {
+        return stopOnGuardProbe(
+            `Дерево сессии для регистрации барьера ${harness} не задано: main() ставит его рядом ` +
+                'с пробой старта, а сессия пошла раньше. Без регистрации она шла бы мимо барьера.',
+            stop,
+        );
+    }
+
+    // #120: барьер сессии Kimi Code. Флага файла настроек у `kimi` нет — хуки живут только в
+    // `config.toml` дома CLI, поэтому дом сессии собирает раннер (`prepareKimiNativeHome`):
+    // конфиг человека, регистрация барьера, вход ссылками. Собирается и пробуется перед
+    // КАЖДОЙ сессией, стоп — тот же, что у `sessionSettingsArgs`. Дерево сессий — то же, что
+    // у Codex (ставит `main()`); до этого `null` — стоп, а не дом человека без барьера.
+    function kimiNativeHomeFor(
+        deps: Parameters<typeof prepareKimiNativeHome>[1] = {},
+        {
+            tree = codexGuardTree,
+            roots = sessionSettingsRoots,
+            sourceHome = kimiSourceHome(config?.kimiNativeRuntime?.home, process.env),
+            ...stop
+        }: {
+            tree?: string | null;
+            roots?: typeof sessionSettingsRoots;
+            sourceHome?: string | null;
+        } & TGuardStopDeps = {},
+    ): string {
+        if (tree === null) return noGuardTree('Kimi Code', stop);
+        if (sourceHome === null) {
+            return stopOnGuardProbe(
+                'Дом Kimi Code не найден: ни kimiNativeRuntime.home, ни KIMI_CODE_HOME, ни HOME в ' +
+                    'окружении раннера — сессии kimi-native не на чем войти.',
+                stop,
+            );
+        }
+        const prepared = prepareKimiNativeHome(
+            {
+                roots,
+                sessionTree: tree,
+                sourceHome,
+                home: path.join(path.resolve(RUNTIME.kimiNative), 'home'),
+            },
+            deps,
+        );
+        if (prepared.ok) return prepared.home;
+        return stopOnGuardProbe(prepared.reason, stop);
+    }
+
+    // #121: барьер сессии OpenCode. Хуков-команд у CLI нет — барьер плагином в каталоге
+    // `OPENCODE_CONFIG_DIR`, его собирает раннер (`prepareOpencodeSession`): плагин из тех же
+    // хуков, проба на его исходнике, затем полнота скиллов. Перед КАЖДОЙ сессией, стоп — тот
+    // же, что у `sessionSettingsArgs`. Дерево сессий — то же, что у Codex; до него — стоп.
+    function opencodeConfigDirFor(
+        deps: Parameters<typeof prepareOpencodeSession>[1] = {},
+        {
+            tree = codexGuardTree,
+            roots = sessionSettingsRoots,
+            baseEnv = process.env,
+            ...stop
+        }: {
+            tree?: string | null;
+            roots?: typeof sessionSettingsRoots;
+            baseEnv?: NodeJS.ProcessEnv;
+        } & TGuardStopDeps = {},
+    ): string {
+        if (tree === null) return noGuardTree('OpenCode', stop);
+        const prepared = prepareOpencodeSession(
+            {
+                roots,
+                sessionTree: tree,
+                configDir: path.join(path.resolve(RUNTIME.opencode), 'config'),
+                baseEnv,
+            },
+            deps,
+        );
+        if (prepared.ok) return prepared.configDir;
+        return stopOnGuardProbe(prepared.reason, stop);
+    }
+
+    // #119: барьер сессии Codex. `codex exec` настроек Claude Code не читает, поэтому
+    // регистрация хуков едет в его argv (`-c hooks.PreToolUse=…` с флагами доверия и
+    // включения), собирается и пробуется перед КАЖДОЙ сессией — то же правило и тот же стоп,
+    // что у `sessionSettingsArgs`. Проба не прошла — сессия не стартует.
+    function codexGuardArgsFor(
+        deps: Pick<TSessionSettingsDeps, 'readFileFn' | 'runHookFn'> = {},
+        {
+            tree = codexGuardTree,
+            roots = sessionSettingsRoots,
+            ...stop
+        }: { tree?: string | null; roots?: typeof sessionSettingsRoots } & TGuardStopDeps = {},
+    ): string[] {
+        if (tree === null) return noGuardTree('Codex', stop);
+        const prepared = prepareCodexGuardArgs({ roots, sessionTree: tree }, deps);
+        if (prepared.ok) return prepared.args;
+        return stopOnGuardProbe(prepared.reason, stop);
     }
 
     function runClaudeOnce(
@@ -2215,14 +2404,18 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // фиксирована (флаги и имя модели), функция промпта не видит вовсе.
     // maxTurns у Codex аналога не имеет (это Claude-бюджет ходов) — в argv не тащим (research,
     // риск #3: чужой CLI на неизвестный флаг упал бы). fallback-model — тоже Claude-only, нет.
+    //
+    // #119: `guardArgs` — регистрация барьера (`codexGuardArgsFor`), перед хвостом `-- -`.
     function buildCodexArgs({
         model,
         sandboxMode,
         authMode = 'apiKey',
+        guardArgs = [],
     }: {
         model?: string;
         sandboxMode: string;
         authMode?: 'apiKey' | 'subscription';
+        guardArgs?: readonly string[];
     }): string[] {
         // Порядок критичен: `-a` — ГЛОБАЛЬНЫЙ флаг codex и обязан стоять ДО подкоманды.
         // `codex exec -a never …` CLI 0.147.0 отвергает (`unexpected argument '-a'`, exit 2) —
@@ -2239,7 +2432,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // конфиге перенаправил бы встроенный `openai` на любой endpoint — и токен подписки
         // уехал бы туда. Вектор не умозрительный: кодер-сессии ходят с danger-full-access и
         // сами могут дописать этот файл. Авторизация от флага не страдает — CLI берёт её из
-        // `CODEX_HOME`, а не из конфига.
+        // `CODEX_HOME`, а не из конфига. Флаг держит и MCP (ревью Фазы 16b): доверие проекту
+        // записано в том же конфиге, и `.codex/config.toml` дерева без него не грузится —
+        // MCP-сервер, дописанный туда сессией, следующая сессия не поднимет (стенд 0.163).
         cmdArgs.push('--ignore-user-config');
         // Канал входа фиксируется на САМОМ вызове (ревью Codex, 2-й проход): проверка
         // `login status` живёт до spawn, и между ней и `exec` остаётся окно, а к custom
@@ -2251,7 +2446,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // вместо одного честного стопа.
         if (authMode === 'subscription') cmdArgs.push('-c', 'forced_login_method="chatgpt"');
         if (model) cmdArgs.push('-m', model);
-        cmdArgs.push('--', '-');
+        cmdArgs.push(...guardArgs, '--', '-');
         return cmdArgs;
     }
 
@@ -2665,6 +2860,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         spawnFn: typeof spawnSync = spawnSync,
         readFileFn: (path: string, encoding: 'utf8') => string = fs.readFileSync,
         cliVersionFn: (runtime: string) => CliVersion = (rt) => sessionCliVersion(rt),
+        guardArgsFn: () => string[] = () => codexGuardArgsFor(),
     ): RunResult {
         // Провайдер-гейт: чужую (не-openai) модель к codex `-m` не пускаем — резолвер тогда
         // возьмёт openaiRuntime.model.
@@ -2679,11 +2875,18 @@ export function createOrchestrator(env: OrchestratorEnv) {
             requireToken: !DRY,
             model: routedModel,
         });
-        const cmdArgs = buildCodexArgs({ model: resolvedModel, sandboxMode, authMode });
         log(
             `▶ openai (codex exec) "${prompt.slice(0, 80)}…" -m ${resolvedModel} -s ${sandboxMode}`,
         );
         if (DRY) return { code: 0, output: '' };
+        // Барьер — после проверки DRY, как `--settings` у Claude: сухой прогон ничего не
+        // пишет и пробу прошёл на старте.
+        const cmdArgs = buildCodexArgs({
+            model: resolvedModel,
+            sandboxMode,
+            authMode,
+            guardArgs: guardArgsFn(),
+        });
         const timeout = config.claudeTimeoutMs || 2 * 60 * 60 * 1000;
         // token не-null при !DRY только в режиме apiKey (requireToken выше); при подписке он
         // null штатно, и buildOpenAISpawnEnv тогда вычищает OPENAI_API_KEY из окружения.
@@ -2709,6 +2912,398 @@ export function createOrchestrator(env: OrchestratorEnv) {
             profile: runtimeProfile('openai', resolvedModel),
             cliVersion: cliVersionFn('openai'),
         });
+    }
+
+    // ── Рантайм kimi-native (#120, Фаза 16b) ────────────────────────────────
+    // Kimi Code CLI родным харнессом (`adapters/kimi-native.ts`). Сиблинг spawnCodex, а не
+    // правка Claude-пути: у `kimi` свой argv, свой вывод (stream-json) и свои признаки исхода.
+
+    // Секреты раннера, которые сессии чужого харнесса (`kimi-native`, `opencode`) не
+    // принадлежат: ключи Claude (подписка, API), Moonshot для `kimi`, OpenAI для `openai` и
+    // Telegram. Промпт-инъекция одной командой `env` вынесла бы их наружу (симметрично
+    // buildKimiSpawnEnv). Имена ключей провайдеров — фактические, с кастомным `authTokenEnv`,
+    // как у collectSessionSecrets. Список один на оба харнесса: две копии уже разошлись —
+    // кастомный openaiRuntime.authTokenEnv не снимала ни одна (ревью Фазы 16b).
+    function stripRunnerSecrets(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+        const named = (v: unknown, fallback: string) =>
+            typeof v === 'string' && v.trim() !== '' ? v : fallback;
+        for (const name of [
+            'CLAUDE_CODE_OAUTH_TOKEN',
+            SUBSCRIPTION_KEYS_ENV,
+            'ANTHROPIC_API_KEY',
+            'ANTHROPIC_AUTH_TOKEN',
+            'OPENAI_API_KEY',
+            'RALPH_TG_BOT_TOKEN',
+            named(config?.kimiRuntime?.authTokenEnv, KIMI_DEFAULT_TOKEN_ENV),
+            named(config?.openaiRuntime?.authTokenEnv, OPENAI_DEFAULT_TOKEN_ENV),
+        ])
+            delete env[name];
+        return env;
+    }
+
+    // Окружение сессии kimi-native: env раннера без чужих секретов. Свой вход сессия берёт из
+    // дома CLI, а не из env.
+    function buildKimiNativeSpawnEnv(
+        baseEnv: NodeJS.ProcessEnv,
+        opts: { home: string | null; maxTurns?: number },
+    ): NodeJS.ProcessEnv {
+        return stripRunnerSecrets(kimiNativeSessionEnv(baseEnv, opts));
+    }
+
+    // Тонкая обвязка над spawnSync для бинаря `kimi`. Промпта в stdin нет: CLI его оттуда не
+    // читает, промпт лежит файлом, а argv несёт указатель (докблок adapters/kimi-native.ts).
+    // stdin закрыт ('ignore'): ждать на нём CLI нечего.
+    //
+    // Срок: Kimi ловит SIGTERM и выходит кодом 143 сам, поэтому у spawnSync тогда
+    // `error: ETIMEDOUT` без сигнала (проверено живьём). Такой исход приводится к сигналу ДО
+    // общей классификации границы: иначе строка лога врала бы про maxBuffer, а исход читался
+    // бы обычным падением.
+    function spawnKimiNative(
+        cmdArgs: string[],
+        timeoutMs: number,
+        spawnFn: typeof spawnSync = spawnSync,
+        env?: NodeJS.ProcessEnv,
+        attempt: TAttemptContext = unreadAttemptContext('kimi-native'),
+    ): RunResult {
+        if (spawnFn === spawnSync) guardSideEffect('spawnKimiNative(kimi)');
+        const raw = spawnFn(KIMI_NATIVE_BIN, cmdArgs, {
+            stdio: ['ignore', 'pipe', 'pipe'],
+            shell: false,
+            timeout: timeoutMs,
+            encoding: 'utf-8',
+            maxBuffer: 64 * 1024 * 1024,
+            ...(env ? { env } : {}),
+        });
+        const timedOut =
+            !raw.signal && (raw.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT';
+        const res = timedOut ? { ...raw, signal: 'SIGTERM' as NodeJS.Signals } : raw;
+        const stdoutRaw = String(res.stdout || '');
+        const stderr = String(res.stderr || '');
+        const text = kimiStreamText(stdoutRaw);
+        const output = `${text}\n${stderr}`;
+        if (text) process.stdout.write(`${text}\n`);
+        if (stderr) process.stderr.write(stderr);
+        const { result, logLines } = resolveSpawnResult('kimi', res, output, timeoutMs);
+        for (const line of logLines) log(line);
+        const end = classifyKimiNativeSessionEnd({
+            code: result.code,
+            stdout: stdoutRaw,
+            stderr,
+            signal: res.signal ?? null,
+            failureKind: result.failureKind,
+        });
+        recordAttempt({
+            runtime: 'kimi-native',
+            code: result.code,
+            parsed: null,
+            unknownReason: 'рантайм kimi-native расход токенов в stream-json не отдаёт',
+            session: { ...attempt, endReason: end.endReason },
+        });
+        return { ...result, ...end };
+    }
+
+    // Одна сессия kimi-native. Форма и роль как у runOpenAIOnce: {code, output}, DRY
+    // возвращает рано. Модель — по тому же правилу провайдера (#393): opts.model берётся,
+    // только если маршрут назвал провайдера 'kimi-native', иначе kimiNativeRuntime.model, а
+    // без него — умолчание CLI. maxTurns уходит потолком шагов CLI (KIMI_LOOP_MAX_STEPS_PER_TURN).
+    function runKimiNativeOnce(
+        prompt: string,
+        { model, maxTurns, modelProvider }: ClaudeOpts,
+        spawnFn: typeof spawnSync = spawnSync,
+        cliVersionFn: (runtime: string) => CliVersion = (rt) => sessionCliVersion(rt),
+        {
+            homeFn = () => kimiNativeHomeFor(),
+            writePromptFn = (p: string, text: string) => {
+                guardSideEffect(`runKimiNativeOnce:prompt(${p})`);
+                fs.mkdirSync(path.dirname(p), { recursive: true, mode: 0o700 });
+                writeFileAtomic(p, text);
+            },
+            isDirFn = (p: string) => {
+                try {
+                    return fs.statSync(p).isDirectory();
+                } catch {
+                    return false;
+                }
+            },
+            removePromptFn = (p: string) => {
+                guardSideEffect(`runKimiNativeOnce:rm-prompt(${p})`);
+                fs.rmSync(p, { force: true });
+            },
+            sessionTree = codexGuardTree,
+        }: {
+            homeFn?: () => string | null;
+            writePromptFn?: (p: string, text: string) => void;
+            removePromptFn?: (p: string) => void;
+            isDirFn?: (p: string) => boolean;
+            sessionTree?: string | null;
+        } = {},
+    ): RunResult {
+        const configured = config?.kimiNativeRuntime?.model;
+        const resolvedModel =
+            modelProvider === 'kimi-native' && model
+                ? model
+                : typeof configured === 'string' && configured.trim() !== ''
+                  ? configured
+                  : undefined;
+        log(
+            `▶ kimi-native (kimi -p) "${prompt.slice(0, 80)}…" --max-steps ${maxTurns}` +
+                ` -m ${resolvedModel ?? MODEL_CLI_DEFAULT}`,
+        );
+        if (DRY) return { code: 0, output: '' };
+        // Дом с барьером — после проверки DRY, как `--settings` у Claude и argv у Codex:
+        // сухой прогон ничего не пишет и пробу прошёл на старте.
+        const home = homeFn();
+        const promptPath = path.join(path.resolve(RUNTIME.kimiNative), 'prompt', 'prompt.md');
+        writePromptFn(promptPath, prompt);
+        const cmdArgs = buildKimiNativeArgs({
+            promptPath,
+            model: resolvedModel,
+            // Дерево сессии ставит `main()` до первой сессии; без него (юнит-тесты фабрики)
+            // каталогов дерева нет — якорь к CWD здесь угадывал бы дерево, а не знал его.
+            skillsDirs: kimiNativeSkillsDirs(
+                {
+                    sessionTree,
+                    kimiHome: kimiSourceHome(config?.kimiNativeRuntime?.home, process.env),
+                    env: process.env,
+                },
+                isDirFn,
+            ),
+        });
+        const timeout = config.claudeTimeoutMs || 2 * 60 * 60 * 1000;
+        const env = withSkillGuard(buildKimiNativeSpawnEnv(process.env, { home, maxTurns }));
+        // Промпт снимается после сессии: он лежит по фиксированному пути и иначе ждал бы
+        // следующей сессии с текстом прошлой задачи. Снятие — уборка, best-effort: `rmSync`
+        // с `force` гасит только ENOENT, а исключение из `finally` подменило бы и исход
+        // доведённой сессии (вывод, блок намерений), и исходную ошибку спавна (ревью Фазы 16b).
+        // Следующая сессия файл перезапишет, так что неснятый — строка `⚠`, а не отказ.
+        try {
+            return spawnKimiNative(cmdArgs, timeout, spawnFn, env, {
+                profile: runtimeProfile('kimi-native', resolvedModel),
+                cliVersion: cliVersionFn('kimi-native'),
+            });
+        } finally {
+            try {
+                removePromptFn(promptPath);
+            } catch (error) {
+                log(
+                    `⚠ Файл промпта kimi-native ${promptPath} не снят: ` +
+                        `${error instanceof Error ? error.message : String(error)}`,
+                );
+            }
+        }
+    }
+
+    // #120: готовность kimi-native до выбора задачи — бинарь отвечает на `--version`, и вход
+    // есть: модель задана, ключи в доме CLI лежат. Отказ называет причину; сеть не трогается
+    // (протухший токен узнает первая сессия исходом `auth`, и петля встанет «вход отвергнут»).
+    function checkKimiNativeAvailable({
+        probeFn = (bin: string) => probeRuntimeBinaryOnce(bin),
+        readFileFn = (p: string) => fs.readFileSync(p, 'utf-8'),
+        listDirFn = (p: string) => fs.readdirSync(p),
+        cfg = config,
+        env = process.env,
+    }: {
+        probeFn?: (bin: string) => void;
+        readFileFn?: (p: string) => string;
+        listDirFn?: (p: string) => string[];
+        cfg?: RalphConfig;
+        env?: NodeJS.ProcessEnv;
+    } = {}): void {
+        probeFn(KIMI_NATIVE_BIN);
+        const home = kimiSourceHome(cfg?.kimiNativeRuntime?.home, env);
+        if (home === null) {
+            throw new Error(
+                'дом Kimi Code не найден: ни kimiNativeRuntime.home, ни KIMI_CODE_HOME, ни HOME',
+            );
+        }
+        let configToml: string | null;
+        try {
+            configToml = readFileFn(path.join(home, 'config.toml'));
+        } catch {
+            configToml = null;
+        }
+        let credentialFiles: string[];
+        try {
+            credentialFiles = listDirFn(path.join(home, 'credentials'));
+        } catch {
+            credentialFiles = [];
+        }
+        const problems = kimiNativeAuthProblems({
+            configToml,
+            credentialFiles,
+            model: cfg?.kimiNativeRuntime?.model,
+        });
+        if (problems.length > 0) {
+            throw new Error(`Kimi Code не авторизован (${home}): ${problems.join('; ')}`);
+        }
+    }
+
+    // ── Рантайм opencode (#121, Фаза 16b, экспериментальный) ───────────────
+    // OpenCode CLI третьим харнессом (`adapters/opencode.ts`). Сиблинг spawnKimiNative: свой
+    // argv, свой вывод (`--format json`) и свои признаки исхода.
+
+    // Окружение сессии opencode: env раннера без чужих секретов (`stripRunnerSecrets`). Ключ
+    // провайдера OpenCode берёт из своего хранилища входа (`opencode auth login`) или конфига
+    // человека, а не из env раннера: `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` сюда не доходят, и
+    // готовность проверяет вход тем же env (`checkOpencodeAvailable`).
+    function buildOpencodeSpawnEnv(
+        baseEnv: NodeJS.ProcessEnv,
+        opts: { configDir: string | null },
+    ): NodeJS.ProcessEnv {
+        return stripRunnerSecrets(opencodeSessionEnv(baseEnv, opts));
+    }
+
+    // Тонкая обвязка над spawnSync для бинаря `opencode`. Промпт — на stdin (`opencode run` без
+    // позиционного сообщения читает его оттуда — проверено живьём), argv его не несёт (#8).
+    // Срок: OpenCode SIGTERM сам не ловит, spawnSync отдаёт сигнал — общая граница его знает.
+    function spawnOpencode(
+        cmdArgs: string[],
+        prompt: string,
+        timeoutMs: number,
+        spawnFn: typeof spawnSync = spawnSync,
+        env?: NodeJS.ProcessEnv,
+        attempt: TAttemptContext = unreadAttemptContext('opencode'),
+    ): RunResult {
+        if (spawnFn === spawnSync) guardSideEffect('spawnOpencode(opencode)');
+        const res = spawnFn(OPENCODE_BIN, cmdArgs, {
+            stdio: ['pipe', 'pipe', 'pipe'],
+            input: prompt,
+            shell: false,
+            timeout: timeoutMs,
+            encoding: 'utf-8',
+            maxBuffer: 64 * 1024 * 1024,
+            ...(env ? { env } : {}),
+        });
+        const stdoutRaw = String(res.stdout || '');
+        const stderr = String(res.stderr || '');
+        const text = opencodeEventsText(stdoutRaw);
+        const output = `${text}\n${stderr}`;
+        if (text) process.stdout.write(`${text}\n`);
+        if (stderr) process.stderr.write(stderr);
+        const { result, logLines } = resolveSpawnResult('opencode', res, output, timeoutMs);
+        for (const line of logLines) log(line);
+        const end = classifyOpencodeSessionEnd({
+            code: result.code,
+            stdout: stdoutRaw,
+            stderr,
+            signal: res.signal ?? null,
+            failureKind: result.failureKind,
+        });
+        recordAttempt({
+            runtime: 'opencode',
+            code: result.code,
+            parsed: null,
+            unknownReason: 'рантайм opencode расход токенов в текст попытки не переводит',
+            session: { ...attempt, endReason: end.endReason },
+        });
+        return { ...result, ...end };
+    }
+
+    // Одна сессия opencode. Форма и роль как у runKimiNativeOnce. Модель — только
+    // `opencodeRuntime.model`: маршрут modelRouting на OpenCode — назначение роли, и его
+    // отвергает старт (checkExperimentalRuntimes), так что модели маршрута здесь взяться
+    // неоткуда. maxTurns в argv не уходит — бюджета ходов у CLI нет (best-effort).
+    function runOpencodeOnce(
+        prompt: string,
+        { maxTurns }: ClaudeOpts,
+        spawnFn: typeof spawnSync = spawnSync,
+        cliVersionFn: (runtime: string) => CliVersion = (rt) => sessionCliVersion(rt),
+        { configDirFn = () => opencodeConfigDirFor() }: { configDirFn?: () => string | null } = {},
+    ): RunResult {
+        const model = String(config?.opencodeRuntime?.model ?? '');
+        log(
+            `▶ opencode [${OPENCODE_STATUS}] (opencode run) "${prompt.slice(0, 80)}…" -m ${model}` +
+                ` (maxTurns ${maxTurns} — best-effort, CLI его не исполняет)`,
+        );
+        if (DRY) return { code: 0, output: '' };
+        // Каталог с барьером — после проверки DRY, как `--settings` у Claude и дом у Kimi.
+        const configDir = configDirFn();
+        const timeout = config.claudeTimeoutMs || 2 * 60 * 60 * 1000;
+        const env = withSkillGuard(buildOpencodeSpawnEnv(process.env, { configDir }));
+        return spawnOpencode(buildOpencodeArgs({ model }), prompt, timeout, spawnFn, env, {
+            profile: runtimeProfile('opencode', model),
+            cliVersion: cliVersionFn('opencode'),
+        });
+    }
+
+    // #121: готовность opencode до выбора задачи. Отказы с причиной: нет CLI (`--version`
+    // не отвечает), эксперимент не заявлен или модель не `provider/model`, провайдер или
+    // модель CLI неизвестны (`opencode models <провайдер>`), у провайдера нет ключа, который
+    // дойдёт до сессии. Модели — не перестраховка: неизвестную модель сессия узнаёт лишь
+    // «Unexpected server error» без причины. Ключ — тоже (ревью Фазы 16b): список моделей CLI
+    // отдаёт и без него, а сессия идёт без ключей раннера в env, и вход, державшийся на
+    // `ANTHROPIC_API_KEY`, кончился бы первой же сессией исходом `auth`. Поэтому оба вызова CLI
+    // идут окружением сессии без ключей раннера (`buildOpencodeSpawnEnv`), но БЕЗ каталога
+    // сессии: `OPENCODE_CONFIG`/`OPENCODE_CONFIG_DIR` раннер собирает перед каждой сессией, на
+    // старте их ещё нет. Расхождение названо и безвредно для этой проверки: в каталоге сессии
+    // лежат только плагин барьера и `permission`, провайдер и ключ — из конфига человека, который
+    // CLI читает и здесь. `RALPH_SKILL_GUARD` (`withSkillGuard`) конфиг CLI не меняет.
+    function checkOpencodeAvailable({
+        probeFn = (bin: string) => probeRuntimeBinaryOnce(bin),
+        cliFn = (args: string[], env: NodeJS.ProcessEnv) => {
+            guardSideEffect(`checkOpencodeAvailable(opencode ${args.join(' ')})`);
+            const r = spawnSync(OPENCODE_BIN, args, {
+                encoding: 'utf-8',
+                stdio: ['ignore', 'pipe', 'pipe'],
+                timeout: 60_000,
+                maxBuffer: 16 * 1024 * 1024,
+                env,
+            });
+            return {
+                code: r.status,
+                stdout: String(r.stdout ?? ''),
+                stderr: String(r.stderr ?? ''),
+            };
+        },
+        readFileFn = (p: string) => fs.readFileSync(p, 'utf-8'),
+        cfg = config,
+        baseEnv = process.env,
+    }: {
+        probeFn?: (bin: string) => void;
+        cliFn?: (
+            args: string[],
+            env: NodeJS.ProcessEnv,
+        ) => { code: number | null; stdout: string; stderr: string };
+        readFileFn?: (p: string) => string;
+        cfg?: RalphConfig;
+        baseEnv?: NodeJS.ProcessEnv;
+    } = {}): void {
+        probeFn(OPENCODE_BIN);
+        const problems = opencodeConfigProblems(cfg?.opencodeRuntime);
+        if (problems.length > 0) throw new Error(`OpenCode не заявлен: ${problems.join('; ')}`);
+        const model = String(cfg.opencodeRuntime?.model);
+        const parsed = parseOpencodeModel(model);
+        if (!parsed.ok) throw new Error(parsed.reason);
+        const env = buildOpencodeSpawnEnv(baseEnv, { configDir: null });
+        const missing = opencodeModelProblems(cliFn(['models', parsed.provider], env), model);
+        if (missing.length > 0) throw new Error(missing.join('; '));
+        const debug = cliFn(['debug', 'config'], env);
+        let resolvedConfig: unknown = null;
+        try {
+            resolvedConfig = debug.code === 0 ? (JSON.parse(debug.stdout) as unknown) : null;
+        } catch {
+            resolvedConfig = null;
+        }
+        if (resolvedConfig === null) {
+            throw new Error(
+                `\`opencode debug config\` — код ${debug.code}: конфиг OpenCode не прочитан, ключ провайдера проверить нечем`,
+            );
+        }
+        const authFile = opencodeAuthFile(env);
+        let authProviders: string[] = [];
+        try {
+            const raw = authFile ? (JSON.parse(readFileFn(authFile)) as unknown) : null;
+            if (raw && typeof raw === 'object' && !Array.isArray(raw))
+                authProviders = Object.keys(raw);
+        } catch {
+            authProviders = [];
+        }
+        const auth = opencodeAuthProblems({
+            provider: parsed.provider,
+            resolvedConfig,
+            authProviders,
+        });
+        if (auth.length > 0) throw new Error(auth.join('; '));
     }
 
     // ── Issues ───────────────────────────────────────────────────────────────
@@ -5159,6 +5754,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             claude: createCoderRuntime({
                 run: runClaudeOnce,
                 checkAvailable: () => probeRuntimeBinaryOnce('claude'),
+                capabilities: CLAUDE_CODE_CAPABILITIES,
             }),
             // #373 (фаза 6): Kimi через тот же `claude` + endpoint Moonshot (env-своп в
             // runKimiOnce). Ключ выбирается конфигом (`adapters.coderRuntime: 'kimi'`);
@@ -5166,6 +5762,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             kimi: createCoderRuntime({
                 run: runKimiOnce,
                 checkAvailable: () => probeRuntimeBinaryOnce('claude'),
+                capabilities: KIMI_CAPABILITIES,
             }),
             // #374 (фаза 6): OpenAI через ОТДЕЛЬНЫЙ `codex exec` (не поверх claude). Ключ
             // выбирается конфигом (`adapters.coderRuntime: 'openai'`); дефолт остаётся
@@ -5173,6 +5770,22 @@ export function createOrchestrator(env: OrchestratorEnv) {
             openai: createCoderRuntime({
                 run: runOpenAIOnce,
                 checkAvailable: () => probeRuntimeBinaryOnce('codex'),
+                capabilities: CODEX_CAPABILITIES,
+            }),
+            // #120 (Фаза 16b): Kimi Code родным харнессом — свой бинарь `kimi`, рядом с
+            // `kimi` (Claude Code → Moonshot), а не вместо. Ключ — `adapters.coderRuntime:
+            // 'kimi-native'`; готовность включает вход, а не только бинарь.
+            'kimi-native': createCoderRuntime({
+                run: runKimiNativeOnce,
+                checkAvailable: () => checkKimiNativeAvailable(),
+                capabilities: KIMI_NATIVE_CAPABILITIES,
+            }),
+            // #121 (Фаза 16b): OpenCode — экспериментальный третий харнесс, только статическим
+            // `adapters.coderRuntime: 'opencode'` и с `opencodeRuntime.status: "experimental"`.
+            opencode: createCoderRuntime({
+                run: runOpencodeOnce,
+                checkAvailable: () => checkOpencodeAvailable(),
+                capabilities: OPENCODE_CAPABILITIES,
             }),
         },
     };
@@ -5333,11 +5946,13 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // набор на две проверки старта — резолв ключей в preflight и пробу готовности (#44):
     // разъехавшись, они проверяли бы разные рантаймы, и фолбэк на непроверенный всплыл бы
     // посреди ночи.
-    function reachableRuntimes(cfg: RalphConfig): {
+    function reachableRuntimes(
+        cfg: RalphConfig,
+        fallbackProvider: string = adapterSelection.coderRuntime,
+    ): {
         providers: Set<string>;
         routes: { provider: string; model?: string }[];
     } {
-        const fallbackProvider = adapterSelection.coderRuntime;
         const routing = cfg.modelRouting;
         const entries: (ModelRouteEntry | undefined)[] = [];
         if (routing) {
@@ -5393,6 +6008,100 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 return;
             }
             logFn(`✅ Кодер-рантайм готов: ${provider}`);
+        }
+    }
+
+    // #118: сверка требований конфига с объявленными возможностями рантаймов — те же
+    // достижимые рантаймы, что у пробы готовности (докблок runtime-requirements.ts).
+    function checkRuntimeCapabilities(
+        cfg: RalphConfig,
+        {
+            failFn = fail as FailFn,
+            logFn = log,
+            registry = adapterRegistries.coderRuntime,
+        }: {
+            failFn?: FailFn;
+            logFn?: LogFn;
+            registry?: Record<string, CoderRuntimeAdapter>;
+        } = {},
+    ): void {
+        checkRuntimeRequirements(cfg, reachableRuntimes(cfg).providers, {
+            capabilitiesOf: (provider) => registry[provider]?.capabilities,
+            failFn: failFn as (m: string) => never,
+            logFn,
+        });
+    }
+
+    // #121: экспериментальный рантайм не назначается ни на одну роль. Маршрут modelRouting —
+    // это и есть назначение: метка сложности, фолбэк лимита, эскалация лечения. Маршрут,
+    // который приводит в эксперимент (явным provider или статическим рантаймом у записи без
+    // provider), — отказ до выбора задачи. Статический `adapters.coderRuntime` — эксперимент
+    // оператора: статус назван в конфиге дословно, и старт говорит это строкой в логе.
+    //
+    // Экспериментов два, и причины у них разные. OpenCode — допуска профиля по canary (Фаза 17)
+    // нет. kimi-native — песочницы, которой `docs/harness-adapters.md` требует от него, нет
+    // (ревью Фазы 16b): без этого шага `apiLimitFallback → kimi-native` молча отдавал ночную
+    // сессию на хост. Проверка — чтение конфига, без процесса CLI, поэтому в main() стоит
+    // РАНЬШЕ готовности (`checkCoderRuntimes` поднимает `opencode models`): дешёвый отказ первым.
+    const EXPERIMENTAL_RUNTIMES: Record<
+        string,
+        {
+            title: string;
+            section: 'opencodeRuntime' | 'kimiNativeRuntime';
+            status: string;
+            why: string;
+        }
+    > = {
+        opencode: {
+            title: 'OpenCode',
+            section: 'opencodeRuntime',
+            status: OPENCODE_STATUS,
+            why: 'допуска профиля по canary (Фаза 17) нет',
+        },
+        'kimi-native': {
+            title: 'Kimi Code (kimi-native)',
+            section: 'kimiNativeRuntime',
+            status: KIMI_NATIVE_STATUS,
+            why: 'песочницы, которой docs/harness-adapters.md требует от него, нет — сессия идёт на хосте',
+        },
+    };
+
+    function checkExperimentalRuntimes(
+        cfg: RalphConfig,
+        {
+            failFn = fail as FailFn,
+            logFn = log,
+            selected = adapterSelection.coderRuntime,
+        }: { failFn?: FailFn; logFn?: LogFn; selected?: string } = {},
+    ): void {
+        const { providers, routes } = reachableRuntimes(cfg, selected);
+        for (const [runtime, exp] of Object.entries(EXPERIMENTAL_RUNTIMES)) {
+            if (!providers.has(runtime)) continue;
+            if (routes.some((r) => r.provider === runtime)) {
+                failFn(
+                    `Маршрут modelRouting ведёт в ${exp.title} — это назначение роли (метка, фолбэк, ` +
+                        `эскалация), а статус ${runtime} — "${exp.status}": ${exp.why}. Назови в маршрутах ` +
+                        `другой provider; ${runtime} — только статическим adapters.coderRuntime: ` +
+                        `'${runtime}'. Запуск остановлен до выбора задачи.`,
+                );
+                return;
+            }
+            const section = cfg?.[exp.section] as { status?: unknown; model?: unknown } | undefined;
+            // Статус сверяется ДО строки 🧪: иначе при битой секции лог сначала объявлял бы
+            // эксперимент, а отказ приходил бы следующей строкой из готовности.
+            const problems =
+                runtime === 'kimi-native'
+                    ? kimiNativeConfigProblems(section, { required: true })
+                    : opencodeConfigProblems(section);
+            if (problems.length > 0) {
+                failFn(`Рантайм ${runtime} не заявлен экспериментом: ${problems.join('; ')}.`);
+                return;
+            }
+            logFn(
+                `🧪 Рантайм ${runtime} — ЭКСПЕРИМЕНТАЛЬНЫЙ (${exp.section}.status: "${exp.status}", ` +
+                    `модель ${String(section?.model ?? 'по умолчанию CLI')}): ${exp.why}; резервом и ` +
+                    'ролью не назначается — прогон идёт как эксперимент оператора.',
+            );
         }
     }
 
@@ -10791,7 +11500,15 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // ли сессия» dry обязан давать тот же, что живой запуск. В --reset — нет: сброс
         // state — инструмент восстановления, кодер ему не нужен, и хост со сломанным CLI
         // остался бы без способа сбросить состояние.
+        //
+        // #121: экспериментальный рантайм — только экспериментом, ни в одном маршруте роли.
+        // Первым: это чтение конфига, а готовность поднимает процессы CLI — дешёвый отказ
+        // раньше дорогого (ревью Фазы 16b).
+        if (!RESET) checkExperimentalRuntimes(config);
         if (!RESET) checkCoderRuntimes(config);
+        // #118: требования конфига к возможностям каждого достижимого рантайма — там же, до
+        // worktree и выбора задачи. Чтение конфига и объявлений, ничего не пишет: в dry тоже.
+        if (!RESET) checkRuntimeCapabilities(config);
 
         // #76: раннер переезжает в выделенный worktree ДО всего остального (включая --reset —
         // state в прежней раскладке живёт в worktree — RUNTIME.state тогда CLAUDE_DIR-
@@ -10851,7 +11568,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // preflight, ни одна сессия не запущена. В --dry-run проба тоже идёт: она ничего
         // не меняет (исполняются только хуки, не сами вызовы), а ответ «барьер держит ли»
         // dry обязан давать тот же, что живой запуск.
-        // Рантайм кодера тоже в пробе: сессия `codex exec` хуков `.claude/` не читает.
+        // Рантайм кодера тоже в пробе (#119): у каждого достижимого харнесса — своя
+        // регистрация барьера (Codex — argv, `codexGuardArgsFor`; Kimi Code — дом CLI,
+        // `kimiNativeHomeFor`, #120), и харнесс без доказанного guard не стартует.
         //
         // Задача 101: при заданной раскладке корней проба идёт на settings, который раннер
         // соберёт сессии сам (`session-settings.ts`): хуки — из каталога ЭТОГО ядра, контур
@@ -10903,6 +11622,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             },
         });
         sessionSettingsRoots = settingsRoots;
+        codexGuardTree = sessionTree;
 
         // Сироту от прошлого прогона (kill -9, OOM) подбираем ДО preflight: чаще всего
         // preflight и отвергает запуск (грязное дерево, active=false), а брошенный монитор
@@ -11019,6 +11739,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
     return {
         setConfigForTests,
         sessionSettingsArgs,
+        codexGuardArgsFor,
+        kimiNativeHomeFor,
+        opencodeConfigDirFor,
         withSkillGuard,
         resolveProfile,
         deepMerge,
@@ -11138,6 +11861,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         probeRuntimeBinary,
         probeRuntimeBinaryOnce,
         checkCoderRuntimes,
+        checkRuntimeCapabilities,
         adapterRegistries,
         buildKimiSpawnEnv,
         resolveKimiRuntime,
@@ -11150,6 +11874,17 @@ export function createOrchestrator(env: OrchestratorEnv) {
         buildOpenAISpawnEnv,
         resolveOpenAIRuntime,
         spawnCodex,
+        // #120: рантайм kimi-native (Kimi Code CLI родным харнессом).
+        runKimiNativeOnce,
+        spawnKimiNative,
+        buildKimiNativeSpawnEnv,
+        checkKimiNativeAvailable,
+        // #121: рантайм opencode (экспериментальный).
+        runOpencodeOnce,
+        spawnOpencode,
+        buildOpencodeSpawnEnv,
+        checkOpencodeAvailable,
+        checkExperimentalRuntimes,
         tunnelHealthy,
         ensureTunnel,
         tunnelCheckEnabled,

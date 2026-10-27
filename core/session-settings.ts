@@ -59,7 +59,27 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { guardSideEffect } from '../shared/side-effect-guard.ts';
-import { probeProblems, runHook, type TRunHookFn } from './guard-probe.ts';
+import {
+    codexArgsProblems,
+    guardHooksOf,
+    kimiTomlProblems,
+    opencodePluginProblems,
+    probeProblems,
+    runHook,
+    runOpencodePlugin,
+    type TRunHookFn,
+    type TRunPluginFn,
+} from './guard-probe.ts';
+import { codexGuardArgs, opencodeGuardPlugin } from '../adapters/harness-guard.ts';
+import { KIMI_HOME_LINKS, kimiSessionConfig } from '../adapters/kimi-native.ts';
+import {
+    OPENCODE_BIN,
+    OPENCODE_GUARD_PLUGIN_FILE,
+    expectedOpencodeSkills,
+    opencodeSessionConfig,
+    opencodeSessionEnv,
+    opencodeSkillProblems,
+} from '../adapters/opencode.ts';
 import { stripGitContext } from './consumer-tree.ts';
 import { writeFileAtomic } from './roots.ts';
 
@@ -450,4 +470,312 @@ export function prepareSessionSettings(
         };
     }
     return { ok: true, path: outPath };
+}
+
+type TGuardRoots = { productRoot: string; humanRoot: string; coreSha: string } | null;
+
+/**
+ * Настройки, из которых строится регистрация барьера НЕ-Claude харнесса: при раскладке
+ * корней — собранные (хуки из установки ядра, контур и хуки человека), без неё —
+ * `.claude/settings.json` дерева сессии. Те же, что получила бы сессия Claude Code: барьер
+ * у харнессов один, различается только его регистрация.
+ */
+function guardSettingsFor(
+    roots: TGuardRoots,
+    sessionTree: string,
+    readFileFn: (p: string) => string,
+): unknown {
+    return roots
+        ? buildSessionSettings({
+              ...roots,
+              humanSettings: readHumanSettings(roots.humanRoot, readFileFn),
+          })
+        : JSON.parse(readFileFn(path.join(sessionTree, SETTINGS_REL)));
+}
+
+/** Исход подготовки регистрации Codex: аргументы `codex exec` либо причина отказа. */
+export type TPreparedCodexGuard = { ok: true; args: string[] } | { ok: false; reason: string };
+
+/**
+ * Регистрация барьера для сессии Codex (#119) и проба на ней перед КАЖДОЙ сессией — то же
+ * правило, что у `--settings` Claude Code. Хуки берутся из тех же настроек, что получила бы
+ * сессия Claude Code: при раскладке корней — собранные (хуки из установки ядра, контур и
+ * хуки человека), без неё — `.claude/settings.json` дерева сессии. Codex этих настроек сам не
+ * читает: без регистрации в argv его сессия шла бы без барьера, о чём до карточки и
+ * говорил отказ пробы старта. Проба идёт на ТОМ argv, который уйдёт в CLI.
+ */
+export function prepareCodexGuardArgs(
+    {
+        roots,
+        sessionTree,
+    }: {
+        roots: { productRoot: string; humanRoot: string; coreSha: string } | null;
+        sessionTree: string;
+    },
+    {
+        readFileFn = (p) => fs.readFileSync(p, 'utf-8'),
+        runHookFn = runHook,
+    }: Pick<TSessionSettingsDeps, 'readFileFn' | 'runHookFn'> = {},
+): TPreparedCodexGuard {
+    let settings: unknown;
+    try {
+        settings = guardSettingsFor(roots, sessionTree, readFileFn);
+    } catch (error) {
+        return {
+            ok: false,
+            reason:
+                `Хуки для сессии Codex не собраны: ${error instanceof Error ? error.message : String(error)}. ` +
+                'Без них сессия Codex шла бы без барьера — старт отменён.',
+        };
+    }
+    const args = codexGuardArgs(guardHooksOf(settings, sessionTree));
+    const problems = codexArgsProblems(args, sessionTree, { runHookFn });
+    if (problems.length > 0) {
+        return {
+            ok: false,
+            reason:
+                'Проба барьера Codex перед сессией не прошла — сессия не запущена:\n' +
+                problems.map((p) => `  - ${p}`).join('\n'),
+        };
+    }
+    return { ok: true, args };
+}
+
+/** Исход подготовки дома Kimi Code: каталог для `KIMI_CODE_HOME` либо причина отказа. */
+export type TPreparedKimiHome = { ok: true; home: string } | { ok: false; reason: string };
+
+export type TKimiHomeDeps = Pick<
+    TSessionSettingsDeps,
+    'readFileFn' | 'writeFileFn' | 'runHookFn'
+> & {
+    existsFn?: (p: string) => boolean;
+    /** Что лежит на месте ссылки в доме сессии: ничего, ссылка или настоящий файл/каталог. */
+    entryKindFn?: (p: string) => 'missing' | 'link' | 'other';
+    unlinkFn?: (p: string) => void;
+    mkdirFn?: (p: string) => void;
+    linkFn?: (target: string, link: string) => void;
+};
+
+/**
+ * Дом Kimi Code для сессии `kimi-native` (#120) и проба барьера на нём перед КАЖДОЙ сессией —
+ * то же правило, что у `--settings` Claude Code и argv Codex. Флага файла настроек у Kimi нет:
+ * хуки живут только в `config.toml` дома CLI (стенд Фазы 11). Поэтому дом собирает раннер в
+ * каталоге состояния: `config.toml` человека как есть плюс регистрация барьера, вход —
+ * ссылками на дом человека (`KIMI_HOME_LINKS`). Проба идёт на ТОМ тексте `config.toml`,
+ * который ляжет в дом, и до записи: не прошедший пробу конфиг не должен лечь туда, откуда
+ * его возьмёт сессия. Конфиг человека без хуков установки сессии не достаётся никогда —
+ * профиль «дом человека как есть» стенд не допускает.
+ *
+ * Ссылка входа снимается ВСЕГДА и ставится заново, только если цель есть: ссылка на
+ * пропавший у человека файл иначе висела бы с прошлой сессии. Настоящий файл или каталог на
+ * месте ссылки (CLI создал `credentials` сам, пока ссылки не было) раннер не удаляет — там
+ * может лежать вход, — а называет в отказе: прежде `rmSync` на нём бросал, и после
+ * `kimi login` человека каждая сессия вставала с безымянным «дом не собран» (ревью Фазы 16b).
+ */
+export function prepareKimiNativeHome(
+    {
+        roots,
+        sessionTree,
+        sourceHome,
+        home,
+    }: { roots: TGuardRoots; sessionTree: string; sourceHome: string; home: string },
+    {
+        readFileFn = (p) => fs.readFileSync(p, 'utf-8'),
+        writeFileFn = (p, text) => writeFileAtomic(p, text),
+        runHookFn = runHook,
+        existsFn = (p) => fs.existsSync(p),
+        entryKindFn = (p) => {
+            try {
+                return fs.lstatSync(p).isSymbolicLink() ? 'link' : 'other';
+            } catch {
+                return 'missing';
+            }
+        },
+        unlinkFn = (p) => {
+            guardSideEffect(`prepareKimiNativeHome:unlink(${p})`, 'Подмени unlinkFn в тесте.');
+            fs.unlinkSync(p);
+        },
+        mkdirFn = (p) => {
+            guardSideEffect(`prepareKimiNativeHome:mkdir(${p})`, 'Подмени mkdirFn в тесте.');
+            fs.mkdirSync(p, { recursive: true, mode: 0o700 });
+        },
+        linkFn = (target, link) => {
+            guardSideEffect(`prepareKimiNativeHome:symlink(${link})`, 'Подмени linkFn в тесте.');
+            fs.symlinkSync(target, link);
+        },
+    }: TKimiHomeDeps = {},
+): TPreparedKimiHome {
+    const why = (error: unknown) => (error instanceof Error ? error.message : String(error));
+    let settings: unknown;
+    try {
+        settings = guardSettingsFor(roots, sessionTree, readFileFn);
+    } catch (error) {
+        return {
+            ok: false,
+            reason:
+                `Хуки для сессии Kimi Code не собраны: ${why(error)}. ` +
+                'Без них сессия kimi-native шла бы без барьера — старт отменён.',
+        };
+    }
+    let humanToml: string;
+    try {
+        humanToml = readFileFn(path.join(sourceHome, 'config.toml'));
+    } catch (error) {
+        return {
+            ok: false,
+            reason:
+                `config.toml дома Kimi Code ${sourceHome} не прочитан (${why(error)}): без него ` +
+                'сессии не на чем войти — войди `kimi login` или задай kimiNativeRuntime.home.',
+        };
+    }
+    const toml = kimiSessionConfig(humanToml, guardHooksOf(settings, sessionTree));
+    const problems = kimiTomlProblems(toml, sessionTree, { runHookFn });
+    if (problems.length > 0) {
+        return {
+            ok: false,
+            reason:
+                'Проба барьера Kimi Code перед сессией не прошла — сессия не запущена:\n' +
+                problems.map((p) => `  - ${p}`).join('\n'),
+        };
+    }
+    try {
+        mkdirFn(home);
+        writeFileFn(path.join(home, 'config.toml'), toml);
+        for (const name of KIMI_HOME_LINKS) {
+            const target = path.join(sourceHome, name);
+            const link = path.join(home, name);
+            const kind = entryKindFn(link);
+            if (kind === 'other') {
+                return {
+                    ok: false,
+                    reason:
+                        `В доме Kimi Code сессии ${link} — настоящий файл или каталог, а не ссылка на ` +
+                        `${target}: его создал CLI, пока ссылки не было, и вход человека сессия за ним ` +
+                        'не увидит. Перенеси нужное в дом человека и удали его — раннер вход не удаляет.',
+                };
+            }
+            if (kind === 'link') unlinkFn(link);
+            if (existsFn(target)) linkFn(target, link);
+        }
+    } catch (error) {
+        return { ok: false, reason: `Дом Kimi Code сессии не собран в ${home} (${why(error)}).` };
+    }
+    return { ok: true, home };
+}
+
+/** Исход подготовки каталога сессии OpenCode: каталог для `OPENCODE_CONFIG_DIR` либо причина. */
+export type TPreparedOpencode = { ok: true; configDir: string } | { ok: false; reason: string };
+
+/** Ответ `opencode debug skill` в дереве сессии: код и stdout (JSON-список скиллов). */
+export type TListSkillsFn = (
+    env: NodeJS.ProcessEnv,
+    cwd: string,
+) => { code: number | null; stdout: string };
+
+export type TOpencodeDeps = Pick<TSessionSettingsDeps, 'readFileFn' | 'writeFileFn'> & {
+    runPluginFn?: TRunPluginFn;
+    mkdirFn?: (p: string) => void;
+    listSkillsFn?: TListSkillsFn;
+    listDirFn?: (p: string) => string[];
+    isFileFn?: (p: string) => boolean;
+};
+
+/** Боевой `opencode debug skill`: только чтение, но процесс CLI — побочка для теста. */
+export const listOpencodeSkills: TListSkillsFn = (env, cwd) => {
+    guardSideEffect('listOpencodeSkills(opencode debug skill)', 'Подмени listSkillsFn в тесте.');
+    const r = spawnSync(OPENCODE_BIN, ['debug', 'skill'], {
+        cwd,
+        env,
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 60_000,
+        maxBuffer: 64 * 1024 * 1024,
+    });
+    return { code: r.status, stdout: String(r.stdout ?? '') };
+};
+
+/**
+ * Каталог сессии OpenCode (`opencode`, #121) и проба барьера на нём перед КАЖДОЙ сессией —
+ * то же правило, что у `--settings` Claude Code, argv Codex и дома Kimi Code. Хуков-команд у
+ * OpenCode нет: барьер — плагин `plugin/ralph-guard.js` в каталоге `OPENCODE_CONFIG_DIR`,
+ * рядом `opencode.json` для `OPENCODE_CONFIG` (разрешения без подтверждений). CLI сливает их с
+ * конфигом человека и дерева, и `"plugin": []` потребителя внешний плагин не снимает (стенд).
+ * Проба исполняет ТОТ исходник плагина, что ляжет в каталог, и до записи.
+ *
+ * После записи — полнота скиллов: `opencode debug skill` с окружением сессии в её дереве
+ * обязан назвать каждый `.claude/skills/<имя>/SKILL.md` дерева. Поиск `.claude/skills` CLI
+ * делает сам, но «нашёл» не значит «нашёл все» — недостающий скилл сессия просто не увидела бы.
+ */
+export function prepareOpencodeSession(
+    {
+        roots,
+        sessionTree,
+        configDir,
+        baseEnv,
+    }: { roots: TGuardRoots; sessionTree: string; configDir: string; baseEnv: NodeJS.ProcessEnv },
+    {
+        readFileFn = (p) => fs.readFileSync(p, 'utf-8'),
+        writeFileFn = (p, text) => writeFileAtomic(p, text),
+        runPluginFn = runOpencodePlugin,
+        mkdirFn = (p) => {
+            guardSideEffect(`prepareOpencodeSession:mkdir(${p})`, 'Подмени mkdirFn в тесте.');
+            fs.mkdirSync(p, { recursive: true, mode: 0o700 });
+        },
+        listSkillsFn = listOpencodeSkills,
+        listDirFn = (p) => fs.readdirSync(p),
+        isFileFn = (p) => {
+            try {
+                return fs.statSync(p).isFile();
+            } catch {
+                return false;
+            }
+        },
+    }: TOpencodeDeps = {},
+): TPreparedOpencode {
+    const why = (error: unknown) => (error instanceof Error ? error.message : String(error));
+    let settings: unknown;
+    try {
+        settings = guardSettingsFor(roots, sessionTree, readFileFn);
+    } catch (error) {
+        return {
+            ok: false,
+            reason:
+                `Хуки для сессии OpenCode не собраны: ${why(error)}. ` +
+                'Без них сессия opencode шла бы без барьера — старт отменён.',
+        };
+    }
+    const plugin = opencodeGuardPlugin(guardHooksOf(settings, sessionTree));
+    const problems = opencodePluginProblems(plugin, sessionTree, { runPluginFn });
+    if (problems.length > 0) {
+        return {
+            ok: false,
+            reason:
+                'Проба барьера OpenCode перед сессией не прошла — сессия не запущена:\n' +
+                problems.map((p) => `  - ${p}`).join('\n'),
+        };
+    }
+    try {
+        mkdirFn(path.join(configDir, 'plugin'));
+        writeFileFn(path.join(configDir, 'plugin', OPENCODE_GUARD_PLUGIN_FILE), plugin);
+        writeFileFn(path.join(configDir, 'opencode.json'), opencodeSessionConfig());
+    } catch (error) {
+        return {
+            ok: false,
+            reason: `Каталог сессии OpenCode не собран в ${configDir} (${why(error)}).`,
+        };
+    }
+    const expected = expectedOpencodeSkills(sessionTree, listDirFn, isFileFn);
+    const skills = opencodeSkillProblems(
+        listSkillsFn(opencodeSessionEnv(baseEnv, { configDir }), sessionTree),
+        expected,
+    );
+    if (skills.length > 0) {
+        return {
+            ok: false,
+            reason:
+                'Набор скиллов сессии OpenCode неполон — сессия не запущена:\n' +
+                skills.map((p) => `  - ${p}`).join('\n'),
+        };
+    }
+    return { ok: true, configDir };
 }

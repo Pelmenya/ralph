@@ -216,3 +216,15 @@ describe('main(): проверка рантайма стоит до worktree, з
         }
     });
 });
+
+// Фаза 16b: у kimi-native и opencode проверка готовности — не голый `--version`, но начинается
+// с него; боевой вызов из реестра обязан дойти до процесса и быть остановлен предохранителем.
+describe('реестр coderRuntime: готовность харнессов Фазы 16b — боевой путь', () => {
+    it.each(['kimi-native', 'opencode'])('%s: checkAvailable идёт в настоящий spawn', (name) => {
+        expect(() => adapterRegistries.coderRuntime[name].checkAvailable()).toThrow();
+        const bin = name === 'opencode' ? 'opencode' : 'kimi';
+        expect(sideEffectAttempts.splice(0).join(' | ')).toContain(
+            `probeRuntimeBinary(${bin} --version)`,
+        );
+    });
+});

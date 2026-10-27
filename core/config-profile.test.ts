@@ -1391,3 +1391,42 @@ describe('resolveProfile — корни по умолчанию при стар�
         ).toBe(null);
     });
 });
+
+// Ревью Фазы 16b: секции рантаймов-харнессов разбирались только рантаймом, и мусор молча
+// становился умолчанием (`home: 123` — дом по умолчанию, сессия входила не тем домом).
+describe('resolveProfile: секции kimiNativeRuntime и opencodeRuntime — fail-closed форма', () => {
+    const boom = (m: string) => {
+        throw new Error(m);
+    };
+    const raw = (section: Record<string, unknown>) => ({
+        common: { model: 'm', phases: [{ milestone: 'M', branch: 'b' }], ...section },
+        profiles: { dev: {} },
+        defaultProfile: 'dev',
+    });
+
+    it('годные секции собираются', () => {
+        const cfg = resolveProfile(
+            raw({
+                kimiNativeRuntime: { status: 'experimental', model: 'k/m', home: '/path/to/home' },
+                opencodeRuntime: { status: 'experimental', model: 'prov/m' },
+            }),
+            'dev',
+            boom,
+        );
+        expect(cfg.kimiNativeRuntime.home).toBe('/path/to/home');
+    });
+
+    it.each([
+        [
+            { kimiNativeRuntime: { home: 123 } },
+            /kimiNativeRuntime\.home = 123 — ожидалась непустая строка/,
+        ],
+        [{ kimiNativeRuntime: { homee: '/x' } }, /kimiNativeRuntime\.homee — незнакомый ключ/],
+        [{ kimiNativeRuntime: { model: '' } }, /kimiNativeRuntime\.model = ""/],
+        [{ kimiNativeRuntime: [] }, /kimiNativeRuntime = \[\] — ожидался объект/],
+        [{ opencodeRuntime: { model: 42 } }, /opencodeRuntime\.model = 42/],
+        [{ opencodeRuntime: { providers: 'x' } }, /opencodeRuntime\.providers — незнакомый ключ/],
+    ])('НЕГАТИВНЫЙ: %j — стоп, а не умолчание', (section, why) => {
+        expect(() => resolveProfile(raw(section), 'dev', boom)).toThrow(why);
+    });
+});

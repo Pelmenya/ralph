@@ -35,6 +35,9 @@ type RuntimeIdentity = {
     // у claude и kimi бинарь один, и обновление видно обоим.
     bin: string;
     parseVersion: (output: string) => CliVersion;
+    // Провайдер берётся из модели `provider/model` (OpenCode, #121): харнесс один, а
+    // провайдер выбирает модель. `provider` выше — слово на случай модели без префикса.
+    providerFromModel?: boolean;
 };
 
 const VERSION = String.raw`\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?`;
@@ -61,6 +64,17 @@ export function parseCodexCliVersion(output: string): CliVersion {
     return versionFrom(new RegExp(`^codex-cli\\s+(${VERSION})$`), output, 'codex');
 }
 
+// Kimi Code 2.3.2: голый номер «2.3.2» — без имени CLI. Поэтому строка обязана быть номером
+// ЦЕЛИКОМ: баннер обёртки или предупреждение с номером внутри — не версия.
+export function parseKimiCodeCliVersion(output: string): CliVersion {
+    return versionFrom(new RegExp(`^(${VERSION})$`), output, 'kimi');
+}
+
+// OpenCode 1.19.4: тоже голый номер «1.19.4» — то же строгое правило, что у Kimi Code.
+export function parseOpencodeCliVersion(output: string): CliVersion {
+    return versionFrom(new RegExp(`^(${VERSION})$`), output, 'opencode');
+}
+
 // Ключи — те же, что у реестра `coderRuntime` (`CODER_RUNTIME_PROVIDERS`); сьют сверяет
 // совпадение: рантайм без записи ушёл бы в журнал без профиля.
 export const RUNTIME_IDENTITIES: Record<string, RuntimeIdentity> = {
@@ -82,15 +96,31 @@ export const RUNTIME_IDENTITIES: Record<string, RuntimeIdentity> = {
         bin: 'codex',
         parseVersion: parseCodexCliVersion,
     },
+    // #120: Kimi Code родным харнессом — свой бинарь `kimi`, версия у него своя.
+    'kimi-native': {
+        harness: 'kimi-code',
+        provider: 'moonshot',
+        bin: 'kimi',
+        parseVersion: parseKimiCodeCliVersion,
+    },
+    // #121: OpenCode — экспериментальный третий харнесс; провайдер — из `provider/model`.
+    opencode: {
+        harness: 'opencode',
+        provider: 'model-provider',
+        bin: 'opencode',
+        parseVersion: parseOpencodeCliVersion,
+        providerFromModel: true,
+    },
 };
 
 // Профиль по ключу рантайма. Незнакомый ключ — «неизвестно» в каждом поле, а не бросок:
 // запись попытки пишется уже ПОСЛЕ сессии, и отказ здесь потерял бы саму запись.
 export function runtimeProfile(runtime: string, model?: string | null): RuntimeProfile {
     const id = RUNTIME_IDENTITIES[runtime];
+    const slash = id?.providerFromModel && model ? model.indexOf('/') : -1;
     return {
         harness: id?.harness ?? CLI_VERSION_UNKNOWN,
-        provider: id?.provider ?? CLI_VERSION_UNKNOWN,
+        provider: slash > 0 ? model!.slice(0, slash) : (id?.provider ?? CLI_VERSION_UNKNOWN),
         model: model || MODEL_CLI_DEFAULT,
     };
 }

@@ -32,6 +32,8 @@ import {
     type TRootsInput,
 } from './roots.ts';
 import { productRootFromLock } from './core-install.ts';
+import { kimiNativeConfigProblems } from '../adapters/kimi-native.ts';
+import { opencodeSectionShapeProblems } from '../adapters/opencode.ts';
 
 // fail() боевой уходит в process.exit(1); тестовый failFn может вернуть значение или
 // бросить — поэтому возврат unknown, а не never (мягкий результат пробрасывается наверх).
@@ -231,6 +233,29 @@ export function createConfigProfile(env: ConfigProfileEnv) {
             );
         }
         return true;
+    }
+
+    // Ревью Фазы 16b: секции рантаймов-харнессов (`kimiNativeRuntime`, `opencodeRuntime`)
+    // разбирались только там, где их читал рантайм, и мусор молча становился умолчанием:
+    // `home: 123` или опечатка `homee` уводили Kimi в дом по умолчанию — сессия входила не
+    // тем домом. Форма проверяется здесь, на резолве, достижим рантайм или нет: незнакомый
+    // ключ и не-строка — отказ. Обязательность секции и статус эксперимента решает старт
+    // (`checkExperimentalRuntimes`): он знает, достижим ли рантайм.
+    // Возврат: true — валиден; иначе результат failFn (мягкий failFn пробрасываем наверх).
+    function assertValidRuntimeSections(
+        cfg: Record<string, unknown>,
+        profileName: string,
+        failFn: FailFn = fail,
+    ): unknown {
+        const problems = [
+            ...kimiNativeConfigProblems(cfg.kimiNativeRuntime),
+            ...opencodeSectionShapeProblems(cfg.opencodeRuntime),
+        ];
+        if (problems.length === 0) return true;
+        return failFn(
+            `ralph.config.json (профиль "${profileName}"): ${problems.join('; ')}. ` +
+                'Битая секция рантайма — стоп, а не умолчание: сессия пошла бы не с той моделью или не тем домом.',
+        );
     }
 
     // Канон, задача 33: permissionMode уходит в `--permission-mode` кодер-сессии как есть
@@ -933,6 +958,8 @@ export function createConfigProfile(env: ConfigProfileEnv) {
         // тихо сменила бы режим прав сессии (см. assertValidPermissionMode).
         const permOk = assertValidPermissionMode(merged, wanted, failFn);
         if (permOk !== true) return permOk; // мягкий failFn — наверх как есть
+        const sectionsOk = assertValidRuntimeSections(merged, wanted, failFn);
+        if (sectionsOk !== true) return sectionsOk; // мягкий failFn — наверх как есть
         // #376: modelRouting провайдер-осведомлён — валидируем схему целиком (labels/
         // default/apiLimitFallback/healEscalation) до того, как раннер начнёт резолвить
         // провайдера по label'ам issue.
@@ -977,6 +1004,7 @@ export function createConfigProfile(env: ConfigProfileEnv) {
         parseProfileFlag,
         assertValidHaltBeforeDeploy,
         assertValidPermissionMode,
+        assertValidRuntimeSections,
         assertValidModelRouting,
         assertValidPromptPlaceholders,
         assertValidReviewBacklog,

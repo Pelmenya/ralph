@@ -8,19 +8,31 @@
 import { spawnSync } from 'node:child_process';
 import {
     cpSync,
+    existsSync,
+    lstatSync,
     mkdirSync,
     mkdtempSync,
     readFileSync,
     realpathSync,
     rmSync,
+    symlinkSync,
     writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { coreIsRepoRoot } from '../tests/core-repo.ts';
+import { sideEffectAttempts } from '../shared/side-effect-guard.ts';
 import { stripComments } from '../tests/strip-comments.ts';
-import { hooksFor, type TRunHookFn } from './guard-probe.ts';
+import { hooksFor, type TRunHookFn, type TRunPluginFn } from './guard-probe.ts';
+import {
+    CODEX_HOOK_TRUST_FLAG,
+    OPENCODE_PLUGIN_DRIVER,
+    codexGuardFromArgs,
+    kimiHooksFromToml,
+    opencodeHooksFromPlugin,
+} from '../adapters/harness-guard.ts';
+import { OPENCODE_CONFIG_DIR_ENV, OPENCODE_CONFIG_ENV } from '../adapters/opencode.ts';
 import {
     CANON_SESSION_HOOKS,
     CORE_SHA_ENV,
@@ -30,6 +42,9 @@ import {
     coreShaPolicy,
     describeSessionSettingsStart,
     doctorStartChecks,
+    prepareCodexGuardArgs,
+    prepareKimiNativeHome,
+    prepareOpencodeSession,
     prepareSessionSettings,
     readHumanSettings,
     resolveCoreSha,
@@ -49,13 +64,23 @@ const liveGit: TGitInDirFn = (dir, args) => {
 };
 
 /** Живой запуск хука — как боевой `runHook`, но мимо предохранителя побочек. */
-const spawnHook: TRunHookFn = (hook, payload, projectDir) => {
+/**
+ * Окружение хука — как у боевого `runHook`: `CLAUDE_PROJECT_DIR` получает только хук Claude
+ * Code, остальным харнессам её не ставит CLI, и тест её не подкладывает (#120).
+ */
+function hookEnv(projectDir: string, withProjectDir: boolean): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = { ...process.env, CLAUDE_PROJECT_DIR: projectDir };
+    if (!withProjectDir) delete env.CLAUDE_PROJECT_DIR;
+    return env;
+}
+
+const spawnHook: TRunHookFn = (hook, payload, projectDir, opts = {}) => {
     const r = spawnSync('sh', ['-c', hook.command], {
         cwd: projectDir,
         input: payload,
         encoding: 'utf-8',
         timeout: hook.timeoutSec * 1000,
-        env: { ...process.env, CLAUDE_PROJECT_DIR: projectDir },
+        env: hookEnv(projectDir, opts.projectDirEnv !== false),
     });
     return { status: r.status, stderr: r.stderr ?? '' };
 };
@@ -69,6 +94,12 @@ const CONSUMER_HOOKS = {
     PostToolUse: [{ matcher: 'Write', hooks: [{ type: 'command', command: 'node post.cjs' }] }],
     PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'node own-guard.cjs' }] }],
 };
+
+// Барьер скиллов в регистрации не-Claude харнессов не переносится: транскрипта у них нет
+// (`guardHooksOf`, ревью Фазы 16b).
+const HARNESS_HOOK_MATCHERS = CANON_SESSION_HOOKS.filter((h) => h.file !== 'skill-barrier.cjs').map(
+    (h) => h.matcher,
+);
 
 describe('сборка settings сессии', () => {
     it('канонические хуки — из каталога ядра, данные контура — из дерева человека', () => {
@@ -457,6 +488,475 @@ describe('живые хуки: дерево сессии не решает за 
     });
 });
 
+// #119: сессия Codex настроек Claude Code не читает — барьер едет в её argv и пробуется
+// перед каждой сессией на том argv, который уйдёт в CLI.
+describe('prepareCodexGuardArgs — регистрация барьера Codex перед сессией', () => {
+    const roots = { productRoot: '/core', humanRoot: '/app', coreSha: 'a'.repeat(40) };
+    /** 2 на запрещённом, 0 на безобидном; вход — в форме Codex (`turn_id`). */
+    const codexGuard: TRunHookFn = (_h, payload) => {
+        const p = JSON.parse(payload) as { turn_id?: string; tool_input: { command?: string } };
+        if (!p.turn_id) return { status: 1, stderr: 'не форма Codex' };
+        return { status: p.tool_input.command === 'git status' ? 0 : 2, stderr: '' };
+    };
+
+    it('при корнях — хуки из установки ядра с контрактом, флаги доверия и включения', () => {
+        const r = prepareCodexGuardArgs(
+            { roots, sessionTree: '/work' },
+            { readFileFn: () => '{}', runHookFn: codexGuard },
+        );
+        if (!r.ok) throw new Error(r.reason);
+        expect(r.args).toContain(CODEX_HOOK_TRUST_FLAG);
+        const { hooks } = codexGuardFromArgs(r.args);
+        expect(hooks.map((h) => h.matcher)).toEqual(HARNESS_HOOK_MATCHERS);
+        expect(hooks[0].command).toContain("CLAUDE_PROJECT_DIR='/work'");
+        expect(hooks[0].command).toContain(
+            canonHookCommand('/core', 'guard.cjs', '/app', 'a'.repeat(40)),
+        );
+    });
+
+    it('без корней — хуки из .claude/settings.json дерева сессии', () => {
+        const reads: string[] = [];
+        const r = prepareCodexGuardArgs(
+            { roots: null, sessionTree: '/work' },
+            {
+                readFileFn: (p) => {
+                    reads.push(p);
+                    return JSON.stringify({
+                        hooks: {
+                            PreToolUse: [
+                                {
+                                    matcher: 'Bash',
+                                    hooks: [{ type: 'command', command: 'node g.cjs' }],
+                                },
+                            ],
+                        },
+                    });
+                },
+                runHookFn: codexGuard,
+            },
+        );
+        expect(reads).toEqual([path.join('/work', '.claude', 'settings.json')]);
+        expect(r.ok).toBe(true);
+    });
+
+    it('барьер не держит на событии Codex — отказ с причиной, аргументов нет', () => {
+        const r = prepareCodexGuardArgs(
+            { roots, sessionTree: '/work' },
+            { readFileFn: () => '{}', runHookFn: () => ({ status: 0, stderr: '' }) },
+        );
+        expect(r.ok).toBe(false);
+        if (!r.ok) expect(r.reason).toMatch(/Проба барьера Codex[\s\S]*рекурсивное удаление/);
+    });
+
+    it('настройки не прочитались — отказ, а не сессия без хуков', () => {
+        const r = prepareCodexGuardArgs(
+            { roots: null, sessionTree: '/work' },
+            {
+                readFileFn: () => {
+                    throw new Error('ENOENT');
+                },
+                runHookFn: codexGuard,
+            },
+        );
+        expect(r.ok).toBe(false);
+        if (!r.ok) expect(r.reason).toMatch(/Хуки для сессии Codex не собраны: ENOENT/);
+    });
+});
+
+describe('prepareKimiNativeHome — дом Kimi Code с барьером перед сессией (#120)', () => {
+    const roots = { productRoot: '/core', humanRoot: '/app', coreSha: SHA };
+    /** 2 на запрещённом, 0 на безобидном; вход — в форме Kimi Code (`client_type`). */
+    const kimiGuard: TRunHookFn = (_h, payload) => {
+        const p = JSON.parse(payload) as {
+            client_type?: string;
+            tool_input: { command?: string };
+        };
+        if (p.client_type !== 'kimi_code_cli') return { status: 1, stderr: 'не форма Kimi' };
+        return { status: p.tool_input.command === 'git status' ? 0 : 2, stderr: '' };
+    };
+    const HUMAN_TOML = 'default_model = "kimi-code/kimi-for-coding"\n';
+    const fakeFs = () => {
+        const writes = new Map<string, string>();
+        const links: Array<[string, string]> = [];
+        const unlinked: string[] = [];
+        const dirs: string[] = [];
+        return {
+            writes,
+            links,
+            unlinked,
+            dirs,
+            deps: {
+                readFileFn: (p: string) => (p.endsWith('config.toml') ? HUMAN_TOML : '{}'),
+                writeFileFn: (p: string, t: string) => void writes.set(p, t),
+                mkdirFn: (p: string) => void dirs.push(p),
+                linkFn: (t: string, l: string) => void links.push([t, l]),
+                unlinkFn: (p: string) => void unlinked.push(p),
+                entryKindFn: (_p: string): 'missing' | 'link' | 'other' => 'missing',
+                existsFn: (p: string) => !p.endsWith('device_id'),
+                runHookFn: kimiGuard,
+            },
+        };
+    };
+
+    it('конфиг человека плюс хуки установки ядра; вход — ссылками на дом человека', () => {
+        const f = fakeFs();
+        const r = prepareKimiNativeHome(
+            { roots, sessionTree: '/work', sourceHome: '/h/.kimi-code', home: '/r/home' },
+            f.deps,
+        );
+        expect(r).toEqual({ ok: true, home: '/r/home' });
+        expect(f.dirs).toEqual(['/r/home']);
+        const toml = f.writes.get('/r/home/config.toml') ?? '';
+        expect(toml.startsWith(HUMAN_TOML)).toBe(true);
+        const { hooks } = kimiHooksFromToml(toml);
+        expect(hooks.map((h) => h.matcher)).toEqual(HARNESS_HOOK_MATCHERS);
+        expect(hooks[0].command).toContain("CLAUDE_PROJECT_DIR='/work'");
+        expect(hooks[0].command).toContain(canonHookCommand('/core', 'guard.cjs', '/app', SHA));
+        // Отсутствующий у человека файл ссылкой не становится.
+        expect(f.links).toEqual([
+            ['/h/.kimi-code/credentials', '/r/home/credentials'],
+            ['/h/.kimi-code/oauth', '/r/home/oauth'],
+        ]);
+    });
+
+    it('барьер не держит на событии Kimi — отказ, дом не пишется', () => {
+        const f = fakeFs();
+        const r = prepareKimiNativeHome(
+            { roots, sessionTree: '/work', sourceHome: '/h', home: '/r/home' },
+            { ...f.deps, runHookFn: () => ({ status: 0, stderr: '' }) },
+        );
+        expect(r.ok).toBe(false);
+        if (!r.ok) expect(r.reason).toMatch(/Проба барьера Kimi Code[\s\S]*рекурсивное удаление/);
+        expect(f.writes.size).toBe(0);
+        expect(f.links).toEqual([]);
+    });
+
+    // Ревью Фазы 16b: висячая ссылка на пропавший у человека файл оставалась с прошлой сессии.
+    it('ссылка с прошлой сессии снимается всегда; цели нет — новой не ставится', () => {
+        const f = fakeFs();
+        const r = prepareKimiNativeHome(
+            { roots, sessionTree: '/work', sourceHome: '/h', home: '/r/home' },
+            { ...f.deps, entryKindFn: () => 'link' },
+        );
+        expect(r.ok).toBe(true);
+        expect(f.unlinked).toEqual(['/r/home/credentials', '/r/home/oauth', '/r/home/device_id']);
+        expect(f.links.map(([, l]) => l)).toEqual(['/r/home/credentials', '/r/home/oauth']);
+    });
+
+    // Ревью Фазы 16b: `rmSync` без recursive бросал на каталоге, созданном CLI, и каждая
+    // следующая сессия вставала с безымянным «дом не собран».
+    it('НЕГАТИВНЫЙ: настоящий каталог на месте ссылки — отказ с его адресом, вход не удаляется', () => {
+        const f = fakeFs();
+        const r = prepareKimiNativeHome(
+            { roots, sessionTree: '/work', sourceHome: '/h', home: '/r/home' },
+            {
+                ...f.deps,
+                entryKindFn: (p) => (p.endsWith('credentials') ? 'other' : 'missing'),
+            },
+        );
+        expect(r.ok).toBe(false);
+        if (!r.ok)
+            expect(r.reason).toMatch(
+                /\/r\/home\/credentials — настоящий файл или каталог, а не ссылка на \/h\/credentials/,
+            );
+        expect(f.unlinked).toEqual([]);
+        expect(f.links).toEqual([]);
+    });
+
+    it('боевое снятие ссылки — побочка: в тесте громкий отказ, дом не собран', () => {
+        const f = fakeFs();
+        const deps: Record<string, unknown> = { ...f.deps, entryKindFn: () => 'link' };
+        delete deps.unlinkFn;
+        const r = prepareKimiNativeHome(
+            { roots, sessionTree: '/work', sourceHome: '/h', home: '/r/home' },
+            deps,
+        );
+        expect(r.ok).toBe(false);
+        expect(sideEffectAttempts.splice(0).join(' | ')).toContain(
+            'prepareKimiNativeHome:unlink(/r/home/credentials)',
+        );
+    });
+
+    it('настройки хуков не прочитались — отказ, а не сессия без барьера', () => {
+        const f = fakeFs();
+        const r = prepareKimiNativeHome(
+            { roots: null, sessionTree: '/work', sourceHome: '/h', home: '/r/home' },
+            { ...f.deps, readFileFn: enoent },
+        );
+        expect(r.ok).toBe(false);
+        if (!r.ok) expect(r.reason).toMatch(/Хуки для сессии Kimi Code не собраны/);
+    });
+
+    it('config.toml человека не прочитан — отказ с советом войти', () => {
+        const f = fakeFs();
+        const r = prepareKimiNativeHome(
+            { roots, sessionTree: '/work', sourceHome: '/h', home: '/r/home' },
+            {
+                ...f.deps,
+                readFileFn: (p) => {
+                    if (p.endsWith('config.toml')) enoent();
+                    return '{}';
+                },
+            },
+        );
+        expect(r.ok).toBe(false);
+        if (!r.ok) expect(r.reason).toMatch(/config\.toml дома Kimi Code \/h не прочитан/);
+    });
+
+    it('запись дома упала — отказ с адресом, а не сессия на чужом доме', () => {
+        const f = fakeFs();
+        const r = prepareKimiNativeHome(
+            { roots, sessionTree: '/work', sourceHome: '/h', home: '/r/home' },
+            {
+                ...f.deps,
+                writeFileFn: () => {
+                    throw new Error('ENOSPC');
+                },
+            },
+        );
+        expect(r).toEqual({
+            ok: false,
+            reason: 'Дом Kimi Code сессии не собран в /r/home (ENOSPC).',
+        });
+    });
+
+    describe('живые хуки канона в доме Kimi Code', () => {
+        const made: string[] = [];
+        afterEach(() => {
+            for (const d of made.splice(0)) rmSync(d, { recursive: true, force: true });
+        });
+        const tmp = (name: string) => {
+            const d = realpathSync(mkdtempSync(path.join(tmpdir(), `kimi-home-${name}-`)));
+            made.push(d);
+            return d;
+        };
+
+        it.skipIf(!coreIsRepoRoot())(
+            'настоящий guard блокирует запрещённое на событиях Kimi, дом собран на диске',
+            () => {
+                const core = tmp('installed');
+                cpSync(
+                    path.join(CANON_ROOT, '.claude', 'hooks'),
+                    path.join(core, '.claude', 'hooks'),
+                    { recursive: true },
+                );
+                const sha = initRepo(core);
+                const human = tmp('human');
+                const source = tmp('source');
+                writeFileSync(path.join(source, 'config.toml'), HUMAN_TOML);
+                mkdirSync(path.join(source, 'credentials'));
+                const home = path.join(tmp('runtime'), 'kimi-native', 'home');
+                const r = prepareKimiNativeHome(
+                    {
+                        roots: { productRoot: core, humanRoot: human, coreSha: sha },
+                        sessionTree: tmp('session'),
+                        sourceHome: source,
+                        home,
+                    },
+                    {
+                        writeFileFn: (p, t) => writeFileSync(p, t),
+                        mkdirFn: (p) => mkdirSync(p, { recursive: true }),
+                        linkFn: (t, l) => symlinkSync(t, l),
+                        runHookFn: spawnHook,
+                    },
+                );
+                expect(r).toEqual({ ok: true, home });
+                const toml = readFileSync(path.join(home, 'config.toml'), 'utf-8');
+                expect(kimiHooksFromToml(toml).hooks.length).toBeGreaterThan(0);
+                expect(lstatSync(path.join(home, 'credentials')).isSymbolicLink()).toBe(true);
+                expect(existsSync(path.join(home, 'oauth'))).toBe(false);
+
+                // Ревью Фазы 16b: следующая сборка снимает прежнюю ссылку боевым путём, а
+                // каталог, созданный CLI на месте ссылки, называет в отказе и не удаляет.
+                const deps = {
+                    writeFileFn: (p: string, t: string) => writeFileSync(p, t),
+                    mkdirFn: (p: string) => mkdirSync(p, { recursive: true }),
+                    linkFn: (t: string, l: string) => symlinkSync(t, l),
+                    unlinkFn: (p: string) => rmSync(p),
+                    runHookFn: spawnHook,
+                };
+                const args = {
+                    roots: { productRoot: core, humanRoot: human, coreSha: sha },
+                    sessionTree: tmp('session'),
+                    sourceHome: source,
+                    home,
+                };
+                expect(prepareKimiNativeHome(args, deps)).toEqual({ ok: true, home });
+                rmSync(path.join(home, 'credentials'));
+                mkdirSync(path.join(home, 'credentials'));
+                const blocked = prepareKimiNativeHome(args, deps);
+                expect(blocked.ok).toBe(false);
+                if (!blocked.ok) expect(blocked.reason).toMatch(/настоящий файл или каталог/);
+                expect(lstatSync(path.join(home, 'credentials')).isDirectory()).toBe(true);
+            },
+        );
+    });
+});
+
+/** Живой запуск плагина OpenCode — то же, что боевой `runOpencodePlugin`, мимо предохранителя. */
+const spawnPlugin: TRunPluginFn = (source, event, projectDir) => {
+    const r = spawnSync('node', ['--input-type=module', '-e', OPENCODE_PLUGIN_DRIVER], {
+        cwd: projectDir,
+        input: JSON.stringify({ source, ...event, directory: projectDir }),
+        encoding: 'utf-8',
+        timeout: 120 * 1000,
+    });
+    return { status: r.status, stderr: r.stderr ?? '' };
+};
+
+describe('prepareOpencodeSession — каталог OpenCode с барьером перед сессией (#121)', () => {
+    const roots = { productRoot: '/core', humanRoot: '/app', coreSha: SHA };
+    /** 2 на запрещённом, 0 на безобидном; судит по аргументам в форме OpenCode. */
+    const pluginGuard: TRunPluginFn = (_src, ev) => {
+        const args = JSON.stringify(ev.output.args);
+        return { status: args.includes('git status') ? 0 : 2, stderr: '' };
+    };
+    const SKILL = '/work/.claude/skills/vitest/SKILL.md';
+    const fakeFs = (seen: string[] = [SKILL]) => {
+        const writes = new Map<string, string>();
+        const dirs: string[] = [];
+        const skillCalls: Array<[NodeJS.ProcessEnv, string]> = [];
+        return {
+            writes,
+            dirs,
+            skillCalls,
+            deps: {
+                readFileFn: () => '{}',
+                writeFileFn: (p: string, t: string) => void writes.set(p, t),
+                mkdirFn: (p: string) => void dirs.push(p),
+                runPluginFn: pluginGuard,
+                listDirFn: () => ['vitest'],
+                isFileFn: (p: string) => p === SKILL,
+                listSkillsFn: (env: NodeJS.ProcessEnv, cwd: string) => {
+                    skillCalls.push([env, cwd]);
+                    return {
+                        code: 0,
+                        stdout: JSON.stringify(seen.map((location) => ({ name: 'x', location }))),
+                    };
+                },
+            },
+        };
+    };
+    const args = (r: typeof roots | null = roots) => ({
+        roots: r,
+        sessionTree: '/work',
+        configDir: '/r/opencode/config',
+        baseEnv: { HOME: '/h' },
+    });
+
+    it('плагин с хуками установки ядра и настройки сессии; скиллы — в окружении сессии', () => {
+        const f = fakeFs();
+        expect(prepareOpencodeSession(args(), f.deps)).toEqual({
+            ok: true,
+            configDir: '/r/opencode/config',
+        });
+        expect(f.dirs).toEqual(['/r/opencode/config/plugin']);
+        const plugin = f.writes.get('/r/opencode/config/plugin/ralph-guard.js') ?? '';
+        const { hooks } = opencodeHooksFromPlugin(plugin);
+        expect(hooks.map((h) => h.matcher)).toEqual(HARNESS_HOOK_MATCHERS);
+        expect(hooks[0].command).toContain(canonHookCommand('/core', 'guard.cjs', '/app', SHA));
+        const cfg = JSON.parse(f.writes.get('/r/opencode/config/opencode.json') ?? '{}') as {
+            permission?: unknown;
+        };
+        expect(cfg.permission).toEqual({ bash: 'allow', edit: 'allow' });
+        const [env, cwd] = f.skillCalls[0];
+        expect(cwd).toBe('/work');
+        expect(env[OPENCODE_CONFIG_DIR_ENV]).toBe('/r/opencode/config');
+        expect(env[OPENCODE_CONFIG_ENV]).toBe('/r/opencode/config/opencode.json');
+        expect(env.HOME).toBe('/h');
+    });
+
+    it('плагин не держит — отказ, каталог не пишется, скиллы не спрашиваются', () => {
+        const f = fakeFs();
+        const r = prepareOpencodeSession(args(), {
+            ...f.deps,
+            runPluginFn: () => ({ status: 0, stderr: '' }),
+        });
+        expect(r.ok).toBe(false);
+        if (!r.ok) expect(r.reason).toMatch(/Проба барьера OpenCode[\s\S]*рекурсивное удаление/);
+        expect(f.writes.size).toBe(0);
+        expect(f.skillCalls).toEqual([]);
+    });
+
+    it('настройки хуков не прочитались — отказ, а не сессия без барьера', () => {
+        const f = fakeFs();
+        const r = prepareOpencodeSession(args(null), { ...f.deps, readFileFn: enoent });
+        expect(r.ok).toBe(false);
+        if (!r.ok) expect(r.reason).toMatch(/Хуки для сессии OpenCode не собраны/);
+    });
+
+    it('запись каталога упала — отказ с адресом', () => {
+        const f = fakeFs();
+        const r = prepareOpencodeSession(args(), {
+            ...f.deps,
+            writeFileFn: () => {
+                throw new Error('ENOSPC');
+            },
+        });
+        expect(r).toEqual({
+            ok: false,
+            reason: 'Каталог сессии OpenCode не собран в /r/opencode/config (ENOSPC).',
+        });
+    });
+
+    it('CLI не видит скилл дерева — отказ с путём, сессия не стартует', () => {
+        const f = fakeFs([]);
+        const r = prepareOpencodeSession(args(), f.deps);
+        expect(r.ok).toBe(false);
+        if (!r.ok)
+            expect(r.reason).toMatch(
+                /Набор скиллов сессии OpenCode неполон[\s\S]*\/work\/\.claude\/skills\/vitest\/SKILL\.md/,
+            );
+    });
+
+    describe('живые хуки канона в плагине OpenCode', () => {
+        const made: string[] = [];
+        afterEach(() => {
+            for (const d of made.splice(0)) rmSync(d, { recursive: true, force: true });
+        });
+        const tmp = (name: string) => {
+            const d = realpathSync(mkdtempSync(path.join(tmpdir(), `opencode-${name}-`)));
+            made.push(d);
+            return d;
+        };
+
+        it.skipIf(!coreIsRepoRoot())(
+            'настоящий guard через плагин блокирует запрещённое, каталог собран на диске',
+            () => {
+                const core = tmp('installed');
+                cpSync(
+                    path.join(CANON_ROOT, '.claude', 'hooks'),
+                    path.join(core, '.claude', 'hooks'),
+                    { recursive: true },
+                );
+                const sha = initRepo(core);
+                const configDir = path.join(tmp('runtime'), 'opencode', 'config');
+                const r = prepareOpencodeSession(
+                    {
+                        roots: { productRoot: core, humanRoot: tmp('human'), coreSha: sha },
+                        sessionTree: tmp('session'),
+                        configDir,
+                        baseEnv: {},
+                    },
+                    {
+                        writeFileFn: (p, t) => writeFileSync(p, t),
+                        mkdirFn: (p) => mkdirSync(p, { recursive: true }),
+                        runPluginFn: spawnPlugin,
+                        listSkillsFn: () => ({ code: 0, stdout: '[]' }),
+                    },
+                );
+                expect(r).toEqual({ ok: true, configDir });
+                const plugin = readFileSync(
+                    path.join(configDir, 'plugin', 'ralph-guard.js'),
+                    'utf-8',
+                );
+                expect(opencodeHooksFromPlugin(plugin).hooks.length).toBeGreaterThan(0);
+                expect(existsSync(path.join(configDir, 'opencode.json'))).toBe(true);
+            },
+        );
+    });
+});
+
 // Проводку в оркестраторе сторожит текст: `main()` поднимает лок, worktree и монитор, и
 // гонять его в сьюте нельзя. Ловит спавн `claude` мимо собранного settings и пробу, уехавшую
 // из-под `if (DRY)` или после спавна.
@@ -476,6 +976,24 @@ describe('проводка в оркестраторе', () => {
             expect(dry, body.slice(0, 60)).toBeGreaterThan(-1);
             expect(push, body.slice(0, 60)).toBeGreaterThan(dry);
         }
+    });
+
+    it('спавн codex-сессии идёт с регистрацией барьера, собранной после проверки DRY', () => {
+        const fnStart = source.indexOf('function runOpenAIOnce(');
+        const body = source.slice(fnStart, source.indexOf('return spawnCodex(', fnStart));
+        const dry = body.indexOf('if (DRY) return');
+        const guard = body.indexOf('guardArgs: guardArgsFn()');
+        expect(dry).toBeGreaterThan(-1);
+        expect(guard).toBeGreaterThan(dry);
+        expect(source).toMatch(/guardArgsFn: \(\) => string\[\] = \(\) => codexGuardArgsFor\(\)/);
+        expect(source).toMatch(/cmdArgs\.push\(\.\.\.guardArgs, '--', '-'\)/);
+    });
+
+    it('main(): дерево барьера Codex ставится вместе с корнями settings, после пробы', () => {
+        const main = source.slice(source.indexOf('function main('));
+        const probe = main.indexOf('settings: builtSettings');
+        const set = main.indexOf('codexGuardTree = sessionTree');
+        expect(set).toBeGreaterThan(probe);
     });
 
     it('main(): корни settings — ядро и дерево человека, ставятся после пробы на собранном', () => {
@@ -716,5 +1234,77 @@ describe('session-settings: краевые формы отказов', () => {
             humanSettings: { hooks: { SessionStart: 'не список' } },
         });
         expect((s.hooks as Record<string, unknown[]>).SessionStart).toEqual([]);
+    });
+});
+
+// Боевые умолчания коллабораторов подготовки сессии — файловая система и процессы. В тесте
+// пишущее из них обязано быть громкой побочкой, а читающее — читать то, что ему дали:
+// каталог, которого нет, не превращается в «всё хорошо».
+describe('подготовка сессий харнессов: боевые умолчания', () => {
+    const missing = '/nonexistent-ralph-core';
+    const roots = { productRoot: missing, humanRoot: missing, coreSha: 'a'.repeat(40) };
+    const blockAll: TRunHookFn = (_h, payload) => ({
+        status: payload.includes('git status') ? 0 : 2,
+        stderr: '',
+    });
+
+    it('Codex: настройки человека читаются с диска — нет файла, есть хуки установки ядра', () => {
+        const r = prepareCodexGuardArgs({ roots, sessionTree: missing }, { runHookFn: blockAll });
+        expect(r.ok).toBe(true);
+    });
+
+    it('Kimi Code: конфиг человека читается с диска, запись дома — громкая побочка', () => {
+        expect(
+            prepareKimiNativeHome(
+                { roots, sessionTree: missing, sourceHome: missing, home: '/r/home' },
+                { runHookFn: blockAll },
+            ).ok,
+        ).toBe(false);
+        const base = {
+            readFileFn: () => '{}',
+            runHookFn: blockAll,
+            writeFileFn: () => {},
+            entryKindFn: () => 'missing' as const,
+        };
+        const noMkdir = prepareKimiNativeHome(
+            { roots, sessionTree: '/work', sourceHome: '/h', home: '/r/home' },
+            base,
+        );
+        expect(noMkdir.ok).toBe(false);
+        const noLink = prepareKimiNativeHome(
+            { roots, sessionTree: '/work', sourceHome: '/h', home: '/r/home' },
+            { ...base, mkdirFn: () => {}, existsFn: () => true },
+        );
+        expect(noLink.ok).toBe(false);
+        expect(sideEffectAttempts.splice(0).join(' | ')).toMatch(
+            /prepareKimiNativeHome:mkdir\(\/r\/home\)[\s\S]*prepareKimiNativeHome:symlink\(\/r\/home\/credentials\)/,
+        );
+    });
+
+    it('OpenCode: скиллы дерева ищутся на диске, каталог сессии — громкая побочка', () => {
+        const pluginOk: TRunPluginFn = (_s, ev) => ({
+            status: JSON.stringify(ev.output.args).includes('git status') ? 0 : 2,
+            stderr: '',
+        });
+        const r = prepareOpencodeSession(
+            { roots, sessionTree: missing, configDir: '/r/opencode/config', baseEnv: {} },
+            { readFileFn: () => '{}', runPluginFn: pluginOk },
+        );
+        expect(r.ok).toBe(false);
+        expect(sideEffectAttempts.splice(0).join(' | ')).toContain(
+            'prepareOpencodeSession:mkdir(/r/opencode/config/plugin)',
+        );
+        const r2 = prepareOpencodeSession(
+            { roots, sessionTree: missing, configDir: '/r/opencode/config', baseEnv: {} },
+            {
+                runPluginFn: pluginOk,
+                mkdirFn: () => {},
+                writeFileFn: () => {},
+                listSkillsFn: () => ({ code: 0, stdout: '[]' }),
+            },
+        );
+        // Каталога скиллов нет — ожидать нечего; настройки человека — тоже с диска.
+        expect(r2.ok).toBe(true);
+        expect(sideEffectAttempts.splice(0)).toEqual([]);
     });
 });

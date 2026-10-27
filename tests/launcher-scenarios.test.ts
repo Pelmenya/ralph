@@ -19,8 +19,10 @@ import { LAUNCHER_CONTRACT_VERSION } from '../core/compat.ts';
 import { sandboxLauncher } from './live-sandbox.ts';
 
 // Срок — как у соседних живых наборов: настоящие git, launcher и раннер. Сценарий stop
-// с секундной сессией внутри под нагрузкой гейта шёл дольше дефолтных 5 с.
-vi.setConfig({ testTimeout: 60_000 });
+// с секундной сессией внутри под нагрузкой гейта шёл дольше дефолтных 5 с. Срок хука —
+// тот же: мир с `install` собирается в `beforeAll`, и на облачном раннере гейта эта сборка
+// не уложилась в дефолтные 10 с хука, хотя на хосте шла за пару секунд.
+vi.setConfig({ testTimeout: 60_000, hookTimeout: 60_000 });
 
 const PRODUCT_ROOT = path.resolve(import.meta.dirname, '..');
 const SHIM = path.join(PRODUCT_ROOT, 'examples', 'ralph');

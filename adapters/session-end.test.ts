@@ -21,6 +21,8 @@ import {
     SESSION_END_REASONS,
     classifyClaudeSessionEnd,
     classifyCodexSessionEnd,
+    classifyKimiNativeSessionEnd,
+    classifyOpencodeSessionEnd,
     parseCodexRetryAtMs,
     parseResetWaitMs,
     readClaudeResultEnvelope,
@@ -50,8 +52,15 @@ function fixture(name: string): TFixture {
 }
 
 // Набор фикстур по ключу реестра. Kimi — тот же бинарь `claude` с endpoint Moonshot, и
-// вывод у него тот же: отдельный набор был бы копией, расходящейся молча.
-const FIXTURE_OF: Record<string, string> = { claude: 'claude', kimi: 'claude', openai: 'codex' };
+// вывод у него тот же: отдельный набор был бы копией, расходящейся молча. `kimi-native` —
+// свой бинарь `kimi`, и набор у него свой.
+const FIXTURE_OF: Record<string, string> = {
+    claude: 'claude',
+    kimi: 'claude',
+    openai: 'codex',
+    'kimi-native': 'kimi-native',
+    opencode: 'opencode',
+};
 
 const SPAWN_OF: Record<string, (stdout: string, stderr: string, c: TCase) => unknown> = {
     claude: (stdout, stderr, c) =>
@@ -60,6 +69,10 @@ const SPAWN_OF: Record<string, (stdout: string, stderr: string, c: TCase) => unk
         ralph.spawnClaude(['-p'], 'промпт', 1000, spawnFake(c, stdout, stderr), {}, 'kimi'),
     openai: (stdout, stderr, c) =>
         ralph.spawnCodex(['exec'], 'промпт', 1000, spawnFake(c, stdout, stderr)),
+    'kimi-native': (stdout, stderr, c) =>
+        ralph.spawnKimiNative(['-p', 'указатель'], 1000, spawnFake(c, stdout, stderr)),
+    opencode: (stdout, stderr, c) =>
+        ralph.spawnOpencode(['run'], 'промпт', 1000, spawnFake(c, stdout, stderr)),
 };
 
 function spawnFake(c: TCase, stdout: string, stderr: string): never {
@@ -281,6 +294,45 @@ describe('порядок признаков — часть контракта', 
         ).toBe('auth');
     });
 
+    it('kimi-native читает только строку отказа CLI в stderr — stdout модели не исход', () => {
+        // Сессия, читавшая обработчик ошибок CLI, держит его текст в stdout; код 1 при этом
+        // — не лимит и не вход, пока CLI сам не написал строку отказа.
+        const prose = JSON.stringify({
+            role: 'assistant',
+            content: 'error: failed to run prompt: provider.rate_limit: x',
+        });
+        expect(classifyKimiNativeSessionEnd({ code: 1, stdout: prose, stderr: '' }).endReason).toBe(
+            'unknown',
+        );
+        // Код 0 — успех, что бы ни лежало в stderr.
+        expect(
+            classifyKimiNativeSessionEnd({
+                code: 0,
+                stdout: '',
+                stderr: 'error: failed to run prompt: provider.auth_error: x',
+            }).endReason,
+        ).toBe('completed');
+    });
+
+    it('kimi-native: 429 провайдера без слов квоты — не лимит; отказ запуска — unknown', () => {
+        const apiError = 'error: failed to run prompt: provider.api_error: 429 Too Many Requests\n';
+        expect(
+            classifyKimiNativeSessionEnd({ code: 1, stdout: '', stderr: apiError }).endReason,
+        ).toBe('unknown');
+        expect(
+            classifyKimiNativeSessionEnd({
+                code: 1,
+                stdout: '',
+                stderr: '',
+                failureKind: 'runtime-unavailable',
+            }).endReason,
+        ).toBe('unknown');
+        // Код сигнала CLI (SIGINT) — тот же срок, что 143.
+        expect(classifyKimiNativeSessionEnd({ code: 130, stdout: '', stderr: '' }).endReason).toBe(
+            'timeout',
+        );
+    });
+
     it('лимит Kimi узнаётся по коду 429, а не по словам тела Moonshot', () => {
         expect(
             classifyClaudeSessionEnd({
@@ -411,5 +463,60 @@ describe('зона в суффиксе времени сброса — от ча
 
     it('незнакомая зона — undefined: ядро возьмёт fallback', () => {
         expect(parseResetWaitMs('resets 3am (Mars/Olympus)', NOW_UTC)).toBeUndefined();
+    });
+});
+
+describe('OpenCode: исход по имени ошибки и коду провайдера (#121)', () => {
+    const err = (data: Record<string, unknown>, name = 'APIError') =>
+        `${JSON.stringify({ type: 'error', error: { name, data } })}\n`;
+    const classify = (stdout: string, code = 1) =>
+        classifyOpencodeSessionEnd({ code, stdout, stderr: '' });
+
+    it('лимит: retry-after-ms раньше retry-after; без заголовка — без срока', () => {
+        const h = (responseHeaders: Record<string, string>) =>
+            classify(err({ statusCode: 429, responseHeaders }));
+        expect(h({ 'retry-after-ms': '1500', 'retry-after': '9' })).toEqual({
+            endReason: 'api-limit',
+            retryAfterMs: 1500,
+        });
+        expect(h({ 'retry-after': '30' })).toEqual({
+            endReason: 'api-limit',
+            retryAfterMs: 30_000,
+        });
+        expect(h({ 'retry-after': 'Wed, 21 Oct 2026 07:28:00 GMT' })).toEqual({
+            endReason: 'api-limit',
+        });
+    });
+
+    it('вход: ProviderAuthError без кода и 403 — auth', () => {
+        expect(classify(err({ message: 'no key' }, 'ProviderAuthError')).endReason).toBe('auth');
+        expect(classify(err({ statusCode: 403 })).endReason).toBe('auth');
+    });
+
+    it('решает последняя ошибка; текст модели про 429 исхода не меняет', () => {
+        const text = `${JSON.stringify({ type: 'text', part: { text: 'API Error: 429 rate limit' } })}\n`;
+        expect(classify(text, 0).endReason).toBe('completed');
+        expect(classify(err({ statusCode: 429 }) + err({ statusCode: 503 })).endReason).toBe(
+            'interrupted',
+        );
+    });
+
+    // Ревью Фазы 16b: 503 или 429, пережитые повтором самого CLI, при коде 0 делали выполненную
+    // работу `interrupted` или `api-limit`, и ядро ждало окно после сделанного. Падение с
+    // ошибкой CLI кончает кодом 1 — так у всех живых фикстур.
+    it('код 0 — completed, даже если по пути было событие error; отказ запуска — unknown', () => {
+        for (const statusCode of [429, 503, 400])
+            expect(classify(err({ statusCode }), 0).endReason, String(statusCode)).toBe(
+                'completed',
+            );
+        expect(classify(err({ statusCode: 400 }), 1).endReason).toBe('unknown');
+        expect(
+            classifyOpencodeSessionEnd({
+                code: 127,
+                stdout: '',
+                stderr: '',
+                failureKind: 'runtime-unavailable',
+            }).endReason,
+        ).toBe('unknown');
     });
 });
