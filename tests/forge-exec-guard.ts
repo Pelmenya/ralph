@@ -105,6 +105,9 @@ const WRAPPER_VALUE_OPTS: Readonly<Record<string, ReadonlySet<string>>> = {
         '-d',
         '--delimiter',
         '-E',
+        // `-I {}` — самая частая форма. `--replace` и `-i` значение берут только слитно
+        // (`--replace={}`, `-i{}`), отдельный токен после них — уже команда.
+        '-I',
         '-L',
         '--max-lines',
         '-n',
@@ -113,6 +116,7 @@ const WRAPPER_VALUE_OPTS: Readonly<Record<string, ReadonlySet<string>>> = {
         '--max-procs',
         '-s',
         '--max-chars',
+        '--process-slot-var',
     ]),
 };
 // `-c` шелла бывает в связке коротких флагов: `bash -lc` (ради профиля), `sh -ec`.

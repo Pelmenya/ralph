@@ -190,6 +190,8 @@ function buildFakeTaskSource(): { adapter: TaskSourceAdapter; calls: string[] } 
     // флейворов (__setActualHead/__setHeadThrows).
     let actualHead = SHA;
     let headThrows = false;
+    // #127: отказ чтения открытых PR — свой флаг: «PR нет» и «форж не ответил» различимы.
+    let pullsThrow = false;
     let milestonesThrow = false;
     const adapter: TaskSourceAdapter = {
         checkAuth: () => {
@@ -251,7 +253,10 @@ function buildFakeTaskSource(): { adapter: TaskSourceAdapter; calls: string[] } 
                 { body: SUMMARY, isSummary: true, author: 'ok-author' },
             ];
         },
-        findOpenPullRequest: (branch) => prs[branch] ?? null,
+        findOpenPullRequest: (branch) => {
+            if (pullsThrow) throw new Error('форж не отдал список PR');
+            return prs[branch] ?? null;
+        },
         // #49: голова PR — вопрос к форжу, а не к гейту. Отказ — общим флагом чтения PR:
         // у боевых реализаций это тот же маршрут, что и у выборки pull request'ов.
         pullRequestHeadSha: (prNumber) => {
@@ -330,6 +335,11 @@ function buildFakeTaskSource(): { adapter: TaskSourceAdapter; calls: string[] } 
         v: boolean,
     ) => {
         authFails = v;
+    };
+    (adapter as unknown as { __setPullsThrow: (v: boolean) => void }).__setPullsThrow = (
+        v: boolean,
+    ) => {
+        pullsThrow = v;
     };
     (adapter as unknown as { __setCommentsThrow: (v: boolean) => void }).__setCommentsThrow = (
         v: boolean,
@@ -562,6 +572,8 @@ type TaskSourceHook = {
     // своим маршрутом (не через ghJson): связать этот отказ с общим флагом чтения значило
     // бы проверять не тот метод.
     __setHeadThrows?: (v: boolean) => void;
+    // #127: форж не отдал список открытых PR — для реализаций, читающих его своим маршрутом.
+    __setPullsThrow?: (v: boolean) => void;
     // Трасса вызовов реализации — для #45: якорь обязан доехать до форжа, а куда именно
     // (argv у GitHub, тело запроса у площадки) — деталь реализации.
     __calls?: () => string[];
@@ -972,6 +984,12 @@ function registerTaskSourceContract(
 
         it('findOpenPullRequest: PR нет → null', () => {
             const { adapter } = build();
+            // #127: до карточки GitHub-флейвор был здесь зелёным на ПРОГЛОЧЕННОМ отказе
+            // неподменённого чтения — «PR нет» доказывал сбой. Форж обязан ответить пустым.
+            (adapter as unknown as TaskSourceHook).__setGhJson?.((cmd) => {
+                if (cmd.includes('gh pr list --head')) return [];
+                throw new Error(`unexpected: ${cmd}`);
+            });
             expect(adapter.findOpenPullRequest('feature/none')).toBeNull();
         });
 
@@ -993,6 +1011,24 @@ function registerTaskSourceContract(
                 return; // фейк-флейвор не моделирует множественность отдельно
             }
             expect(adapter.findOpenPullRequest(BRANCH)).toBeNull();
+        });
+
+        // #127: сбой форжа — бросок, а не null. null — ответ «PR нет»; сбой, отданный им же,
+        // петля прочитала бы как «PR нет» и завела бы второй PR, а панель показала бы «нет».
+        it('НЕГАТИВНЫЙ: findOpenPullRequest — форж не ответил → бросает, а не null', () => {
+            const { adapter } = build();
+            const hook = adapter as unknown as TaskSourceHook;
+            if (hook.__setGhJson) {
+                hook.__setGhJson(() => {
+                    throw new Error('форж недоступен');
+                });
+            } else if (hook.__setPullsThrow) {
+                hook.__setPullsThrow(true);
+            } else {
+                // Не `return`: тихий пропуск сделал бы негативный тест зелёным no-op.
+                throw new Error(`${label}: флейвор не дал ручку отказа чтения PR`);
+            }
+            expect(() => adapter.findOpenPullRequest(BRANCH)).toThrow();
         });
 
         // #49: голову PR — ту самую, на которой гейт гоняет чеки и к которой прижимает
@@ -1114,6 +1150,8 @@ function buildSourcecraftTaskSource(): { adapter: TaskSourceAdapter; calls: stri
     // #49: отказ чтения головы. Свой флаг, а не общий с карточками: у площадки это
     // отдельный маршрут `GET /pulls/{n}`.
     let headThrows = false;
+    // #127: отказ чтения открытых PR — свой флаг: «PR нет» и «форж не ответил» различимы.
+    let pullsThrow = false;
 
     // Slug milestone на площадке ОТЛИЧАЕТСЯ от имени фазы в конфиге — как в жизни
     // (генерируется из имени с потерей символов). Фикстура, отдающая карточки на имя
@@ -1134,6 +1172,7 @@ function buildSourcecraftTaskSource(): { adapter: TaskSourceAdapter; calls: stri
             return { issues: hit ? scIssues : [] };
         }
         if (path.includes('/pulls?')) {
+            if (pullsThrow) throw new Error('SourceCraft: список PR не отдался');
             const merged = path.includes('status%3Dmerged');
             return { pull_requests: merged ? mergedPulls : openPulls };
         }
@@ -1243,6 +1282,9 @@ function buildSourcecraftTaskSource(): { adapter: TaskSourceAdapter; calls: stri
     };
     hook.__setHeadThrows = (v) => {
         headThrows = v;
+    };
+    hook.__setPullsThrow = (v) => {
+        pullsThrow = v;
     };
     hook.__setAllOpenThrows = (v) => {
         issuesThrow = v;

@@ -7,6 +7,7 @@ export type TConsumerData = {
 };
 
 export declare const DATA_PATH: string;
+export declare const DATA_ENV: string;
 export declare function emptyData(): TConsumerData;
 export declare function parseConsumerData(text: string, file?: string): TConsumerData;
 export declare function loadConsumerData(deps?: {

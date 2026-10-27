@@ -477,6 +477,27 @@ describe('tryMergePhase — гейт мерджа: hold/blocked/red/merged', () 
         expect(tryMergeWith(g, phase, { findOpenPrFn: () => null })).toBe('not-merged');
     });
 
+    // #127: сбой чтения — не «PR нет». Отдельный исход с причиной в lastForgeStop, мердж
+    // и чеки не зовутся; иначе стоп звучал бы «PR не найден» про PR, который, может, есть.
+    it('PR не прочитался (шов бросил) → pr-unreadable с причиной, чеки не идут', () => {
+        const g = createGateRunner(makeEnv());
+        const logs: string[] = [];
+        const checksGreenFn = vi.fn(() => true);
+        const res = tryMergeWith(g, phase, {
+            findOpenPrFn: () => {
+                throw new Error('HTTP 502\nдетали');
+            },
+            checksGreenFn,
+            logFn: (m: string) => logs.push(m),
+        });
+        expect(res).toBe('pr-unreadable');
+        expect(checksGreenFn).not.toHaveBeenCalled();
+        expect(g.getLastForgeStop()).toContain('HTTP 502');
+        expect(g.getLastForgeStop()).not.toContain('детали');
+        expect(g.getLastGatePr()).toBeNull();
+        expect(logs.join('\n')).toMatch(/не прочитался у форжа: HTTP 502 — мердж отменён/);
+    });
+
     it('hold сильнее blocked — проверяется первым', () => {
         const g = createGateRunner(makeEnv());
         const res = tryMergeWith(g, phase, {

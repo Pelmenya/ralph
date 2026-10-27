@@ -31,10 +31,7 @@ const requiredSkillsOf = hook.requiredSkills as (
     command?: string,
     rules?: TRules,
 ) => Map<string, unknown>;
-const isLoopTranscript = hook.isLoopTranscript as (
-    lines: string[] | null,
-    env?: Record<string, string | undefined>,
-) => boolean;
+const isLoopSession = hook.isLoopSession as (env?: Record<string, string | undefined>) => boolean;
 const loadedSkills = hook.loadedSkills as (lines: string[]) => Set<string>;
 const decideOf = hook.decide as (input: TDecideInput) => TVerdict;
 
@@ -53,10 +50,14 @@ const requiredSkills = (targets: string[], command?: string) =>
 const decide = (input: TDecideInput) => decideOf({ rules: RULES, ...input });
 /** Контракт запуска петли: ожидаемая ревизия ядра. Значение здесь — только форма SHA. */
 const CORE_SHA = 'a'.repeat(40);
+const LOOP_ENV = { RALPH_CORE_SHA: CORE_SHA };
 
 const userPrompt = (content: string) =>
     JSON.stringify({ type: 'user', message: { role: 'user', content } });
-/** Промпт сессии раннера на каноне: контракт `ralph.md` лежит в корне. */
+/**
+ * Промпт сессии раннера на каноне: контракт `ralph.md` лежит в корне. Петлю он больше не
+ * заявляет (#132) — только контракт запуска; в вердиктах ниже он стоит с `LOOP_ENV`.
+ */
 const LOOP_PROMPT = userPrompt('Прочитай ralph.md и строго следуй правилам.');
 const HUMAN_PROMPT = userPrompt('Подхвати handoff.');
 const skillCall = (skill: string) =>
@@ -157,52 +158,48 @@ describe('какой скилл обязателен для какого фай�
     );
 });
 
-describe('сессия петли узнаётся по первому сообщению транскрипта', () => {
-    it('промпт раннера — петля; чужой промпт — нет; пустой транскрипт — нет', () => {
-        expect(isLoopTranscript([LOOP_PROMPT], {})).toBe(true);
-        expect(isLoopTranscript([HUMAN_PROMPT, LOOP_PROMPT], {})).toBe(false);
-        expect(isLoopTranscript([], {})).toBe(false);
+describe('сессия петли узнаётся по контракту запуска, а не по тексту промпта', () => {
+    it('контракт запуска — петля; без него — нет', () => {
+        expect(isLoopSession({ RALPH_CORE_SHA: CORE_SHA })).toBe(true);
+        expect(isLoopSession({})).toBe(false);
+        expect(isLoopSession({ RALPH_CORE_SHA: '  ' })).toBe(false);
     });
 
-    it('узнаёт обе раскладки контракта: в корне канона и в каталоге у потребителя', () => {
-        for (const text of [
-            'Прочитай ralph.md и следуй правилам.',
-            'Прочитай .claude/ralph/ralph.md и строго следуй правилам.',
-            'Правила — в `ralph.md`.',
-        ]) {
-            expect(isLoopTranscript([userPrompt(text)], {})).toBe(true);
-        }
-        // Имя внутри чужого слова — не ссылка на контракт.
-        expect(isLoopTranscript([userPrompt('Открой myralph.md')], {})).toBe(false);
+    // #132: прежний переходный признак — строка `ralph.md` в первом сообщении. Промпт,
+    // называющий файл, петлю не заявляет: заявляет раннер переменной.
+    it('сессия с ralph.md в промпте без переменной петлёй не считается (#132)', () => {
+        expect(hook).not.toHaveProperty('LOOP_PROMPT_RE');
+        expect(hook).not.toHaveProperty('isLoopTranscript');
+        expect(
+            decide({
+                toolName: 'Edit',
+                toolInput: { file_path: TEST },
+                transcriptLines: [LOOP_PROMPT],
+                env: {},
+            }),
+        ).toEqual({ blocked: false });
+        expect(
+            decide({
+                toolName: 'Edit',
+                toolInput: { file_path: TEST },
+                transcriptLines: [LOOP_PROMPT],
+                env: LOOP_ENV,
+            }).blocked,
+        ).toBe(true);
     });
 
-    it('контракт запуска узнаёт петлю без строки ralph.md в промпте (#99)', () => {
-        // При внешней установке путь контракта другой, и строка в промпте не совпала бы:
-        // сессию петли узнаёт заявление раннера, а не текст.
-        expect(isLoopTranscript([HUMAN_PROMPT], { RALPH_CORE_SHA: CORE_SHA })).toBe(true);
-        expect(isLoopTranscript([], { RALPH_CORE_SHA: CORE_SHA })).toBe(true);
-        expect(isLoopTranscript(null, { RALPH_CORE_SHA: CORE_SHA })).toBe(true);
-        expect(isLoopTranscript(null, {})).toBe(false);
-    });
-
-    it('переключатель среды сильнее транскрипта — для проверки руками', () => {
-        expect(isLoopTranscript([HUMAN_PROMPT], { RALPH_SKILL_GUARD: 'on' })).toBe(true);
-        expect(isLoopTranscript([LOOP_PROMPT], { RALPH_SKILL_GUARD: 'off' })).toBe(false);
+    // Переключатель только включает: выключателя нет, любое значение кроме `on` — то же,
+    // что пустая переменная.
+    it('переключатель среды включает барьер без контракта, и только значением on', () => {
+        expect(isLoopSession({ RALPH_SKILL_GUARD: 'on' })).toBe(true);
+        expect(isLoopSession({})).toBe(false);
+        expect(isLoopSession({ RALPH_SKILL_GUARD: 'yes' })).toBe(false);
     });
 
     // Петлю заявляет раннер: `off`, унаследованный из его окружения или env-файла, молча
     // снимал бы барьер скиллов во всех его сессиях.
-    it('контракт запуска сильнее переключателя: off при заявленной петле не действует', () => {
-        expect(
-            isLoopTranscript([HUMAN_PROMPT], {
-                RALPH_CORE_SHA: CORE_SHA,
-                RALPH_SKILL_GUARD: 'off',
-            }),
-        ).toBe(true);
-    });
-
-    it('битая строка перед промптом не ослепляет распознавание', () => {
-        expect(isLoopTranscript(['{"type":"user", broken', LOOP_PROMPT], {})).toBe(true);
+    it('контракт запуска сильнее переключателя: его значение при заявленной петле не действует', () => {
+        expect(isLoopSession({ RALPH_CORE_SHA: CORE_SHA, RALPH_SKILL_GUARD: 'off' })).toBe(true);
     });
 });
 
@@ -228,28 +225,35 @@ describe('загруженные скиллы читаются из вызово
 describe('вердикт', () => {
     const loop = [LOOP_PROMPT];
     const edit = { toolName: 'Edit', toolInput: { file_path: TEST } };
+    const env = LOOP_ENV;
 
     it('в сессии петли правка теста без vitest заблокирована, с ним — разрешена', () => {
-        const blocked = decide({ ...edit, transcriptLines: loop });
+        const blocked = decide({ ...edit, transcriptLines: loop, env });
         expect(blocked.blocked).toBe(true);
         expect(blocked.reason).toContain('Skill(vitest)');
         expect(blocked.reason).toContain(TEST);
-        expect(decide({ ...edit, transcriptLines: [...loop, skillCall('vitest')] })).toEqual({
+        expect(decide({ ...edit, transcriptLines: [...loop, skillCall('vitest')], env })).toEqual({
             blocked: false,
             loaded: ['vitest'],
         });
     });
 
     it('в сессии человека и без транскрипта не вмешивается; прочие файлы не трогает', () => {
-        expect(decide({ ...edit, transcriptLines: [HUMAN_PROMPT] })).toEqual({ blocked: false });
-        expect(decide({ ...edit, transcriptLines: null })).toEqual({ blocked: false });
+        expect(decide({ ...edit, transcriptLines: [HUMAN_PROMPT], env: {} })).toEqual({
+            blocked: false,
+        });
+        expect(decide({ ...edit, transcriptLines: null, env: {} })).toEqual({ blocked: false });
         expect(
-            decide({ toolName: 'Edit', toolInput: { file_path: CODE }, transcriptLines: loop }),
+            decide({
+                toolName: 'Edit',
+                toolInput: { file_path: CODE },
+                transcriptLines: loop,
+                env,
+            }),
         ).toEqual({ blocked: false });
     });
 
     it('петля по контракту без ralph.md в промпте: правка теста без vitest заблокирована', () => {
-        const env = { RALPH_CORE_SHA: CORE_SHA };
         expect(decide({ ...edit, transcriptLines: [HUMAN_PROMPT], env }).blocked).toBe(true);
         expect(
             decide({ ...edit, transcriptLines: [HUMAN_PROMPT, skillCall('vitest')], env }),
@@ -267,7 +271,9 @@ describe('вердикт', () => {
     });
 
     it('кэш маркеров заменяет чтение транскрипта', () => {
-        expect(decide({ ...edit, transcriptLines: loop, cached: new Set(['vitest']) })).toEqual({
+        expect(
+            decide({ ...edit, transcriptLines: loop, env, cached: new Set(['vitest']) }),
+        ).toEqual({
             blocked: false,
             loaded: ['vitest'],
         });
@@ -281,13 +287,15 @@ describe('хук процессом: код выхода и fail-closed', () => 
         dir = '';
     });
 
-    const run = (payload: Record<string, unknown>) =>
+    // Петлю процессу заявляет переключатель: контракт с SHA сверял бы рабочее дерево с
+    // ревизией, а промпт петлю больше не заявляет (#132).
+    const run = (payload: Record<string, unknown>, guard = 'on') =>
         spawnSync(process.execPath, [HOOK], {
             input: JSON.stringify(payload),
             encoding: 'utf-8',
             env: {
                 ...process.env,
-                RALPH_SKILL_GUARD: '',
+                RALPH_SKILL_GUARD: guard,
                 RALPH_CORE_SHA: '',
                 CLAUDE_PROJECT_DIR: ROOT,
                 TMPDIR: dir || tmpdir(),
@@ -341,9 +349,14 @@ describe('хук процессом: код выхода и fail-closed', () => 
         expect(result.stderr).toContain('Таблица скиллов не загрузилась');
     });
 
-    it('транскрипт не назван или файл не целевой — exit 0', () => {
+    it('петля не заявлена или файл не целевой — exit 0', () => {
         dir = mkdtempSync(path.join(tmpdir(), 'skill-barrier-'));
-        expect(run({ tool_name: 'Edit', tool_input: { file_path: TEST } }).status).toBe(0);
+        const transcript = path.join(dir, 'session.jsonl');
+        writeFileSync(transcript, `${LOOP_PROMPT}\n`);
+        const edit = { tool_name: 'Edit', tool_input: { file_path: TEST } };
+        // ralph.md в промпте без контракта — сессия человека (#132).
+        expect(run({ ...edit, session_id: 's3', transcript_path: transcript }, '').status).toBe(0);
+        expect(run(edit, '').status).toBe(0);
         expect(run({ tool_name: 'Edit', tool_input: { file_path: 'docs/x.md' } }).status).toBe(0);
     });
 });

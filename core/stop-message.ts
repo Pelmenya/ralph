@@ -31,6 +31,7 @@ export type TStopReason =
     | 'stage-journal'
     | 'forge-unreadable'
     | 'issue-format'
+    | 'guard-probe'
     | 'breaker'
     | 'deadman'
     | 'unknown';
@@ -82,6 +83,8 @@ export const REASON_TITLES: Record<TStopReason, string> = {
     'forge-unreadable': 'форж или git не читаются',
     // Фаза 10: карточка не держит формат, заданный потребителем (`issueFormat`).
     'issue-format': 'карточка не по формату потребителя',
+    // Ревью Фазы 12: собранный settings сессии не прошёл пробу барьера посреди прогона.
+    'guard-probe': 'барьер сессии не прошёл пробу',
     breaker: 'circuit breaker',
     deadman: 'тишина лога (deadman)',
     unknown: 'причина не установлена',

@@ -53,7 +53,7 @@ export default defineConfig({
             reporter: ['text-summary', 'json-summary'],
             reportsDirectory: './node_modules/.coverage',
             thresholds: {
-                'core/**': { lines: 92.78, statements: 91.63, functions: 89.31, branches: 89.39 },
+                'core/**': { lines: 92.8, statements: 91.74, functions: 89.43, branches: 89.43 },
                 'runtime/**': {
                     lines: 80.82,
                     statements: 80.33,

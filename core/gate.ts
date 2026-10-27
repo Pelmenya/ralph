@@ -912,6 +912,8 @@ export function createGateRunner(env: GateEnv) {
      *   'head-diverged'      — локальный ref ветки разошёлся с головой PR (#85): локально
      *                          есть коммиты, которых нет в PR. Строка гейта — в
      *                          `getLastHeadDivergence()`; стоп человеку пушем с ней же;
+     *   'pr-unreadable'      — открытый PR ветки не прочитался: форж бросил (#127). Это не
+     *                          «PR нет» — стоп человеку пушем, причина в `lastForgeStop`;
      *   'not-merged'         — не мерджили по нечинимой причине (нет PR / blocked /
      *                          сеть-git проблемы / merge упал).
      *
@@ -1039,6 +1041,7 @@ export function createGateRunner(env: GateEnv) {
         | 'gate-tool-failure'
         | 'main-conflict'
         | 'head-diverged'
+        | 'pr-unreadable'
         | 'not-merged' {
         // #218: сброс СРАЗУ, тем же приёмом, что checksGreen сбрасывает lastRedCheck/
         // lastVerifiedHead — раунд, упавший ДО findOpenPr (dry/грязное дерево), не должен
@@ -1063,7 +1066,20 @@ export function createGateRunner(env: GateEnv) {
             logFn(`⛔ Гейт: дерево раннера грязное — мердж не выполняется.`);
             return 'not-merged';
         }
-        const pr = findOpenPrFn(phase.branch);
+        // #127: сбой чтения — не «PR нет». Шов бросает, и гейт отдаёт его своим исходом:
+        // строка «PR не найден» отправила бы человека искать PR, который, может, и есть, а
+        // неперехваченный бросок ронял бы петлю без пуша. Причина — в `lastForgeStop`.
+        let pr: ReturnType<FindOpenPrFn>;
+        try {
+            pr = findOpenPrFn(phase.branch);
+        } catch (e) {
+            const why = String((e as Error).message).split('\n')[0];
+            lastForgeStop = `открытый PR ветки ${phase.branch} не прочитался у форжа: ${why}`;
+            logFn(
+                `⛔ Гейт: открытый PR ветки ${phase.branch} не прочитался у форжа: ${why} — мердж отменён.`,
+            );
+            return 'pr-unreadable';
+        }
         if (!pr) {
             logFn(
                 `⛔ Гейт: открытый PR ветки ${phase.branch} в main не найден — мердж невозможен.`,

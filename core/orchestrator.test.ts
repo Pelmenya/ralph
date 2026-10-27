@@ -4948,8 +4948,41 @@ describe('runLoop — основной while-цикл: итерации коде
                 }),
             );
             expect(runClaudeFn).not.toHaveBeenCalled();
-            expect(getIssueFn).toHaveBeenCalledTimes(2);
-            expect(logs.join('\n')).toMatch(/#5 .*не прочитать \(форж не ответил\).*не проверен/);
+            // Выбор плюс ISSUE_BODY_READ_ATTEMPTS чтений для промпта.
+            expect(getIssueFn).toHaveBeenCalledTimes(3);
+            const text = logs.join('\n');
+            expect(text).toMatch(/#5 .*не прочитать за 2 попытки \(форж не ответил\).*не проверен/);
+            // #130: сбой форжа, а не формат — человека не отправляют править карточку.
+            expect(text).toContain('(forge-unreadable)');
+            expect(text).not.toContain('(issue-format)');
+            expect(text).toMatch(/проверь доступ к форжу/);
+        });
+
+        // #130: моргнули выбор и первое чтение для промпта — повтор, а не стоп.
+        it('формат задан, два чтения моргнули, третье отдало тело по формату — сессия идёт', () => {
+            const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+            let reads = 0;
+            runLoop(
+                validCfg({ issueFormat }),
+                ctx(mkState()),
+                deps([], {
+                    once: true,
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn: queue,
+                    getIssueFn: (number: number) => {
+                        reads++;
+                        if (reads <= 2) throw new Error('форж моргнул');
+                        return {
+                            number,
+                            title: 'витрина',
+                            body: '## Макет\nhttps://example.com/mockup',
+                        };
+                    },
+                    runClaudeFn,
+                }),
+            );
+            expect(reads).toBe(3);
+            expect(runClaudeFn).toHaveBeenCalledTimes(1);
         });
 
         it('битая секция issueFormat без preflight — отказ, а не «формата нет»', () => {
@@ -7542,6 +7575,67 @@ describe('runLoop — основной while-цикл: итерации коде
         expect(pushes.some((m) => m.includes('(forge-unreadable)'))).toBe(true);
     });
 
+    // #127: сбой чтения PR шов бросает. Для комментариев сессии сдачи это тот же стоп, что
+    // у непрочитанных комментариев, — не крах петли без пуша и не промпт без замечаний.
+    it('#127: PR не прочитался перед шагом сдачи — стоп forge-unreadable, сессии нет', () => {
+        const logs: string[] = [];
+        const state = mkState();
+        const pushEventFn = vi.fn();
+        const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+        let reads = 0;
+        runLoop(
+            validCfg(),
+            ctx(state),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                // Первое чтение — у заведения PR (PR есть), дальше форж лёг.
+                findOpenPrFn: () => {
+                    if (++reads > 1) throw new Error('HTTP 502');
+                    return { number: 55, labels: [] };
+                },
+                prCommentsFn: () => [],
+                pickReviewModelFn: () => 'none',
+                runClaudeFn,
+                pushEventFn,
+                tryMergePhaseFn: () => 'merged',
+            }),
+        );
+        expect(runClaudeFn).not.toHaveBeenCalled();
+        const pushes = pushEventFn.mock.calls.map((c) => String(c[0]));
+        const stop = pushes.find((m) => m.includes('PR ветки не прочитался'));
+        expect(stop).toBeDefined();
+        expect(stop).toContain('(forge-unreadable)');
+        expect(stop).toContain('HTTP 502');
+    });
+
+    // #127: пока GitHub отдавал сбой чтения null, заведение PR читало его как «PR нет» и
+    // заводило второй. Теперь бросок уходит в стоп «PR фазы не заведён».
+    it('#127: PR ветки не прочитался при заведении — второй PR не создаётся, стоп', () => {
+        const logs: string[] = [];
+        const state = mkState();
+        const pushEventFn = vi.fn();
+        const createPrFn = vi.fn(() => 77);
+        runLoop(
+            validCfg(),
+            ctx(state),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                findOpenPrFn: () => {
+                    throw new Error('HTTP 502');
+                },
+                createPrFn,
+                runClaudeFn: vi.fn<RunClaudeFake>(() => 0),
+                pushEventFn,
+                tryMergePhaseFn: () => 'merged',
+            }),
+        );
+        expect(createPrFn).not.toHaveBeenCalled();
+        const pushes = pushEventFn.mock.calls.map((c) => String(c[0]));
+        expect(pushes.some((m) => m.includes('не заведён') && m.includes('HTTP 502'))).toBe(true);
+    });
+
     it('#594: fixTurnRetries: 0 → прежнее поведение, исчерпание ходов = стоп без повтора', () => {
         const logs: string[] = [];
         const state = mkState();
@@ -9519,6 +9613,36 @@ describe('runLoop — основной while-цикл: итерации коде
         const stopText = String(pushEventFn.mock.calls[0][0]);
         expect(stopText).toContain('(head-diverged)');
         expect(stopText).toContain(line);
+        expect(stopText).not.toContain('(unknown)');
+        expect(state.gateHeals).toBe(0);
+    });
+
+    // #127: гейт не прочитал PR у форжа — стоп с причиной гейта, а не катч-олл unknown и не
+    // «PR не найден».
+    it('#127: pr-unreadable — стоп forge-unreadable с причиной гейта', () => {
+        const logs: string[] = [];
+        const state = mkState({ submitted: true, gateHeals: 1 });
+        const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+        const pushEventFn = vi.fn((msg: string) => msg.length > 0);
+        const why = 'открытый PR ветки feature/m1 не прочитался у форжа: HTTP 502';
+        runLoop(
+            validCfg({ gateHealAttempts: 2 }),
+            ctx(state),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => false,
+                tryMergePhaseFn: () => 'pr-unreadable',
+                getLastForgeStop: () => why,
+                runClaudeFn,
+                pushEventFn,
+            }),
+        );
+        expect(runClaudeFn).not.toHaveBeenCalled();
+        expect(pushEventFn).toHaveBeenCalledTimes(1);
+        const stopText = String(pushEventFn.mock.calls[0][0]);
+        expect(stopText).toContain('(forge-unreadable)');
+        expect(stopText).toContain(why);
         expect(stopText).not.toContain('(unknown)');
         expect(state.gateHeals).toBe(0);
     });
@@ -15525,5 +15649,117 @@ describe('pickLiveCandidate (#43)', () => {
         });
         expect(r.picked).toBeNull();
         expect(readIssue).not.toHaveBeenCalled();
+    });
+});
+
+// Ревью Фазы 12: отказ пробы перед сессией посреди прогона — стоп «оставлен человеку»,
+// а не `process.exit` без пуша: state на диск, пуш с причиной `guard-probe`, затем выход.
+describe('sessionSettingsArgs: отказ пробы посреди прогона', () => {
+    const roots = {
+        productRoot: '/core',
+        humanRoot: '/app',
+        sessionTree: '/work',
+        coreSha: 'a'.repeat(40),
+    };
+    const brokenSettings = {
+        readFileFn: (): string => {
+            throw Object.assign(new Error('EACCES: нет прав'), { code: 'EACCES' });
+        },
+    };
+
+    it('state сохраняется ДО пуша, пуш — одна строка стопа с причиной, затем выход кодом 1', () => {
+        const order: string[] = [];
+        const pushes: string[] = [];
+        expect(() =>
+            ralph.sessionSettingsArgs(brokenSettings, {
+                roots,
+                persistFn: () => order.push('save'),
+                pushEventFn: (msg: string) => {
+                    order.push('push');
+                    pushes.push(msg);
+                    return false;
+                },
+                exitFn: (code: number): never => {
+                    order.push(`exit ${String(code)}`);
+                    throw new Error('exit');
+                },
+            }),
+        ).toThrow('exit');
+        expect(order).toEqual(['save', 'push', 'exit 1']);
+        expect(pushes).toHaveLength(1);
+        expect(pushes[0]).toMatch(/^⛔ Ralph: .*барьер сессии не прошёл пробу/s);
+        expect(pushes[0]).toMatch(/Settings сессии не собран: .*EACCES/s);
+        expect(pushes[0]).toMatch(/перезапусти loop/);
+    });
+
+    it('state не записался — стоп всё равно уходит, и пуш это называет', () => {
+        const pushes: string[] = [];
+        expect(() =>
+            ralph.sessionSettingsArgs(brokenSettings, {
+                roots,
+                persistFn: () => {
+                    throw new Error('ENOSPC');
+                },
+                pushEventFn: (msg: string) => {
+                    pushes.push(msg);
+                    return false;
+                },
+                exitFn: (): never => {
+                    throw new Error('exit');
+                },
+            }),
+        ).toThrow('exit');
+        expect(pushes[0]).toMatch(/State перед стопом не сохранён: ENOSPC/);
+    });
+
+    it('без раскладки корней — пусто, settings не собирается', () => {
+        expect(ralph.sessionSettingsArgs({}, { roots: null })).toEqual([]);
+    });
+});
+
+// Ревью Фазы 12: в раскладке без `roots` контракта нет, и барьер скиллов в сессиях петли
+// снимался молча. Раннер включает его переключателем в env сессии.
+describe('барьер скиллов без roots — переключатель в env сессии', () => {
+    it('выключено (есть roots или вне main) — env как был, в том числе «наследуй»', () => {
+        expect(ralph.withSkillGuard(undefined, { A: '1' }, false)).toBeUndefined();
+        const env = { A: '1' };
+        expect(ralph.withSkillGuard(env, {}, false)).toBe(env);
+    });
+
+    it('включено — RALPH_SKILL_GUARD=on поверх env сессии или наследуемого, off раннера не проходит', () => {
+        expect(ralph.withSkillGuard(undefined, { A: '1', RALPH_SKILL_GUARD: 'off' }, true)).toEqual(
+            {
+                A: '1',
+                RALPH_SKILL_GUARD: 'on',
+            },
+        );
+        expect(ralph.withSkillGuard({ B: '2' }, { A: '1' }, true)).toEqual({
+            B: '2',
+            RALPH_SKILL_GUARD: 'on',
+        });
+    });
+
+    // Ревью Фазы 12: контракт и путь данных контура раннер кладёт только в команду своего
+    // хука; унаследованные из окружения запуска, они достались бы хукам дерева сессии.
+    it('RALPH_CORE_SHA и RALPH_HOOKS_DATA из окружения раннера в env сессии не попадают', () => {
+        const base = { A: '1', RALPH_CORE_SHA: 'f'.repeat(40), RALPH_HOOKS_DATA: '/x/hooks.json' };
+        expect(ralph.withSkillGuard(undefined, base, false)).toEqual({ A: '1' });
+        expect(ralph.withSkillGuard({ ...base }, {}, true)).toEqual({
+            A: '1',
+            RALPH_SKILL_GUARD: 'on',
+        });
+        expect(base.RALPH_CORE_SHA).toBe('f'.repeat(40));
+    });
+
+    it('проводка: main() включает его в ветке без roots, оба claude-спавна идут через него', () => {
+        const src = fs.readFileSync(path.join(import.meta.dirname, 'orchestrator.ts'), 'utf-8');
+        const main = src.slice(src.indexOf('function main('));
+        const noRoots = main.indexOf('log(describeSessionSettingsStart(null))');
+        const on = main.indexOf('skillGuardByEnv = true;');
+        expect(on).toBeGreaterThan(-1);
+        expect(noRoots - on).toBeGreaterThan(0);
+        expect(noRoots - on).toBeLessThan(100);
+        expect(src).toMatch(/withSkillGuard\(claudeSessionEnv\(authToken\)\)/);
+        expect(src).toMatch(/withSkillGuard\(buildKimiSpawnEnv\(/);
     });
 });

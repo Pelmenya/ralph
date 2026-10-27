@@ -238,37 +238,42 @@ export function createGithubPrCommands(env: GithubPrCommandsEnv) {
         return Number.isInteger(num) && num > 0 ? num : null;
     }
 
+    // #127: сбой чтения БРОСАЕТ, а не отдаёт null. Раньше `catch` здесь писал лог и
+    // возвращал null — «PR нет» для петли и панели, тогда как SourceCraft на том же сбое
+    // бросал. Две реализации одного шва разошлись по режиму отказа, и на GitHub ветка
+    // «PR нет» после сбоя форжа заводила бы второй PR вместо стопа. null остаётся ответом
+    // форжа: PR нет, их больше одного, номер не похож на целое.
     function findOpenPr(
         branch: string,
         { ghJsonFn = ghJson, logFn = log }: { ghJsonFn?: GhJsonFn; logFn?: LogFn } = {},
     ): PullRequest | null {
-        try {
-            // --base main (M5): PR из этой же ветки в ДРУГУЮ базу мерджить нельзя —
-            // фаза «сдалась» бы мимо main, а следующая строилась бы без неё.
-            const prs = ghJsonFn<PullRequest[]>(
-                `gh pr list --head ${shq(branch)} --base main --state open --json number,labels`,
+        // --base main (M5): PR из этой же ветки в ДРУГУЮ базу мерджить нельзя —
+        // фаза «сдалась» бы мимо main, а следующая строилась бы без неё.
+        const prs = ghJsonFn<PullRequest[]>(
+            `gh pr list --head ${shq(branch)} --base main --state open --json number,labels`,
+        );
+        if (!Array.isArray(prs)) {
+            // Ответ не список — форж ответил не то, что спрашивали. Это сбой чтения, а не
+            // «PR нет»: `[]` и мусор обязаны быть различимы.
+            throw new Error(`список PR ветки ${branch} от форжа — не массив`);
+        }
+        if (prs.length > 1) {
+            // M5: несколько открытых PR на одну ветку — prs[0] был бы произвольным
+            // выбором с непредсказуемым результатом. Fail-closed: разберёт человек.
+            logFn(
+                `⛔ Несколько открытых PR из ветки ${branch} в main: ${prs.map((p) => `#${p.number}`).join(', ')} — неоднозначно, авто-мердж отменён.`,
             );
-            if (prs.length > 1) {
-                // M5: несколько открытых PR на одну ветку — prs[0] был бы произвольным
-                // выбором с непредсказуемым результатом. Fail-closed: разберёт человек.
-                logFn(
-                    `⛔ Несколько открытых PR из ветки ${branch} в main: ${prs.map((p) => `#${p.number}`).join(', ')} — неоднозначно, авто-мердж отменён.`,
-                );
-                return null;
-            }
-            const pr = prs[0] || null;
-            if (pr && !prNumberRe.test(String(pr.number))) {
-                // Fail-closed: номер не похож на целое → в argv/шелл его не пускаем.
-                logFn(
-                    `⛔ Номер PR ветки ${branch} не похож на целое ('${pr.number}') — авто-мердж отменён.`,
-                );
-                return null;
-            }
-            return pr;
-        } catch (e) {
-            logFn(`⚠ Не смог получить PR ветки ${branch}: ${(e as Error).message}`);
             return null;
         }
+        const pr = prs[0] || null;
+        if (pr && !prNumberRe.test(String(pr.number))) {
+            // Fail-closed: номер не похож на целое → в argv/шелл его не пускаем.
+            logFn(
+                `⛔ Номер PR ветки ${branch} не похож на целое ('${pr.number}') — авто-мердж отменён.`,
+            );
+            return null;
+        }
+        return pr;
     }
 
     return { prComments, prHeadSha, commentOnPr, createPr, findOpenPr };

@@ -75,6 +75,12 @@ export type LiveSandboxOptions = {
      * раннер обязан отказаться от запуска до первой сессии (`core/guard-probe.ts`).
      */
     guardHook?: string | null;
+    /**
+     * Тело `guard.cjs` в копии ядра (`<productRoot>/.claude/hooks/guard.cjs`); `null` —
+     * файла нет. При заданных `roots` барьер сессии регистрируется из ядра (задача 101), и
+     * сломать его можно только там: хук потребителя добавляется к нему, а не заменяет.
+     */
+    productGuard?: string | null;
 };
 
 /**
@@ -271,6 +277,7 @@ export function buildLiveSandbox({
     coderScript = '',
     phaseBranchOnOrigin = false,
     guardHook = DEFAULT_GUARD_HOOK,
+    productGuard,
 }: LiveSandboxOptions = {}): LiveSandbox {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-live-')));
     const consumerRoot = path.join(root, 'consumer');
@@ -293,6 +300,12 @@ export function buildLiveSandbox({
         // `node_modules` — не продукт: его ставит потребитель.
         filter: (src) => !['.git', 'node_modules'].includes(path.basename(src)),
     });
+
+    if (productGuard !== undefined) {
+        const guardFile = path.join(sb.productRoot, '.claude', 'hooks', 'guard.cjs');
+        if (productGuard === null) fs.rmSync(guardFile, { force: true });
+        else fs.writeFileSync(guardFile, productGuard);
+    }
 
     fs.writeFileSync(path.join(root, 'open-issues.json'), JSON.stringify(openIssues));
     fs.writeFileSync(

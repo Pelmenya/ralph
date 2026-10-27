@@ -25,6 +25,7 @@
  *   touch <runtimeDir>/ralph.stop                 мягкая остановка: петля встанет на границе шага (#88)
  *   node .claude/ralph/ralph.js --migrate-runtime   перевезти состояние в runtimeDir и выйти
  *   node .claude/ralph/ralph.js --migrate-rollback  вернуть состояние в прежнюю раскладку
+ *   node .claude/ralph/ralph.js --doctor           совместимость слоёв и сверка ядра с lock; только чтение
  *   node .claude/ralph/ralph.js --profile <name>   профиль конфига (по умолчанию defaultProfile)
  *
  * Требования: gh CLI авторизован, git-репозиторий, ralph.config.json настроен, active: true.
@@ -85,6 +86,9 @@ const flags = {
     // чинить и ехать одновременно.
     migrate: argv.includes('--migrate-runtime'),
     migrateRollback: argv.includes('--migrate-rollback'),
+    // #37: отчёт о совместимости launcher / ядро / конфиг / state / адаптеры и сверке ядра
+    // с lock — тем же кодом, что у старта; только чтение, код выхода — вердикт старта.
+    doctor: argv.includes('--doctor'),
 };
 
 // Allowlist известных флагов — fail-closed против тихого сдвига режима (инвариант №1,
@@ -101,6 +105,7 @@ const KNOWN_FLAGS = new Set([
     '--deploy-resolved',
     '--migrate-runtime',
     '--migrate-rollback',
+    '--doctor',
     '--profile',
 ]);
 function assertKnownFlags(args) {

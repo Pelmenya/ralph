@@ -45,6 +45,36 @@ describe('загрузка данных из каталога проекта', (
         expect(data.mcp.writeAllowed.has('mcp__sourcecraft__CreateIssue')).toBe(true);
     });
 
+    // Фаза 12: раннер называет данные из дерева человека — правка файла в дереве сессии
+    // не меняет контура хука, которого регистрирует раннер.
+    it('RALPH_HOOKS_DATA сильнее CLAUDE_PROJECT_DIR: данные из названного файла', () => {
+        const seen: string[] = [];
+        const data = loadConsumerData({
+            env: { CLAUDE_PROJECT_DIR: '/session', RALPH_HOOKS_DATA: '/human/hooks.json' },
+            readFileFn: (file) => {
+                seen.push(file);
+                return CANON;
+            },
+        });
+        expect(seen).toEqual(['/human/hooks.json']);
+        expect(data.mcp.writeAllowed.has('mcp__sourcecraft__CreateIssue')).toBe(true);
+    });
+
+    it('названного файла нет — самый строгий контур, а не данные дерева сессии', () => {
+        expect(
+            loadConsumerData({
+                env: { CLAUDE_PROJECT_DIR: '/session', RALPH_HOOKS_DATA: '/human/hooks.json' },
+                readFileFn: enoent,
+            }),
+        ).toEqual(emptyData());
+    });
+
+    it('относительный RALPH_HOOKS_DATA — исключение: его база снова дерево сессии', () => {
+        expect(() =>
+            loadConsumerData({ env: { RALPH_HOOKS_DATA: '.claude/ralph/hooks.json' } }),
+        ).toThrow('не абсолютный путь');
+    });
+
     it('файл есть, но не читается — исключение, а не пустые данные', () => {
         expect(() =>
             loadConsumerData({
@@ -184,7 +214,7 @@ describe('guard на правилах из данных потребителя',
         }
     });
 
-    // Раннер контракт сессиям пока не передаёт: забор по одному контракту в бою не
+    // Guard дерева сессии контракта не получает (#132): забор по одному контракту там не
     // действовал бы нигде. Хук отдаёт признак функцией, и читается он только по делу.
     it('признак петли функцией зовётся лишь на вызове, который трогает данные', () => {
         const write = { file_path: '.claude/ralph/hooks.json' };

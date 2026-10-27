@@ -249,8 +249,34 @@ import type {
     TaskSourceAdapter,
 } from '../adapters/adapters.ts';
 import { underRoot, writeFileAtomic, type TResolvedRoots } from './roots.ts';
+import { checkCoreBeforeStart, describeStartCheck, productRootMismatch } from './core-install.ts';
+import {
+    checkCompatibility,
+    compatLockOf,
+    describeCompat,
+    doctorStatePath,
+    inspectStateAt,
+    observeAdapters,
+    observeConfig,
+    observeCore,
+    observeLauncher,
+    observeState,
+    runDoctorMode,
+} from './compat.ts';
 import { updateConsumerTree } from './consumer-tree.ts';
 import { ensureGuardHolds } from './guard-probe.ts';
+import {
+    buildSessionSettings,
+    prepareSessionSettings,
+    readHumanSettings,
+    resolveCoreSha,
+    coreShaPolicy,
+    describeSessionSettingsStart,
+    doctorStartChecks,
+    SKILL_GUARD_ENV,
+    HOOK_COMMAND_ONLY_ENV,
+    type TSessionSettingsDeps,
+} from './session-settings.ts';
 import {
     acquireRepoOwnership,
     canonicalRepoId,
@@ -442,10 +468,18 @@ export function issueFormatProblem(
 // потом»: «потом» в этой итерации уже не наступает. Формата нет — отказ чтения остаётся
 // вызывающему (его стоп «без тела задачи не запускаю»), `details` тогда null.
 //
+// #130: непрочитанное тело — сбой форжа, а не формат, и стоп у него свой (`forge-unreadable`
+// с советом проверить доступ): под причиной `issue-format` человек ночью шёл править здоровую
+// карточку или конфиг. И чтение здесь повторяется (`ISSUE_BODY_READ_ATTEMPTS`), как у
+// комментариев PR: транзиент переживают повтором, и два моргнувших чтения подряд — выбор и
+// промпт — не должны были останавливать петлю.
+//
 // Продолжение попытки ПОСЛЕ сессии (`sessionDone`) карточку не читает: тело нужно только
 // сессии, и доведённую сессию формат задним числом не снимает. Вынесено из `runLoop` по
 // той же причине, что и `pickLiveCandidate`: окно барьера проводки в `phase-branch.test.ts`
 // не растягивается.
+export const ISSUE_BODY_READ_ATTEMPTS = 2;
+
 export function nextIssueBody<D extends { body: string }>({
     next,
     picked,
@@ -453,6 +487,7 @@ export function nextIssueBody<D extends { body: string }>({
     milestone,
     sessionDone,
     readIssue,
+    logFn,
 }: {
     next: { number: number; labels?: Array<{ name: string }> };
     picked: { number: number; details: D } | null;
@@ -460,38 +495,49 @@ export function nextIssueBody<D extends { body: string }>({
     milestone: string;
     sessionDone: boolean;
     readIssue: (n: number) => D;
+    logFn: (msg: string) => void;
 }): { details: D | null; stop: string | null } {
     if (sessionDone) return { details: null, stop: null };
     let details: D | null = picked?.number === next.number ? picked.details : null;
     let readError = '';
-    if (details === null) {
+    for (let attempt = 1; details === null && attempt <= ISSUE_BODY_READ_ATTEMPTS; attempt++) {
         try {
             details = readIssue(next.number);
         } catch (e) {
-            readError = (e as Error).message;
+            readError = String((e as Error).message).split('\n')[0];
+            logFn(
+                `⚠ Не смог прочитать карточку #${String(next.number)} для промпта ` +
+                    `(попытка ${attempt}/${ISSUE_BODY_READ_ATTEMPTS}): ${readError}`,
+            );
         }
     }
     if (format === null) return { details, stop: null };
-    const fail = (diagnosis: string) => ({
+    if (details === null)
+        return {
+            details,
+            stop: `⛔ Ralph: ${formatStopMessage({
+                reason: 'forge-unreadable',
+                diagnosis:
+                    `карточку #${String(next.number)} фазы "${milestone}" не прочитать за ` +
+                    `${ISSUE_BODY_READ_ATTEMPTS} попытки (${readError}) — формат потребителя ` +
+                    '(issueFormat) не проверен, сессию по ней не запускаю',
+                question:
+                    'проверь доступ к форжу и перезапусти loop — сама карточка и issueFormat ' +
+                    'здесь ни при чём',
+            })}`,
+        };
+    const problem = issueFormatProblem(next, details, format);
+    if (problem === null) return { details, stop: null };
+    return {
         details,
         stop: `⛔ Ralph: ${formatStopMessage({
             reason: 'issue-format',
-            diagnosis,
+            diagnosis: `карточка фазы "${milestone}" не по формату потребителя (issueFormat) — ${problem}`,
             question:
                 'допиши разделы в тело карточки либо поправь issueFormat ' +
                 'в ralph.config.json, затем перезапусти loop',
         })}`,
-    });
-    if (details === null)
-        return fail(
-            `карточку #${String(next.number)} фазы "${milestone}" не прочитать (${readError}) — ` +
-                'формат потребителя (issueFormat) не проверен, сессию по ней не запускаю',
-        );
-    const problem = issueFormatProblem(next, details, format);
-    if (problem === null) return { details, stop: null };
-    return fail(
-        `карточка фазы "${milestone}" не по формату потребителя (issueFormat) — ${problem}`,
-    );
+    };
 }
 
 // Фаза 10: карточки фазы против формата потребителя — на старте, до первой итерации.
@@ -894,6 +940,9 @@ export type OrchestratorFlags = {
     deployResolved: boolean;
     migrate: boolean;
     migrateRollback: boolean;
+    // #37: отчёт о совместимости слоёв и сверке ядра с lock; read-only, выход до записи.
+    // Необязателен в типе: entry и тестовые сборки фабрики до него флага не знали.
+    doctor?: boolean;
 };
 
 // Мост из entry к соседям: telegram-notifier.ts (доставка пушей) и gate-env.mts
@@ -929,6 +978,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // означали бы «чиню и еду одновременно».
     const MIGRATE = flags.migrate;
     const MIGRATE_ROLLBACK = flags.migrateRollback;
+    const DOCTOR = flags.doctor === true;
 
     // Конфиг — фабричный (бывший module-level): заполняется в main(). Держим let, а не
     // параметр, чтобы сборка фабрики (require/import ralph.js в юнит-тестах) не запускала
@@ -1653,6 +1703,100 @@ export function createOrchestrator(env: OrchestratorEnv) {
         return env;
     }
 
+    // Задача 101: откуда собирается settings сессии. Ставит `main()`, когда известно дерево
+    // сессий и задана раскладка корней; до этого (юнит-тесты фабрики, раскладка без `roots`)
+    // `null` — сессия идёт на настройках своего дерева, как раньше, и это сказано в логе
+    // старта, а не молчанием.
+    let sessionSettingsRoots: {
+        productRoot: string;
+        humanRoot: string;
+        sessionTree: string;
+        coreSha: string;
+    } | null = null;
+
+    // Ревью Фазы 12: раскладка без `roots` контракта `RALPH_CORE_SHA` сессии не даёт (settings
+    // не собирается), а барьер скиллов узнаёт петлю только по контракту (#132) — без этого
+    // флага он молча снимался во всех сессиях петли. Ставит `main()` в ветке без `roots`;
+    // тогда env claude-сессии (и Kimi — тот же бинарь) несёт `RALPH_SKILL_GUARD=on`. Это
+    // переключатель, а не контракт: хуки дерева сессии его переживают, ревизию они не сверяют.
+    let skillGuardByEnv = false;
+
+    /**
+     * Env claude-сессии с переключателем барьера скиллов там, где контракта нет, и без
+     * переменных, которые раннер даёт только команде своего хука (`HOOK_COMMAND_ONLY_ENV`):
+     * унаследованный из окружения запуска `RALPH_CORE_SHA` хуки дерева сессии приняли бы за
+     * контракт и сверяли бы себя с чужой ревизией (ревью Фазы 12).
+     */
+    function withSkillGuard(
+        env: NodeJS.ProcessEnv | undefined,
+        base: NodeJS.ProcessEnv = process.env,
+        enabled: boolean = skillGuardByEnv,
+    ): NodeJS.ProcessEnv | undefined {
+        const src = env ?? base;
+        const leaked = HOOK_COMMAND_ONLY_ENV.some((k) => src[k] !== undefined);
+        if (!enabled && !leaked) return env;
+        const out: NodeJS.ProcessEnv = { ...src };
+        for (const k of HOOK_COMMAND_ONLY_ENV) delete out[k];
+        if (enabled) out[SKILL_GUARD_ENV] = 'on';
+        return out;
+    }
+
+    // Сохранение state петли перед стопом из глубины сессии. Ставит `runLoop` на входе (state
+    // живёт у него в памяти и пишется после шага), вне петли и в dry — `null`.
+    let persistBeforeStop: (() => void) | null = null;
+
+    // Задача 101: settings сессии собирается и проходит пробу перед КАЖДОЙ сессией, а не
+    // однажды на старте: правка хука, легшая посреди фазы, иначе жила бы до рестарта. Проба
+    // не прошла — сессия не стартует, петля встаёт с причиной. Флаг `--settings` уходит в
+    // argv ПОСЛЕ проверки DRY: сухой прогон ничего не пишет, пробу он прошёл на старте.
+    //
+    // Отказ посреди прогона — стоп «оставлен человеку», как остальные стопы петли (ревью
+    // Фазы 12): state на диск, пуш с причиной `guard-probe`, затем выход. Прежний `fail`
+    // уходил `process.exit` без пуша, и ночная петля просто исчезала до срабатывания deadman.
+    // Вверх по стеку отказ не возвращается: спавнов сессии десяток, и каждый из них, не
+    // разобравший отказ, запустил бы сессию мимо барьера — выход здесь закрывает все разом.
+    function sessionSettingsArgs(
+        deps: TSessionSettingsDeps = {},
+        {
+            roots = sessionSettingsRoots,
+            pushEventFn = pushEvent,
+            persistFn = persistBeforeStop,
+            exitFn = (code: number): never => process.exit(code),
+        }: {
+            roots?: typeof sessionSettingsRoots;
+            pushEventFn?: typeof pushEvent;
+            persistFn?: (() => void) | null;
+            exitFn?: (code: number) => never;
+        } = {},
+    ): string[] {
+        if (!roots) return [];
+        const prepared = prepareSessionSettings(
+            { ...roots, outPath: path.resolve(RUNTIME.sessionSettings) },
+            deps,
+        );
+        if (prepared.ok) return ['--settings', prepared.path];
+        let notSaved = '';
+        if (persistFn) {
+            try {
+                persistFn();
+            } catch (e) {
+                notSaved = ` State перед стопом не сохранён: ${(e as Error)?.message ?? String(e)}.`;
+            }
+        }
+        pushEventFn(
+            `⛔ Ralph: ${formatStopMessage({
+                reason: 'guard-probe',
+                diagnosis: `${prepared.reason}${notSaved}`,
+                question:
+                    'почини хук ядра или настройки дерева человека, названные выше, ' +
+                    'и перезапусти loop — сессия не запускалась',
+            })}`,
+            config,
+            { logFn: log },
+        );
+        return exitFn(1);
+    }
+
     function runClaudeOnce(
         prompt: string,
         { model, maxTurns, fallbackModel, authToken }: ClaudeOpts,
@@ -1664,10 +1808,17 @@ export function createOrchestrator(env: OrchestratorEnv) {
             `▶ claude -p "${prompt.slice(0, 80)}…" --max-turns ${maxTurns}${model ? ` --model ${model}` : ''}`,
         );
         if (DRY) return { code: 0, output: '' };
+        cmdArgs.push(...sessionSettingsArgs());
         // timeout (M3): зависший claude (сетевой столл) иначе блокирует синхронный
         // loop навсегда — AFK-прогон молча стоит до утра.
         const timeout = config.claudeTimeoutMs || 2 * 60 * 60 * 1000;
-        return spawnClaude(cmdArgs, prompt, timeout, spawnSync, claudeSessionEnv(authToken));
+        return spawnClaude(
+            cmdArgs,
+            prompt,
+            timeout,
+            spawnSync,
+            withSkillGuard(claudeSessionEnv(authToken)),
+        );
     }
 
     // ── Рантайм Kimi (#373, фаза 6) ──────────────────────────────────────────
@@ -1793,10 +1944,12 @@ export function createOrchestrator(env: OrchestratorEnv) {
             `▶ kimi (claude+Moonshot) -p "${prompt.slice(0, 80)}…" --max-turns ${maxTurns} --model ${resolvedModel}`,
         );
         if (DRY) return { code: 0, output: '' };
+        // Тот же бинарь `claude` — те же хуки и тот же собранный settings (задача 101).
+        cmdArgs.push(...sessionSettingsArgs());
         const timeout = config.claudeTimeoutMs || 2 * 60 * 60 * 1000;
         // token гарантированно не-null при !DRY (requireToken выше). Секрет — только в env
         // процесса (buildKimiSpawnEnv), НЕ в argv (иначе виден в /proc/*/cmdline).
-        const env = buildKimiSpawnEnv(baseUrl, token as string, process.env);
+        const env = withSkillGuard(buildKimiSpawnEnv(baseUrl, token as string, process.env));
         return spawnClaude(cmdArgs, prompt, timeout, spawnFn, env, 'kimi');
     }
 
@@ -5534,6 +5687,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // журнал (loadState); state литералом (тесты, прямой вызов) переводится здесь, и
         // его флаги ложатся в журнал теми же операциями, что пишет петля.
         attachSubmitJournal(state);
+        // Стоп из глубины сессии (проба барьера перед ней) сохраняет state тем же
+        // `saveStateFn`, что шаги петли. Dry ничего не пишет — и здесь тоже.
+        persistBeforeStop = dry ? null : () => saveStateFn(state);
 
         // L6: бюджет итераций ЭТОГО запуска — отдельно от накопленного state.count.
         // Раньше --once обнулял state.count, стирая честный учёт AFK-итераций фазы; теперь
@@ -6243,6 +6399,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     milestone: phase.milestone,
                     sessionDone: stageDone('session'),
                     readIssue: getIssueFn,
+                    logFn,
                 });
                 if (body.stop !== null) {
                     pushEventFn(body.stop, cfg, { logFn });
@@ -6868,7 +7025,27 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 // причиной и пушем: `null` здесь значит «сессию не запускать», стоп уже
                 // отправлен. PR нет — это не сбой, а пустой список по факту.
                 const trustedCommentsContext = (branch: string, what: string): string | null => {
-                    const pr = findOpenPrFn(branch);
+                    // #127: сбой чтения PR шов бросает. Неперехваченный, он ронял бы петлю
+                    // без пуша; принятый за «PR нет», давал бы промпт без замечаний — тот же
+                    // стоп, что у непрочитанных комментариев ниже.
+                    let pr: PullRequest | null;
+                    try {
+                        pr = findOpenPrFn(branch);
+                    } catch (e) {
+                        const why = String((e as Error).message).split('\n')[0];
+                        pushEventFn(
+                            `⛔ Ralph: фаза "${phase.milestone}" — шаг «${what}» не запущен: PR ветки не прочитался. ` +
+                                formatStopMessage({
+                                    reason: 'forge-unreadable',
+                                    diagnosis: `открытый PR ветки ${branch} не прочитался у форжа: ${why}`,
+                                    question:
+                                        'проверь доступ к форжу и перезапусти loop — сессия без списка замечаний приняла бы их отсутствие за «править нечего»',
+                                }),
+                            cfg,
+                            { logFn },
+                        );
+                        return null;
+                    }
                     if (!pr) return '';
                     let lastError = '';
                     for (let attempt = 1; attempt <= PR_COMMENTS_READ_ATTEMPTS; attempt++) {
@@ -7081,6 +7258,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     }
                     if (!prDone)
                         try {
+                            // #127: сбой чтения шов бросает — в `catch` ниже, стопом. Пока GitHub
+                            // отдавал его null, сбой форжа здесь читался «PR нет» и заводил второй.
                             const existingPr = findOpenPrFn(phase.branch);
                             if (existingPr) {
                                 logFn(
@@ -8996,6 +9175,26 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     saveStateFn(state);
                     break;
                 }
+                // #127: открытый PR ветки не прочитался — сбой форжа, а не «PR нет». Раньше
+                // GitHub отдавал его тем же null, и петля шла катч-оллом «PR не найден».
+                // Стоп с причиной: мерджить вслепую нельзя, а повтор той же сети — гадание.
+                if (gate === 'pr-unreadable') {
+                    const stopMsg =
+                        `⛔ Ralph: гейт фазы "${phase.milestone}" не прочитал PR у форжа — PR оставлен человеку. ` +
+                        formatStopMessage({
+                            reason: 'forge-unreadable',
+                            diagnosis:
+                                getLastForgeStop() ??
+                                'гейт вернул pr-unreadable без записи о причине (регресс проводки)',
+                            question:
+                                'проверь доступ к форжу и перезапусти loop — сдача не повторится, пойдёт сразу гейт',
+                        });
+                    pushEventFn(stopMsg, cfg, { logFn });
+                    state.gateHeals = 0;
+                    state.forgeHealedRunId = null;
+                    saveStateFn(state);
+                    break;
+                }
                 // #123: мердж вызван и не удался — отказ форжа по существу, транзиенты дольше
                 // предела повторов или нераспознанный отказ после своего повтора. Класс и
                 // строку ответа гейт знает точно, а пуш уходил катч-оллом «причина не
@@ -9835,6 +10034,73 @@ export function createOrchestrator(env: OrchestratorEnv) {
             );
         }
 
+        // Фаза 12 (#36): ядро из установки сверяется с `.ralph/core.lock` потребителя ДО
+        // лока и первой записи — в любом режиме, включая dry и миграцию: изменённое дерево
+        // ревизии не должно исполнить ни одного шага, а dry обязан отвечать «запустится ли»
+        // так же, как живой старт. Ядро без манифеста установки (клон канона) — исход
+        // `not-installed`, он идёт строкой в лог ниже, а не молчанием.
+        const coreCheck = checkCoreBeforeStart(
+            PRODUCT_DIR,
+            config.rootsResolved?.consumerRoot ?? null,
+            { env: process.env },
+        );
+
+        // Фаза 12 (#37): контракт совместимости пяти слоёв (`compat.ts`). Ожидаемое — из lock
+        // ядра из установки, у клона — версии самого ядра. Здесь сверяются слои, у которых
+        // источник версии известен до записи: launcher, ядро, конфиг, адаптеры. State
+        // лежит в дереве работы, которого ещё нет, и сверяется ниже — той же функцией и
+        // до первой сессии.
+        const compatLock = compatLockOf(coreCheck);
+        const compatObserved = {
+            launcher: observeLauncher(process.env),
+            core: observeCore(),
+            config: observeConfig(raw as Record<string, unknown>),
+            adapters: observeAdapters(),
+        };
+        // Ядро из установки: `roots.productRoot` обязан называть каталог, который исполняется,
+        // — иначе это вторая копия SHA, разошедшаяся с lock молча (ревью Фазы 12).
+        const productRootDrift =
+            coreCheck.status === 'ok' && config.rootsResolved
+                ? productRootMismatch(config.rootsResolved.productRoot, PRODUCT_DIR)
+                : null;
+        if (DOCTOR) {
+            // Тот же код, что у старта, — и до первой записи: doctor спрашивают как раз
+            // тогда, когда старт под вопросом, и он не вправе ничего трогать. Проверки старта
+            // вне слоёв (корень ядра, ревизия, settings дерева человека) — те же функции, что
+            // ниже отказывают старту: зелёный doctor обязан значить «старт их пройдёт».
+            const wt = resolveWorktreePath(config);
+            const roots0 = config.rootsResolved;
+            const startChecks = doctorStartChecks({
+                productRootDrift,
+                productRoot: PRODUCT_DIR,
+                humanRoot: roots0?.consumerRoot ?? null,
+                installed: coreCheck.status === 'ok',
+            });
+            process.exit(
+                runDoctorMode({
+                    flags: { ...flags },
+                    coreCheck,
+                    coreLine: describeStartCheck(coreCheck),
+                    observed: compatObserved,
+                    statePath: doctorStatePath({
+                        runtimeState: roots0 ? runtimePathsIn(roots0.runtimeDir).state : null,
+                        worktree: wt,
+                        worktreeReady: runnerWorktreeReady(wt),
+                        legacyState: RUNTIME.state,
+                        resolveFn: path.resolve,
+                    }),
+                    readFn: (p) => fs.readFileSync(p, 'utf8'),
+                    out: (line) => console.log(line),
+                    failFn: fail,
+                    startChecks,
+                }),
+            );
+        }
+        if (coreCheck.status === 'refused') fail(describeStartCheck(coreCheck));
+        if (productRootDrift) fail(`🔐 Старт отвергнут: ${productRootDrift}.`);
+        const compat = checkCompatibility({ lock: compatLock, observed: compatObserved });
+        if (!compat.ok) fail(describeCompat(compat));
+
         // Канон, задача 22: состояние уезжает из каталога ядра. Секции нет — остаётся старая
         // раскладка (умолчание, названное вслух), и переезжать нечего.
         const roots = config.rootsResolved ?? null;
@@ -9976,6 +10242,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // Режим в лог первой строкой: разбирая утренний ralph.log, надо видеть, в каком
         // профиле шёл прогон, не сверяясь с историей команд.
         log(`⚙️  Профиль: ${config.profileName}`);
+        log(describeStartCheck(coreCheck));
         if (roots) log(`🗂  Состояние экземпляра: ${roots.runtimeDir}`);
 
         // #44: рантайм кодера — до worktree и установки зависимостей (докблок
@@ -10020,6 +10287,22 @@ export function createOrchestrator(env: OrchestratorEnv) {
             process.exit(0);
         }
 
+        // #37: слой state — здесь, в дереве, где его прочтёт петля (cwd уже переведён), и до
+        // пробы барьера, preflight и первой сессии. --reset сюда не доходит намеренно: сброс
+        // и есть выход из несовместимого state, и запирать его той же проверкой нельзя.
+        // Отчёт полный — одной строкой лога все пять слоёв.
+        const stateCompat = checkCompatibility({
+            lock: compatLock,
+            observed: {
+                ...compatObserved,
+                state: observeState(
+                    inspectStateAt(path.resolve(RUNTIME.state), (p) => fs.readFileSync(p, 'utf8')),
+                ),
+            },
+        });
+        if (!stateCompat.ok) fail(describeCompat(stateCompat));
+        log(describeCompat(stateCompat));
+
         // Канон, задача 6: барьер обязан ДЕРЖАТЬ до первой сессии. Под bypassPermissions
         // `permissions.deny` не действует, и единственная защита — PreToolUse-хук дерева, в
         // котором пойдут сессии (cwd уже переведён в него выше). Проба подаёт хукам
@@ -10028,14 +10311,57 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // не меняет (исполняются только хуки, не сами вызовы), а ответ «барьер держит ли»
         // dry обязан давать тот же, что живой запуск.
         // Рантайм кодера тоже в пробе: сессия `codex exec` хуков `.claude/` не читает.
+        //
+        // Задача 101: при заданной раскладке корней проба идёт на settings, который раннер
+        // соберёт сессии сам (`session-settings.ts`): хуки — из каталога ЭТОГО ядра, контур
+        // и прочие настройки — из дерева человека, а не из дерева сессии, которое правит PR.
+        // Перед каждой сессией сборка и проба повторяются (`sessionSettingsArgs`). Без
+        // `roots` ядро — копия в дереве потребителя без своих хуков, и проба идёт по-старому,
+        // на настройках дерева сессии: так и сказано строкой в логе.
+        //
+        // #132: хуки из установки получают контракт запуска `RALPH_CORE_SHA` — ревизию этого
+        // ядра — в своей команде, и проба ниже идёт с ним же: хук, разошедшийся с ревизией,
+        // блокирует и безобидное, и старт отменяется. Ревизия не определилась у ядра из
+        // установки — стоп здесь, а не блок каждого вызова в первой сессии; у копии ядра в
+        // дереве потребителя — громкая работа без контракта (`coreShaPolicy`).
+        let coreSha = '';
+        if (roots) {
+            const policy = coreShaPolicy(resolveCoreSha(PRODUCT_DIR), coreCheck.status === 'ok');
+            if (policy.kind === 'contract') coreSha = policy.sha;
+            else if (policy.kind === 'refuse') fail(policy.reason);
+            else log(`⚠ ${policy.note}`);
+        }
+        const settingsRoots = roots
+            ? { productRoot: PRODUCT_DIR, humanRoot: roots.consumerRoot, sessionTree, coreSha }
+            : null;
+        let builtSettings: Record<string, unknown> | undefined;
+        if (settingsRoots) {
+            try {
+                builtSettings = buildSessionSettings({
+                    ...settingsRoots,
+                    humanSettings: readHumanSettings(settingsRoots.humanRoot),
+                });
+            } catch (error) {
+                fail(
+                    `Settings сессии не собран: ${error instanceof Error ? error.message : String(error)}. ` +
+                        'Без настроек дерева человека сессия потеряла бы хуки потребителя — старт отменён.',
+                );
+            }
+            log(describeSessionSettingsStart(settingsRoots));
+        } else {
+            skillGuardByEnv = true;
+            log(describeSessionSettingsStart(null));
+        }
         ensureGuardHolds(sessionTree, {
             failFn: fail,
             logFn: log,
+            settings: builtSettings,
             runtimes: {
                 coderRuntime: adapterSelection.coderRuntime,
                 modelRouting: config.modelRouting,
             },
         });
+        sessionSettingsRoots = settingsRoots;
 
         // Сироту от прошлого прогона (kill -9, OOM) подбираем ДО preflight: чаще всего
         // preflight и отвергает запуск (грязное дерево, active=false), а брошенный монитор
@@ -10140,6 +10466,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // контракт закреплён orchestrator.test.ts (REQUIRED_API).
     return {
         setConfigForTests,
+        sessionSettingsArgs,
+        withSkillGuard,
         resolveProfile,
         deepMerge,
         parseProfileFlag,

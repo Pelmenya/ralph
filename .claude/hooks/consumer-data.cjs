@@ -25,13 +25,16 @@
  * следующего вызова, а ship человека в `review.yaml` срабатывает только на мердже. Поэтому
  * в сессии петли guard не пускает к этому пути ни файловые инструменты записи, ни вызов
  * оболочки, который его пишет (`guard-rules.cjs`). Сессию петли он узнаёт по контракту
- * `RALPH_CORE_SHA` или, пока раннер контракт сессиям не передаёт, переходным признаком —
- * строкой `ralph.md` в промпте транскрипта (`core-revision.cjs`). Признак — догадка по
- * тексту: сессия петли, чей промпт строки не содержит, забора не получит. Это и сам забор
- * по тексту вызова, а не доказательство: путь, собранный в оболочке по частям, и скрипт,
- * пишущий файл без имени в командной строке, он не видит. Данные из закоммиченной
- * ревизии, которую петля не правит, — вместе с регистрацией хуков из установки ядра
- * (Фаза 12); до неё канал правки данных сужен, но не закрыт.
+ * `RALPH_CORE_SHA` или — хук дерева сессии, которому раннер контракт не даёт (#132), —
+ * переходным признаком: строкой `ralph.md` в промпте транскрипта (`core-revision.cjs`).
+ * Признак — догадка по тексту: сессия петли, чей промпт строки не содержит, забора не
+ * получит. Это и сам забор по тексту вызова, а не доказательство: путь, собранный в
+ * оболочке по частям, и скрипт, пишущий файл без имени в командной строке, он не видит.
+ * Закрывает канал раннер: хуки,
+ * которые он регистрирует сессии своим settings (`core/session-settings.ts`), читают
+ * данные по `RALPH_HOOKS_DATA` из дерева человека. Хуки, которые Claude Code берёт из
+ * `.claude/settings.json` самого дерева сессии, по-прежнему читают данные этого дерева —
+ * блокировать сильнее, чем хук раннера, они могут, ослабить его — нет.
  */
 const fs = require('node:fs');
 const path = require('node:path');
@@ -140,11 +143,30 @@ function parseConsumerData(text, file = DATA_PATH) {
     };
 }
 
-/** Данные проекта из `CLAUDE_PROJECT_DIR`; нет файла — пустые, битый — исключение. */
+/**
+ * Путь данных, названный раннером. Сессию петли раннер запускает с settings, собранным из
+ * доверенного дерева человека (`core/session-settings.ts`, Фаза 12), и команда хука несёт
+ * этот путь переменной: данные контура берутся из дерева человека, а не из дерева сессии,
+ * которое правит PR. Относительный путь — исключение: его база — каталог, где Claude Code
+ * запустил хук, то есть снова дерево сессии.
+ */
+const DATA_ENV = 'RALPH_HOOKS_DATA';
+
+/**
+ * Данные проекта: из `RALPH_HOOKS_DATA`, если раннер его назвал, иначе из
+ * `CLAUDE_PROJECT_DIR`; нет файла — пустые, битый — исключение.
+ */
 function loadConsumerData({ env = process.env, readFileFn = fs.readFileSync } = {}) {
-    const root = env.CLAUDE_PROJECT_DIR;
-    if (typeof root !== 'string' || root === '') return emptyData();
-    const file = path.join(root, DATA_PATH);
+    const named = env[DATA_ENV];
+    let file;
+    if (typeof named === 'string' && named !== '') {
+        if (!path.isAbsolute(named)) fail(named, `${DATA_ENV} — не абсолютный путь`);
+        file = named;
+    } else {
+        const root = env.CLAUDE_PROJECT_DIR;
+        if (typeof root !== 'string' || root === '') return emptyData();
+        file = path.join(root, DATA_PATH);
+    }
     let text;
     try {
         text = readFileFn(file, 'utf-8');
@@ -155,4 +177,4 @@ function loadConsumerData({ env = process.env, readFileFn = fs.readFileSync } = 
     return parseConsumerData(text, file);
 }
 
-module.exports = { DATA_PATH, emptyData, parseConsumerData, loadConsumerData };
+module.exports = { DATA_PATH, DATA_ENV, emptyData, parseConsumerData, loadConsumerData };

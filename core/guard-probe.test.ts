@@ -274,6 +274,25 @@ describe('ensureGuardHolds — старт отменяется до первой
         expect(c.failed[0]).toMatch(/coderRuntime = 'openai'[\s\S]*без Claude-хуков/);
     });
 
+    // Задача 101: собранный раннером settings — то, что прочтёт сессия; файл дерева не
+    // читается вовсе, иначе его правка в PR снова решала бы исход пробы.
+    it('settings передан — файл дерева не читается, проба идёт на переданном', () => {
+        const failed: string[] = [];
+        const reads: string[] = [];
+        ensureGuardHolds('/s', {
+            failFn: (m) => failed.push(m),
+            logFn: () => {},
+            readFileFn: (p) => {
+                reads.push(p);
+                return '{}';
+            },
+            runHookFn: () => ({ status: 0, stderr: '' }),
+            settings: { disableAllHooks: true },
+        });
+        expect(reads).toEqual([]);
+        expect(failed[0]).toMatch(/disableAllHooks/);
+    });
+
     it('битый JSON — fail', () => {
         const c = calls();
         ensureGuardHolds('/path/to/app', { ...c, readFileFn: () => '{' });

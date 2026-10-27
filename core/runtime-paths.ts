@@ -29,6 +29,7 @@ export type TRuntimePaths = {
     heartbeat: string;
     dryEvents: string;
     dryHeartbeat: string;
+    sessionSettings: string;
 };
 
 export function runtimePathsIn(runtimeDir: string): TRuntimePaths {
@@ -57,5 +58,9 @@ export function runtimePathsIn(runtimeDir: string): TRuntimePaths {
         heartbeat: path.join(runtimeDir, 'ralph.heartbeat'),
         dryEvents: path.join(runtimeDir, 'ralph.dry.events.jsonl'),
         dryHeartbeat: path.join(runtimeDir, 'ralph.dry.heartbeat'),
+        // Задача 101: settings сессии, собранный раннером из ядра и дерева человека. Он
+        // пересобирается перед каждой сессией, и лежит здесь, а не в дереве сессии: файл в
+        // дереве, которое правит PR, снова был бы настройкой, которую правит код под проверкой.
+        sessionSettings: path.join(runtimeDir, 'ralph.session-settings.json'),
     };
 }

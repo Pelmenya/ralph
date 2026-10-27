@@ -39,6 +39,11 @@ describe('forgeInArgv / forgeInShell — имя решает запускаем�
         [['ionice', '-c', '3', 'gh', 'pr', 'merge'], 'gh pr merge'],
         [['stdbuf', '-o', 'L', 'gh', 'pr', 'merge'], 'gh pr merge'],
         [['xargs', '-n', '1', 'gh', 'issue', 'close'], 'gh issue close'],
+        // Ревью: `-I` — самая частая опция xargs со значением; раздельная форма не команда.
+        [['xargs', '-I', '{}', 'gh', 'pr', 'merge', '{}'], 'gh pr merge'],
+        [['xargs', '-I{}', 'gh', 'pr', 'merge', '{}'], 'gh pr merge'],
+        [['xargs', '--replace={}', 'gh', 'pr', 'merge', '{}'], 'gh pr merge'],
+        [['xargs', '--process-slot-var', 'SLOT', 'gh', 'pr', 'merge'], 'gh pr merge'],
         [['nice', '-n', '5', 'timeout', '-k', '5', '30', 'gh', 'pr', 'merge'], 'gh pr merge'],
     ])('%j → %s', (argv, want) => {
         expect(forgeInArgv(argv)).toBe(want);

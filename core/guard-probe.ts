@@ -304,7 +304,9 @@ export function hooklessRoutes(sel: TRuntimeSelection): string[] {
 
 /**
  * Проверка перед первой сессией: не держит барьер — `failFn` с полным списком причин.
- * `projectDir` — дерево, в котором пойдут сессии: его настройки они и прочтут.
+ * `projectDir` — дерево, в котором пойдут сессии. Настройки — `settings`, собранный
+ * раннером (задача 101, `session-settings.ts`), а без него — `.claude/settings.json` этого
+ * дерева: их сессия и прочтёт.
  */
 export function ensureGuardHolds(
     projectDir: string,
@@ -314,24 +316,28 @@ export function ensureGuardHolds(
         readFileFn = (p: string) => fs.readFileSync(p, 'utf-8'),
         runHookFn = runHook,
         runtimes = {},
+        settings: given,
     }: {
         failFn: FailFn;
         logFn: LogFn;
         readFileFn?: (p: string) => string;
         runHookFn?: TRunHookFn;
         runtimes?: TRuntimeSelection;
+        settings?: unknown;
     },
 ): void {
     const settingsPath = path.join(projectDir, '.claude', 'settings.json');
-    let settings: unknown;
-    try {
-        settings = JSON.parse(readFileFn(settingsPath));
-    } catch (error) {
-        failFn(
-            `Проба барьера: ${settingsPath} не прочитан (${error instanceof Error ? error.message : String(error)}). ` +
-                'Без настроек хуков сессии под bypassPermissions идут без барьера — старт отменён.',
-        );
-        return;
+    let settings: unknown = given;
+    if (settings === undefined) {
+        try {
+            settings = JSON.parse(readFileFn(settingsPath));
+        } catch (error) {
+            failFn(
+                `Проба барьера: ${settingsPath} не прочитан (${error instanceof Error ? error.message : String(error)}). ` +
+                    'Без настроек хуков сессии под bypassPermissions идут без барьера — старт отменён.',
+            );
+            return;
+        }
     }
     const problems = [
         ...hooklessRoutes(runtimes).map(

@@ -478,6 +478,7 @@ describe('переезд состояния в runtimeDir (канон, зада�
             'monitorOut',
             'monitorPid',
             'requests',
+            'sessionSettings',
             'sessions',
             'stages',
             'state',

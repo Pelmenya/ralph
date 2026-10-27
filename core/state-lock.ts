@@ -96,7 +96,9 @@ export type TMergeInFlight = { milestone: string; pr: number; sha: string | null
 // --reset достаёт из него барьер деплоя, даже когда форма в целом не прошла проверку.
 export type TStateInspection =
     | { status: 'absent' }
-    | { status: 'ok'; state: RalphState; migrated: boolean }
+    // `foundVersion` — версия на ДИСКЕ (0 у файла без поля): `state.schemaVersion` после
+    // миграции уже текущая, а контракту совместимости (#37) нужна та, что была записана.
+    | { status: 'ok'; state: RalphState; migrated: boolean; foundVersion: number }
     | { status: 'old-schema'; raw: Record<string, unknown> }
     | { status: 'foreign-version'; found: number; raw: Record<string, unknown> }
     | { status: 'corrupt'; reason: string; raw: Record<string, unknown> | null }
@@ -244,7 +246,7 @@ export function inspectState(text: string): TStateInspection {
     } catch (e) {
         return bad((e as Error).message);
     }
-    return { status: 'ok', state, migrated: legacy };
+    return { status: 'ok', state, migrated: legacy, foundVersion: v ?? 0 };
 }
 
 /**

@@ -259,16 +259,26 @@ describe('findOpenPr — открытый PR ветки фазы', () => {
         expect(make().findOpenPr('feature/x', { ghJsonFn: (() => []) as never })).toBeNull();
     });
 
-    it('сбой чтения — null и лог, а не исключение наружу', () => {
+    // #127: null — ответ форжа «PR нет»; сбой, отданный тем же null, петля прочитала бы
+    // как «PR нет» и завела бы второй PR вместо стопа.
+    it('сбой чтения — бросок наружу, а не null', () => {
         const logFn = vi.fn();
-        expect(
+        expect(() =>
             make().findOpenPr('feature/x', {
                 ghJsonFn: (() => {
                     throw new Error('форж лёг');
                 }) as never,
                 logFn,
             }),
-        ).toBeNull();
-        expect(String(logFn.mock.calls[0][0])).toContain('Не смог получить PR');
+        ).toThrow('форж лёг');
+        // Бросок — единственный канал отказа: строка лога рядом была бы вторым сообщением
+        // об одном событии, а прежняя строка «PR нет» — неправдой.
+        expect(logFn).not.toHaveBeenCalled();
+    });
+
+    it('ответ не массив — бросок: мусор от форжа не «PR нет»', () => {
+        expect(() =>
+            make().findOpenPr('feature/x', { ghJsonFn: (() => ({ items: [] })) as never }),
+        ).toThrow(/не массив/);
     });
 });

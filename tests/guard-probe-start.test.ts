@@ -34,16 +34,44 @@ function startWith(options: LiveSandboxOptions) {
 }
 
 describe('проба барьера останавливает петлю до первой сессии', () => {
+    // Хук потребителя, который отказывает сам, — тоже часть собранного settings: Claude Code
+    // не послушал бы его кода 1, и проба это видит.
     it.each([
-        ['настроек хуков нет вовсе', null],
-        ['хук пропускает всё', 'node -e "process.exit(0)"'],
-        ['хук падает кодом 1 — Claude Code его не послушал бы', 'node -e "process.exit(1)"'],
-        ['файла хука нет', 'node "${CLAUDE_PROJECT_DIR}/.claude/hooks/missing.cjs"'],
+        [
+            'хук потребителя падает кодом 1 — Claude Code его не послушал бы',
+            'node -e "process.exit(1)"',
+        ],
+        ['файла хука потребителя нет', 'node "${CLAUDE_PROJECT_DIR}/.claude/hooks/missing.cjs"'],
     ] as const)('%s → старт отменён, кодер не запускался', (_why, guardHook) => {
         const run = startWith({ guardHook });
         expect(run.code, run.output).not.toBe(0);
         expect(run.output).toContain('Проба барьера');
         expect(run.coderRan, 'кодер-сессия успела стартовать на сломанном барьере').toBe(false);
+    });
+
+    // Раскладка с `roots`: барьер сессии — guard ЯДРА (задача 101). Сломан он — стоп; хук
+    // потребителя, который пропускает всё или отсутствует, барьер не снимает: он
+    // добавляется к хукам ядра, а не заменяет их. Guard продукта есть только у ядра —
+    // корня своего репозитория (`core-repo.ts`).
+    it.skipIf(!coreIsRepoRoot()).each([
+        ['guard ядра пропускает всё', 'process.exit(0);\n'],
+        ['guard ядра падает кодом 1', 'process.exit(1);\n'],
+        ['guard ядра нет', null],
+    ] as const)('%s → старт отменён, кодер не запускался', (_why, productGuard) => {
+        const run = startWith({ productGuard });
+        expect(run.code, run.output).not.toBe(0);
+        expect(run.output).toContain('Проба барьера');
+        expect(run.coderRan, 'кодер-сессия успела стартовать на сломанном барьере').toBe(false);
+    });
+
+    it.skipIf(!coreIsRepoRoot()).each([
+        ['настроек хуков у потребителя нет вовсе', null],
+        ['хук потребителя пропускает всё', 'node -e "process.exit(0)"'],
+    ] as const)('%s — барьер ядра держит, старт идёт', (_why, guardHook) => {
+        const run = startWith({ guardHook });
+        expect(run.code, run.output).toBe(0);
+        expect(run.output).toContain('Проба барьера пройдена');
+        expect(run.coderRan).toBe(true);
     });
 
     // Исправный барьер — guard продукта из `.claude/hooks/` канона; у копии ядра в дереве
