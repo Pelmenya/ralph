@@ -134,6 +134,9 @@ describe('createGithubTaskSource — раскладка функций форж�
             openIssues: spy('openIssues', []) as never,
             allOpenIssues: spy('allOpenIssues', []) as never,
             hasAnyIssues: spy('hasAnyIssues', true) as never,
+            // false, а не true: маппер обязан отдать ответ как есть, и подмена вида
+            // `?? true` видна только на закрытой вехе (#65).
+            milestoneOpen: spy('milestoneOpen', false) as never,
             milestoneLabels: spy('milestoneLabels', []) as never,
             prComments: spy('prComments', []) as never,
             commentOnPr: spy('commentOnPr') as never,
@@ -157,6 +160,7 @@ describe('createGithubTaskSource — раскладка функций форж�
         ts.listReadyIssues('MS');
         ts.listAllOpenIssues('MS');
         expect(ts.hasAnyIssues('MS')).toBe(true);
+        expect(ts.isMilestoneOpen('Бэклог')).toBe(false);
         ts.listMilestoneLabels('MS');
         ts.listPullRequestComments(42);
         ts.commentOnPullRequest(42, { body: 'текст' });
@@ -179,6 +183,7 @@ describe('createGithubTaskSource — раскладка функций форж�
             'openIssues:["MS"]',
             'allOpenIssues:["MS"]',
             'hasAnyIssues:["MS"]',
+            'milestoneOpen:["Бэклог"]',
             'milestoneLabels:["MS"]',
             'prComments:[42]',
             'commentOnPr:[42,{"body":"текст"}]',
@@ -209,6 +214,7 @@ describe('createGithubTaskSource — раскладка функций форж�
             openIssues: (() => []) as never,
             allOpenIssues: (() => []) as never,
             hasAnyIssues: (() => false) as never,
+            milestoneOpen: (() => true) as never,
             milestoneLabels: (() => []) as never,
             prComments: (() => []) as never,
             commentOnPr: (() => {}) as never,
@@ -300,6 +306,7 @@ function fakeRegistries(): AdapterRegistries {
         openIssues: () => [],
         allOpenIssues: () => [],
         hasAnyIssues: () => true,
+        milestoneOpen: () => true,
         milestoneLabels: () => [],
         prComments: () => [],
         commentOnPr: () => {},

@@ -25,17 +25,32 @@ export const BACKLOG_MILESTONE_CAP = 5;
 
 export type BacklogTarget = { milestone: string; index: number; count: number };
 
+// Статус вехи и её наполнение — РАЗНЫЕ вопросы, и #65 стоил того, что спрашивался только
+// второй. Разобранный том закрыт, все его карточки закрыты, открытых в нём ноль — и для
+// выбора по наполнению это «самая свободная веха списка»: находки ехали в закрытую веху,
+// где их не видит ни доска, ни ревизия бэклога, а лог бодро писал «адрес запрошен».
+// Чем аккуратнее разобран том, тем охотнее в него ложились новые карточки.
+//
+// Косвенный признак («ноль открытых и хоть одна закрытая — значит разобран») отвергнут:
+// он ломается на томе, где одну карточку закрыли руками до разбора, — такой том открыт и
+// годен. Поэтому статус спрашивается у форжа прямо (`isMilestoneOpen` шва), а `isOpenFn`
+// обязателен: канал адреса, забывший про статус, не соберётся.
 export function pickBacklogMilestone({
     candidates,
     currentPhase,
     cap,
     countOpenFn,
+    isOpenFn,
     from = 0,
 }: {
     candidates: readonly string[];
     currentPhase: string;
     cap: number;
     countOpenFn: (milestone: string) => number | null;
+    // null — «статус не прочитан». Кандидат пропускается, как при непрочитанном
+    // наполнении: принять неизвестный статус за открытый значило бы возвращать #65 на
+    // любом отказе чтения.
+    isOpenFn: (milestone: string) => boolean | null;
     from?: number;
 }): BacklogTarget | null {
     for (let i = Math.max(0, from); i < candidates.length; i += 1) {
@@ -43,6 +58,9 @@ export function pickBacklogMilestone({
         // Наполнение вехи текущей фазы не спрашиваем вовсе: она отвергнута правилом, а
         // лишний запрос к форжу оплачивался бы на каждой карточке круга.
         if (milestone === currentPhase) continue;
+        // Статус — ДО наполнения: у лестницы подсчёт заодно чистит протухшее, то есть
+        // мутирует карточки, и делать это в вехе, которая не кандидат, незачем.
+        if (isOpenFn(milestone) !== true) continue;
         // null — «не сосчитали». Ревью PR !6: считать его нулём нельзя двояко. У площадки
         // самая частая причина отказа чтения в том, что вехи там нет вовсе (резолв имени
         // бросает) — адресовать карточку в неё бессмысленно. А главное, потолок при таком
@@ -88,6 +106,7 @@ export function createBacklogAddress({
     cap,
     currentPhase,
     countOpenFn,
+    isOpenFn,
     logFn,
     what,
 }: {
@@ -95,6 +114,7 @@ export function createBacklogAddress({
     cap: number;
     currentPhase: string;
     countOpenFn: (milestone: string) => number | null;
+    isOpenFn: (milestone: string) => boolean | null;
     logFn: (line: string) => void;
     // Чьи это карточки — только для строки лога. Человеку нужно знать, ЧТО именно поехало
     // без адреса: у лестницы и у кодер-сессии разная цена потери.
@@ -106,7 +126,13 @@ export function createBacklogAddress({
     return () => {
         if (candidates.length === 0) return undefined;
         if (target === undefined) {
-            target = pickBacklogMilestone({ candidates, currentPhase, cap, countOpenFn });
+            target = pickBacklogMilestone({
+                candidates,
+                currentPhase,
+                cap,
+                countOpenFn,
+                isOpenFn,
+            });
         }
         // Веха добилась до потолка карточками ЭТОГО ЖЕ батча — дальше ищем с её места:
         // перебирать уже отвергнутых заново значит платить за их наполнение по второму разу.
@@ -116,19 +142,22 @@ export function createBacklogAddress({
                 currentPhase,
                 cap,
                 countOpenFn,
+                isOpenFn,
                 from: target.index + 1,
             });
         }
         if (!target) {
-            // Молчать нельзя: ключ конфига задан, а карточки едут без адреса. Причин три —
-            // вехи переполнены, единственная названная и есть текущая фаза, либо их
-            // наполнение не читается (чаще всего потому, что вехи на площадке нет). Все три
-            // чинит человек, но узнать о них ему неоткуда, кроме лога.
+            // Молчать нельзя: ключ конфига задан, а карточки едут без адреса. Причин четыре —
+            // вехи переполнены, закрыты (тома разобраны, пора завести следующий),
+            // единственная названная и есть текущая фаза, либо их статус или наполнение не
+            // читается (чаще всего потому, что вехи на площадке нет). Все четыре чинит
+            // человек, но узнать о них ему неоткуда, кроме лога.
             if (!logged) {
                 logged = true;
                 logFn(
                     `⚠ Накопительной вехи для ${what} не нашлось ` +
-                        `(кандидаты: ${candidates.join(', ')}; потолок ${String(cap)}) — ` +
+                        `(кандидаты: ${candidates.join(', ')}; потолок ${String(cap)}; ` +
+                        'закрытые и непрочитанные пропущены) — ' +
                         'карточки заводятся без адреса.',
                 );
             }

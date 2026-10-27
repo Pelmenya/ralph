@@ -4,8 +4,9 @@
 // поведение НЕ меняется, это извлечение, а не переписывание.
 //
 // Что собрано здесь:
-// - log/fail/setLogTarget — лог-строка с ISO-временем в консоль + append в файл лога
-//   (цель перенаправляется в worktree раннера ДО chdir, #SiaUB) и fail-closed стоп;
+// - log/fail/setLogTarget — лог-строка с ISO-временем в консоль + запись в три приёмника
+//   (лог, журнал событий, heartbeat — задача 95; цель перенаправляется в worktree раннера
+//   ДО chdir, #SiaUB) и fail-closed стоп; emitEvent — событие только для журнала;
 // - sh/shArgv — шелл-строка (только чтения, #133) и argv без шелла (мутации, #193/#252),
 //   обе под предохранителем #138;
 // - ghJson — gh-чтения с ретраями и backoff (M3);
@@ -26,6 +27,8 @@ import path from 'node:path';
 import { execSync, execFileSync } from 'node:child_process';
 import type { StdioOptions } from 'node:child_process';
 import { NO_SIDE_EFFECTS } from '../shared/side-effect-guard.ts';
+import { createLogSinks } from './event-journal.ts';
+import { DEFAULT_SESSION_LOGS_KEEP, pruneSessionLogs } from './observability.ts';
 import {
     ExecTimeoutError,
     execPolicy,
@@ -82,19 +85,42 @@ export function createExec(env: ExecEnv) {
     // репойнтит на АБСОЛЮТНЫЙ путь внутри worktree раннера ещё ДО chdir (#SiaUB): иначе
     // строки создания worktree (🌳/📦) ушли бы в ralph.log дерева человека, а монитор
     // тейлит только worktree-лог — ранние события на панели пропадали бы.
-    let logTarget = initialLogTarget;
+    //
+    // `null` — лог без файла, только консоль (#58). Нужен процессу-НАБЛЮДАТЕЛЮ: панель
+    // монитора спрашивает трекер через шов, а адаптер пишет свои предупреждения этим же
+    // log(). Файлом здесь был бы ralph.log рядом с ядром — а свежесть ralph.log и есть
+    // признак жизни петли: строка наблюдателя оживила бы мёртвый раннер.
+    let logTarget: string | null = initialLogTarget;
 
-    function setLogTarget(p: string): void {
+    function setLogTarget(p: string | null): void {
         logTarget = p;
     }
 
+    // Сколько выводов сессий держит каталог `sessions/` (задача 95). Ставит main() из
+    // конфига, как и цель лога: фабрика собирается раньше, чем конфиг прочитан.
+    let sessionLogsKeep = DEFAULT_SESSION_LOGS_KEEP;
+
+    function setSessionLogsKeep(n: number): void {
+        sessionLogsKeep = n;
+    }
+
+    // Задача 95: строка уходит в три независимых приёмника — лог, журнал событий и
+    // heartbeat (`event-journal.ts`). Прежний `catch {}` вокруг одной записи делал отказ
+    // диска невидимым, а deadman — слепым: свежесть одного файла и была признаком жизни.
+    const sinks = createLogSinks();
+
     function log(msg: string): void {
-        const line = `[${new Date().toISOString()}] ${msg}`;
-        console.log(line);
-        if (NO_SIDE_EFFECTS) return;
-        try {
-            fs.appendFileSync(logTarget, line + '\n');
-        } catch {}
+        const ts = new Date().toISOString();
+        console.log(`[${ts}] ${msg}`);
+        if (NO_SIDE_EFFECTS || logTarget === null) return;
+        sinks.write(logTarget, msg, ts);
+    }
+
+    // Событие только для журнала — без строки в человеческом логе (стоимость попытки).
+    // Тот же предохранитель, что у log(): в тестах и у наблюдателя журнала нет.
+    function emitEvent(kind: string, data: Record<string, unknown>): void {
+        if (NO_SIDE_EFFECTS || logTarget === null) return;
+        sinks.emit(logTarget, kind, data, new Date().toISOString());
     }
 
     function fail(msg: string): never {
@@ -208,10 +234,28 @@ export function createExec(env: ExecEnv) {
             guardSideEffect(`saveSessionOutput(${p})`);
             fs.mkdirSync(path.dirname(p), { recursive: true });
             fs.writeFileSync(p, data);
+            // Задача 95: ротация `sessions/` сразу после записи. Выводы раньше не убирались
+            // никогда, и каталог рос, пока сам не становился причиной полного диска. Только
+            // что записанный вывод — самый свежий и под ротацию не попадает. Отказ уборки —
+            // строка в лог, а не исключение: разбор падения важнее чистоты каталога.
+            const { errors } = pruneSessionLogs(path.dirname(p), sessionLogsKeep);
+            if (errors.length > 0) {
+                log(`⚠ Ротация логов сессий не удалась частично: ${errors.join('; ')}`);
+            }
         },
     ): void {
         writeFn(filePath, redactSecrets(output, secrets));
     }
 
-    return { log, fail, setLogTarget, sh, shArgv, ghJson, saveSessionOutput };
+    return {
+        log,
+        emitEvent,
+        fail,
+        setLogTarget,
+        setSessionLogsKeep,
+        sh,
+        shArgv,
+        ghJson,
+        saveSessionOutput,
+    };
 }

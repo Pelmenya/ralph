@@ -177,6 +177,28 @@ export function createGithubIssueCommands(env: GithubIssueCommandsEnv) {
         );
     }
 
+    // #65: открыта ли веха сама. `state=all`, а не `state=open`: «в списке открытых нет»
+    // неотличимо от «вехи нет вовсе», а ненайденная веха по контракту — отказ, не `false`.
+    // `--paginate`: дефолтная страница — 30 вех, и веха за её краем читалась бы
+    // отсутствующей. Fail-closed: ошибку gh не глушим.
+    function milestoneOpen(
+        title: string,
+        { ghJsonFn = ghJson }: { ghJsonFn?: GhJsonFn } = {},
+    ): boolean {
+        const all = ghJsonFn<unknown>(
+            'gh api --paginate "repos/{owner}/{repo}/milestones?state=all&per_page=100"',
+        );
+        if (!Array.isArray(all)) throw new Error('gh api milestones вернул не массив');
+        const ms = (all as Array<{ title?: unknown; state?: unknown }>).find(
+            (m) => m.title === title,
+        );
+        if (!ms) throw new Error(`milestone "${title}" не найден — статус вехи неизвестен`);
+        if (ms.state !== 'open' && ms.state !== 'closed') {
+            throw new Error(`milestone "${title}": неизвестный статус ${JSON.stringify(ms.state)}`);
+        }
+        return ms.state === 'open';
+    }
+
     // #37: метки всех карточек фазы — плоским списком имён. Читает `gh` ОДИН раз и
     // отдаёт то, что нужно вызывающему; раньше этот вызов стоял прямо в review.ts, то
     // есть ядро знало, чем отвечает форж. Fail-closed: ошибку не глушим — «меток не
@@ -204,8 +226,8 @@ export function createGithubIssueCommands(env: GithubIssueCommandsEnv) {
         number: number,
         { ghJsonFn = ghJson }: { ghJsonFn?: GhJsonFn } = {},
     ): IssueDetails {
-        const raw = ghJsonFn<{ title?: unknown; body?: unknown }>(
-            `gh issue view ${String(number)} --json number,title,body`,
+        const raw = ghJsonFn<{ title?: unknown; body?: unknown; state?: unknown }>(
+            `gh issue view ${String(number)} --json number,title,body,state`,
         );
         const title = String(raw.title ?? '').trim();
         if (!title) {
@@ -214,7 +236,16 @@ export function createGithubIssueCommands(env: GithubIssueCommandsEnv) {
                     'Сессия без тела задачи выдумает себе работу — это отказ, а не пустая карточка.',
             );
         }
-        return { number, title, body: String(raw.body ?? '') };
+        // #43: статус — для сверки перед взятием. Незнакомое значение — «не знаю», а не
+        // «закрыта»: поле просто не ставится.
+        const state = String(raw.state ?? '');
+        const open = state === 'OPEN' ? true : state === 'CLOSED' ? false : undefined;
+        return {
+            number,
+            title,
+            body: String(raw.body ?? ''),
+            ...(open === undefined ? {} : { open }),
+        };
     }
 
     // ── Намерения кодер-сессии: применение на стороне GitHub (#40) ───────────
@@ -347,6 +378,7 @@ export function createGithubIssueCommands(env: GithubIssueCommandsEnv) {
         openIssues,
         allOpenIssues,
         hasAnyIssues,
+        milestoneOpen,
         milestoneLabels,
         issueDetails,
         commentOnIssue,

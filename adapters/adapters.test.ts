@@ -38,6 +38,7 @@ function makeFakeTaskSource(seed: {
     prs?: Record<string, PullRequest | null>;
     merged?: Record<string, number | null>;
     allowlist?: string[];
+    closedMilestones?: string[];
 }): { adapter: TaskSourceAdapter; calls: string[] } {
     const calls: string[] = [];
     const allowlist = seed.allowlist ?? ['ok-author'];
@@ -77,6 +78,8 @@ function makeFakeTaskSource(seed: {
         // #39: у фейка «карточки любого статуса» = наличие ключа в seed.issues. Ключ
         // есть, а массив пуст — milestone заведён без задач, фаза не начата.
         hasAnyIssues: (milestone) => (seed.issues?.[milestone] ?? []).length > 0,
+        // #65: статус вехи. У фейка закрытые вехи названы в seed явно, прочие открыты.
+        isMilestoneOpen: (title) => !(seed.closedMilestones ?? []).includes(title),
         findOpenPullRequest: (branch) => seed.prs?.[branch] ?? null,
         // #49: голова PR. У фейка — фиксированная sha: интерфейс обязан быть реализуем
         // без форжа вообще, иначе он описывает `gh`, а не контракт.
@@ -242,6 +245,18 @@ describe('TaskSourceAdapter — контракт источника задач',
         const { adapter } = makeFakeTaskSource({ issues: { [milestone]: issues, Пустая: [] } });
         expect(adapter.hasAnyIssues(milestone)).toBe(true);
         expect(adapter.hasAnyIssues('Пустая')).toBe(false);
+    });
+
+    // #65: «ноль открытых» верно и для свежего тома, и для разобранного — интерфейс
+    // обязан различать их статусом вехи, а не наполнением.
+    it('isMilestoneOpen отличает закрытую веху от пустой открытой', () => {
+        const { adapter } = makeFakeTaskSource({
+            issues: { 'Том 1': [], 'Том 2': [] },
+            closedMilestones: ['Том 1'],
+        });
+        expect(adapter.listAllOpenIssues('Том 1')).toHaveLength(0);
+        expect(adapter.isMilestoneOpen('Том 1')).toBe(false);
+        expect(adapter.isMilestoneOpen('Том 2')).toBe(true);
     });
 
     // #40: интерфейс обязан выражать намерения сессии, не зная про форж.

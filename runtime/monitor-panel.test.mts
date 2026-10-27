@@ -10,11 +10,14 @@
 // файло-ориентированность и делает детект живучим при мёртвом раннере — он смотрит на
 // файл, а не на процесс. readLogTail проверяем на реальном временном файле.
 import { describe, it, expect, afterEach, afterAll, vi } from 'vitest';
+import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import {
     evalDeadman,
     readLogTail,
+    readHeartbeat,
+    withHeartbeat,
     shouldPushDeadman,
     deadmanPushMessage,
     dailyMetricLine,
@@ -23,11 +26,16 @@ import {
     metricDayKey,
     monitorLogPath,
     openPhasePRs,
+    issuesProgress,
+    panelTaskSource,
     resolveRuntimeDir,
+    type PanelTaskSource,
 } from './monitor-panel.mts';
+import type { Issue, PullRequest } from '../adapters/adapters.ts';
 // @ts-expect-error — JS-entry раннера без деклараций типов.
 import { pushEvent as pushEventReal } from '../ralph.js';
 import { DEFAULT_DEADMAN } from './deadman.ts';
+import { encodeHeartbeat, writeHeartbeat } from '../core/event-journal.ts';
 import { logLine as t, makeTmpLog } from '../tests/test-helpers.ts';
 
 // Резолвнутый конфиг (как отдаёт resolveProfile раннеру/монитору): пороги на верхнем
@@ -417,105 +425,174 @@ describe('maybePushDeadman — доставка через pushEvent() + дед�
     });
 });
 
-describe('openPhasePRs — поиск PR текущей фазы по ветке из конфига (#214)', () => {
-    it('находит PR по ветке фазы из конфига (строгий --head, ветка через shq)', () => {
-        const config = {
-            phases: [
-                { milestone: 'Фаза 1', branch: 'feature/phase-1' },
-                { milestone: 'Фаза 2', branch: 'feature/ralph-post-merge' },
-            ],
-        };
-        const state = { milestone: 'Фаза 2' };
-        const shFn = vi.fn((_cmd: string) =>
-            JSON.stringify([
-                { number: 123, title: 'PR Фаза 2', headRefName: 'feature/ralph-post-merge' },
-            ]),
+// #58: панель спрашивает трекер через шов. Фейк шва — объект с ДВУМЯ методами
+// (PanelTaskSource): тип не даст подсунуть панели ничего пишущего.
+function fakeSource(over: Partial<PanelTaskSource> = {}): PanelTaskSource {
+    return {
+        listAllOpenIssues: vi.fn((_m: string): Issue[] => []),
+        findOpenPullRequest: vi.fn((_b: string): PullRequest | null => null),
+        ...over,
+    };
+}
+
+describe('openPhasePRs — PR текущей фазы через шов по ветке из конфига (#214, #58)', () => {
+    const config = {
+        phases: [
+            { milestone: 'Фаза 1', branch: 'feature/phase-1' },
+            { milestone: 'Фаза 2', branch: 'feature/ralph-post-merge' },
+        ],
+    };
+
+    it('спрашивает шов ровно о ветке фазы из конфига и отдаёт найденный PR', () => {
+        const pr = { number: 123, labels: [{ name: 'blocked' }] };
+        const findOpenPullRequest = vi.fn((_b: string) => pr);
+        const result = openPhasePRs(
+            config,
+            { milestone: 'Фаза 2' },
+            fakeSource({ findOpenPullRequest }),
         );
-        const result = openPhasePRs(config, state, shFn);
-        expect(result).toEqual([
-            { number: 123, title: 'PR Фаза 2', headRefName: 'feature/ralph-post-merge' },
-        ]);
-        // #THS8X: строгий --head, а не --search "head:…" (тот ловил бы соседние ветки по
-        // префиксу); ветка — через shq (одинарные кавычки), а не двойные.
-        expect(shFn).toHaveBeenCalledWith(
-            expect.stringContaining("--head 'feature/ralph-post-merge'"),
-        );
-        expect(shFn).not.toHaveBeenCalledWith(expect.stringContaining('--search'));
+        expect(result).toEqual([pr]);
+        expect(findOpenPullRequest).toHaveBeenCalledWith('feature/ralph-post-merge');
     });
 
-    it('возвращает пустой массив когда PR нет, но ветка определена', () => {
-        const config = {
-            phases: [{ milestone: 'Фаза 1', branch: 'feature/phase-1' }],
-        };
-        const state = { milestone: 'Фаза 1' };
-        const shFn = vi.fn((_cmd: string) => '[]');
-        const result = openPhasePRs(config, state, shFn);
+    it('шов ответил null — «открытого PR нет», а не сбой', () => {
+        const result = openPhasePRs(config, { milestone: 'Фаза 1' }, fakeSource());
         expect(result).toEqual([]);
-        expect(shFn).toHaveBeenCalledWith(expect.stringContaining("--head 'feature/phase-1'"));
     });
 
-    it('возвращает { error: "no-branch" } когда фаза не найдена в конфиге', () => {
-        const config = {
-            phases: [{ milestone: 'Другая Фаза', branch: 'feature/other' }],
-        };
-        const state = { milestone: 'Фаза 1' };
-        const shFn = vi.fn();
-        const result = openPhasePRs(config, state, shFn);
+    it('шов бросил — SeamFailure с причиной, а не молчаливое «нет PR»', () => {
+        const source = fakeSource({
+            findOpenPullRequest: () => {
+                throw new Error('HTTP 503 от площадки\nстек…');
+            },
+        });
+        const result = openPhasePRs(config, { milestone: 'Фаза 1' }, source);
+        expect(result).toEqual({ error: 'seam-failed', reason: 'HTTP 503 от площадки' });
+    });
+
+    it('шов не собран — его отказ доходит до строки PR, шов не зовётся', () => {
+        const failure = { error: 'seam-failed' as const, reason: 'конфиг петли не прочитался' };
+        expect(openPhasePRs(config, { milestone: 'Фаза 1' }, failure)).toBe(failure);
+    });
+
+    it('фаза не найдена в конфиге → { error: "no-branch" }, шов не спрашивается', () => {
+        const source = fakeSource();
+        const result = openPhasePRs(
+            { phases: [{ milestone: 'Другая Фаза', branch: 'feature/other' }] },
+            { milestone: 'Фаза 1' },
+            source,
+        );
         expect(result).toEqual({ error: 'no-branch' });
-        expect(shFn).not.toHaveBeenCalled();
+        expect(source.findOpenPullRequest).not.toHaveBeenCalled();
     });
 
-    it('возвращает { error: "no-branch" } когда phases не массив', () => {
-        // Каст: тип ResolvedConfig.phases теперь PhaseConfig[] (#403-review), но проверяем
+    it('phases не массив → { error: "no-branch" }', () => {
+        // Каст: тип ResolvedConfig.phases — PhaseConfig[] (#403-review), но проверяем
         // именно рантайм-ветку Array.isArray — phases: null мимо типа, ради fail-closed.
-        const config = { phases: null } as unknown as Parameters<typeof openPhasePRs>[0];
-        const state = { milestone: 'Фаза 1' };
-        const shFn = vi.fn();
-        const result = openPhasePRs(config, state, shFn);
-        expect(result).toEqual({ error: 'no-branch' });
-        expect(shFn).not.toHaveBeenCalled();
+        const bad = { phases: null } as unknown as Parameters<typeof openPhasePRs>[0];
+        const source = fakeSource();
+        expect(openPhasePRs(bad, { milestone: 'Фаза 1' }, source)).toEqual({ error: 'no-branch' });
+        expect(source.findOpenPullRequest).not.toHaveBeenCalled();
     });
 
-    it('возвращает { error: "no-branch" } когда config null', () => {
-        const shFn = vi.fn();
-        const result = openPhasePRs(null, { milestone: 'Фаза 1' }, shFn);
-        expect(result).toEqual({ error: 'no-branch' });
-        expect(shFn).not.toHaveBeenCalled();
+    it('config null → { error: "no-branch" }', () => {
+        const source = fakeSource();
+        expect(openPhasePRs(null, { milestone: 'Фаза 1' }, source)).toEqual({ error: 'no-branch' });
+        expect(source.findOpenPullRequest).not.toHaveBeenCalled();
     });
 
     it('#THS8M: milestone === null (все фазы сданы) → { error: "all-done" }, не no-branch', () => {
-        const config = { phases: [{ milestone: 'Фаза 1', branch: 'feature/phase-1' }] };
-        const state = { milestone: null };
-        const shFn = vi.fn();
-        const result = openPhasePRs(config, state, shFn);
-        expect(result).toEqual({ error: 'all-done' });
-        expect(shFn).not.toHaveBeenCalled();
-    });
-
-    it('#THS8Z: gh упал (пустой вывод) → { error: "gh-failed" }, не молчаливое «нет PR»', () => {
-        const config = { phases: [{ milestone: 'Фаза 1', branch: 'feature/phase-1' }] };
-        const state = { milestone: 'Фаза 1' };
-        const shFn = vi.fn((_cmd: string) => '');
-        const result = openPhasePRs(config, state, shFn);
-        expect(result).toEqual({ error: 'gh-failed' });
-    });
-
-    it('#THS8Z: gh вернул мусор (невалидный JSON) → { error: "gh-failed" }', () => {
-        const config = { phases: [{ milestone: 'Фаза 1', branch: 'feature/phase-1' }] };
-        const state = { milestone: 'Фаза 1' };
-        const shFn = vi.fn((_cmd: string) => 'не-json');
-        const result = openPhasePRs(config, state, shFn);
-        expect(result).toEqual({ error: 'gh-failed' });
+        const source = fakeSource();
+        expect(openPhasePRs(config, { milestone: null }, source)).toEqual({ error: 'all-done' });
+        expect(source.findOpenPullRequest).not.toHaveBeenCalled();
     });
 
     it('не падает когда state пустой', () => {
-        const config = {
-            phases: [{ milestone: 'Фаза 1', branch: 'feature/phase-1' }],
-        };
-        const state = {};
-        const shFn = vi.fn((_cmd: string) => '[]');
-        const result = openPhasePRs(config, state, shFn);
-        expect(result).toEqual({ error: 'no-branch' });
+        expect(openPhasePRs(config, {}, fakeSource())).toEqual({ error: 'no-branch' });
+    });
+});
+
+describe('issuesProgress — сколько задач фазы осталось, через шов (#58)', () => {
+    it('считает открытые карточки вехи и выделяет blocked', () => {
+        const listAllOpenIssues = vi.fn((_m: string): Issue[] => [
+            { number: 1, title: 'a' },
+            { number: 2, title: 'b', labels: [{ name: 'blocked' }] },
+            { number: 3, title: 'c', labels: [{ name: 'complexity:low' }] },
+        ]);
+        const result = issuesProgress('Фаза 1', fakeSource({ listAllOpenIssues }));
+        expect(result).toEqual({ open: 3, blocked: 1 });
+        expect(listAllOpenIssues).toHaveBeenCalledWith('Фаза 1');
+    });
+
+    it('пустая веха — честный ноль, а не сбой', () => {
+        expect(issuesProgress('Фаза 1', fakeSource())).toEqual({ open: 0, blocked: 0 });
+    });
+
+    it('шов бросил — SeamFailure с причиной, отличимый от нуля', () => {
+        const source = fakeSource({
+            listAllOpenIssues: () => {
+                throw new Error('токен площадки отвергнут');
+            },
+        });
+        expect(issuesProgress('Фаза 1', source)).toEqual({
+            error: 'seam-failed',
+            reason: 'токен площадки отвергнут',
+        });
+    });
+
+    it('шов вернул не список — сбой, а не «0 открыто»', () => {
+        const source = fakeSource({ listAllOpenIssues: () => null as unknown as Issue[] });
+        expect(issuesProgress('Фаза 1', source)).toMatchObject({ error: 'seam-failed' });
+    });
+
+    it('фаза не определена — шов не спрашивается', () => {
+        const source = fakeSource();
+        expect(issuesProgress(null, source)).toEqual({ error: 'no-milestone' });
+        expect(source.listAllOpenIssues).not.toHaveBeenCalled();
+    });
+});
+
+describe('panelTaskSource — шов панели из того же config.adapters, что у петли (#58)', () => {
+    it('выбор реализации уходит сборщику из config.adapters', () => {
+        const built = fakeSource();
+        const buildFn = vi.fn((_a: unknown, _f: (m: string) => never) => built as never);
+        const result = panelTaskSource(
+            { adapters: { taskSource: 'sourcecraft' } },
+            buildFn as never,
+        );
+        expect(result).toBe(built);
+        expect(buildFn.mock.calls[0][0]).toEqual({ taskSource: 'sourcecraft' });
+    });
+
+    it('тот же выбор — шов из кеша (кеш резолва вех не теряется); другой — сборка заново', () => {
+        const buildFn = vi.fn((_a: unknown, _f: (m: string) => never) => fakeSource() as never);
+        const first = panelTaskSource(
+            { adapters: { taskSource: 'sourcecraft' } },
+            buildFn as never,
+        );
+        const again = panelTaskSource(
+            { adapters: { taskSource: 'sourcecraft' } },
+            buildFn as never,
+        );
+        expect(again).toBe(first);
+        expect(buildFn).toHaveBeenCalledTimes(1);
+        panelTaskSource({ adapters: { taskSource: 'github' } }, buildFn as never);
+        expect(buildFn).toHaveBeenCalledTimes(2);
+    });
+
+    it('конфиг не прочитался — отказ строкой, сборщик не зовётся', () => {
+        const buildFn = vi.fn();
+        expect(panelTaskSource(null, buildFn as never)).toMatchObject({ error: 'seam-failed' });
+        expect(buildFn).not.toHaveBeenCalled();
+    });
+
+    it('отказ выбора — строка панели, а не exit процесса: failFn бросает', () => {
+        const buildFn = (_a: unknown, failFn: (m: string) => never) =>
+            failFn("adapters.taskSource: реализация 'nope' не зарегистрирована.");
+        expect(panelTaskSource({ adapters: { taskSource: 'nope' } }, buildFn as never)).toEqual({
+            error: 'seam-failed',
+            reason: "adapters.taskSource: реализация 'nope' не зарегистрирована.",
+        });
     });
 });
 
@@ -686,5 +763,94 @@ describe('dailyMetricLine — проводка суточной строки п�
         expect(() => dailyMetricLine(null, DIR, readFn)(UNTIL)).toThrow(
             'конфиг петли не прочитался',
         );
+    });
+});
+
+// Задача 95, критерий «отказ записи лога не даёт ложного DEADMAN». Живой раннер, у которого
+// дописывание лога отказало (полный диск), продолжает писать heartbeat — детект обязан
+// судить по нему, и по режиму СТРОКИ heartbeat, а не по устаревшему хвосту.
+describe('withHeartbeat — отказ записи лога не даёт ложного DEADMAN (задача 95)', () => {
+    const NOW = 1000 * MIN;
+    // Лог замёрз 20 мин назад на хозяйственном шаге: строка старта сессии в него не легла.
+    const frozenLog = {
+        lines: [t('🌳 Worktree раннера переведён на свежий origin/main.'), ''],
+        lastMtime: NOW - 20 * MIN,
+    };
+
+    it('без heartbeat тот же лог даёт DEADMAN — это и есть ложная тревога', () => {
+        const r = evalDeadman({ now: NOW, ...frozenLog, config: CFG });
+        expect(r.silent).toBe(true);
+    });
+
+    it('свежий heartbeat со строкой сессии: не тишина, режим сессии', () => {
+        const hb = {
+            mtime: NOW - 20 * MIN + 1000,
+            record: { ts: '2026-10-27T00:00:01.000Z', msg: '▶ claude -p "…" --max-turns 200' },
+        };
+        const merged = withHeartbeat(frozenLog, hb);
+        expect(merged.lastMtime).toBe(hb.mtime);
+        const r = evalDeadman({ now: NOW, ...merged, config: CFG });
+        expect(r.activity).toBe('coder');
+        expect(r.silent).toBe(false);
+    });
+
+    it('heartbeat тоже замёрз дольше порога — DEADMAN остаётся (раннер действительно мёртв)', () => {
+        const hb = {
+            mtime: NOW - 3 * 60 * MIN,
+            record: { ts: 't', msg: '▶ claude -p "…"' },
+        };
+        const log = { lines: frozenLog.lines, lastMtime: NOW - 3 * 60 * MIN - 1000 };
+        const r = evalDeadman({ now: NOW, ...withHeartbeat(log, hb), config: CFG });
+        expect(r.silent).toBe(true);
+    });
+
+    it('heartbeat не новее лога — хвост и mtime лога как есть', () => {
+        const hb = { mtime: NOW - 30 * MIN, record: { ts: 't', msg: '▶ claude -p' } };
+        expect(withHeartbeat(frozenLog, hb)).toBe(frozenLog);
+        expect(withHeartbeat(frozenLog, null)).toBe(frozenLog);
+    });
+
+    it('строка heartbeat уже последняя в логе — дубля нет', () => {
+        const log = { lines: ['[ts1] ▶ claude -p', ''], lastMtime: NOW - 10 };
+        const merged = withHeartbeat(log, {
+            mtime: NOW,
+            record: { ts: 'ts1', msg: '▶ claude -p' },
+        });
+        expect(merged.lines).toBe(log.lines);
+        expect(merged.lastMtime).toBe(NOW);
+    });
+
+    it('многострочное сообщение уже в логе — дубля нет', () => {
+        const msg = '⛔ Ralph: стоп\nпричина: конфликт\nвопрос: влей main';
+        const log = { lines: [...`[ts1] ${msg}`.split('\n'), ''], lastMtime: NOW - 10 };
+        const merged = withHeartbeat(log, { mtime: NOW, record: { ts: 'ts1', msg } });
+        expect(merged.lines).toBe(log.lines);
+    });
+
+    it('многострочное сообщение, не легшее в лог, дописывается построчно', () => {
+        const msg = '⛔ Ralph: стоп\nпричина: диск';
+        const log = { lines: ['[ts0] ▶ claude -p', ''], lastMtime: NOW - 10 };
+        const merged = withHeartbeat(log, { mtime: NOW, record: { ts: 'ts1', msg } });
+        expect(merged.lines.slice(-2)).toEqual(['[ts1] ⛔ Ralph: стоп', 'причина: диск']);
+    });
+
+    it('лога нет вовсе, а heartbeat свежий — детект судит по heartbeat, а не «лог не найден»', () => {
+        const merged = withHeartbeat(
+            { lines: [], lastMtime: null },
+            { mtime: NOW - MIN, record: { ts: 't', msg: '🚦 Гейт мерджа' } },
+        );
+        const r = evalDeadman({ now: NOW, ...merged, config: CFG });
+        expect(r.reason).toBeNull();
+        expect(r.activity).toBe('gate');
+        expect(r.silent).toBe(false);
+    });
+
+    it('readHeartbeat читает настоящий файл, записанный приёмником раннера', () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-hb-'));
+        const p = path.join(dir, 'ralph.heartbeat');
+        writeHeartbeat(p, encodeHeartbeat('t9', '🔄 Итерация 3'));
+        const hb = readHeartbeat(p);
+        expect(hb?.record).toEqual({ ts: 't9', msg: '🔄 Итерация 3' });
+        expect(readHeartbeat(path.join(dir, 'нет'))).toBeNull();
     });
 });

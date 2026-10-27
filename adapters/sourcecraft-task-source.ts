@@ -106,6 +106,14 @@ function slugToNumber(slug: unknown): number {
     return n;
 }
 
+// #43: статус карточки (а с #65 и вехи) из ответа площадки — строкой либо объектом со
+// `slug`. Иная форма — `null`, то есть «не знаю»: сверка перед взятием тогда молчит, а не
+// выкидывает карточку из очереди по догадке, и адрес накопителя не берёт веху вслепую.
+function statusSlug(raw: unknown): string | null {
+    const slug = typeof raw === 'object' && raw !== null ? (raw as { slug?: unknown }).slug : raw;
+    return typeof slug === 'string' && slug.trim() !== '' ? slug.trim() : null;
+}
+
 // Метки ядро сравнивает по `name` ('blocked'/'hold'). У площадки есть и name, и slug,
 // причём slug теряет двоеточие (`complexity:low` → `complexitylow`) — поэтому берём
 // именно name, а slug оставляем как фолбэк для меток, заведённых без отображаемого имени.
@@ -386,6 +394,31 @@ export function createSourcecraftTaskSource(deps: SourcecraftTaskSourceDeps): Ta
             return listIssues(milestone, 'status in (open, in_progress, paused)');
         },
 
+        // #65: статус вехи — свежим листингом, мимо кеша резолва. Кеш помнит адреса вехи,
+        // и они не меняются; статус меняет сам раннер, закрывая веху сданной фазы, и
+        // запомненный ответ держал бы закрытый том открытым до конца прогона. Статус в
+        // листинге — строка (`open`/`closed`), той же формы, какой его пишет closeMilestone,
+        // но читается он `statusSlug`, как статус карточки: форма поля спекой не закреплена,
+        // и объект со `slug` иначе стал бы «[object Object]» — отказом на каждой вехе, то
+        // есть #65 не работал бы вовсе. Незнакомое значение — отказ, а не «открыта»:
+        // молчаливое `true` и есть #65.
+        isMilestoneOpen(title: string): boolean {
+            const found = pageThrough(`${base}/milestones`, 'items').find(
+                (m) => String((m as { name?: unknown }).name ?? '') === title,
+            ) as { status?: unknown } | undefined;
+            if (!found) {
+                throw new Error(`SourceCraft: milestone «${title}» не найден в ${org}/${repo}.`);
+            }
+            const status = statusSlug(found.status);
+            if (status !== 'open' && status !== 'closed') {
+                throw new Error(
+                    `SourceCraft: milestone «${title}» отдан с неизвестным статусом ` +
+                        `${JSON.stringify(found.status)} — открыт ли он, неизвестно.`,
+                );
+            }
+            return status === 'open';
+        },
+
         // #37: метки всех карточек фазы. Закрытые карточки характеризуют фазу не меньше
         // открытых — сложная задача, уже сделанная в этой фазе, зону риска не отменяет.
         // Запрос тот же, что у hasAnyIssues, и это ОДНА функция (`allStatusIssues`), а не
@@ -412,6 +445,7 @@ export function createSourcecraftTaskSource(deps: SourcecraftTaskSourceDeps): Ta
                 slug?: unknown;
                 title?: unknown;
                 description?: unknown;
+                status?: unknown;
             } | null;
             const title = String(raw?.title ?? '').trim();
             if (!title) {
@@ -420,10 +454,16 @@ export function createSourcecraftTaskSource(deps: SourcecraftTaskSourceDeps): Ta
                         'Сессия без тела задачи выдумает себе работу — это отказ, а не пустая карточка.',
                 );
             }
+            // #43: статус для сверки перед взятием. В очередь идёт ровно `open`, значит
+            // и «берётся» — ровно он: `paused` (замена `hold`) и закрытые не берутся.
+            // Форма поля в ответе спекой не закреплена, принимаются обе — строка и объект
+            // со `slug`; иная форма — «не знаю», поле не ставится.
+            const status = statusSlug(raw?.status);
             return {
                 number: slugToNumber(raw?.slug ?? number),
                 title,
                 body: String(raw?.description ?? ''),
+                ...(status === null ? {} : { open: status === 'open' }),
             };
         },
 

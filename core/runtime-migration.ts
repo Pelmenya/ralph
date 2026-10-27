@@ -27,8 +27,15 @@ export const MIGRATION_JOURNAL = '.migration.json';
 export const MIGRATED_MARKER = 'MIGRATED-TO';
 /** Суффикс переименованного оригинала — он же материал отката. */
 export const MIGRATED_SUFFIX = '.migrated';
-/** Файлы, растущие неограниченно: сверяются по размеру, а не по содержимому (см. ниже). */
-const LOGS: ReadonlySet<string> = new Set(['ralph.log', 'ralph.dry.log', 'monitor.out']);
+/** Файлы, растущие неограниченно: сверяются по размеру, а не по содержимому (см. ниже).
+ *  Журнал событий растёт вместе со своим логом (строка на строку), поэтому он здесь же. */
+const LOGS: ReadonlySet<string> = new Set([
+    'ralph.log',
+    'ralph.dry.log',
+    'monitor.out',
+    'ralph.events.jsonl',
+    'ralph.dry.events.jsonl',
+]);
 
 export type TMigrationFile = { name: string; from: string; to: string };
 export type TMigrationPlan = { from: string; to: string; files: TMigrationFile[] };

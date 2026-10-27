@@ -25,6 +25,19 @@ const counter = (counts: Record<string, number | null>) => {
     return { asked, countOpenFn };
 };
 
+// #65: статус вехи — отдельный журнал вызовов. По умолчанию все вехи открыты: тесты
+// арифметики потолка про статус не говорят, и закрытость в них — шум. Не названная в
+// `statuses` веха — открыта, заданный null — «статус не прочитан», как у счётчика.
+const opener = (statuses: Record<string, boolean | null> = {}) => {
+    const askedOpen: string[] = [];
+    const isOpenFn = (m: string): boolean | null => {
+        askedOpen.push(m);
+        return m in statuses ? statuses[m] : true;
+    };
+    return { askedOpen, isOpenFn };
+};
+const allOpen = (m: string): boolean | null => (void m, true);
+
 describe('pickBacklogMilestone — адрес накопительной вехи для карточек лестницы', () => {
     it('берёт первого кандидата, у которого есть место', () => {
         const { countOpenFn } = counter({ 'Бэклог 1': 2 });
@@ -34,6 +47,7 @@ describe('pickBacklogMilestone — адрес накопительной вех�
                 currentPhase: 'Фаза 7',
                 cap: 5,
                 countOpenFn,
+                isOpenFn: allOpen,
             }),
         ).toEqual({ milestone: 'Бэклог 1', index: 0, count: 2 });
     });
@@ -48,6 +62,7 @@ describe('pickBacklogMilestone — адрес накопительной вех�
                 currentPhase: 'Бэклог 1',
                 cap: 5,
                 countOpenFn,
+                isOpenFn: allOpen,
             }),
         ).toEqual({ milestone: 'Бэклог 2', index: 1, count: 0 });
         expect(asked).toEqual(['Бэклог 2']);
@@ -61,6 +76,7 @@ describe('pickBacklogMilestone — адрес накопительной вех�
                 currentPhase: 'Фаза 7',
                 cap: 5,
                 countOpenFn,
+                isOpenFn: allOpen,
             }),
         ).toEqual({ milestone: 'Бэклог 2', index: 1, count: 1 });
     });
@@ -77,6 +93,7 @@ describe('pickBacklogMilestone — адрес накопительной вех�
                 currentPhase: 'Фаза 7',
                 cap: 5,
                 countOpenFn,
+                isOpenFn: allOpen,
             }),
         ).toEqual({ milestone: 'Бэклог 2', index: 1, count: 1 });
     });
@@ -89,6 +106,7 @@ describe('pickBacklogMilestone — адрес накопительной вех�
                 currentPhase: 'Фаза 7',
                 cap: 5,
                 countOpenFn,
+                isOpenFn: allOpen,
             }),
         ).toBeNull();
     });
@@ -101,6 +119,7 @@ describe('pickBacklogMilestone — адрес накопительной вех�
                 currentPhase: 'Бэклог 2',
                 cap: 5,
                 countOpenFn,
+                isOpenFn: allOpen,
             }),
         ).toBeNull();
         expect(
@@ -109,6 +128,7 @@ describe('pickBacklogMilestone — адрес накопительной вех�
                 currentPhase: 'Фаза 7',
                 cap: 5,
                 countOpenFn,
+                isOpenFn: allOpen,
             }),
         ).toBeNull();
     });
@@ -121,10 +141,77 @@ describe('pickBacklogMilestone — адрес накопительной вех�
                 currentPhase: 'Фаза 7',
                 cap: 5,
                 countOpenFn,
+                isOpenFn: allOpen,
                 from: 1,
             }),
         ).toEqual({ milestone: 'Бэклог 2', index: 1, count: 3 });
         expect(asked).toEqual(['Бэклог 2']);
+    });
+
+    // #65, поймано живьём: разобранный том закрыт, все его карточки закрыты, счётчик
+    // открытых даёт ноль — и для выбора по одному наполнению это «самая свободная веха».
+    // Находки уезжали в закрытую веху, где их не видит ни доска, ни ревизия бэклога.
+    it('первый том ЗАКРЫТ и пуст, второй открыт → находка едет во второй', () => {
+        const { asked, countOpenFn } = counter({ 'Бэклог 1': 0, 'Бэклог 2': 2 });
+        const { askedOpen, isOpenFn } = opener({ 'Бэклог 1': false });
+        expect(
+            pickBacklogMilestone({
+                candidates: ['Бэклог 1', 'Бэклог 2'],
+                currentPhase: 'Фаза 7',
+                cap: 5,
+                countOpenFn,
+                isOpenFn,
+            }),
+        ).toEqual({ milestone: 'Бэклог 2', index: 1, count: 2 });
+        expect(askedOpen).toEqual(['Бэклог 1', 'Бэклог 2']);
+        // Наполнение закрытой вехи не спрашивается: у лестницы подсчёт заодно чистит
+        // протухшее, то есть мутирует карточки, — в вехе, которая не кандидат, незачем.
+        expect(asked).toEqual(['Бэклог 2']);
+    });
+
+    it('статус вехи не прочитан → кандидат пропускается, а не считается открытым', () => {
+        // Тот же довод, что у null наполнения: «не знаем» не равно «можно». Принять
+        // непрочитанный статус за открытый значило бы вернуть ровно этот дефект на любом
+        // отказе чтения.
+        const { asked, countOpenFn } = counter({ 'Бэклог 1': 0, 'Бэклог 2': 1 });
+        const { isOpenFn } = opener({ 'Бэклог 1': null });
+        expect(
+            pickBacklogMilestone({
+                candidates: ['Бэклог 1', 'Бэклог 2'],
+                currentPhase: 'Фаза 7',
+                cap: 5,
+                countOpenFn,
+                isOpenFn,
+            }),
+        ).toEqual({ milestone: 'Бэклог 2', index: 1, count: 1 });
+        expect(asked).toEqual(['Бэклог 2']);
+    });
+
+    it('все кандидаты закрыты → null, карточка поедет без адреса', () => {
+        const { countOpenFn } = counter({});
+        const { isOpenFn } = opener({ 'Бэклог 1': false, 'Бэклог 2': false });
+        expect(
+            pickBacklogMilestone({
+                candidates: ['Бэклог 1', 'Бэклог 2'],
+                currentPhase: 'Фаза 7',
+                cap: 5,
+                countOpenFn,
+                isOpenFn,
+            }),
+        ).toBeNull();
+    });
+
+    it('статус вехи текущей фазы тоже не спрашивается — она отвергнута правилом', () => {
+        const { countOpenFn } = counter({});
+        const { askedOpen, isOpenFn } = opener();
+        pickBacklogMilestone({
+            candidates: ['Бэклог 1', 'Бэклог 2'],
+            currentPhase: 'Бэклог 1',
+            cap: 5,
+            countOpenFn,
+            isOpenFn,
+        });
+        expect(askedOpen).toEqual(['Бэклог 2']);
     });
 });
 
@@ -159,17 +246,20 @@ describe('createBacklogAddress — память о наполнении внут
         cap: number;
         currentPhase: string;
         counts: Record<string, number | null>;
+        statuses: Record<string, boolean | null>;
         what: string;
     }>;
 
     const make = (over: Over = {}) => {
         const logs: string[] = [];
         const { asked, countOpenFn } = counter(over.counts ?? {});
+        const { isOpenFn } = opener(over.statuses);
         const address = createBacklogAddress({
             candidates: over.candidates ?? ['Бэклог 1'],
             cap: over.cap ?? 5,
             currentPhase: over.currentPhase ?? 'Фаза 7',
             countOpenFn,
+            isOpenFn,
             logFn: (l: string) => logs.push(l),
             what: over.what ?? 'карточек чего-то',
         });
@@ -250,5 +340,19 @@ describe('createBacklogAddress — память о наполнении внут
         const { address, logs } = make({ counts: { 'Бэклог 1': null } });
         expect(address()).toBeUndefined();
         expect(logs).toHaveLength(1);
+    });
+
+    // #65: и через фабрику — именно она стоит у обоих каналов. Строка лога называет
+    // закрытость среди причин: иначе человек, видящий «вехи не нашлось» при пустом
+    // накопителе, искал бы переполнение, которого нет.
+    it('единственный кандидат закрыт → без адреса, и строка лога называет закрытость', () => {
+        const { address, logs, asked } = make({
+            counts: { 'Бэклог 1': 0 },
+            statuses: { 'Бэклог 1': false },
+        });
+        expect(address()).toBeUndefined();
+        expect(asked).toEqual([]);
+        expect(logs).toHaveLength(1);
+        expect(logs[0]).toMatch(/закрыт/);
     });
 });

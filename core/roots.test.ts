@@ -466,7 +466,12 @@ describe('переезд состояния в runtimeDir (канон, зада�
         // остаётся в каталоге ядра, а узнаётся это на первом же грязном подмодуле.
         const { runtimePathsIn } = await import('./runtime-paths.ts');
         expect(Object.keys(runtimePathsIn('/path/to/runtime')).sort()).toEqual([
+            'dryEvents',
+            'dryHeartbeat',
             'dryLog',
+            'events',
+            'heartbeat',
+            'keys',
             'lock',
             'lockMarker',
             'log',

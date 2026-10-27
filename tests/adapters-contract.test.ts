@@ -141,6 +141,9 @@ const MILESTONE = 'Фаза X';
 // фикстура, а не несуществующее имя: несуществующий milestone — другой случай (отказ),
 // и подменять им пустой значило бы проверять не то свойство.
 const EMPTY_MILESTONE = 'Фаза Пустая';
+// #65: веха ЗАКРЫТА — разобранный том. По открытым карточкам она неотличима от
+// EMPTY_MILESTONE (ноль в обеих), и ровно это смешение уводило находки в закрытую веху.
+const CLOSED_MILESTONE = 'Том Разобранный';
 const BRANCH = 'feature/x';
 
 const ISSUES: Issue[] = [
@@ -184,6 +187,7 @@ function buildFakeTaskSource(): { adapter: TaskSourceAdapter; calls: string[] } 
     // флейворов (__setActualHead/__setHeadThrows).
     let actualHead = SHA;
     let headThrows = false;
+    let milestonesThrow = false;
     const adapter: TaskSourceAdapter = {
         checkAuth: () => {
             if (authFails) throw new Error('форж отверг авторизацию');
@@ -201,6 +205,13 @@ function buildFakeTaskSource(): { adapter: TaskSourceAdapter; calls: string[] } 
         hasAnyIssues: (milestone) => {
             if (hasAnyThrows) throw new Error('gh issue list упал');
             return milestone === MILESTONE;
+        },
+        // #65: статус вехи — свой флаг отказа, по той же причине, что у hasAnyIssues.
+        isMilestoneOpen: (title) => {
+            if (milestonesThrow) throw new Error('форж не отдал вехи');
+            if (title === CLOSED_MILESTONE) return false;
+            if (title === MILESTONE || title === EMPTY_MILESTONE) return true;
+            throw new Error(`веха «${title}» не найдена`);
         },
         // #37: метки карточек фазы плоским списком. Отказ — тем же флагом чтения, что и
         // у соседних выборок: транспорт у них общий и у фейка, и у боевых реализаций.
@@ -294,6 +305,9 @@ function buildFakeTaskSource(): { adapter: TaskSourceAdapter; calls: string[] } 
         v: boolean,
     ) => {
         hasAnyThrows = v;
+    };
+    (adapter as unknown as TaskSourceHook).__setMilestonesThrow = (v: boolean) => {
+        milestonesThrow = v;
     };
     (adapter as unknown as { __setMutationFails: (v: boolean) => void }).__setMutationFails = (
         v: boolean,
@@ -411,6 +425,9 @@ function buildRealTaskSource(): { adapter: TaskSourceAdapter; gateEnv: GateEnv }
         // поэтому «боевой» флейвор здесь честно боевой, а не фейк.
         hasAnyIssues: (milestone: string): boolean =>
             ralph.hasAnyIssues(milestone, { ghJsonFn: (cmd: string) => ghJsonImpl(cmd) }),
+        // #65: статус вехи — боевая функция с DI-хуком на чтение gh.
+        milestoneOpen: (title: string): boolean =>
+            ralph.milestoneOpen(title, { ghJsonFn: (cmd: string) => ghJsonImpl(cmd) }),
         // #37: тоже боевая функция с DI-хуком на чтение gh.
         milestoneLabels: (milestone: string): string[] =>
             ralph.milestoneLabels(milestone, { ghJsonFn: (cmd: string) => ghJsonImpl(cmd) }),
@@ -541,6 +558,8 @@ type TaskSourceHook = {
     // реализаций комментарии живут своим маршрутом, и связать их отказ с очередью карточек
     // значило бы проверять не тот метод.
     __setCommentsThrow?: (v: boolean) => void;
+    // #65: форж не отдал список вех — для реализаций, читающих его своим маршрутом.
+    __setMilestonesThrow?: (v: boolean) => void;
 };
 
 function registerTaskSourceContract(
@@ -751,6 +770,44 @@ function registerTaskSourceContract(
             // Молчаливое false здесь означало бы «фаза не начата» на сетевом чихе —
             // петля встала бы с диагнозом «поправь конфиг», хотя конфиг верен.
             expect(() => adapter.hasAnyIssues(MILESTONE)).toThrow();
+        });
+
+        // #65: статус вехи САМОЙ, а не её карточек. Пустая открытая и закрытая веха по
+        // наполнению неразличимы — адрес накопителя путал их и клал находки в закрытую.
+        // GitHub-флейвор отвечает списком вех `state=all`: закрытая обязана в нём быть.
+        const ghMilestones = (cmd: string): unknown => {
+            if (!cmd.includes('milestones?state=all')) throw new Error(`unexpected: ${cmd}`);
+            return [
+                { title: MILESTONE, state: 'open' },
+                { title: EMPTY_MILESTONE, state: 'open' },
+                { title: CLOSED_MILESTONE, state: 'closed' },
+            ];
+        };
+
+        it('isMilestoneOpen: пустая открытая веха — true, закрытая — false', () => {
+            const { adapter } = build();
+            (adapter as unknown as TaskSourceHook).__setGhJson?.(ghMilestones);
+            expect(adapter.isMilestoneOpen(MILESTONE)).toBe(true);
+            expect(adapter.isMilestoneOpen(EMPTY_MILESTONE)).toBe(true);
+            expect(adapter.isMilestoneOpen(CLOSED_MILESTONE)).toBe(false);
+        });
+
+        it('НЕГАТИВНЫЙ: isMilestoneOpen на ненайденной вехе бросает, а не отвечает', () => {
+            // И `true`, и `false` здесь были бы выдумкой: первое возвращает #65, второе
+            // выдаёт опечатку в конфиге за разобранный том.
+            const { adapter } = build();
+            (adapter as unknown as TaskSourceHook).__setGhJson?.(ghMilestones);
+            expect(() => adapter.isMilestoneOpen('Такой вехи нет')).toThrow();
+        });
+
+        it('НЕГАТИВНЫЙ: isMilestoneOpen fail-closed — бросает при сбое форжа', () => {
+            const { adapter } = build();
+            const hook = adapter as unknown as TaskSourceHook;
+            hook.__setMilestonesThrow?.(true);
+            hook.__setGhJson?.(() => {
+                throw new Error('gh api упал');
+            });
+            expect(() => adapter.isMilestoneOpen(MILESTONE)).toThrow();
         });
 
         // ── Намерения кодер-сессии (#40) ────────────────────────────────────
@@ -1008,6 +1065,7 @@ function buildSourcecraftTaskSource(): { adapter: TaskSourceAdapter; calls: stri
     let authFails = false;
     let mutationFails = false;
     let commentsThrow = false;
+    let milestonesThrow = false;
     // Голова PR на стороне форжа. По умолчанию совпадает с той, что проверил гейт, —
     // иначе штатный мердж-тест ловил бы отказ, которого в сценарии нет.
     let actualHead = SHA;
@@ -1054,15 +1112,28 @@ function buildSourcecraftTaskSource(): { adapter: TaskSourceAdapter; calls: stri
             return { slug: '101' };
         }
         if (path.includes('/milestones?')) {
+            if (milestonesThrow) throw new Error('SourceCraft: вехи не отдались');
             return {
                 items: [
                     // `id` — не для полноты: тело создания карточки адресует веху именно
                     // им (#16), тогда как фильтр очереди — slug'ом. Одна фикстура на два
                     // разных адреса той же сущности.
-                    { name: MILESTONE, slug: MILESTONE_SLUG, id: 'ms-x' },
+                    { name: MILESTONE, slug: MILESTONE_SLUG, id: 'ms-x', status: 'open' },
                     // #39: заведён, но без единой карточки — на его slug выборка выше
                     // отдаёт пусто (фильтр не совпадает с MILESTONE_SLUG).
-                    { name: EMPTY_MILESTONE, slug: 'faza-pustaya', id: 'ms-empty' },
+                    {
+                        name: EMPTY_MILESTONE,
+                        slug: 'faza-pustaya',
+                        id: 'ms-empty',
+                        status: 'open',
+                    },
+                    // #65: статус — строкой, той же, какой его пишет closeMilestone.
+                    {
+                        name: CLOSED_MILESTONE,
+                        slug: 'tom-razobrannyj',
+                        id: 'ms-closed',
+                        status: 'closed',
+                    },
                 ],
             };
         }
@@ -1134,6 +1205,9 @@ function buildSourcecraftTaskSource(): { adapter: TaskSourceAdapter; calls: stri
     };
     hook.__setCommentsThrow = (v) => {
         commentsThrow = v;
+    };
+    hook.__setMilestonesThrow = (v) => {
+        milestonesThrow = v;
     };
     hook.__calls = () => calls;
     // `mergedPulls` остаётся пустым: контракт проверяет isPhaseMerged/mergedPullRequestNumber

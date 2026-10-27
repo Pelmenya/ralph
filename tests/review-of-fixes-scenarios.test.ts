@@ -120,6 +120,11 @@ function runPhase({
     // шов, которым петля считает очередь фазы: потолок вехи считается её содержимым, а не
     // числом, которое тест мог бы подсунуть мимо форжа.
     backlogCounts = {} as Record<string, number>,
+    // #65: ЗАКРЫТЫЕ вехи — разобранные тома. Прочие открыты: тесты потолка про статус не
+    // говорят. Через шов статуса, а не наполнения: закрытый том пуст так же, как свежий.
+    closedMilestones = [] as string[],
+    // #65: форж не отдаёт статус вех вовсе — предохранитель fail-open обязан пережить и это.
+    milestoneStatusThrows = false,
     // #18: карточки, которые УЖЕ лежат в вехе, целиком — с заголовком и датой. Счётчиком
     // (`backlogCounts`) срок годности не проверить: он синтезирует безымянные карточки,
     // а чистка отличает свою косметику от чужой карточки именно по заголовку.
@@ -203,6 +208,10 @@ function runPhase({
                 issueComments.push({ issue, body });
             },
             hasAnyIssuesFn: () => true,
+            milestoneOpenFn: (title: string) => {
+                if (milestoneStatusThrows) throw new Error('форж не отдал вехи');
+                return !closedMilestones.includes(title);
+            },
             findOpenPrFn: () => ({ number: PR, labels: [] }),
             createPrFn: () => PR,
             phasePrBodyFn: () => 'тело PR',
@@ -776,6 +785,42 @@ describe('крит. 2: поток новых minor/nit не продлевает
         });
 
         expect(s.issues.map((i) => i.milestone)).toEqual(['Бэклог 2']);
+    });
+
+    // #65, поймано живьём: разобранный том закрыт, его карточки закрыты, наполнение ноль —
+    // и по одному наполнению он «самая свободная веха». Четыре находки уехали в закрытую
+    // веху, где их не видит ни доска, ни ревизия бэклога, а лог писал «адрес запрошен».
+    it('первый том ЗАКРЫТ и пуст, второй открыт — находка едет во второй', () => {
+        const s = runPhase({
+            backlogCounts: { 'Бэклог 1': 0, 'Бэклог 2': 2 },
+            closedMilestones: ['Бэклог 1'],
+            passes: [{ findings: [nit('пробел', 1), nit('запятая', 2)] }],
+            config: cfg({
+                review: {
+                    ...cfg().review,
+                    backlogMilestone: ['Бэклог 1', 'Бэклог 2'],
+                },
+            }),
+        });
+
+        expect(s.issues.map((i) => i.milestone)).toEqual(['Бэклог 2', 'Бэклог 2']);
+    });
+
+    // Предохранитель «fail-open при отказе форжа» сохраняется и для статуса: не прочитали
+    // — кандидат пропущен (не принят за открытый), карточка всё равно заводится, сдача
+    // фазы не рвётся.
+    it('статус вехи не читается — карточка заводится без адреса, сдача не рвётся', () => {
+        const s = runPhase({
+            milestoneStatusThrows: true,
+            passes: [{ findings: [nit('пробел', 1)] }],
+            config: cfg({
+                review: { ...cfg().review, backlogMilestone: 'Бэклог 1' },
+            }),
+        });
+
+        expect(s.issues).toHaveLength(1);
+        expect(s.issues[0].milestone).toBeUndefined();
+        expect(s.logs.join('\n')).toMatch(/Накопительной вехи для карточек ревью правок/);
     });
 
     it('вехи кончились — карточка всё равно заводится, без адреса и с записью в лог', () => {

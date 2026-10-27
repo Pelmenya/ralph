@@ -24,6 +24,11 @@ export type TRuntimePaths = {
     requests: string;
     stopRequest: string;
     stages: string;
+    keys: string;
+    events: string;
+    heartbeat: string;
+    dryEvents: string;
+    dryHeartbeat: string;
 };
 
 export function runtimePathsIn(runtimeDir: string): TRuntimePaths {
@@ -41,5 +46,16 @@ export function runtimePathsIn(runtimeDir: string): TRuntimePaths {
         stopRequest: path.join(runtimeDir, 'ralph.stop'),
         // #92: журнал этапов текущей кодер-попытки — по нему рестарт продолжает с этапа.
         stages: path.join(runtimeDir, 'ralph.stages.jsonl'),
+        // Задача 96: ротация ключей подписки — номер активного и сбросы упёршихся, без
+        // значений ключей.
+        keys: path.join(runtimeDir, 'ralph.keys.json'),
+        // Задача 95: спутники лога — журнал событий и heartbeat. Писатель выводит их из пути
+        // лога (`companionPaths`), но опись называет их здесь: иначе переезд состояния унёс
+        // бы лог и оставил его журнал в старом каталоге. Совпадение имён с `companionPaths`
+        // сверяет тест описи.
+        events: path.join(runtimeDir, 'ralph.events.jsonl'),
+        heartbeat: path.join(runtimeDir, 'ralph.heartbeat'),
+        dryEvents: path.join(runtimeDir, 'ralph.dry.events.jsonl'),
+        dryHeartbeat: path.join(runtimeDir, 'ralph.dry.heartbeat'),
     };
 }

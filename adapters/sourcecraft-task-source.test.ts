@@ -50,6 +50,8 @@ type FakeServer = {
     // #40: справочник меток репозитория (имя ↔ slug) и slug созданной карточки.
     labels?: unknown[];
     createdIssueSlug?: string;
+    // #43: ответ на чтение одной карточки (`GET /issues/{slug}`).
+    issue?: unknown;
 };
 
 function build(server: FakeServer = {}) {
@@ -100,6 +102,7 @@ function build(server: FakeServer = {}) {
             }
             return { pull_request_comments: server.prComments ?? [] };
         }
+        if (method === 'GET' && /\/issues\/\d+$/.test(path)) return server.issue ?? {};
         if (path.includes('/pulls?')) return { pull_requests: server.pulls ?? [] };
         if (/\/pulls\/\d+$/.test(path)) return server.prSource ? { source: server.prSource } : {};
         return {};
@@ -361,6 +364,66 @@ describe('комментарий в PR: публикация и якорь — �
     it('ответ без поля is_published отказом не считается — это смена формата', () => {
         const { adapter } = build({ createdComment: {} });
         expect(() => adapter.commentOnPullRequest(55, { body: 'x' })).not.toThrow();
+    });
+});
+
+describe('карточка целиком: статус для сверки перед взятием (#43)', () => {
+    const issue = (status: unknown) => ({ slug: '7', title: 'т', description: 'б', status });
+
+    it.each([
+        ['open', true],
+        ['closed', false],
+        // `paused` заменяет `hold`: из очереди выпадает, значит и не берётся.
+        ['paused', false],
+        ['in_progress', false],
+    ])('статус строкой «%s» → open=%s', (status, open) => {
+        const { adapter } = build({ issue: issue(status) });
+        expect(adapter.getIssue(7)).toEqual({ number: 7, title: 'т', body: 'б', open });
+    });
+
+    it('статус объектом со slug — та же сверка', () => {
+        const { adapter } = build({ issue: issue({ slug: 'closed', name: 'Закрыта' }) });
+        expect(adapter.getIssue(7).open).toBe(false);
+    });
+
+    it('НЕГАТИВНЫЙ: статуса нет или форма незнакома — поле не ставится («не знаю»)', () => {
+        // «Закрыта» по догадке опустошила бы очередь, и фаза ушла бы в сдачу несделанной.
+        expect('open' in build({ issue: issue(undefined) }).adapter.getIssue(7)).toBe(false);
+        expect('open' in build({ issue: issue(42) }).adapter.getIssue(7)).toBe(false);
+    });
+});
+
+describe('статус вехи для адреса накопителя (#65)', () => {
+    const withStatus = (status: unknown) => ({ name: MILESTONE, slug: MILESTONE_SLUG, status });
+
+    it.each([
+        ['open', true],
+        ['closed', false],
+    ])('статус строкой «%s» → %s', (status, open) => {
+        const { adapter } = build({ milestones: [withStatus(status)] });
+        expect(adapter.isMilestoneOpen(MILESTONE)).toBe(open);
+    });
+
+    it('статус объектом со slug читается так же, как у карточки', () => {
+        const { adapter } = build({
+            milestones: [withStatus({ slug: 'closed', name: 'Закрыта' })],
+        });
+        expect(adapter.isMilestoneOpen(MILESTONE)).toBe(false);
+    });
+
+    it('НЕГАТИВНЫЙ: статуса нет или он незнаком — отказ, а не «открыта»', () => {
+        // Молчаливое `true` клало бы находки в разобранный том — это и есть #65.
+        expect(() =>
+            build({ milestones: [withStatus(undefined)] }).adapter.isMilestoneOpen(MILESTONE),
+        ).toThrow(/неизвестным статусом/);
+        expect(() =>
+            build({ milestones: [withStatus('archived')] }).adapter.isMilestoneOpen(MILESTONE),
+        ).toThrow(/неизвестным статусом/);
+    });
+
+    it('НЕГАТИВНЫЙ: вехи нет на площадке — отказ с её именем', () => {
+        const { adapter } = build({ milestones: [] });
+        expect(() => adapter.isMilestoneOpen(MILESTONE)).toThrow(/не найден/);
     });
 });
 

@@ -2,7 +2,7 @@
 //
 // Вынесено из runtime/monitor.js: entry (`monitor.js`) остаётся тонким JS, запускаемым
 // напрямую (проверка Node ≥24 до первого require('*.mts')); вся логика — чтение лога,
-// сводка, gh-запросы, детект тишины и дедуп пуша — живёт здесь и покрыта
+// сводка, вопросы к трекеру, детект тишины и дедуп пуша — живёт здесь и покрыта
 // monitor-panel.test.mts. Место entry в ядре (`runtime/monitor.js`) НЕ меняется: на него
 // опираются RUNBOOK и tmux-раскладка, а раннер спавнит его по абсолютному пути от каталога
 // ядра (задача 122) — в раскладке с `roots` `.claude/ralph/…` от места запуска указывал бы
@@ -11,13 +11,22 @@
 // Каждые N секунд (по умолчанию 300 = 5 минут) main() печатает сводку:
 //   - жив ли loop (по свежести ralph.log)
 //   - текущая фаза / submitted (из ralph.state.json)
-//   - прогресс issues текущего milestone (gh)
-//   - открытые PR текущей фазы (gh, по ветке из конфига #214)
+//   - сколько задач фазы ещё открыто (шов taskSource, #58)
+//   - открытый PR текущей фазы (шов taskSource, по ветке из конфига #214)
 //   - последние значимые строки ralph.log (маркеры фаз/итераций/ревью/мерджа)
 // и раз в сутки шлёт строку метрики продукта (maybePushDailyMetric).
 //
-// Только чтение: gh-запросы + чтение файлов. Ничего не мутирует (инвариант №12: монитор
+// Только чтение: два чтения шва + чтение файлов. Ничего не мутирует (инвариант №12: монитор
 // не пишет в ralph.log — свежесть этого файла и есть признак жизни раннера).
+//
+// ── Почему трекер — через шов (#58) ──
+// Панель звала CLI GitHub напрямую, мимо шва, которым пользуется сама петля. На площадке,
+// где этого CLI нет вовсе, она поднималась живой и показывала ветку и хвост лога, а две
+// строки из четырёх — ровно «сколько задач осталось» и «есть ли PR» — пустыми. Хуже того,
+// сбой спроса на панели был неотличим от честного «PR нет». Теперь она спрашивает шов,
+// выбранный тем же `config.adapters`, что у петли (`observerTaskSource` раннера), и у
+// каждого вопроса три различимых исхода: ответ, «ответ — ничего» и «спросить не удалось».
+// Шов здесь — только читающие методы (`PanelTaskSource`): монитор остаётся наблюдателем.
 //
 // ── Почему .mts (а не .ts), и почему import.meta.dirname (#404, по образцу gate-env.mts/#403) ──
 // Панель берёт ralph.log/state/config ОТ КАТАЛОГА МОДУЛЯ — потому монитор и запускают из
@@ -39,6 +48,8 @@ import { execSync } from 'node:child_process';
 // в sync-пути require(esm)); @ts-expect-error — как в config-profile.test.ts (#366).
 // @ts-expect-error — JS-entry раннера без деклараций типов.
 import ralph from '../ralph.js';
+import type { Issue, PullRequest, TaskSourceAdapter } from '../adapters/adapters.ts';
+import type { AdapterConfig } from '../adapters/adapters-impl.ts';
 // ralph.js — module.exports = createOrchestrator(...), поэтому его поверхность точно
 // описывается ReturnType<typeof createOrchestrator> (#409-ревью). Тем же кастом, что в
 // test-helpers.ts, типизируем три функции боевыми типами вместо `any` из ts-expect-error-
@@ -47,7 +58,7 @@ import ralph from '../ralph.js';
 type Runtime = ReturnType<typeof import('../core/orchestrator.ts').createOrchestrator>;
 const resolveProfile = ralph.resolveProfile as Runtime['resolveProfile'];
 const parseProfileFlag = ralph.parseProfileFlag as Runtime['parseProfileFlag'];
-const shq = ralph.shq as Runtime['shq'];
+const observerTaskSource = ralph.observerTaskSource as Runtime['observerTaskSource'];
 // #386: та же чистая функция разводки лога, что и у раннера (exec.ts) — панель обязана
 // читать РОВНО тот файл, в который пишет наблюдаемый прогон, иначе судила бы о жизни по
 // чужому/протухшему логу (см. monitorLogPath ниже).
@@ -61,10 +72,13 @@ const { pushEvent } = ralph;
 // Пороги тишины (#147): классификация хвоста лога по режиму + порог по режиму. Здесь
 // (в мониторе) — импёровая половина: чтение файла, «сейчас» и сравнение с порогом.
 import { classifyActivity, silenceThresholdMs, type Activity } from './deadman.ts';
+import { companionPaths, decodeHeartbeat, type THeartbeat } from '../core/event-journal.ts';
 import { formatStopMessage } from '../core/stop-message.ts';
 import { submittedOf, type TSubmitRecord } from '../core/submit-journal.ts';
 import { formatMetricDayLine } from './product-metric.ts';
 import { summarizeRuntime } from './metric.mts';
+import { evalDisk, freeBytes, maybePushDiskLow } from './disk-watch.ts';
+import { resolveObservability } from '../core/observability.ts';
 
 // monitor-panel.mts живёт в .claude/ralph/runtime/ (#396), поэтому каталог раннера —
 // родитель import.meta.dirname, а не он сам. Служебные файлы (ralph.log/state/config)
@@ -159,6 +173,7 @@ type PhaseConfig = { milestone?: string; branch?: string };
 type ResolvedConfig = {
     profileName?: string;
     phases?: PhaseConfig[];
+    adapters?: AdapterConfig;
 } | null;
 
 // state фазы (ralph.state.json): milestone === null — штатный конец очереди (#THS8M).
@@ -196,14 +211,61 @@ type PushFn = (
     opts: { logFn: (...a: unknown[]) => void; dry: boolean },
 ) => boolean;
 
-// Открытый PR фазы (нужные панели поля из gh pr list --json …).
-type PhasePr = {
-    number: number;
-    title: string;
-    headRefName: string;
-    mergeStateStatus?: string;
-    reviewDecision?: string;
-};
+// Ровно то, о чём панель спрашивает трекер. Узкий тип — барьер, а не экономия: панели
+// физически нечем закрыть карточку или смерджить PR, и подставить ей в тесте нечего лишнего.
+export type PanelTaskSource = Pick<TaskSourceAdapter, 'listAllOpenIssues' | 'findOpenPullRequest'>;
+
+// «Спросить не удалось» — отдельный исход у КАЖДОГО вопроса панели, с причиной словами шва.
+// Без него отказ шва сливался бы с ответом «ничего нет» — ровно та ложь, из-за которой #58.
+export type SeamFailure = { error: 'seam-failed'; reason: string };
+
+// Первая строка текста отказа: многострочный ответ форжа разорвал бы рамку панели.
+function failureOf(e: unknown): SeamFailure {
+    const reason = String((e as Error)?.message ?? e)
+        .split('\n')[0]
+        .slice(0, 160);
+    return { error: 'seam-failed', reason: reason || 'причина не названа' };
+}
+
+// Шов для панели — из того же config.adapters, что у петли. Отказ сборки (конфиг не
+// прочитался, имя реализации неизвестно) — не падение тика, а строка панели: `failFn`
+// бросает, а не делает exit, как `fail` раннера. Наблюдатель обязан пережить кривой конфиг
+// и сказать о нём, а не умереть вместе с deadman.
+//
+// Собранный шов запоминается по выбору (`config.adapters` текстом): конфиг читается на
+// каждом тике, и пересборка без кеша теряла бы вместе с адаптером его кеш резолва вех — у
+// SourceCraft каждый тик заново листал бы `/milestones`. Сменился выбор — шов собирается
+// заново, так что правка конфига доходит до панели тем же тиком. Отказ не запоминается:
+// следующий тик пробует снова.
+let builtSeam: {
+    key: string;
+    buildFn: Runtime['observerTaskSource'];
+    source: PanelTaskSource;
+} | null = null;
+
+export function panelTaskSource(
+    config: ResolvedConfig,
+    buildFn: Runtime['observerTaskSource'] = observerTaskSource,
+): PanelTaskSource | SeamFailure {
+    if (!config) {
+        return {
+            error: 'seam-failed',
+            reason: 'конфиг петли не прочитался — шов выбрать не по чему',
+        };
+    }
+    const key = JSON.stringify(config.adapters ?? null);
+    if (builtSeam && builtSeam.key === key && builtSeam.buildFn === buildFn)
+        return builtSeam.source;
+    try {
+        const source = buildFn(config.adapters, (msg: string): never => {
+            throw new Error(msg);
+        });
+        builtSeam = { key, buildFn, source };
+        return source;
+    } catch (e) {
+        return failureOf(e);
+    }
+}
 
 function sh(cmd: string): string {
     try {
@@ -271,6 +333,40 @@ export function readLogTail(
     }
     const all = raw.split('\n');
     return { lines: n == null ? all : all.slice(-n), lastMtime };
+}
+
+// Heartbeat раннера (задача 95) — спутник лога, который пишется даже тогда, когда
+// дописывание лога уже отказывает (полный диск, права). Отдаёт mtime и последнюю строку
+// лога, которую раннер пытался записать. null — файла нет или он не читается: тогда
+// детект судит по логу, как до задачи.
+export function readHeartbeat(hbPath: string): { mtime: number; record: THeartbeat | null } | null {
+    try {
+        const mtime = fs.statSync(hbPath).mtimeMs;
+        return { mtime, record: decodeHeartbeat(fs.readFileSync(hbPath, 'utf8')) };
+    } catch {
+        return null;
+    }
+}
+
+// Признак жизни — свежее из двух: лог или heartbeat. Одного лога мало: отказ его записи
+// замораживал mtime при живом раннере и давал ложный DEADMAN. Одного mtime heartbeat тоже
+// мало: режим считается по хвосту, а хвост без строки, не легшей в лог, классифицирует
+// прошлый шаг — сессия под коротким порогом шага git. Поэтому строка heartbeat, которой
+// в хвосте нет, дописывается в хвост; если она там уже есть (штатный случай: heartbeat
+// пишется сразу после строки лога), хвост не трогается, иначе панель показала бы дубль.
+// Сверяется КОНЕЦ хвоста с записью целиком, а не последняя строка: сообщение бывает
+// многострочным (пуш стопа, вклейка разбора падения), и последней строкой файла тогда стоит
+// хвост сообщения — сравнение по ней дописывало бы дубль почти после каждого такого лога.
+export function withHeartbeat(
+    log: { lines: string[]; lastMtime: number | null },
+    hb: { mtime: number; record: THeartbeat | null } | null,
+): { lines: string[]; lastMtime: number | null } {
+    if (!hb || (log.lastMtime != null && hb.mtime <= log.lastMtime)) return log;
+    if (!hb.record) return { lines: log.lines, lastMtime: hb.mtime };
+    const line = `[${hb.record.ts}] ${hb.record.msg}`;
+    const tail = log.lines.join('\n').trimEnd();
+    const lines = tail.endsWith(line) ? log.lines : [...log.lines, ...line.split('\n')];
+    return { lines, lastMtime: hb.mtime };
 }
 
 // Детект тишины: возраст последней записи лога (now − lastMtime) против порога режима
@@ -352,7 +448,7 @@ export function deadmanPushMessage(
     );
 }
 
-// Оценка + сам пуш, вынесено из snapshot(), чтобы тестировать без реальных gh-вызовов
+// Оценка + сам пуш, вынесено из snapshot(), чтобы тестировать без реальных вызовов трекера
 // остального снапшота — тот же приём, что evalDeadman/readLogTail (#147/#148): чистая
 // логика решения отдельно от побочек панели. pushFn инжектируется (как pushEventFn в
 // ralph.js) — тесты мокают сам вызов, не profileName/Telegram. Возвращает новый ключ
@@ -517,35 +613,44 @@ function currentMilestone(
     };
 }
 
-function issuesProgress(
+// Сколько задач фазы ещё открыто — `listAllOpenIssues`, тот же вопрос, которым петля решает,
+// готова ли фаза к сдаче (C2): открытые `blocked` и чужие карточки фазу тоже держат, и панель
+// их тоже считает. Закрытых шов не отдаёт — и это не потеря: человек смотрит на панель, чтобы
+// понять, сколько ОСТАЛОСЬ, а прежний процент от «открытые + закрытые» стоил отдельного запроса.
+// `blocked` выделен из открытых: такие петля не возьмёт, и фаза ждёт человека.
+export function issuesProgress(
     milestone: string | null,
-): { open: number; closed: number; total: number } | null {
-    if (!milestone) return null;
-    // gh поддерживает поиск по milestone имени. Имя milestone — недоверенный источник
-    // из конфига (тот же класс #133, что и ветка фазы): в shell-строку через shq, не в
-    // двойные кавычки, где $()/бэкктики/\ раскрылись бы шеллом.
-    const open = sh(
-        `gh issue list --milestone ${shq(milestone)} --state open --json number --jq "length"`,
-    );
-    const closed = sh(
-        `gh issue list --milestone ${shq(milestone)} --state closed --json number --jq "length"`,
-    );
-    if (open === '' && closed === '') return null;
-    const o = Number(open) || 0;
-    const c = Number(closed) || 0;
-    return { open: o, closed: c, total: o + c };
+    source: PanelTaskSource | SeamFailure,
+): { open: number; blocked: number } | { error: 'no-milestone' } | SeamFailure {
+    if (!milestone) return { error: 'no-milestone' };
+    if ('error' in source) return source;
+    let issues: Issue[];
+    try {
+        issues = source.listAllOpenIssues(milestone);
+    } catch (e) {
+        return failureOf(e);
+    }
+    if (!Array.isArray(issues)) {
+        return { error: 'seam-failed', reason: 'шов вернул не список карточек' };
+    }
+    const blocked = issues.filter((i) => i.labels?.some((l) => l.name === 'blocked')).length;
+    return { open: issues.length, blocked };
 }
 
-// Поиск открытых PR текущей фазы по ветке из конфига (#214).
-// Параметры: config (резолвлен из конфига), state (из ralph.state.json), shFn (для тестов).
+// Поиск открытого PR текущей фазы по ветке из конфига (#214) — `findOpenPullRequest` шва.
 // Различает исходы (fail-closed, каждый — своя строка панели): ветку фазы определить не
 // удалось → { error: 'no-branch' }; все фазы завершены (штатный конец) → { error:
-// 'all-done' }; gh упал / вернул мусор → { error: 'gh-failed' }; иначе найденные PR или [].
+// 'all-done' }; шов не собран или бросил → SeamFailure; иначе найденный PR или [] — ответ
+// шва «открытого PR нет». Ветку панель передаёт шву как есть: точное совпадение и
+// экранирование — забота реализации (#THS8X, класс #133), а не наблюдателя.
+//
+// Оговорка контракта: при нескольких открытых PR на ветку шов тоже отвечает null (не гадает,
+// что мерджить, M5) — это ответ шва, а не сбой, поэтому и на панели он «нет».
 export function openPhasePRs(
     config: ResolvedConfig,
     state: PhaseState,
-    shFn: (cmd: string) => string = sh,
-): PhasePr[] | { error: string } {
+    source: PanelTaskSource | SeamFailure,
+): PullRequest[] | { error: 'all-done' | 'no-branch' } | SeamFailure {
     // #THS8M: milestone === null — не «битый state», а штатный конец: advancePhase после
     // ПОСЛЕДНЕЙ фазы пишет milestone: null. Отдельный маркер, чтобы панель не пугала
     // «не удалось определить ветку фазы» на успешно сданной очереди.
@@ -560,23 +665,12 @@ export function openPhasePRs(
     if (!phase || !phase.branch) {
         return { error: 'no-branch' };
     }
-    // Ищем PR строго по ветке фазы: --head <branch> (точное совпадение), не
-    // --search "head:…" (#THS8X: search-квалификатор матчит по префиксу — head:feature/x
-    // поймал бы и feature/x-check, показав на панели PR чужой фазы). Ветка из конфига —
-    // недоверенный источник (класс #133): в shell-строку идёт через shq, как в ralph.js
-    // (findOpenPr: gh pr list --head ${shq(branch)}). --jq "." был no-op поверх --json.
-    const out = shFn(
-        `gh pr list --state open --head ${shq(phase.branch)} --json number,title,headRefName,mergeStateStatus,reviewDecision`,
-    );
-    // #THS8Z: пустой вывод sh() = упавшая gh-команда (успех «нет PR» даёт непустой `[]`),
-    // непарсимый вывод = мусор от gh. Оба → { error: 'gh-failed' }, а не `[]`: иначе сбой
-    // gh на панели неотличим от честного «PR нет» (докблок обещает fail-closed, но эта
-    // ветка молча притворялась бы «нет»).
-    if (out === '') return { error: 'gh-failed' };
+    if ('error' in source) return source;
     try {
-        return JSON.parse(out);
-    } catch {
-        return { error: 'gh-failed' };
+        const pr = source.findOpenPullRequest(phase.branch);
+        return pr ? [pr] : [];
+    } catch (e) {
+        return failureOf(e);
     }
 }
 
@@ -591,6 +685,11 @@ let lastMetricDay: string | null = null;
 // Разовое предупреждение об исчезнувшем логе (см. snapshot). Сбрасывается, когда лог
 // снова находится, — чтобы каждый эпизод отсутствия файла предупреждал ровно раз.
 let warnedNoLog = false;
+
+// Эпизод «мало места» (задача 95, disk-watch.ts) и разовое предупреждение о том, что
+// свободное место не читается: молчащий сторож диска не должен выглядеть «места хватает».
+let diskLowLatched = false;
+let warnedDiskUnknown = false;
 
 function snapshot(): void {
     const now = Date.now();
@@ -608,7 +707,13 @@ function snapshot(): void {
     // (signalTail). Сам пуш о тишине и дедуп — #149; здесь только детект и его показ.
     // #386: путь лога — по профилю резолвнутого конфига, а не жёстко ralph.log: не-боевой
     // прогон (playground) пишет в ralph.dry.log, и панель обязана читать именно его.
-    const { lines: allLogLines, lastMtime } = readLogTail(null, monitorLogPath(config));
+    // Задача 95: свежесть берётся у лога ИЛИ у heartbeat — отказ записи лога при живом
+    // раннере больше не выглядит тишиной (см. withHeartbeat).
+    const logPath = monitorLogPath(config);
+    const { lines: allLogLines, lastMtime } = withHeartbeat(
+        readLogTail(null, logPath),
+        readHeartbeat(companionPaths(logPath).heartbeat),
+    );
     const lines = signalTail(allLogLines, 8);
     const deadman = evalDeadman({
         now,
@@ -640,12 +745,33 @@ function snapshot(): void {
         cfg: config,
         milestoneName,
     });
+    // Сторож диска (задача 95): сигнал раньше отказа записи state и лога. Битая секция
+    // observability панель не роняет — строка в свой stdout и умолчание; стоп по ней даёт
+    // preflight раннера.
+    const observability = resolveObservability(config, (msg) =>
+        console.log(`⚠ Ralph disk-watch: ${msg} — беру умолчание.`),
+    );
+    const disk = evalDisk(freeBytes(RUNTIME_DIR), observability.diskMinFreeMb);
+    if (!disk.known && !warnedDiskUnknown) {
+        console.log(
+            `⚠ Ralph disk-watch: свободное место под ${RUNTIME_DIR} не читается — сторож диска слеп.`,
+        );
+    }
+    warnedDiskUnknown = !disk.known;
+    diskLowLatched = maybePushDiskLow(disk, diskLowLatched, {
+        pushFn: pushEvent,
+        cfg: config,
+        dir: RUNTIME_DIR,
+    });
     lastMetricDay = maybePushDailyMetric(now, lastMetricDay, {
         cfg: config,
         computeLine: dailyMetricLine(config, RUNTIME_DIR, (p) => fs.readFileSync(p, 'utf8')),
     });
-    const prog = issuesProgress(milestoneName);
-    const prs = openPhasePRs(config, state);
+    // Выбор шва сверяется на каждом тике: конфиг читается заново, и реализация обязана
+    // идти за ним, а не застыть на первом тике (сборка при том же выборе — из кеша).
+    const source = panelTaskSource(config);
+    const prog = issuesProgress(ms?.phase?.milestone || state?.milestone || null, source);
+    const prs = openPhasePRs(config, state, source);
     const head = sh('git rev-parse --short HEAD');
     const branch = sh('git rev-parse --abbrev-ref HEAD');
 
@@ -677,6 +803,11 @@ function snapshot(): void {
                 : `  ⏱  лог ${fmtAge(deadman.silenceMs ?? 0)}, порог тишины ${fmtDur(deadman.thresholdMs ?? 0)} (режим ${deadman.activity})`,
         );
     }
+    out.push(
+        disk.known
+            ? `  ${disk.low ? '💾 МАЛО МЕСТА' : '💾 диск'}: свободно ${disk.freeMb} МБ, порог ${disk.minFreeMb} МБ`
+            : '  💾 диск: свободное место не читается',
+    );
     out.push(`╚${bar}╝`);
     out.push(
         `Фаза: ${milestoneName}` +
@@ -694,33 +825,35 @@ function snapshot(): void {
         `профиль: ${config?.profileName || '—'}   доставка пушей: ${deliveryOn ? 'вкл' : 'выкл (только prod)'}`,
     );
 
-    if (prog) {
-        const pct = prog.total ? Math.round((prog.closed / prog.total) * 100) : 0;
-        const filled = Math.round((pct / 100) * 20);
-        const gauge = '█'.repeat(filled) + '░'.repeat(20 - filled);
+    if ('open' in prog) {
         out.push(
-            `Issues: [${gauge}] ${prog.closed}/${prog.total} закрыто (${pct}%)  открыто: ${prog.open}`,
+            `Issues фазы: открыто ${prog.open}` +
+                (prog.blocked ? ` (из них blocked: ${prog.blocked} — ждут человека)` : ''),
         );
+    } else if (prog.error === 'no-milestone') {
+        out.push('Issues фазы: (фаза не определена — спрашивать не о чем)');
     } else {
-        out.push('Issues: (нет данных gh по milestone)');
+        out.push(
+            `Issues фазы: (шов задач не ответил: ${prog.reason}) — сколько осталось, неизвестно`,
+        );
     }
 
-    if ('error' in prs && prs.error === 'all-done') {
-        out.push('Открытые PR фаз: (все фазы завершены)');
-    } else if ('error' in prs && prs.error === 'gh-failed') {
-        out.push('Открытые PR фаз: (сбой gh — статус PR фазы неизвестен)');
-    } else if ('error' in prs && prs.error === 'no-branch') {
-        out.push('Открытые PR фаз: (не удалось определить ветку фазы из конфига)');
-    } else if (Array.isArray(prs) && prs.length) {
-        out.push('Открытые PR фаз:');
-        for (const pr of prs) {
-            out.push(
-                `  #${pr.number} ${pr.headRefName}  merge=${pr.mergeStateStatus || '?'}  review=${pr.reviewDecision || '—'}`,
-            );
-            out.push(`     ${pr.title}`);
+    if (Array.isArray(prs)) {
+        if (prs.length) {
+            out.push('PR фазы:');
+            for (const pr of prs) {
+                const labels = (pr.labels ?? []).map((l) => l.name).join(', ');
+                out.push(`  #${pr.number}  метки: ${labels || '—'}`);
+            }
+        } else {
+            out.push('PR фазы: шов ответил — открытого нет');
         }
+    } else if ('reason' in prs) {
+        out.push(`PR фазы: (шов задач не ответил: ${prs.reason}) — статус PR неизвестен`);
+    } else if (prs.error === 'all-done') {
+        out.push('PR фазы: (все фазы завершены)');
     } else {
-        out.push('Открытые PR фаз: нет');
+        out.push('PR фазы: (не удалось определить ветку фазы из конфига)');
     }
 
     out.push('Лог (последние события):');
@@ -735,7 +868,7 @@ function snapshot(): void {
 
 // Точка входа панели — зовётся тонким entry monitor.js (require(esm) → main()). Здесь
 // НЕ запускается сама: импорт из теста (monitor-panel.test.mts) выполняет только
-// объявления, без gh-запросов и setInterval.
+// объявления, без запросов к трекеру и setInterval.
 export function main(): void {
     snapshot();
     if (ONCE) return;

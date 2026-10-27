@@ -185,6 +185,15 @@ describe('issueDetails — тело карточки для кодер-сесс�
         expect(ghJsonFn.mock.calls[0][0]).toContain('gh issue view 7');
     });
 
+    it('#43 статус карточки: OPEN/CLOSED → open, незнакомый — поле не ставится', () => {
+        const read = (state: unknown) =>
+            make().issueDetails(7, { ghJsonFn: () => ({ title: 'т', state }) as never });
+        expect(read('OPEN').open).toBe(true);
+        expect(read('CLOSED').open).toBe(false);
+        expect('open' in read(undefined)).toBe(false);
+        expect('open' in read('MERGED')).toBe(false);
+    });
+
     it('пустой заголовок — ОТКАЗ: сессия без тела задачи выдумает себе работу', () => {
         expect(() => make().issueDetails(7, { ghJsonFn: () => ({}) as never })).toThrow(
             /не прочиталась/,

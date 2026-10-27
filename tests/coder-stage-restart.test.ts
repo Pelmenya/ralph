@@ -237,6 +237,48 @@ describe('рестарт посреди этапа продолжает с эт�
     });
 });
 
+// #43: карточку закрыл ЧЕЛОВЕК между итерациями, а список форжа ещё отдаёт её открытой.
+// После рестарта память прогона (`closedThisRun`) пуста, и опереться петле не на что,
+// кроме точечной сверки карточки перед взятием.
+describe('карточка, закрытая человеком, после рестарта не берётся (#43)', () => {
+    const closedByHuman =
+        (closed: number) =>
+        (number: number): { number: number; title: string; body: string; open: boolean } => ({
+            number,
+            title: 'задача',
+            body: 'тело',
+            open: number !== closed,
+        });
+
+    it('свежий процесс: список старый, карточка закрыта — берётся следующая', () => {
+        const disk = freshDisk();
+        runProcess(disk, { queue: [7] });
+        // Человек закрыл #7 между процессами; список форжа об этом ещё не знает.
+        const second = runProcess(disk, {
+            queue: [7, 8],
+            over: { getIssueFn: vi.fn(closedByHuman(7)) },
+        });
+        expect(second.picked).toEqual([8]);
+        expect(second.runClaudeFn).toHaveBeenCalledTimes(1);
+        expect(String(second.runClaudeFn.mock.calls[0][0])).toContain('#8');
+        expect(second.logs.join('\n')).toMatch(/Issue #7 уже не открыт/);
+        expect(disk.state.count).toBe(2);
+    });
+
+    it('брошенная попытка по карточке, закрытой человеком, не продолжается', () => {
+        const disk = freshDisk();
+        runProcess(disk, { queue: [7], killIn: 'pick' });
+        const second = runProcess(disk, {
+            queue: [7, 8],
+            over: { getIssueFn: vi.fn(closedByHuman(7)) },
+        });
+        expect(second.logs.join('\n')).toMatch(/Попытка попытка-1 по Issue #7 не продолжается/);
+        expect(second.picked).toEqual([8]);
+        expect(second.runClaudeFn).toHaveBeenCalledTimes(1);
+        expect(second.chat).toEqual([]);
+    });
+});
+
 describe('повреждённый журнал — стоп с диагнозом до первого шага (#92)', () => {
     it('оборванная запись: ни сессии, ни счёта итерации, причина в чате', () => {
         const disk = freshDisk();
@@ -276,6 +318,7 @@ describe('повреждённый журнал — стоп с диагнозо
             checkOnPhaseBranchFn: () => ({ ok: true, sha: 'a'.repeat(40) }),
             ensureMonitorAliveFn: () => null,
             syncProjectBoardFn: () => {},
+            getIssueFn: (number: number) => ({ number, title: 'задача', body: 'тело' }),
             runClaudeFn,
             stageJournal: createStageJournal({
                 read: () => null,

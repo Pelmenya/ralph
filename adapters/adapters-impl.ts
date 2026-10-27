@@ -186,6 +186,7 @@ export type GithubTaskSourceFns = {
     openIssues: (milestone: string) => Issue[];
     allOpenIssues: (milestone: string) => Issue[];
     hasAnyIssues: (milestone: string) => boolean;
+    milestoneOpen: (title: string) => boolean;
     milestoneLabels: (milestone: string) => string[];
     // #37: комментарии PR одной лентой. Раскладку по трём поверхностям GitHub делает сама
     // боевая функция — маппер, как и везде здесь, только раскладывает имена.
@@ -240,6 +241,7 @@ export function createGithubTaskSource(fns: GithubTaskSourceFns): TaskSourceAdap
         listReadyIssues: fns.openIssues,
         listAllOpenIssues: fns.allOpenIssues,
         hasAnyIssues: fns.hasAnyIssues,
+        isMilestoneOpen: fns.milestoneOpen,
         listMilestoneLabels: fns.milestoneLabels,
         getIssue: fns.getIssue,
         listPullRequestComments: fns.prComments,

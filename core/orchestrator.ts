@@ -116,6 +116,14 @@ type TPhaseBranchStopKind = Extract<TStopReason, 'tree-dirty' | 'main-conflict' 
 import { createReviewModule, reviewVerdict } from './review.ts';
 import { createGateRunner, resolveGateChecks, resolveGatePolicy } from './gate.ts';
 import { resolveMergeRetryMaxMs } from './merge-retry.ts';
+import { resolveObservability } from './observability.ts';
+import {
+    CLAUDE_JSON_ARGS,
+    attemptLogLine,
+    attemptRecord,
+    parseClaudeJsonResult,
+    type TAttemptRecord,
+} from './attempt-cost.ts';
 import { createDeployCheckModule } from './deploy-check.ts';
 // #82: классификация отказа запуска рантайма (E2BIG, ENOENT, таймаут) — чистые функции
 // без замыканий на config/DRY/adapters, общие для обоих spawn-путей.
@@ -193,6 +201,19 @@ import {
     apiLimitWaitMs,
     apiLimitMessage,
 } from './api-limit.ts';
+import {
+    SUBSCRIPTION_KEY_ENV,
+    SUBSCRIPTION_KEYS_ENV,
+    subscriptionKeys,
+    parseKeyRotation,
+    normalizeRotation,
+    onKeyLimit,
+    resumeAfterWait,
+    keyRotateMessage,
+    allKeysExhaustedMessage,
+    type TKeyRotation,
+    type TKeyLimitStep,
+} from './key-rotation.ts';
 import {
     isRuntimeUnavailable,
     runtimeUnavailableWaitMs,
@@ -326,6 +347,69 @@ function assertNotTruncated(count: number, milestone: string, what: string): voi
                 `(${String(ISSUE_LIST_LIMIT)}) — считать ответ полным нельзя, часть карточек ` +
                 'могла остаться за пределом. Разбери веху на несколько или подними предел осознанно.',
         );
+    }
+}
+
+/**
+ * #43: кандидат итерации, перечитанный точечно. Список фазы форж отдаёт с задержкой, и
+ * карточка, которую ЧЕЛОВЕК закрыл между итерациями или до рестарта, ещё числится в нём
+ * открытой; чтение одной карточки этой задержки не знает. Перечитываем до счёта итерации и
+ * до продолжения попытки, а прочитанное отдаём наверх — оно тут же идёт в промпт, и сверка
+ * не стоит лишнего запроса.
+ *
+ * Карточку продолжаемой попытки с доведённой сессией не читаем вовсе: новой сессии по ней
+ * не будет, а этапы после сессии (намерения, коммит остатка) доводить нужно и по закрытой.
+ * `open` не задан — «не знаю», карточка берётся по списку, как раньше. Отказ чтения здесь
+ * не решается: `picked` остаётся пустым, вызывающий читает карточку сам там, где тело
+ * нужно сессии, и тот же отказ всплывает стопом с причиной.
+ *
+ * Вынесено из `runLoop` функцией, а не оставлено телом цикла: структурный барьер проводки
+ * (`phase-branch.test.ts`) ищет её в окне строк над спавном, и полсотни строк сверки
+ * потребовали бы расширить окно — то есть ослабить барьер для всех пишущих сессий.
+ */
+export function pickLiveCandidate<T extends { number: number }>({
+    issues,
+    milestone,
+    resume,
+    readIssue,
+    logFn,
+}: {
+    issues: T[];
+    milestone: string;
+    resume: { milestone: string; issue: number; resumeStage: TCoderStage } | null;
+    readIssue: (n: number) => IssueDetails;
+    logFn: (msg: string) => void;
+}): { issues: T[]; picked: { number: number; details: IssueDetails } | null; closed: number[] } {
+    let rest = issues;
+    const closed: number[] = [];
+    for (;;) {
+        const resumed =
+            resume !== null && resume.milestone === milestone
+                ? rest.find((i) => i.number === resume.issue)
+                : undefined;
+        const candidate = resumed ?? rest[0];
+        if (!candidate) return { issues: rest, picked: null, closed };
+        if (
+            resumed !== undefined &&
+            resume !== null &&
+            CODER_STAGES.indexOf(resume.resumeStage) > CODER_STAGES.indexOf('session')
+        )
+            return { issues: rest, picked: null, closed };
+        let details: IssueDetails;
+        try {
+            details = readIssue(candidate.number);
+        } catch {
+            return { issues: rest, picked: null, closed };
+        }
+        if (details.open !== false) {
+            return { issues: rest, picked: { number: candidate.number, details }, closed };
+        }
+        logFn(
+            `🚪 Issue #${String(candidate.number)} уже не открыт, хотя список фазы ` +
+                `"${milestone}" ещё отдаёт его открытым, — не беру.`,
+        );
+        closed.push(candidate.number);
+        rest = rest.filter((i) => i.number !== candidate.number);
     }
 }
 
@@ -477,6 +561,9 @@ export type RalphConfig = {
     // #47: предел по времени на повторы мерджа при транзиентных отказах форжа (мс).
     // Дефолт — DEFAULT_MERGE_RETRY_MAX_MS (merge-retry.ts).
     mergeRetryMaxMs?: number;
+    // Задача 95: порог диска, ротация логов сессий, тарифы. Форму держит
+    // `resolveObservability` (observability.ts) — fail-closed на старте.
+    observability?: unknown;
     waitOnApiLimit?: boolean;
     apiLimitGraceMin?: number;
     apiLimitFallbackWaitMin?: number;
@@ -662,6 +749,9 @@ type ClaudeOpts = {
     maxTurns: number;
     fallbackModel?: string | null;
     modelProvider?: string;
+    // Задача 96: ключ подписки этой сессии, когда ключей больше одного (ротация). Нет —
+    // сессия наследует env раннера, как до ротации. Значение не логируется нигде.
+    authToken?: string;
 };
 
 // Флаги режима из argv entry (ONCE/DRY/RESET/RESUBMIT/DEPLOY_RESOLVED как раньше).
@@ -760,7 +850,17 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // shArgv (мутации argv без шелла, #193/#252), ghJson (ретраи чтений, M3) — exec.ts.
     // Начальная цель лога — cwd-относительный RUNTIME.log; main() репойнтит на абсолютный
     // путь внутри worktree раннера ещё ДО chdir (#SiaUB).
-    const { log, fail, setLogTarget, sh, shArgv, ghJson, saveSessionOutput } = createExec({
+    const {
+        log,
+        emitEvent,
+        fail,
+        setLogTarget,
+        setSessionLogsKeep,
+        sh,
+        shArgv,
+        ghJson,
+        saveSessionOutput,
+    } = createExec({
         guardSideEffect,
         sleep,
         initialLogTarget: RUNTIME.log,
@@ -901,6 +1001,69 @@ export function createOrchestrator(env: OrchestratorEnv) {
         getInstallCmd: () => resolveInstallCmd(config),
     });
 
+    // Задача 96: кольцо ключей подписки для runClaude. Ротация — свойство подписки Claude:
+    // у рантайма kimi/openai свой ключ, и метить его номерами чужого списка бессмысленно.
+    // Решает РАНТАЙМ ВЫЗОВА, а не статический adapters.coderRuntime: карточку, которую
+    // modelRouting увёл на kimi, runClaude запускает и при статическом claude, и лимит
+    // Moonshot (его «rate limit» ловит тот же детектор) пометил бы упёршимися ключи
+    // подписки Claude, а сессию Kimi гонял бы «на следующем ключе», которого она не читает.
+    //
+    // Файл ротации — свой, а не поле ralph.state.json: state держит в памяти runLoop и
+    // пишет целиком после сессии, так что запись посреди сессии (ротация случается внутри
+    // runClaude) затёрлась бы его копией, и рестарт снова начал бы с сожжённого ключа.
+    // Отказ файла не стопит петлю (см. parseKeyRotation): ротация в памяти продолжает
+    // работать, худший исход — одна лишняя сессия на упёршемся ключе после рестарта. Но
+    // каждый отказ назван строкой в логе.
+    type TKeyRing = {
+        keys: string[];
+        load: () => TKeyRotation;
+        save: (rot: TKeyRotation) => void;
+    };
+
+    function subscriptionKeyRing(
+        run: typeof runClaudeOnce,
+        env: NodeJS.ProcessEnv = process.env,
+    ): TKeyRing | null {
+        if (run !== runClaudeOnce) return null;
+        const keys = subscriptionKeys(env);
+        if (keys.length < 2) return null;
+        return {
+            keys,
+            load: () => {
+                let text: string | null = null;
+                try {
+                    guardSideEffect(`readKeyRotation(${RUNTIME.keys})`);
+                    text = fs.readFileSync(RUNTIME.keys, 'utf8');
+                } catch (e) {
+                    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
+                        log(
+                            `⚠ Файл ротации ключей ${RUNTIME.keys} не читается (${(e as Error).message}) — ротация начата с ключа 1.`,
+                        );
+                    }
+                }
+                const { rot, reason } = parseKeyRotation(text, keys.length);
+                if (reason) {
+                    log(
+                        `⚠ Файл ротации ключей ${RUNTIME.keys}: ${reason} — ротация начата с ключа 1.`,
+                    );
+                }
+                return rot;
+            },
+            save: (rot) => {
+                if (DRY) return;
+                try {
+                    guardSideEffect(`writeKeyRotation(${RUNTIME.keys})`);
+                    writeFileAtomic(RUNTIME.keys, JSON.stringify(rot, null, 2));
+                } catch (e) {
+                    log(
+                        `⚠ Не удалось записать ротацию ключей в ${RUNTIME.keys} (${(e as Error).message}) — ` +
+                            `ротация продолжается в памяти, рестарт может начать с упёршегося ключа.`,
+                    );
+                }
+            },
+        };
+    }
+
     /**
      * Запуск claude -p. Возвращает exit-код процесса (0 = успех; DRY всегда 0).
      * H2: код возвращаем, а не глотаем, потому что фатальность решает ВЫЗЫВАЮЩИЙ:
@@ -913,6 +1076,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
      * результат в конце сессии; захваченный вывод целиком уходит в консоль после.
      * При маркере лимита: sleep до сброса (+ apiLimitGraceMin запаса) и повтор той же
      * команды, не более config.apiLimitMaxWaits раз (дефолт 3) — защита от вечного сна.
+     * Задача 96: при нескольких ключах подписки сначала ротация на следующий свободный
+     * ключ (без сна и без траты счётчика), и только когда упёрлись все — сон до ближайшего
+     * сброса из меток.
      */
     function runClaude(
         prompt: string,
@@ -934,6 +1100,12 @@ export function createOrchestrator(env: OrchestratorEnv) {
             // подаёт сюда сборщик lastOutput (диагностика падения сессии), остальные
             // вызовы runClaude (шаги сдачи/heal) его не передают — поведение прежнее.
             onOutput = () => {},
+            // Задача 96: кольцо ключей подписки. null — ключ один (или рантайм ЭТОГО вызова не
+            // Claude): ротации нет, путь прежний. Боевое кольцо читает env и файл ротации.
+            // Строится оно по runClaudeOnceFn выше: подменённый рантайм (маршрут на kimi,
+            // фейк в тесте) кольца по умолчанию не получает.
+            keyRing = subscriptionKeyRing(runClaudeOnceFn),
+            nowFn = Date.now,
         }: {
             pushEventFn?: typeof pushEvent;
             cfg?: RalphConfig;
@@ -942,6 +1114,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
             sleepFn?: typeof sleep;
             coderRuntimeRunForFn?: typeof coderRuntimeRunFor;
             onOutput?: (output: string) => void;
+            keyRing?: TKeyRing | null;
+            nowFn?: () => number;
         } = {},
     ): number {
         // #92: единая точка всех claude-сессий (кодер-итерации И шаги сдачи) — здесь же
@@ -991,8 +1165,17 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // имеющей. Документированное «ждать не более N раз» обязано значить ровно это, а
         // не «N минус число транзиентов».
         let attempt = 0;
+        // Задача 96: ротация читается один раз на вызов и нормализуется — после рестарта
+        // активным не останется ключ, о котором уже известно, что он упёрся.
+        let rot: TKeyRotation | null = null;
+        if (keyRing) {
+            rot = normalizeRotation(keyRing.load(), nowFn());
+            keyRing.save(rot);
+        }
         for (;;) {
-            const { code, output, failureKind, systemErrorCode } = runClaudeOnceFn(prompt, opts);
+            const runOpts =
+                keyRing && rot ? { ...opts, authToken: keyRing.keys[rot.active] } : opts;
+            const { code, output, failureKind, systemErrorCode } = runClaudeOnceFn(prompt, runOpts);
             // #611: 'arg-too-long' — детерминированный отказ ЗАПУСКА (argv/env превысили
             // MAX_ARG_STRLEN), НЕ транзиент. Причина уже названа в логе на границе spawn
             // (spawnClaude/spawnCodex) — здесь просто честно возвращаем код БЕЗ повтора:
@@ -1055,6 +1238,22 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 onOutput(output);
                 return code;
             }
+            // Задача 96: сначала своя подписка. Упёрся активный ключ — он помечается временем
+            // сброса, и сессия сразу идёт на следующем свободном: ни ожидания, ни фолбэка,
+            // ни траты счётчика `attempt`. Конец круга гарантирован — каждый виток метит
+            // ключ, а метка живёт до сброса, который всегда в будущем. Помечены все — дальше
+            // штатный путь (фолбэк, затем сон), но сон до БЛИЖАЙШЕГО сброса из меток.
+            let keyStep: TKeyLimitStep | null = null;
+            if (keyRing && rot) {
+                const now = nowFn();
+                keyStep = onKeyLimit(rot, now, now + apiLimitWaitMs(output, cfg));
+                rot = keyStep.rot;
+                keyRing.save(rot);
+                if (keyStep.kind === 'rotate') {
+                    log(keyRotateMessage(keyStep.from, keyStep.to, keyRing.keys.length));
+                    continue;
+                }
+            }
             // Лимит основного рантайма. Кросс-провайдерный фолбэк (#376) пробуем ОДИН раз
             // за весь вызов ДО решения об ожидании: он «вместо ожидания», логически не часть
             // механизма ожидания — поэтому пробуется и при waitOnApiLimit:false (оператор,
@@ -1077,6 +1276,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         `🔀 API-лимит — пробую кросс-провайдерный фолбэк "${fallbackRoute.provider}" вместо ожидания (modelRouting.apiLimitFallback).`,
                     );
                     const fallbackRun = coderRuntimeRunForFn(fallbackRoute.provider);
+                    // Ключ подписки Claude чужому провайдеру не нужен — opts, а не runOpts.
                     const fb = fallbackRun(prompt, {
                         ...opts,
                         model: fallbackRoute.model ?? opts.model,
@@ -1116,12 +1316,22 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 onOutput(output);
                 return code;
             }
-            const waitMs = apiLimitWaitMs(output, cfg);
-            const limitMsg = apiLimitMessage(waitMs, attempt, maxWaits);
+            const waitMs =
+                keyStep?.kind === 'wait'
+                    ? Math.max(0, keyStep.waitUntilMs - nowFn())
+                    : apiLimitWaitMs(output, cfg);
+            const limitMsg =
+                keyRing && keyStep?.kind === 'wait'
+                    ? allKeysExhaustedMessage(waitMs, attempt, maxWaits, keyRing.keys.length)
+                    : apiLimitMessage(waitMs, attempt, maxWaits);
             // pushEvent — единственный логгер события (маркер 🔔 PUSH печатается всегда,
             // даже без Telegram): парный log() выше давал двойную строку в логе.
             pushEventFn(limitMsg, cfg);
             sleepFn(waitMs);
+            if (keyRing && rot && keyStep?.kind === 'wait') {
+                rot = resumeAfterWait(rot, keyStep.next);
+                keyRing.save(rot);
+            }
             // ЕДИНСТВЕННОЕ место, где растёт счётчик ожиданий лимита (ревью #612): бюджет
             // «не более N ожиданий» тратит только сам факт ожидания лимита.
             attempt++;
@@ -1177,7 +1387,40 @@ export function createOrchestrator(env: OrchestratorEnv) {
         if (cfg.permissionMode) cmdArgs.push('--permission-mode', cfg.permissionMode);
         const fb = fallbackModel !== undefined ? fallbackModel : cfg.fallbackModel;
         if (fb && fb !== 'none') cmdArgs.push('--fallback-model', fb);
+        // Задача 95: JSON-результат несёт токены по моделям — по ним считается стоимость
+        // попытки. Вывод переводится обратно в текст в spawnClaude (attempt-cost.ts).
+        cmdArgs.push(...CLAUDE_JSON_ARGS);
         return cmdArgs;
+    }
+
+    // Задача 95: запись попытки — событие `attempt` в журнал (токены, тариф снимком,
+    // стоимость) и строка 💰 в лог. Тариф читается из конфига на КАЖДЫЙ вызов и копируется в
+    // запись: это и есть «тариф момента вызова». Отказ записи журнала попытку не роняет —
+    // приёмники журнала сами называют отказ (event-journal.ts).
+    function recordAttempt(
+        runtimeName: string,
+        code: number,
+        parsed: ReturnType<typeof parseClaudeJsonResult>,
+        unknownReason?: string,
+        {
+            emitFn = emitEvent,
+            logFn = log,
+            cfg = config,
+        }: { emitFn?: typeof emitEvent; logFn?: LogFn; cfg?: RalphConfig } = {},
+    ): TAttemptRecord {
+        const rec = attemptRecord({
+            runtime: runtimeName,
+            code,
+            parsed,
+            // Немой failFn безопасен только потому, что битую секцию observability уже
+            // отверг preflight на старте: сюда доходит проверенный конфиг. Без preflight
+            // он глотал бы ошибку конфига и молча давал бы стоимость рантайма.
+            pricing: resolveObservability(cfg, () => {}).pricing,
+            ...(unknownReason ? { unknownReason } : {}),
+        });
+        emitFn('attempt', rec);
+        logFn(attemptLogLine(rec));
+        return rec;
     }
 
     // #607/#611: правила классификации отказа запуска и тексты причин живут в
@@ -1218,6 +1461,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         timeoutMs: number,
         spawnFn: typeof spawnSync = spawnSync,
         env?: NodeJS.ProcessEnv,
+        runtimeName = 'claude',
     ): RunResult {
         // Дефолт — настоящий spawnSync: забытый мок запустил бы живую claude-сессию
         // (это уже случалось, см. докблок выше). Guard делает промах громким.
@@ -1243,10 +1487,15 @@ export function createOrchestrator(env: OrchestratorEnv) {
             maxBuffer: 64 * 1024 * 1024,
             ...(env ? { env } : {}),
         });
-        const output = `${res.stdout || ''}\n${res.stderr || ''}`;
+        // Задача 95: stdout — JSON-результат (`--output-format json`); читателям вывода
+        // отдаётся его текст в форме текстового режима (`parseClaudeJsonResult`). Не
+        // разобрался — вывод идёт как есть, а попытка ляжет в журнал с причиной.
+        const parsed = parseClaudeJsonResult(res.stdout || '');
+        const stdoutText = parsed ? parsed.text : res.stdout || '';
+        const output = `${stdoutText}\n${res.stderr || ''}`;
         // Захваченный вывод транслируем в консоль (файл фоновой задачи), как раньше
         // делал inherit — просто постфактум, а не потоком.
-        if (res.stdout) process.stdout.write(res.stdout);
+        if (stdoutText) process.stdout.write(parsed ? `${stdoutText}\n` : stdoutText);
         if (res.stderr) process.stderr.write(res.stderr);
         // #607/#611: spawnSync, не сумевший поднять процесс (execve упал), отдаёт
         // res.error, а не status/signal. Раньше это молча падало в `code: res.status ?? 1`
@@ -1255,12 +1504,27 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // модулем spawn-failure.ts; лог получает готовые строки, называющие причину прямо.
         const { result, logLines } = resolveSpawnResult('claude', res, output, timeoutMs);
         for (const line of logLines) log(line);
+        recordAttempt(runtimeName, result.code, parsed);
         return result;
+    }
+
+    // Задача 96: env Claude-сессии под ротацией. Подменяется ровно одна переменная — та, что
+    // CLI читает сам. Без ротации (ключ один) env не передаётся вовсе: undefined значит
+    // «наследуй env раннера», и путь байт-в-байт прежний. Список ключей сессии не нужен —
+    // ей хватает своего, остальные были бы лишней экспозицией для промпт-инъекции.
+    function claudeSessionEnv(
+        authToken: string | undefined,
+        baseEnv: NodeJS.ProcessEnv = process.env,
+    ): NodeJS.ProcessEnv | undefined {
+        if (!authToken) return undefined;
+        const env: NodeJS.ProcessEnv = { ...baseEnv, [SUBSCRIPTION_KEY_ENV]: authToken };
+        delete env[SUBSCRIPTION_KEYS_ENV];
+        return env;
     }
 
     function runClaudeOnce(
         prompt: string,
-        { model, maxTurns, fallbackModel }: ClaudeOpts,
+        { model, maxTurns, fallbackModel, authToken }: ClaudeOpts,
     ): RunResult {
         // Работает кроссплатформенно, т.к. `claude` — нативный бинарник (claude.exe на
         // Windows, бинарь/симлинк на Linux), а НЕ npm .cmd-shim (тот без shell даёт ENOENT).
@@ -1272,7 +1536,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // timeout (M3): зависший claude (сетевой столл) иначе блокирует синхронный
         // loop навсегда — AFK-прогон молча стоит до утра.
         const timeout = config.claudeTimeoutMs || 2 * 60 * 60 * 1000;
-        return spawnClaude(cmdArgs, prompt, timeout);
+        return spawnClaude(cmdArgs, prompt, timeout, spawnSync, claudeSessionEnv(authToken));
     }
 
     // ── Рантайм Kimi (#373, фаза 6) ──────────────────────────────────────────
@@ -1304,6 +1568,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             ANTHROPIC_AUTH_TOKEN: token,
         };
         delete env.CLAUDE_CODE_OAUTH_TOKEN;
+        delete env[SUBSCRIPTION_KEYS_ENV];
         delete env.ANTHROPIC_API_KEY;
         delete env.OPENAI_API_KEY;
         delete env.RALPH_TG_BOT_TOKEN;
@@ -1401,7 +1666,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // token гарантированно не-null при !DRY (requireToken выше). Секрет — только в env
         // процесса (buildKimiSpawnEnv), НЕ в argv (иначе виден в /proc/*/cmdline).
         const env = buildKimiSpawnEnv(baseUrl, token as string, process.env);
-        return spawnClaude(cmdArgs, prompt, timeout, spawnFn, env);
+        return spawnClaude(cmdArgs, prompt, timeout, spawnFn, env, 'kimi');
     }
 
     // ── Рантайм OpenAI (#374, фаза 6) ────────────────────────────────────────
@@ -1552,6 +1817,12 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // логирования — разъехавшись, копии дали бы разный диагноз одному отказу.
         const { result, logLines } = resolveSpawnResult('codex', res, output, timeoutMs);
         for (const line of logLines) log(line);
+        recordAttempt(
+            'codex',
+            result.code,
+            null,
+            'рантайм codex расход токенов в выводе не отдаёт',
+        );
         return result;
     }
 
@@ -1757,6 +2028,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         if (token) env.OPENAI_API_KEY = token;
         else delete env.OPENAI_API_KEY;
         delete env.CLAUDE_CODE_OAUTH_TOKEN;
+        delete env[SUBSCRIPTION_KEYS_ENV];
         delete env.ANTHROPIC_API_KEY;
         delete env.ANTHROPIC_AUTH_TOKEN;
         delete env.RALPH_KIMI_AUTH_TOKEN;
@@ -2306,6 +2578,15 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     // «Не сосчитали» — не ноль: иначе одно неотвеченное чтение делало бы
                     // годной сколь угодно переполненную веху, и потолок переставал бы
                     // быть барьером. Самая частая причина отказа — вехи на площадке нет.
+                    return null;
+                }
+            },
+            // #65: закрытая веха — не кандидат при любом наполнении. Отказ чтения — «не
+            // знаем», кандидат пропускается тем же правилом, что непрочитанное наполнение.
+            isOpenFn: (milestone) => {
+                try {
+                    return taskSource.isMilestoneOpen(milestone);
+                } catch {
                     return null;
                 }
             },
@@ -3593,6 +3874,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
         return [
             process.env.GH_TOKEN,
             process.env.CLAUDE_CODE_OAUTH_TOKEN,
+            // Задача 96: редакция видит каждый ключ списка ротации, а не только активный.
+            ...subscriptionKeys(process.env),
             process.env.RALPH_TG_BOT_TOKEN,
             process.env.RALPH_TG_CHAT_ID,
             process.env[kimiEnv],
@@ -3881,6 +4164,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         openIssues,
         allOpenIssues,
         hasAnyIssues,
+        milestoneOpen,
         milestoneLabels,
         issueDetails,
         commentOnIssue,
@@ -4062,6 +4346,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 openIssues,
                 allOpenIssues,
                 hasAnyIssues,
+                milestoneOpen,
                 milestoneLabels,
                 getIssue: issueDetails,
                 prComments,
@@ -4148,6 +4433,30 @@ export function createOrchestrator(env: OrchestratorEnv) {
             }),
         },
     };
+
+    // Шов задач для процесса-НАБЛЮДАТЕЛЯ — панели монитора (#58). Панель ходила в трекер
+    // командами GitHub мимо шва и на площадке без его CLI показывала пустые строки там, где
+    // человек ищет главное: сколько задач осталось и есть ли PR фазы. Теперь она спрашивает
+    // тот же шов, что и петля, выбранный тем же `config.adapters`.
+    //
+    // Лог отвязывается от файла ДО сборки, и это половина функции, а не попутная деталь:
+    // адаптеры пишут предупреждения через `log()` раннера, а в процессе монитора его файл —
+    // ralph.log рядом с ядром, по свежести которого deadman судит о жизни петли. Строка
+    // наблюдателя туда маскировала бы ту самую тишину, о которой он сообщает. Поэтому
+    // функция только для процесса, который `main()` не запускает: раннеру она отрезала бы
+    // его собственный лог.
+    //
+    // `failFn` — от вызывающего: здесь отказ выбора не стоп процесса (`fail` раннера делает
+    // exit), а строка панели «шов не собран» — наблюдатель обязан пережить кривой конфиг.
+    // Фильтр `human` не накладывается: он режет очередь работы, а панель считает всё открытое.
+    function observerTaskSource(
+        adaptersConfig: AdapterConfig | undefined,
+        failFn: (msg: string) => never,
+    ): TaskSourceAdapter {
+        setLogTarget(null);
+        const selection = resolveAdapterSelection(adaptersConfig, failFn);
+        return buildAdapters(adapterRegistries, selection, failFn).taskSource;
+    }
 
     // Дефолтный набор швов (без config — для юнит-тестов, строящих runtime без main()).
     // main() пересоберёт с выбором из config.adapters (fail-closed). Здесь fail недостижим:
@@ -4449,6 +4758,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
         resolveMergeRetryMaxMs(cfg, failFn);
         // #67: порог брейкера серии — тем же ранним отказом.
         resolveMaxSameIssue(cfg, failFn);
+        // Задача 95: порог диска, ротация логов сессий и тарифы — тем же ранним отказом:
+        // опечатка выключила бы порог молча, а тариф строкой дал бы NaN в стоимости попытки.
+        resolveObservability(cfg, failFn);
 
         // Канон, задача 27: заданный скрипт потребителя ищется на диске ДО первой итерации.
         // Форму пути закрыл валидатор конфига (задача 23), но опечатка в САМОМ пути формы не
@@ -4702,6 +5014,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // Без DI-хвоста боевой hasAnyIssues: шов отдаёт (milestone) => boolean, и более
         // узкое описание совместимо с обеими реализациями (параметры контравариантны).
         hasAnyIssuesFn?: (milestone: string) => boolean;
+        // #65: статус вехи-накопителя для адреса карточек лестницы.
+        milestoneOpenFn?: (title: string) => boolean;
         applySessionRequestsFn?: typeof applySessionRequests;
         // #46: заведение PR фазы, поиск уже открытого и сборка описания — все три с DI,
         // как и остальные побочки. Без хука на ПОИСК цикл сдачи ходил бы в боевой шов даже
@@ -4848,6 +5162,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             openIssuesFn = adapters.taskSource.listReadyIssues,
             allOpenIssuesFn = adapters.taskSource.listAllOpenIssues,
             hasAnyIssuesFn = adapters.taskSource.hasAnyIssues,
+            milestoneOpenFn = adapters.taskSource.isMilestoneOpen,
             applySessionRequestsFn = applySessionRequests,
             findOpenPrFn = adapters.taskSource.findOpenPullRequest,
             getIssueFn = adapters.taskSource.getIssue,
@@ -5556,9 +5871,20 @@ export function createOrchestrator(env: OrchestratorEnv) {
             // полигоне дважды подряд, после #424 и #425). Своему действию доверяем больше,
             // чем чужому списку; C2 при этом не ослаблен — blocked и чужие карточки
             // очередь считает по-прежнему, отфильтровано только собственное закрытие.
-            const issues = openIssuesFn(phase.milestone).filter(
-                (i) => !closedThisRun.has(i.number),
-            );
+            let issues = openIssuesFn(phase.milestone).filter((i) => !closedThisRun.has(i.number));
+
+            // #43: та же задержка списка, но закрывал ЧЕЛОВЕК — между итерациями или до
+            // рестарта, когда `closedThisRun` пуст (см. pickLiveCandidate).
+            const live = pickLiveCandidate({
+                issues,
+                milestone: phase.milestone,
+                resume: resumeAttempt,
+                readIssue: getIssueFn,
+                logFn,
+            });
+            issues = live.issues;
+            const picked = live.picked;
+            for (const n of live.closed) closedThisRun.add(n);
 
             // #92: продолжение попытки прошлого процесса — только по той же карточке той же
             // фазы и только пока она в очереди. Карточку закрыли или увели из вехи —
@@ -5704,7 +6030,11 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 // Тело карточки нужно только сессии: продолжение после неё его не читает.
                 if (!stageDone('session')) {
                     try {
-                        issueContext = buildIssueContext(getIssueFn(next.number));
+                        issueContext = buildIssueContext(
+                            picked?.number === next.number
+                                ? picked.details
+                                : getIssueFn(next.number),
+                        );
                     } catch (e) {
                         pushEventFn(
                             `⛔ Ralph: не смог прочитать карточку #${String(next.number)} — ${(e as Error).message} ` +
@@ -5970,7 +6300,11 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     let progressed = true;
                     try {
                         const headAfter = shFn('git rev-parse HEAD');
-                        const openAfter = openIssuesFn(phase.milestone).length;
+                        // Тот же фильтр, что у очереди: иначе закрытое прогоном (#65, #43)
+                        // числилось бы открытым после сессии и не до неё.
+                        const openAfter = openIssuesFn(phase.milestone).filter(
+                            (i) => !closedThisRun.has(i.number),
+                        ).length;
                         progressed = headAfter !== headBefore || openAfter < openBefore;
                     } catch {}
                     state.noProgress = progressed ? 0 : (state.noProgress || 0) + 1;
@@ -6840,6 +7174,16 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         cap: backlogCap,
                         currentPhase: phase.milestone,
                         countOpenFn: countBacklogOpen,
+                        // #65: разобранный том закрыт и пуст — по наполнению он «самый
+                        // свободный», и находки уезжали в него. Статус спрашивается
+                        // отдельно, отказ чтения пропускает кандидата.
+                        isOpenFn: (milestone: string): boolean | null => {
+                            try {
+                                return milestoneOpenFn(milestone);
+                            } catch {
+                                return null;
+                            }
+                        },
                         logFn,
                         what: 'карточек ревью правок',
                     });
@@ -9152,6 +9496,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
             ),
         );
 
+        // Задача 95: сколько выводов сессий держит `sessions/` — из конфига, до первой записи.
+        // Битое значение здесь не останавливает: его остановит preflight с причиной.
+        setSessionLogsKeep(resolveObservability(config, () => {}).sessionLogsKeep);
+
         // Режим в лог первой строкой: разбирая утренний ralph.log, надо видеть, в каком
         // профиле шёл прогон, не сверяясь с историей команд.
         log(`⚙️  Профиль: ${config.profileName}`);
@@ -9363,6 +9711,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
         openIssues,
         allOpenIssues,
         hasAnyIssues,
+        // #65: статус вехи — тоже с DI-хуком на чтение gh, контракт берёт её боевой.
+        milestoneOpen,
         milestoneLabels,
         // #37: и у этой — свой DI-хук на чтение gh, поэтому контракт проверяет её боевой.
         prComments,
@@ -9412,7 +9762,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
         addBlockedLabel,
         API_LIMIT_RE,
         spawnClaude,
+        claudeSessionEnv,
+        recordAttempt,
         runClaude,
+        subscriptionKeyRing,
         // #373 (фаза 6): рантайм Kimi (тот же `claude` + endpoint Moonshot). Экспорт —
         // для смоук-теста рантайма и юнитов чистых хелперов (env/резолв, fail-closed).
         runKimiOnce,
@@ -9471,6 +9824,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         getAdapters: (): RalphAdapters => adapters,
         buildAdapters,
         resolveAdapterSelection,
+        observerTaskSource,
         // #376 (фаза 6): provider-aware modelRouting — экспорт для юнитов резолва/роутинга.
         // getAdapterSelection — тот же паттерн геттера, что и getAdapters (значение
         // переприсваивается в main()).

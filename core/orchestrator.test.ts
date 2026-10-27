@@ -202,9 +202,10 @@ const mkCmdRecorders = (shImpl?: (cmd: string) => string) => {
 };
 
 describe('buildClaudeArgs — построение argv для claude -p (ядро порта; #607 — без промпта)', () => {
-    it('минимальный вызов: -p --max-turns <n> и больше ничего при пустом конфиге', () => {
+    it('минимальный вызов: -p --max-turns <n> и JSON-результат при пустом конфиге', () => {
+        // Задача 95: `--output-format json` — источник токенов попытки (attempt-cost.ts).
         const argv = buildClaudeArgs({ maxTurns: 200 }, {});
-        expect(argv).toEqual(['-p', '--max-turns', '200']);
+        expect(argv).toEqual(['-p', '--max-turns', '200', '--output-format', 'json']);
     });
 
     it('maxTurns приводится к строке (spawnSync требует строковые argv)', () => {
@@ -276,6 +277,8 @@ describe('buildClaudeArgs — построение argv для claude -p (ядр
             'bypassPermissions',
             '--fallback-model',
             'claude-sonnet-5',
+            '--output-format',
+            'json',
         ]);
     });
 
@@ -285,7 +288,7 @@ describe('buildClaudeArgs — построение argv для claude -p (ядр
     // фиксированного вида что для промпта в 10 байт, что в 200 КБ.
     it('#607: argv не содержит промпт вовсе — состав фиксирован флагами', () => {
         const argv = buildClaudeArgs({ maxTurns: 200 }, {});
-        expect(argv).toEqual(['-p', '--max-turns', '200']);
+        expect(argv).toEqual(['-p', '--max-turns', '200', '--output-format', 'json']);
     });
 
     it('чистота: не мутирует переданный конфиг', () => {
@@ -573,9 +576,12 @@ describe('Kimi-рантайм (#373) — Claude-spawn + env Moonshot', () => {
         it('снимает каналы Claude-аутентификации (иначе CLI ушёл бы на api.anthropic.com мимо Kimi)', () => {
             const env = buildKimiSpawnEnv('https://api.moonshot.ai/anthropic', 'sk-moon', {
                 CLAUDE_CODE_OAUTH_TOKEN: 'oauth-claude',
+                RALPH_CLAUDE_OAUTH_TOKENS: 'oauth-a,oauth-b',
                 ANTHROPIC_API_KEY: 'anthropic-key',
             });
             expect('CLAUDE_CODE_OAUTH_TOKEN' in env).toBe(false);
+            // Задача 96: список ключей ротации — тот же канал Claude, только во множественном.
+            expect('RALPH_CLAUDE_OAUTH_TOKENS' in env).toBe(false);
             expect('ANTHROPIC_API_KEY' in env).toBe(false);
         });
 
@@ -960,6 +966,7 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
             // нужен кодер-сессии для git/gh (та же экспозиция, что у Claude-пути).
             const env = buildOpenAISpawnEnv('sk-openai', {
                 CLAUDE_CODE_OAUTH_TOKEN: 'oauth-claude',
+                RALPH_CLAUDE_OAUTH_TOKENS: 'oauth-a,oauth-b',
                 ANTHROPIC_API_KEY: 'anthropic-key',
                 ANTHROPIC_AUTH_TOKEN: 'anthropic-auth',
                 RALPH_KIMI_AUTH_TOKEN: 'sk-moon',
@@ -968,6 +975,7 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
             });
             expect(env.OPENAI_API_KEY).toBe('sk-openai');
             expect('CLAUDE_CODE_OAUTH_TOKEN' in env).toBe(false);
+            expect('RALPH_CLAUDE_OAUTH_TOKENS' in env).toBe(false);
             expect('ANTHROPIC_API_KEY' in env).toBe(false);
             expect('ANTHROPIC_AUTH_TOKEN' in env).toBe(false);
             expect('RALPH_KIMI_AUTH_TOKEN' in env).toBe(false);
@@ -2453,6 +2461,272 @@ describe('pushEvent — доставка событий в Telegram, prod-only (
     });
 });
 
+// Задача 96: ротация ключей подписки. Кольцо подменяется параметром (keyRing) — боевое
+// читает env и файл ротации, тест держит «файл» в памяти и проверяет, что в него легло.
+describe('runClaude — ротация ключей подписки (задача 96)', () => {
+    const { runClaude } = ralph;
+    const KEYS = ['key-one-secret-96', 'key-two-secret-96', 'key-three-secret-96'];
+    const MIN = 60_000;
+
+    function ring(initial: unknown = null) {
+        const saved: string[] = [];
+        let disk = initial;
+        return {
+            saved,
+            ring: {
+                keys: KEYS,
+                load: () => (disk as never) ?? { keyCount: KEYS.length, active: 0, exhausted: {} },
+                save: (rot: unknown) => {
+                    disk = rot;
+                    saved.push(JSON.stringify(rot));
+                },
+            },
+        };
+    }
+
+    it('лимит на ключе 1 → сессия сразу на ключе 2, ожидание не потрачено', () => {
+        const runClaudeOnceFn = vi
+            .fn<RunClaudeFake>()
+            .mockReturnValueOnce({ code: 1, output: "You've hit your session limit · resets 11am" })
+            .mockReturnValueOnce({ code: 0, output: 'ok' });
+        const pushEventFn = vi.fn();
+        const sleepFn = vi.fn();
+        const { ring: keyRing } = ring();
+
+        const code = runClaude(
+            'промпт',
+            { maxTurns: 5 },
+            {
+                pushEventFn,
+                sleepFn,
+                ensureTunnelFn: () => true,
+                runClaudeOnceFn,
+                keyRing,
+                nowFn: () => 0,
+                cfg: { apiLimitMaxWaits: 1 },
+            },
+        );
+
+        expect(code).toBe(0);
+        expect(runClaudeOnceFn.mock.calls.map((c) => c[1].authToken)).toEqual([KEYS[0], KEYS[1]]);
+        expect(sleepFn).not.toHaveBeenCalled();
+        expect(pushEventFn).not.toHaveBeenCalled();
+    });
+
+    it('ротация не тратит счётчик ожиданий: при apiLimitMaxWaits=1 после круга ключей ещё есть сон', () => {
+        const runClaudeOnceFn = vi
+            .fn<RunClaudeFake>()
+            .mockReturnValueOnce({ code: 1, output: 'session limit resets 11am' })
+            .mockReturnValueOnce({ code: 1, output: 'session limit resets 11am' })
+            .mockReturnValueOnce({ code: 1, output: 'session limit resets 11am' })
+            .mockReturnValueOnce({ code: 0, output: 'ok' });
+        const sleepFn = vi.fn();
+        const { ring: keyRing } = ring();
+
+        const code = runClaude(
+            'промпт',
+            { maxTurns: 5 },
+            {
+                pushEventFn: vi.fn(),
+                sleepFn,
+                ensureTunnelFn: () => true,
+                runClaudeOnceFn,
+                keyRing,
+                nowFn: () => 0,
+                cfg: { apiLimitMaxWaits: 1 },
+            },
+        );
+
+        expect(code).toBe(0);
+        expect(sleepFn).toHaveBeenCalledTimes(1);
+    });
+
+    it('кросс-провайдерный фолбэк — только когда упёрлись все ключи', () => {
+        const runClaudeOnceFn = vi
+            .fn<RunClaudeFake>()
+            .mockReturnValueOnce({ code: 1, output: 'session limit resets 11am' })
+            .mockReturnValueOnce({ code: 0, output: 'ok' });
+        const fallbackRun = vi.fn<RunClaudeFake>(() => ({ code: 0, output: 'kimi' }));
+        const { ring: keyRing } = ring();
+
+        runClaude(
+            'промпт',
+            { maxTurns: 5 },
+            {
+                pushEventFn: vi.fn(),
+                sleepFn: vi.fn(),
+                ensureTunnelFn: () => true,
+                runClaudeOnceFn,
+                coderRuntimeRunForFn: () => fallbackRun,
+                keyRing,
+                nowFn: () => 0,
+                cfg: { modelRouting: { apiLimitFallback: { provider: 'kimi', model: 'k' } } },
+            },
+        );
+
+        expect(fallbackRun).not.toHaveBeenCalled();
+    });
+
+    it('все ключи упёрлись → сон до БЛИЖАЙШЕГО сброса, пуш «все ключи», затем ключ этого сброса', () => {
+        // Ключ 1 сбросится через 180 мин, ключ 2 — через 60, ключ 3 — через 120: ждать
+        // надо 60 минут и идти на ключе 2, а не 180 до сброса первого по порядку.
+        const runClaudeOnceFn = vi
+            .fn<RunClaudeFake>()
+            .mockReturnValueOnce({ code: 1, output: 'session limit, try later' })
+            .mockReturnValueOnce({ code: 1, output: 'session limit, try later' })
+            .mockReturnValueOnce({ code: 1, output: 'session limit, try later' })
+            .mockReturnValueOnce({ code: 0, output: 'ok' });
+        const waits = [180, 60, 120];
+        let hit = 0;
+        const cfgFor = () => ({
+            apiLimitMaxWaits: 3,
+            apiLimitGraceMin: 0,
+            get apiLimitFallbackWaitMin() {
+                return waits[hit++];
+            },
+        });
+        const pushEventFn = vi.fn();
+        const sleepFn = vi.fn();
+        const { ring: keyRing } = ring();
+
+        const code = runClaude(
+            'промпт',
+            { maxTurns: 5 },
+            {
+                pushEventFn,
+                sleepFn,
+                ensureTunnelFn: () => true,
+                runClaudeOnceFn,
+                keyRing,
+                nowFn: () => 0,
+                cfg: cfgFor(),
+            },
+        );
+
+        expect(code).toBe(0);
+        expect(sleepFn).toHaveBeenCalledTimes(1);
+        expect(sleepFn).toHaveBeenCalledWith(60 * MIN);
+        expect(pushEventFn).toHaveBeenCalledTimes(1);
+        expect(pushEventFn.mock.calls[0][0]).toMatch(/все ключи подписки \(3\) упёрлись/);
+        expect(pushEventFn.mock.calls[0][0]).toMatch(/Жду 60 мин/);
+        expect(runClaudeOnceFn.mock.calls.map((c) => c[1].authToken)).toEqual([
+            KEYS[0],
+            KEYS[1],
+            KEYS[2],
+            KEYS[1],
+        ]);
+    });
+
+    it('рестарт не начинает с сожжённого ключа; значений ключей нет ни в логе, ни в пуше, ни в файле ротации', () => {
+        // Файл ротации от прошлого процесса: активным остался ключ 1, и он ещё не сбросился.
+        const runClaudeOnceFn = vi
+            .fn<RunClaudeFake>()
+            .mockReturnValueOnce({ code: 1, output: 'session limit resets 11am' })
+            .mockReturnValueOnce({ code: 1, output: 'session limit resets 11am' })
+            .mockReturnValueOnce({ code: 0, output: 'ok' });
+        const pushes: string[] = [];
+        const logged: string[] = [];
+        const logSpy = vi.spyOn(console, 'log').mockImplementation((m: unknown) => {
+            logged.push(String(m));
+        });
+        const { ring: keyRing, saved } = ring({
+            keyCount: 3,
+            active: 0,
+            exhausted: { 0: 1000 * MIN },
+        });
+
+        try {
+            runClaude(
+                'промпт',
+                { maxTurns: 5 },
+                {
+                    pushEventFn: (m: string) => {
+                        pushes.push(m);
+                        return true;
+                    },
+                    sleepFn: vi.fn(),
+                    ensureTunnelFn: () => true,
+                    runClaudeOnceFn,
+                    keyRing,
+                    nowFn: () => 0,
+                    cfg: { apiLimitMaxWaits: 1, apiLimitGraceMin: 0 },
+                },
+            );
+        } finally {
+            logSpy.mockRestore();
+        }
+
+        expect(runClaudeOnceFn.mock.calls[0][1].authToken).toBe(KEYS[1]);
+        expect(saved.length).toBeGreaterThan(0);
+        const everything = [...saved, ...pushes, ...logged].join('\n');
+        for (const k of KEYS) expect(everything).not.toContain(k);
+        // Строка ротации при этом в логе есть — она называет номера.
+        expect(logged.join('\n')).toMatch(/ключе подписки 2\/3 — сессия сразу на ключе 3\/3/);
+    });
+
+    it('env сессии под ротацией: свой ключ в переменной CLI, списка нет; без ротации env наследуется', () => {
+        const { claudeSessionEnv } = ralph;
+        const env = claudeSessionEnv('key-two', {
+            PATH: '/usr/bin',
+            CLAUDE_CODE_OAUTH_TOKEN: 'key-one',
+            RALPH_CLAUDE_OAUTH_TOKENS: 'key-one,key-two',
+        });
+        expect(env).toEqual({ PATH: '/usr/bin', CLAUDE_CODE_OAUTH_TOKEN: 'key-two' });
+        expect(claudeSessionEnv(undefined, { PATH: '/usr/bin' })).toBeUndefined();
+    });
+
+    it('кольцо решает рантайм вызова: claude — да, kimi при тех же двух ключах — нет', () => {
+        const { subscriptionKeyRing, adapterRegistries } = ralph;
+        const env = { RALPH_CLAUDE_OAUTH_TOKENS: 'key-one,key-two' };
+        expect(subscriptionKeyRing(adapterRegistries.coderRuntime.claude.run, env)?.keys).toEqual([
+            'key-one',
+            'key-two',
+        ]);
+        expect(subscriptionKeyRing(adapterRegistries.coderRuntime.kimi.run, env)).toBeNull();
+        expect(subscriptionKeyRing(vi.fn<RunClaudeFake>(), env)).toBeNull();
+    });
+
+    it('маршрут на kimi + лимит Moonshot → ключи подписки не тронуты, сессия ждёт, а не ротирует', () => {
+        // Два ключа в env хоста: боевое кольцо, построенное по ошибке, полезло бы в файл
+        // ротации — предохранитель побочек покраснил бы тест, а authToken лёг бы в опции.
+        vi.stubEnv('RALPH_CLAUDE_OAUTH_TOKENS', 'key-one,key-two');
+        try {
+            const runClaudeOnceFn = vi
+                .fn<RunClaudeFake>()
+                .mockReturnValueOnce({ code: 1, output: '429 rate limit exceeded' })
+                .mockReturnValueOnce({ code: 0, output: 'ok' });
+            const sleepFn = vi.fn();
+            const code = runClaude(
+                'промпт',
+                { maxTurns: 5 },
+                {
+                    pushEventFn: vi.fn(),
+                    sleepFn,
+                    ensureTunnelFn: () => true,
+                    runClaudeOnceFn,
+                    cfg: { apiLimitMaxWaits: 1, apiLimitGraceMin: 0 },
+                },
+            );
+            expect(code).toBe(0);
+            expect(sleepFn).toHaveBeenCalledTimes(1);
+            for (const c of runClaudeOnceFn.mock.calls)
+                expect(c[1]).not.toHaveProperty('authToken');
+        } finally {
+            vi.unstubAllEnvs();
+        }
+    });
+
+    it('кольца нет (один ключ) — authToken в опции не появляется, путь прежний', () => {
+        const runClaudeOnceFn = vi.fn<RunClaudeFake>(() => ({ code: 0, output: 'ok' }));
+        runClaude(
+            'промпт',
+            { maxTurns: 5 },
+            { ensureTunnelFn: () => true, runClaudeOnceFn, keyRing: null },
+        );
+        expect(runClaudeOnceFn.mock.calls[0][1]).toEqual({ maxTurns: 5 });
+    });
+});
+
 describe('runClaude — 4-е событие (#88): API-лимит пушит уведомление и повторяет попытку', () => {
     const { runClaude } = ralph;
 
@@ -3035,6 +3309,22 @@ describe('preflight — валидация конфига/среды и подг
     // вокруг вызова fail-open, поэтому «файла нет» видно одной строкой ⚠ после мерджа
     // фазы — а через месяц журнал находок пуст, и связать это с опечаткой некому.
     describe('наличие скриптов потребителя (канон, задача 27)', () => {
+        // Задача 95: секция observability проверяется на старте, а не там, где её прочтут.
+        it('битая секция observability — стоп на старте с причиной', () => {
+            expect(() =>
+                preflight(
+                    validCfg({ observability: { diskMinFreeMB: 512 } }),
+                    okDeps({ loadStateFn: fakeState }),
+                ),
+            ).toThrow(/observability: незнакомые ключи diskMinFreeMB/);
+            expect(() =>
+                preflight(
+                    validCfg({ observability: { pricing: { m: { inputPerMTok: '5' } } } }),
+                    okDeps({ loadStateFn: fakeState }),
+                ),
+            ).toThrow(/pricing\.m/);
+        });
+
         const withScripts = (resolved: Record<string, string | null>, extra = {}) =>
             validCfg({ consumerScriptsResolved: resolved, ...extra });
 
@@ -4367,6 +4657,98 @@ describe('runLoop — основной while-цикл: итерации коде
             ([, opts]) => (opts as { model?: string }).model === 'claude-picked',
         );
         expect(coderCalls).toHaveLength(1);
+    });
+
+    // #43: карточку закрыл ЧЕЛОВЕК между итерациями — своего закрытия у петли нет, и
+    // `closedThisRun` её не знает. Список форжа врёт так же, как в #65; правду говорит
+    // точечное чтение карточки, и оно обязано решать до спавна, а не после.
+    it('#43 карточка, закрытая между итерациями при старом списке, не берётся', () => {
+        const logs: string[] = [];
+        const state = mkState();
+        const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+        // #5 закрывается человеком ПОСЛЕ первой итерации: до неё карточка открыта.
+        let humanClosed = false;
+        const getIssueFn = vi.fn((number: number) => ({
+            number,
+            title: `задача ${String(number)}`,
+            body: `тело ${String(number)}`,
+            open: !(number === 5 && humanClosed),
+        }));
+        runLoop(
+            validCfg(),
+            ctx(state),
+            deps(logs, {
+                phaseIndexOfFn: () => 0,
+                openIssuesFn: () => [
+                    { number: 5, title: 'задача 5', labels: [] },
+                    { number: 6, title: 'задача 6', labels: [] },
+                ],
+                getIssueFn,
+                applySessionRequestsFn: () => {
+                    // Сессия по #5 карточку не закрыла — закрыл человек между итерациями.
+                    // Сессия по #6 закрыла свою намерением.
+                    const closed = humanClosed ? [6] : [];
+                    humanClosed = true;
+                    return { applied: closed.length, failed: false, closedIssues: closed };
+                },
+                pickModelFn: () => 'claude-picked',
+                runClaudeFn,
+            }),
+        );
+        const coderPrompts = runClaudeFn.mock.calls
+            .filter(([, opts]) => (opts as { model?: string }).model === 'claude-picked')
+            .map(([prompt]) => String(prompt));
+        expect(coderPrompts).toHaveLength(2);
+        expect(coderPrompts[0]).toContain('тело 5');
+        expect(coderPrompts[1]).toContain('тело 6');
+        expect(logs.join('\n')).toMatch(/Issue #5 уже не открыт/);
+    });
+
+    it('#43 сверка читает карточку один раз: тело для промпта берётся из неё же', () => {
+        const logs: string[] = [];
+        const getIssueFn = vi.fn((number: number) => ({
+            number,
+            title: 'задача',
+            body: 'тело',
+            open: number !== 5,
+        }));
+        const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+        runLoop(
+            validCfg(),
+            ctx(mkState()),
+            deps(logs, {
+                once: true,
+                phaseIndexOfFn: () => 0,
+                openIssuesFn: () => [
+                    { number: 5, title: 'задача', labels: [] },
+                    { number: 6, title: 'задача', labels: [] },
+                ],
+                getIssueFn,
+                pickModelFn: () => 'claude-picked',
+                runClaudeFn,
+            }),
+        );
+        expect(runClaudeFn).toHaveBeenCalledTimes(1);
+        expect(String(runClaudeFn.mock.calls[0][0])).toContain('Задача #6');
+        expect(getIssueFn.mock.calls.map(([n]) => n)).toEqual([5, 6]);
+    });
+
+    it('#43 статус неизвестен (шов его не отдаёт) — карточка берётся, как по списку', () => {
+        // «Не знаю» не становится «закрыта»: иначе адаптер без статуса молча опустошал бы
+        // очередь, и фаза уходила бы в сдачу несделанной.
+        const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+        runLoop(
+            validCfg(),
+            ctx(mkState()),
+            deps([], {
+                once: true,
+                phaseIndexOfFn: () => 0,
+                openIssuesFn: () => [{ number: 5, title: 'задача', labels: [] }],
+                getIssueFn: (number: number) => ({ number, title: 'задача', body: 'тело' }),
+                runClaudeFn,
+            }),
+        );
+        expect(runClaudeFn).toHaveBeenCalledTimes(1);
     });
 
     it('кодер-итерация в ONCE: одна claude-сессия нужной моделью и стоп', () => {
@@ -9135,6 +9517,42 @@ describe('handleCrashedCoderSession — падение кодер-сессии: 
         });
     });
 
+    describe('задача 96: каждый ключ списка ротации редактируется, а не только активный', () => {
+        const LIST = 'rot-key-a-96,rot-key-b-96';
+        beforeEach(() => {
+            process.env.RALPH_CLAUDE_OAUTH_TOKENS = LIST;
+        });
+        afterEach(() => {
+            delete process.env.RALPH_CLAUDE_OAUTH_TOKENS;
+        });
+
+        it('второй ключ списка в выводе и пуше заменён', () => {
+            let saved = '';
+            const pushes: string[] = [];
+            handleCrashedCoderSession(issue, 1, 'auth failed for rot-key-b-96', {
+                shFn: () => {
+                    throw new Error('fatal: token rot-key-b-96 rejected');
+                },
+                logFn: () => {},
+                pushEventFn: (m: string) => {
+                    pushes.push(m);
+                    return true;
+                },
+                saveSessionOutputFn: (
+                    _p: string,
+                    out: string,
+                    secrets?: Array<string | undefined>,
+                ) => {
+                    saved = util.redactSecrets(out, secrets ?? []);
+                },
+                cfg: {} as unknown,
+                secretEnvNamesFn: () => [],
+            });
+            expect(saved).not.toContain('rot-key-b-96');
+            expect(pushes.join('\n')).not.toContain('rot-key-b-96');
+        });
+    });
+
     it('сбой записи вывода (ENOSPC/EACCES) НЕ роняет раннер — диагностика продолжается по git status', () => {
         // Запись вывода — вежливая диагностика, а не инвариант: необёрнутое исключение
         // пролетело бы сквозь runLoop наверх и убило раннер вместо честного git-разбора.
@@ -11891,7 +12309,7 @@ describe('syncProjectBoard', () => {
 // сборка фабрики, а не только то, что она долетает до готового ralph.js.
 
 import path from 'node:path';
-import { createOrchestrator } from './orchestrator.ts';
+import { createOrchestrator, pickLiveCandidate } from './orchestrator.ts';
 import { stripComments } from '../tests/strip-comments.ts';
 
 // Платформенное: тест опирается на POSIX-механизмы, которых на Windows нет
@@ -11952,6 +12370,8 @@ describe('createOrchestrator: API-поверхность', () => {
         'processPpid',
         'sweepOrphanMonitors',
         'ensureMonitorAlive',
+        // #58: шов задач панели монитора — тот же, что у петли, без записи в ralph.log
+        'observerTaskSource',
         // lock/state
         'isRalphProcess',
         'lockAlive',
@@ -11966,6 +12386,7 @@ describe('createOrchestrator: API-поверхность', () => {
         // claude-сессия
         'buildClaudeArgs',
         'spawnClaude',
+        'claudeSessionEnv',
         'runClaude',
         // примитивы исполнения (#138)
         'shq',
@@ -12116,6 +12537,31 @@ describe('createOrchestrator: набор швов адаптеров (#369)', ()
                 throw new Error(m);
             }),
         ).toThrow();
+    });
+});
+
+// #58: панель монитора спрашивает трекер через шов, выбранный ТЕМ ЖЕ config.adapters, что
+// у петли. Иначе на площадке без CLI GitHub панель снова стала бы слепой — тихо, без отказа.
+describe('observerTaskSource — шов задач для панели монитора (#58)', () => {
+    const throwFail = (m: string): never => {
+        throw new Error(m);
+    };
+
+    it('выбор реализации — по config.adapters, как у петли', () => {
+        const runtime = buildRuntime();
+        const sc = runtime.observerTaskSource({ taskSource: 'sourcecraft' }, throwFail);
+        const gh = runtime.observerTaskSource(undefined, throwFail);
+        // Реализации различимы по секрету, который каждая называет сама (#56).
+        expect(sc.secretEnvNames()).not.toEqual(gh.secretEnvNames());
+        expect(typeof sc.listAllOpenIssues).toBe('function');
+        expect(typeof sc.findOpenPullRequest).toBe('function');
+    });
+
+    it('неизвестная реализация — отказ через failFn вызывающего, а не exit процесса', () => {
+        const runtime = buildRuntime();
+        expect(() => runtime.observerTaskSource({ taskSource: 'nope' }, throwFail)).toThrow(
+            /taskSource/,
+        );
     });
 });
 
@@ -13437,6 +13883,8 @@ describe('applySessionRequests: намерения сессии применяе
                         asked.push(milestone);
                         return open[milestone] ?? [];
                     },
+                    // #65: по умолчанию вехи открыты — закрытость тест задаёт явно.
+                    isMilestoneOpen: (milestone: string) => (void milestone, true),
                     // Пишем ВЕСЬ input: раскладка полей руками (`createIssue({title, body,
                     // labels, milestone})` вместо `createIssue(req)`) появилась вместе
                     // с адресом, и потерять в ней поле стало возможно впервые. Фейк,
@@ -13483,6 +13931,53 @@ describe('applySessionRequests: намерения сессии применяе
                     milestone: 'Ревью · Входящие',
                 },
             ]);
+        });
+
+        // #65: канал кодер-сессии ходит через ту же фабрику, что лестница, но проводку
+        // статуса у него можно потерять отдельно — поэтому свой сценарий.
+        it('первый накопитель ЗАКРЫТ и пуст → карточка едет во второй', () => {
+            const { ts, created, asked } = addressingTaskSource(
+                {},
+                { isMilestoneOpen: (m: string) => m !== 'Ревью · Входящие' },
+            );
+            ralph.applySessionRequests({
+                cfg: withBacklog(),
+                currentMilestone: 'Gravity · Фаза 4',
+                dry: false,
+                readFn: () => newIssue('Течёт лимит'),
+                writeFn: () => {},
+                removeFn: () => {},
+                taskSource: ts,
+                logFn: () => {},
+                pushEventFn: () => {},
+            });
+            expect(created).toMatchObject([
+                { title: 'Течёт лимит', milestone: 'Ревью · Запасные' },
+            ]);
+            expect(asked).toEqual(['Ревью · Запасные']);
+        });
+
+        it('статус накопителя не читается → адреса нет, а не «веха открыта»', () => {
+            const { ts, created } = addressingTaskSource(
+                {},
+                {
+                    isMilestoneOpen: () => {
+                        throw new Error('форж не отдал вехи');
+                    },
+                },
+            );
+            ralph.applySessionRequests({
+                cfg: withBacklog(),
+                currentMilestone: 'Gravity · Фаза 4',
+                dry: false,
+                readFn: () => newIssue('Течёт лимит'),
+                writeFn: () => {},
+                removeFn: () => {},
+                taskSource: ts,
+                logFn: () => {},
+                pushEventFn: () => {},
+            });
+            expect(created).toMatchObject([{ title: 'Течёт лимит', milestone: undefined }]);
         });
 
         // Правило сходимости, ради которого адрес вообще выбирается, а не берётся первым
@@ -14063,5 +14558,85 @@ describe('#181: зависимости синхронятся при перее�
     it('синк в гейте мерджа остался на месте', () => {
         const gate = fs.readFileSync(new URL('./gate.ts', import.meta.url), 'utf-8');
         expect(gate).toContain('syncDepsFn(');
+    });
+});
+
+// #43: выбор кандидата итерации вынесен из тела runLoop чистой функцией — юниты здесь,
+// сквозной сценарий закрытия человеком — в tests/coder-stage-restart.test.ts.
+describe('pickLiveCandidate (#43)', () => {
+    const issues = [{ number: 1 }, { number: 2 }, { number: 3 }];
+    const open = (n: number) => ({ number: n, title: `t${String(n)}`, body: '', open: true });
+    const shut = (n: number) => ({ ...open(n), open: false });
+
+    it('закрытые человеком пропускаются до первой открытой; прочитанное отдаётся наверх', () => {
+        const readIssue = vi.fn((n: number) => (n < 3 ? shut(n) : open(n)));
+        const logFn = vi.fn();
+        const r = pickLiveCandidate({ issues, milestone: 'M', resume: null, readIssue, logFn });
+        expect(r.closed).toEqual([1, 2]);
+        expect(r.issues).toEqual([{ number: 3 }]);
+        expect(r.picked).toEqual({ number: 3, details: open(3) });
+        expect(logFn).toHaveBeenCalledTimes(2);
+    });
+
+    it('`open` не задан — «не знаю», карточка берётся по списку', () => {
+        const details = { number: 1, title: 't', body: '' };
+        const r = pickLiveCandidate({
+            issues,
+            milestone: 'M',
+            resume: null,
+            readIssue: () => details,
+            logFn: vi.fn(),
+        });
+        expect(r.picked).toEqual({ number: 1, details });
+        expect(r.closed).toEqual([]);
+    });
+
+    it('отказ чтения не решается здесь: кандидат не выбран, очередь не тронута', () => {
+        const r = pickLiveCandidate({
+            issues,
+            milestone: 'M',
+            resume: null,
+            readIssue: () => {
+                throw new Error('нет сети');
+            },
+            logFn: vi.fn(),
+        });
+        expect(r).toEqual({ issues, picked: null, closed: [] });
+    });
+
+    it('продолжаемая попытка: кандидат — её карточка, а после доведённой сессии не читается вовсе', () => {
+        const readIssue = vi.fn(open);
+        const before = pickLiveCandidate({
+            issues,
+            milestone: 'M',
+            resume: { milestone: 'M', issue: 2, resumeStage: 'session' },
+            readIssue,
+            logFn: vi.fn(),
+        });
+        expect(before.picked?.number).toBe(2);
+
+        readIssue.mockClear();
+        const after = pickLiveCandidate({
+            issues,
+            milestone: 'M',
+            resume: { milestone: 'M', issue: 2, resumeStage: 'intents' },
+            readIssue,
+            logFn: vi.fn(),
+        });
+        expect(after.picked).toBeNull();
+        expect(readIssue).not.toHaveBeenCalled();
+    });
+
+    it('пустая очередь — кандидата нет, чтений нет', () => {
+        const readIssue = vi.fn(open);
+        const r = pickLiveCandidate({
+            issues: [],
+            milestone: 'M',
+            resume: null,
+            readIssue,
+            logFn: vi.fn(),
+        });
+        expect(r.picked).toBeNull();
+        expect(readIssue).not.toHaveBeenCalled();
     });
 });
