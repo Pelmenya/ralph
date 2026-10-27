@@ -26,6 +26,7 @@ export type TStopReason =
     | 'tree-dirty'
     | 'intent-unknown'
     | 'merge-unknown'
+    | 'stage-journal'
     | 'breaker'
     | 'deadman'
     | 'unknown';
@@ -66,6 +67,8 @@ export const REASON_TITLES: Record<TStopReason, string> = {
     'intent-unknown': 'исход намерения сессии неизвестен',
     // #53/#88: форж принял мердж и не подтвердил его, либо раннер убит после POST.
     'merge-unknown': 'исход мерджа неизвестен',
+    // #92: журнал этапов попытки повреждён или не пишется — продолжать по нему нельзя.
+    'stage-journal': 'журнал этапов попытки не читается или не пишется',
     breaker: 'circuit breaker',
     deadman: 'тишина лога (deadman)',
     unknown: 'причина не установлена',

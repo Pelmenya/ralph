@@ -135,6 +135,20 @@ describe('commentOnPr — замечание ревью от имени ранн
         ]);
     });
 
+    // #41: сторона больше не прошита — замечание к удалённой строке живёт в СТАРОЙ версии
+    // файла, и с `RIGHT` оно легло бы на чужую строку того же номера.
+    it('#41 якорь со стороной LEFT — side=LEFT, а не прошитый RIGHT', () => {
+        const runArgvFn = vi.fn((_file: string, args: string[]) => args.join(' '));
+        make().commentOnPr(
+            12,
+            { body: 'удалено зря', anchor: { path: 'src/a.ts', line: 42, side: 'LEFT' } },
+            { runArgvFn, ghJsonFn: (() => ({ headRefOid: SHA })) as never },
+        );
+        const args = runArgvFn.mock.calls[0][1];
+        expect(args).toContain('side=LEFT');
+        expect(args).not.toContain('side=RIGHT');
+    });
+
     // #575: средняя ступень отката — комментарий уровня ФАЙЛА. `line`/`side` в него не
     // кладём вовсе: с ними форж снова ждёт строку в изменённом ханке и снова отвечает 422.
     it('якорь без строки — комментарий уровня файла, без line/side', () => {

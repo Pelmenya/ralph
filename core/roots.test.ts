@@ -474,6 +474,7 @@ describe('переезд состояния в runtimeDir (канон, зада�
             'monitorPid',
             'requests',
             'sessions',
+            'stages',
             'state',
             'stopRequest',
         ]);

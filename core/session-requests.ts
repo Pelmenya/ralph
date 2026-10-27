@@ -15,6 +15,7 @@
 // Разбор fail-closed во всём: файл пишет модель, которая читала тело чужого issue (C3),
 // и неожиданная форма данных здесь обязана быть отказом, а не «пропустим эту строку».
 
+import { MERGE_TRANSIENT_RE } from './merge-retry.ts';
 import { formatStopMessage } from './stop-message.ts';
 
 // Что сессия имеет право попросить. Список ЗАКРЫТЫЙ и намеренно короткий: снятие `hold`,
@@ -30,8 +31,17 @@ export type TSessionRequest =
     // репозитория, включая чужие.
     // Якорь — ВЛОЖЕННЫЙ объект, а не два независимых поля: «либо оба, либо ни одного» —
     // это инвариант, и в типе он выражается структурой, а не договорённостью с парсером.
-    | { kind: 'pr-comment'; comment: string; anchor?: { path: string; line: number } }
+    | { kind: 'pr-comment'; comment: string; anchor?: TRequestAnchor }
     | { kind: 'pr-block'; comment: string };
+
+// Сторона диффа у якоря (#41). Удалённая строка живёт только в СТАРОЙ версии файла, и
+// замечание к ней с прошитой новой стороной форж либо отвергал, либо вешал на строку с
+// тем же номером в новой версии — то есть на чужой код. Поле необязательно: молчание
+// означает новую сторону, как было до него, — замечаний о добавленном и неизменённом
+// коде подавляющее большинство.
+export type TDiffSide = 'LEFT' | 'RIGHT';
+export type TRequestAnchor = { path: string; line: number; side?: TDiffSide };
+const DIFF_SIDES: readonly string[] = ['LEFT', 'RIGHT'];
 
 // #603: предел считает КЛАССЫ намерений раздельно, а не кучей. Инцидент PR #601 —
 // ревью честно нашло 23 замечания (1 major, 6 minor, 16 nit + сводка), все `pr-comment`,
@@ -169,13 +179,17 @@ function text(value: unknown, lineNo: number, what: string, max: number): string
 
 // Якорь комментария: путь + строка. Либо ОБА поля, либо ни одного — половина якоря
 // (путь без строки) у форжа не примется, и намерение потерялось бы уже в транспорте.
-function anchor(
-    req: Record<string, unknown>,
-    lineNo: number,
-): { anchor?: { path: string; line: number } } {
+// Сторона диффа — только при якоре: без строки ей не к чему относиться, и молча
+// выброшенное поле означало бы, что сессия думала о строке, которой в намерении нет.
+function anchor(req: Record<string, unknown>, lineNo: number): { anchor?: TRequestAnchor } {
     const rawPath = req['path'];
     const rawLine = req['line'];
-    if (rawPath === undefined && rawLine === undefined) return {};
+    const rawSide = req['side'];
+    if (rawPath === undefined && rawLine === undefined) {
+        if (rawSide !== undefined)
+            fail(lineNo, 'сторона диффа (side) задаётся только при паре path+line');
+        return {};
+    }
     if (rawPath === undefined || rawLine === undefined) {
         fail(lineNo, 'якорь комментария задаётся ПАРОЙ path+line: одного поля мало');
     }
@@ -190,7 +204,14 @@ function anchor(
     if (typeof rawLine !== 'number' || !Number.isInteger(rawLine) || rawLine <= 0) {
         fail(lineNo, `строка должна быть целым положительным, пришло ${JSON.stringify(rawLine)}`);
     }
-    return { anchor: { path, line: rawLine } };
+    if (rawSide === undefined) return { anchor: { path, line: rawLine } };
+    if (typeof rawSide !== 'string' || !DIFF_SIDES.includes(rawSide)) {
+        fail(
+            lineNo,
+            `сторона диффа должна быть ${DIFF_SIDES.join(' или ')}, пришло ${JSON.stringify(rawSide)}`,
+        );
+    }
+    return { anchor: { path, line: rawLine, side: rawSide as TDiffSide } };
 }
 
 function labels(value: unknown, lineNo: number, allowlist: readonly string[]): string[] {
@@ -325,9 +346,80 @@ export function parseSessionRequests(
 export function serializeSessionRequest(req: TSessionRequest): string {
     if (req.kind === 'pr-comment' && req.anchor) {
         const { anchor, ...rest } = req;
-        return JSON.stringify({ ...rest, path: anchor.path, line: anchor.line });
+        return JSON.stringify({
+            ...rest,
+            path: anchor.path,
+            line: anchor.line,
+            ...(anchor.side ? { side: anchor.side } : {}),
+        });
     }
     return JSON.stringify(req);
+}
+
+// ── #41: отказ форжа, который повтор не лечит ───────────────────────────────────────
+//
+// Раньше ЛЮБОЙ отказ на N-м намерении сохранял хвост целиком и останавливал применение.
+// Для транзиента (сеть, 5xx, лимит) это верно — следующая итерация пройдёт. Но карточка
+// удалена, метки нет, прав нет — такой отказ повторяется детерминированно, и одно битое
+// намерение навсегда загораживало собой весь хвост батча: остальные не применялись ни
+// этой итерацией, ни следующей.
+//
+// Классов три, и умолчание — СОХРАНИТЬ хвост, а не выбросить: незнакомая формулировка
+// отказа не должна молча отнимать у намерения повтор (тот же выбор, что у повтора мерджа
+// в merge-retry.ts):
+//
+//   - `deterministic` — выбывает то, что форж назвал прямо: 403/404/410/422 и их словесные
+//     формы. Ответ форжа пришёл, значит отказ окончательный;
+//   - `unsent` — соединения не было вовсе (адрес не разрешился, порт отказал): запрос
+//     доказуемо не ушёл, и хвост повторяется без сверки — как до #94;
+//   - `retry` — всё прочее, включая обрыв посреди обмена: эффект мог лечь.
+//
+// Транзиент проверяется ПЕРВЫМ — GitHub отвечает на упор в лимит кодом 403 (в том числе
+// устаревшим «abuse detection» без слов «rate limit»), и ветка «нет прав» съела бы его.
+// Набор транзиентов тот же, что у мерджа (`MERGE_TRANSIENT_RE`): у намерения он был у́же,
+// и обрыв вида `connection reset by peer` без errno-токена уходил «по существу».
+//
+// Признаки — только из ОТВЕТА форжа, и это держит не регулярка, а вход: классификатор
+// получает `intentFailureText`, а не сообщение исключения. У `execFileSync` первой строкой
+// сообщения идёт вся команда, а адаптер GitHub кладёт тело комментария в argv — тело,
+// упомянувшее «HTTP 404» (карточки про отказы форжа именно такие), делало бы из обрыва
+// сети отказ по существу, и намерение выбывало бы безвозвратно.
+export type TIntentFailureKind = 'deterministic' | 'unsent' | 'retry';
+
+const INTENT_RATE_LIMIT_RE = /rate limit|abuse detection|secondary rate/i;
+const INTENT_UNSENT_RE =
+    /ECONNREFUSED|ENOTFOUND|EAI_AGAIN|Could not resolve host|no such host|connection refused|Failed to connect/i;
+const INTENT_DETERMINISTIC_RE = new RegExp(
+    [
+        'HTTP (?:403|404|410|422)\\b',
+        'returned error: (?:403|404|410|422)\\b',
+        'Could not resolve to an? (?:Issue|PullRequest|Label)',
+        "could not add label: '[^']*' not found",
+        'Resource not accessible by',
+        'does not have the correct permissions',
+    ].join('|'),
+    'i',
+);
+
+/**
+ * Текст ответа форжа из пойманного отказа: stderr процесса, иначе сообщение исключения
+ * без строки `Command failed: …`. Сообщение, которое ЦЕЛИКОМ — команда (stderr пуст), не
+ * отдаёт ничего: тело в argv может занимать несколько строк, и отделить его от ответа
+ * нечем, а пустой текст классифицируется умолчанием — повтором.
+ */
+export function intentFailureText(e: unknown): string {
+    const err = (e ?? {}) as { stderr?: unknown; message?: unknown };
+    const stderr = err.stderr === undefined || err.stderr === null ? '' : String(err.stderr);
+    if (stderr.trim() !== '') return stderr.trim();
+    const message = String(err.message ?? e).trim();
+    return message.startsWith('Command failed:') ? '' : message;
+}
+
+export function classifyIntentFailure(forgeText: string): TIntentFailureKind {
+    if (INTENT_RATE_LIMIT_RE.test(forgeText)) return 'retry';
+    if (INTENT_UNSENT_RE.test(forgeText)) return 'unsent';
+    if (MERGE_TRANSIENT_RE.test(forgeText)) return 'retry';
+    return INTENT_DETERMINISTIC_RE.test(forgeText) ? 'deterministic' : 'retry';
 }
 
 // ── #86: окно падения посреди применения ─────────────────────────────────────────────
@@ -340,42 +432,220 @@ export function serializeSessionRequest(req: TSessionRequest): string {
 // Поэтому перед каждым эффектом файл переписывается в вид «метка + неприменённый хвост»,
 // а после эффекта — в «хвост без него». Убит до метки — файл честный, повтор безопасен.
 // Убит после метки — исход первого намерения хвоста НЕИЗВЕСТЕН: эффект мог лечь, а мог
-// нет, и раннеру не по чему это различить (сверка с форжем — отдельная работа: шов пока не
-// умеет прочитать ни комментарии карточки, ни её статус). Неизвестный исход — стоп с
-// причиной и пушем, а не догадка: повтор вслепую дал бы дубль, пропуск — потерю.
+// нет. Различает его сверка с форжем по метке в теле эффекта (#94, ниже); где сверить
+// нечем, неизвестный исход — стоп с причиной и пушем, а не догадка: повтор вслепую дал
+// бы дубль, пропуск — потерю.
+//
+// Тот же неизвестный исход у ПОЙМАННОГО отказа, брошенного после того, как запрос к
+// форжу ушёл: обрыв ответа неотличим от отказа, а эффект мог лечь (воспроизведено в
+// исследовании: комментарий PR опубликован дважды). Поэтому такой отказ оставляет метку
+// на диске, а не переписывает файл в голый хвост, — и повтор идёт через сверку.
 //
 // Метка — строка без `kind`: парсер намерений её отвергает, так что файл с меткой не
 // применится НИКАКИМ путём, даже если проверку метки однажды забудут поставить перед ним.
-export const IN_FLIGHT_MARKER = '{"ralph":"in-flight"}';
+//
+// #94: метка несёт ИДЕНТИФИКАТОР попытки (`id`), а тот же идентификатор уходит в тело
+// эффекта невидимой меткой (`intentMark`). Раньше по метке на диске было известно только
+// «что-то начато», и исход решал человек; теперь его решает форж: метка в ленте — эффект
+// лёг, нет — не лёг, и повтор безопасен. Идентификатор одноразовый, а не производный от
+// текста: два одинаковых комментария к одной карточке из разных сессий — обычное дело
+// («тесты красные, вот вывод»), и хэш содержимого нашёл бы в ленте ЧУЖОЙ, давний, приняв
+// неприменённое намерение за применённое. Живёт он ровно столько, сколько метка: в файле,
+// рядом с начатым намерением, — другого места, переживающего убийство, у раннера нет.
+//
+// Префикс общий у метки с `id` и у прежней, без него: файл, оставленный раннером до #94,
+// обязан узнаваться меткой (сверять там нечем — стоп), а не читаться битой строкой.
+export const IN_FLIGHT_PREFIX = '{"ralph":"in-flight"';
+const INTENT_ID_RE = /^[A-Za-z0-9-]{8,64}$/;
+
+/**
+ * Строка-метка начатого намерения с идентификатором попытки. `landed: 'comment'` — у
+ * `close`/`block` комментарий уже лёг, и это известно ЭТОМУ процессу (вызов вернулся), а
+ * отказал статус. Сверять тогда нечего: повтор доводит только статус, он идемпотентен.
+ */
+export function inFlightMarker(id: string, landed?: 'comment'): string {
+    if (!INTENT_ID_RE.test(id)) throw new Error(`идентификатор намерения не по форме: ${id}`);
+    return JSON.stringify(landed ? { ralph: 'in-flight', id, landed } : { ralph: 'in-flight', id });
+}
 
 /** Файл для записи ПЕРЕД эффектом: метка и неприменённый хвост, первым — начатое намерение. */
-export function serializeInFlight(tail: readonly TSessionRequest[]): string {
-    return `${[IN_FLIGHT_MARKER, ...tail.map(serializeSessionRequest)].join('\n')}\n`;
+export function serializeInFlight(
+    tail: readonly TSessionRequest[],
+    id: string,
+    landed?: 'comment',
+): string {
+    return `${[inFlightMarker(id, landed), ...tail.map(serializeSessionRequest)].join('\n')}\n`;
+}
+
+// Невидимая метка в теле эффекта. HTML-комментарий markdown не рисует ни GitHub, ни
+// SourceCraft, а в сыром теле, которое отдаёт лента, он есть. Стоит ХВОСТОМ: журнал
+// находок ревью засчитывает severity, только если она первый значимый символ тела.
+export function intentMark(id: string): string {
+    return `<!-- ralph-intent:${id} -->`;
+}
+export function withIntentMark(body: string, id: string): string {
+    return `${body}\n\n${intentMark(id)}`;
+}
+export function carriesIntentMark(body: string, id: string): boolean {
+    return body.includes(intentMark(id));
 }
 
 /**
- * Начатое, но не подтверждённое намерение: строка, следующая за меткой. `null` — метки
- * нет, файл можно применять.
+ * Начатое, но не подтверждённое намерение. `null` — метки нет, файл можно применять.
+ * `id: null` — метка без идентификатора (оставлена раннером до #94 или испорчена): сверять
+ * её с форжем не по чему. `rest` — файл без метки и без начатого намерения.
  *
  * Метка не на первом месте — тоже метка, а не «нет её»: раннер ставит её только первой,
- * значит файл собран не им, и решать, что в нём начато, раннер не вправе.
+ * значит файл собран не им, и решать, что в нём начато, раннер не вправе — такой метке
+ * идентификатор не признаётся.
  */
-export function inFlightRequest(raw: string | null): string | null {
+export type TInFlight = {
+    marker: string;
+    id: string | null;
+    /** Что из эффекта уже легло по записи самого раннера; `null` — не известно. */
+    landed: 'comment' | null;
+    started: string;
+    rest: string;
+};
+export function inFlightEntry(raw: string | null): TInFlight | null {
     if (!raw) return null;
     const lines = raw
         .split('\n')
         .map((l) => l.trim())
         .filter((l) => l !== '');
-    const at = lines.indexOf(IN_FLIGHT_MARKER);
+    const at = lines.findIndex((l) => l.startsWith(IN_FLIGHT_PREFIX));
     if (at === -1) return null;
-    return lines[at + 1] ?? '(строки намерения за меткой нет)';
+    const marker = lines[at];
+    let id: string | null = null;
+    let landed: 'comment' | null = null;
+    try {
+        const parsed = JSON.parse(marker) as { ralph?: unknown; id?: unknown; landed?: unknown };
+        const keys = Object.keys(parsed);
+        const landedOk = parsed.landed === undefined || parsed.landed === 'comment';
+        if (
+            at === 0 &&
+            parsed.ralph === 'in-flight' &&
+            typeof parsed.id === 'string' &&
+            INTENT_ID_RE.test(parsed.id) &&
+            landedOk &&
+            keys.length === (parsed.landed === undefined ? 2 : 3)
+        ) {
+            id = parsed.id;
+            landed = parsed.landed === 'comment' ? 'comment' : null;
+        }
+    } catch {
+        id = null;
+    }
+    const started = lines[at + 1] ?? '(строки намерения за меткой нет)';
+    const rest = lines.slice(at + 2);
+    return { marker, id, landed, started, rest: rest.length > 0 ? `${rest.join('\n')}\n` : '' };
+}
+
+/** Начатое намерение строкой (для текстов) — `null`, если метки нет. */
+export function inFlightRequest(raw: string | null): string | null {
+    return inFlightEntry(raw)?.started ?? null;
+}
+
+// ── #94: сверка начатого намерения с форжем ─────────────────────────────────────────
+//
+// Чем кончилась сверка. `landed` — сколько эффектов намерения уже на форже: `all` —
+// намерение применено целиком, `comment` — у `close`/`block` лёг комментарий, а статус
+// (закрытие, метка) нет либо неизвестен и повторяется: оба идемпотентны, повтор не
+// плодит сущностей. `none` — метки в ленте нет, намерение применяется заново под тем же
+// идентификатором. `unknown` — сверить не по чему, и это стоп с причиной, а не догадка.
+export type TReconcile =
+    { verdict: 'landed'; landed: 'all' | 'comment' | 'none' } | { verdict: 'unknown'; why: string };
+
+// Чем сверять — решает вид намерения. Комментарий PR ищется в ленте PR (её шов читает
+// всегда), комментарий карточки — в ленте карточки, если источник умеет её читать. Новая
+// карточка не сверяется НИКАК: поиска карточки по метке в шве нет, и неизвестный исход
+// заведения — стоп.
+//
+// `listIssueComments` в контракте `TaskSourceAdapter` пока НЕ объявлен: объявление метода
+// шва правит барьер `tests/seam-defaults.test.ts` и требует ship человека, поэтому оно
+// едет отдельной карточкой вместе с реализациями адаптеров. До неё боевой шов метода не
+// имеет, и неизвестный исход `comment`/`close`/`block` — стоп, а не повтор вслепую.
+export type TReconcileSource = {
+    listIssueComments?: (issue: number) => string[];
+    listPullRequestComments: (pr: number) => Array<{ body: string }>;
+    findOpenPullRequest: (branch: string) => { number: number } | null;
+};
+
+/**
+ * Почему начатое намерение этого вида с этим швом НЕ сверить; `null` — сверить можно.
+ * Одна формулировка на все места, где её называют человеку: старт, применение, сверка.
+ */
+export function unreconcilableWhy(kind: TSessionRequest['kind'], source: object): string | null {
+    if (reconcilableKind(kind, source)) return null;
+    return kind === 'new-issue'
+        ? 'у шва форжа нет поиска карточки по метке намерения'
+        : 'шов форжа не умеет читать комментарии карточки';
+}
+
+/** Можно ли вообще сверить начатое намерение этого вида с этим швом — без похода в форж. */
+// Источник — `object`, а не тип с одним необязательным полем: боевой шов метода пока не
+// объявляет (см. выше), и TypeScript отверг бы его как «слабый тип» без общих полей.
+export function reconcilableKind(kind: TSessionRequest['kind'], source: object): boolean {
+    if (kind === 'pr-comment' || kind === 'pr-block') return true;
+    if (kind === 'new-issue') return false;
+    return typeof (source as { listIssueComments?: unknown }).listIssueComments === 'function';
+}
+
+export function reconcileInFlight(
+    req: TSessionRequest,
+    id: string,
+    source: TReconcileSource,
+    phase: { branch: string } | undefined,
+): TReconcile {
+    const why = unreconcilableWhy(req.kind, source);
+    if (why !== null) return { verdict: 'unknown', why };
+    const unread = (e: unknown): TReconcile =>
+        // Не прочитали ленту — не знаем. «Не нашли» здесь означало бы повтор вслепую.
+        ({ verdict: 'unknown', why: `лента форжа не прочиталась: ${(e as Error).message}` });
+    if (req.kind === 'pr-comment' || req.kind === 'pr-block') {
+        if (!phase) return { verdict: 'unknown', why: 'намерение по PR вне цикла сдачи фазы' };
+        try {
+            const pr = source.findOpenPullRequest(phase.branch);
+            if (!pr) {
+                return {
+                    verdict: 'unknown',
+                    why: `открытого PR ветки ${phase.branch} не найдено — ленту читать негде`,
+                };
+            }
+            const found = source
+                .listPullRequestComments(pr.number)
+                .some((c) => carriesIntentMark(c.body, id));
+            return { verdict: 'landed', landed: found ? 'all' : 'none' };
+        } catch (e) {
+            return unread(e);
+        }
+    }
+    // Несверяемое отсеяно выше — здесь только сужение типа. Инвариант проверяется броском
+    // ВНЕ `try`: пойманный, он ушёл бы человеку «лентой, которая не прочиталась».
+    const list = source.listIssueComments;
+    if (req.kind === 'new-issue' || !list) {
+        throw new Error(`сверка намерения ${req.kind}: несверяемый вид дошёл до чтения ленты`);
+    }
+    try {
+        const found = list(req.issue).some((b) => carriesIntentMark(b, id));
+        if (!found) return { verdict: 'landed', landed: 'none' };
+        return { verdict: 'landed', landed: req.kind === 'comment' ? 'all' : 'comment' };
+    } catch (e) {
+        return unread(e);
+    }
 }
 
 /**
  * Стоп по неизвестному исходу: что начато, почему не повторяем и что решить человеку.
  * Вопрос называет обе развилки построчно — человек правит файл, а не гадает, что в нём.
+ * `why` — почему сверка с форжем не решила исход сама (#94).
  */
-export function inFlightStopMessage(started: string, requestsPath: string): string {
+export function inFlightStopMessage(
+    entry: Pick<TInFlight, 'started' | 'marker'>,
+    requestsPath: string,
+    why?: string,
+): string {
+    const { started, marker } = entry;
     // #87: у pr-block два эффекта, и о мердже решает метка — она ставится первой. Судить
     // по комментарию значило бы гадать: он ложится вторым и мог не лечь при живой метке.
     const block = /"kind"\s*:\s*"pr-block"/.test(started)
@@ -385,12 +655,14 @@ export function inFlightStopMessage(started: string, requestsPath: string): stri
     return formatStopMessage({
         reason: 'intent-unknown',
         diagnosis:
-            `раннер был остановлен посреди применения намерения ${started} — эффект на ` +
-            'форже мог лечь, а мог нет. Повтор вслепую задвоил бы комментарий или карточку, ' +
+            `применение намерения ${started} оборвалось — эффект на ` +
+            'форже мог лечь, а мог нет' +
+            (why ? `, а сверить его с форжем нечем (${why})` : '') +
+            '. Повтор вслепую задвоил бы комментарий или карточку, ' +
             `пропуск потерял бы его, поэтому не применено ничего; файл ${requestsPath} ` +
             'оставлен как есть',
         question:
             'проверь на форже, лёг ли эффект этого намерения: лёг — удали из файла метку ' +
-            `${IN_FLIGHT_MARKER} и строку за ней, не лёг — только метку${block}; затем перезапусти loop`,
+            `${marker} и строку за ней, не лёг — только метку${block}; затем перезапусти loop`,
     });
 }

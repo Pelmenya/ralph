@@ -190,6 +190,8 @@ export function createGithubPrCommands(env: GithubPrCommandsEnv) {
                     'без неё inline-комментарий невозможен.',
             );
         }
+        // #41: сторона — из якоря. Прошитый `RIGHT` вешал замечание к удалённой строке на
+        // строку с тем же номером в НОВОЙ версии файла, то есть на чужой код.
         // #575: якорь без строки — комментарий уровня ФАЙЛА, тот же эндпоинт с
         // `subject_type=file`. `line`/`side` в него не кладём вовсе: с ними GitHub снова
         // ждёт строку в изменённом ханке и снова отвечает 422 — то есть ступень отката
@@ -197,7 +199,7 @@ export function createGithubPrCommands(env: GithubPrCommandsEnv) {
         const place =
             anchor.line === undefined
                 ? ['-f', 'subject_type=file']
-                : ['-F', `line=${String(anchor.line)}`, '-f', 'side=RIGHT'];
+                : ['-F', `line=${String(anchor.line)}`, '-f', `side=${anchor.side ?? 'RIGHT'}`];
         runArgvFn('gh', [
             'api',
             `repos/{owner}/{repo}/pulls/${String(prNumber)}/comments`,

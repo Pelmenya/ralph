@@ -27,6 +27,13 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { execSync } from 'node:child_process';
 import { resolveInstallCmd } from '../shared/ralph-util.ts';
+import {
+    attachSubmitJournal,
+    deployBlockOf,
+    parseSubmitJournal,
+    stateToDisk,
+    type TSubmitRecord,
+} from './submit-journal.ts';
 
 // Формат ralph.state.json — контракт (критерий #359). milestone === null означает «все
 // фазы пройдены» (см. phaseIndexOf/advancePhase в ralph.js). Остальные поля — счётчики
@@ -37,7 +44,11 @@ import { resolveInstallCmd } from '../shared/ralph-util.ts';
 // Версия схемы — номер ФОРМЫ файла, а не ревизии раннера: поднимать её нужно, когда
 // прежний раннер прочитал бы новый файл неверно (переименовали, сменили смысл поля), а не
 // на каждое новое поле — новые поля опциональны и читаются старыми раннерами безвредно.
-export const STATE_SCHEMA_VERSION = 1;
+//
+// v2 (#93): три чекпоинта сдачи (`submitted`, `deployBlock`, `reviewOfFixes.arbitrated`)
+// уехали из полей в журнал этапов `submitStages`. Прежний раннер прочитал бы v2 как
+// «submitted нет — сдача не начата» и повторил бы ревью и мердж, поэтому версия поднята.
+export const STATE_SCHEMA_VERSION = 2;
 
 export type RalphState = {
     schemaVersion: number;
@@ -71,6 +82,12 @@ export type RalphState = {
     // считается смердженной без ответа форжа. Опциональна: state прошлых ревизий её не
     // содержит, и отсутствие читается как «мерджа не начинали».
     mergeInFlight?: TMergeInFlight | null;
+    // #93: журнал этапов сдачи фазы (submit-journal.ts). `submitted`, `deployBlock` и
+    // `reviewOfFixes.arbitrated` выше — его проекции: у state, прошедшего
+    // `attachSubmitJournal`, они аксессоры, и на диск ложится журнал, а не поля.
+    // Опционален в типе, потому что state литералом (тесты, прежние ревизии) его не несёт —
+    // аксессоры перенесут туда флаги сами.
+    submitStages?: TSubmitRecord[];
 };
 
 export type TMergeInFlight = { milestone: string; pr: number; sha: string | null };
@@ -99,15 +116,15 @@ const NULLABLE_STRING_FIELDS = ['reviewModelFloor', 'lastReviewModel', 'forgeHea
  *
  * Версия проверяется ДО формы: файл чужой схемы вправе выглядеть иначе, и отказ «не та
  * форма» назвал бы повреждённым файл, который просто писал другой раннер. Отсутствие
- * версии — не отказ, а проверенная миграция v0 → v1: так выглядит каждый state, записанный
- * до задачи 80, и v1 от него отличается только самим полем версии. «Проверенная» значит,
- * что форма сверена целиком теми же правилами, что у v1, — молча принят не будет ни один
- * файл, который v1 бы отверг.
+ * версии — не отказ, а проверенная миграция: так выглядит каждый state, записанный до
+ * задачи 80. v0 и v1 переводятся в v2 (#93) — чекпоинты сдачи из полей в журнал этапов.
+ * «Проверенная» значит, что форма сверена целиком теми же правилами, что у v1, а журнал,
+ * получившийся из флагов, — тем же разбором, что журнал v2 с диска.
  *
  * Опциональные поля проверяются по типу, только если присутствуют: их добавляли по одному
  * (#217, #223, #269…), и state прошлых ревизий их законно не содержит — код читает их
  * отсутствие как дефолт. Обязательны три поля, без которых раннер не знает, где он:
- * count, milestone, submitted.
+ * count, milestone и submitted (v0/v1) либо журнал submitStages (v2).
  */
 export function inspectState(text: string): TStateInspection {
     let parsed: unknown;
@@ -128,11 +145,13 @@ export function inspectState(text: string): TStateInspection {
         if (typeof v !== 'number' || !Number.isInteger(v) || v < 1) {
             return bad(`schemaVersion не целое положительное число (${JSON.stringify(v)})`);
         }
-        if (v !== STATE_SCHEMA_VERSION) return { status: 'foreign-version', found: v, raw };
+        if (v > STATE_SCHEMA_VERSION) return { status: 'foreign-version', found: v, raw };
     }
     // Старая схема (phaseIndex) — это файл БЕЗ версии и без milestone. При заданной версии
     // отсутствие milestone — не другая схема, а повреждение: v1 его требует.
     if (v === undefined && raw.milestone === undefined) return { status: 'old-schema', raw };
+    // v0 (без поля) и v1 держат три чекпоинта сдачи полями, v2 — журналом (#93).
+    const legacy = v === undefined || v === 1;
 
     if (typeof raw.count !== 'number' || !Number.isInteger(raw.count) || raw.count < 0) {
         return bad('count — не целое неотрицательное число');
@@ -141,7 +160,23 @@ export function inspectState(text: string): TStateInspection {
     if (typeof raw.milestone !== 'string' && raw.milestone !== null) {
         return bad('milestone — не строка и не null');
     }
-    if (typeof raw.submitted !== 'boolean') return bad('submitted — не boolean');
+    if (legacy) {
+        if (typeof raw.submitted !== 'boolean') return bad('submitted — не boolean');
+    } else {
+        // В v2 чекпоинт полем — не «лишнее поле», а второй источник правды рядом с
+        // журналом: какой из них верен, по файлу не решить, поэтому стоп, а не выбор.
+        for (const k of ['submitted', 'deployBlock'] as const) {
+            if (raw[k] !== undefined) return bad(`${k} в v2 — поле журнала сдачи, а не state`);
+        }
+        const rof = raw.reviewOfFixes;
+        if (
+            rof &&
+            typeof rof === 'object' &&
+            (rof as Record<string, unknown>).arbitrated !== undefined
+        ) {
+            return bad('reviewOfFixes.arbitrated в v2 — запись журнала сдачи, а не поле');
+        }
+    }
     for (const k of NUMBER_FIELDS) {
         const n = raw[k];
         if (n !== undefined && (typeof n !== 'number' || !Number.isInteger(n) || n < 0)) {
@@ -188,11 +223,49 @@ export function inspectState(text: string): TStateInspection {
             );
         }
     }
-    return {
-        status: 'ok',
-        state: { ...raw, schemaVersion: STATE_SCHEMA_VERSION } as RalphState,
-        migrated: v === undefined,
-    };
+    let stages: TSubmitRecord[] = [];
+    if (!legacy) {
+        if (raw.submitStages === undefined) return bad('submitStages отсутствует');
+        try {
+            stages = parseSubmitJournal(raw.submitStages, 'state.submitStages');
+        } catch (e) {
+            return bad((e as Error).message);
+        }
+    }
+    // Миграция v0/v1 → v2 — те же операции, которыми пишет петля: флаги ложатся в журнал
+    // аксессорами (`attachSubmitJournal`), и форма журнала после них проверяется тем же
+    // разбором, что у v2 с диска. Молча принят не будет ни один файл, который v2 отверг бы.
+    const { submitStages: _drop, ...rest } = raw;
+    const base = legacy ? rest : { ...rest, submitStages: stages };
+    let state: RalphState;
+    try {
+        state = attachSubmitJournal({ ...base, schemaVersion: STATE_SCHEMA_VERSION } as RalphState);
+        parseSubmitJournal(state.submitStages, 'state.submitStages (миграция)');
+    } catch (e) {
+        return bad((e as Error).message);
+    }
+    return { status: 'ok', state, migrated: legacy };
+}
+
+/**
+ * Барьер деплоя в файле, который проверку не прошёл (`--reset`). v0/v1 держат его полем
+ * `deployBlock`, v2 — этапом журнала `submitStages` (#93): ищи только поле, и v2 со
+ * стоящим барьером и одним битым посторонним полем читался бы «барьера нет», и `--reset`
+ * стёр бы его без `--deploy-resolved`. Журнал, который не разбирается, — неизвестный
+ * барьер: прочитать нечем, а снимать вслепую нельзя.
+ */
+export function rawDeployBlock(raw: Record<string, unknown>): {
+    block: unknown;
+    unknownBlock: boolean;
+} {
+    if (raw.deployBlock) return { block: raw.deployBlock, unknownBlock: false };
+    if (raw.submitStages === undefined) return { block: null, unknownBlock: false };
+    try {
+        const records = parseSubmitJournal(raw.submitStages, 'state.submitStages');
+        return { block: deployBlockOf(records), unknownBlock: false };
+    } catch {
+        return { block: null, unknownBlock: true };
+    }
 }
 
 /** Текст стопа на непрошедшем проверку state: причина, что с файлом и как выйти. */
@@ -295,7 +368,7 @@ export function createStateLock(env: StateLockEnv) {
     // ── State: ralph.state.json ──────────────────────────────────────────────
 
     function defaultState(): RalphState {
-        return {
+        return attachSubmitJournal({
             schemaVersion: STATE_SCHEMA_VERSION,
             count: 0,
             milestone: getConfig().phases[0].milestone,
@@ -324,7 +397,7 @@ export function createStateLock(env: StateLockEnv) {
             deployBlock: null,
             // #269-ревью: прогона, по которому уже лечили, ещё нет.
             forgeHealedRunId: null,
-        };
+        });
     }
 
     // Только ENOENT — «нет»: EACCES/EISDIR/EIO, прочитанные как отсутствие, вернули бы ту же
@@ -354,8 +427,9 @@ export function createStateLock(env: StateLockEnv) {
         if (r.status === 'ok') {
             if (r.migrated) {
                 log(
-                    `🗂 State ${env.statePath} без версии схемы — форма проверена, принят как ` +
-                        `v${STATE_SCHEMA_VERSION}; версия запишется со следующим сохранением.`,
+                    `🗂 State ${env.statePath} прежней схемы — форма проверена, принят как ` +
+                        `v${STATE_SCHEMA_VERSION}: чекпоинты сдачи перенесены в журнал этапов, ` +
+                        `новая форма запишется со следующим сохранением.`,
                 );
             }
             return r.state;
@@ -391,7 +465,7 @@ export function createStateLock(env: StateLockEnv) {
         let unknownBlock = false;
         if (r.status === 'ok') block = r.state.deployBlock;
         else if (r.status !== 'absent') {
-            if (r.raw) block = r.raw.deployBlock;
+            if (r.raw) ({ block, unknownBlock } = rawDeployBlock(r.raw));
             else unknownBlock = true;
         }
         if (unknownBlock && !deployResolved) {
@@ -447,7 +521,8 @@ export function createStateLock(env: StateLockEnv) {
         guardSideEffect(`saveState(${env.statePath})`);
         // Целиком или никак: прерванный прогон иначе оставляет полуфайл, который следующий
         // старт читает как «состояния нет» — то есть теряет фазу вместе с её PR.
-        writeFileAtomic(env.statePath, JSON.stringify(state, null, 2));
+        // #93: на диск — журнал сдачи вместо трёх чекпоинтов (stateToDisk).
+        writeFileAtomic(env.statePath, JSON.stringify(stateToDisk(state), null, 2));
     }
 
     // ── Маркер зависимостей: .deps-lock.sha ──────────────────────────────────

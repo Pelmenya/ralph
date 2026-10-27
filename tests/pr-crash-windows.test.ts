@@ -21,7 +21,7 @@ import { describe, expect, it } from 'vitest';
 import ralph from '../ralph.js';
 import type { RalphConfig } from '../core/orchestrator.ts';
 import type { RalphState } from '../core/state-lock.ts';
-import { IN_FLIGHT_MARKER } from '../core/session-requests.ts';
+import { IN_FLIGHT_PREFIX } from '../core/session-requests.ts';
 import { REASON_TITLES } from '../core/stop-message.ts';
 import { Killed, world } from './crash-world.ts';
 
@@ -125,7 +125,7 @@ const SCENARIOS: Record<string, TScenario> = {
         effects: [
             'apply:fix-review',
             'apply:arbiter',
-            'save:reReviewPending=true,arbitrated=true',
+            'save:submitted=true,reReviewPending=true,arbitrated=true',
             'addBlocked',
             'save:reReviewPending=false',
             'removeBlocked',
@@ -496,8 +496,13 @@ const EARLIER_PR_EFFECT = 'comment:раньше';
 const jsonl = (o: unknown): string => JSON.stringify(o);
 const INTENT_CFG = { issueLabels: ['complexity:low', 'area:core'] };
 
-/** Форж PR: лента эффектов и метки, переживающие смерть процесса. */
-type TPrForge = { effects: string[]; labels: Set<string> };
+/**
+ * Форж PR: лента эффектов и метки, переживающие смерть процесса. `bodies` — сырые тела
+ * комментариев, как их отдаёт лента PR (#94: с меткой намерения); `effects` пишет тело
+ * без метки, чтобы матрица читалась по смыслу. `listFails` — лента не читается.
+ */
+type TPrForge = { effects: string[]; labels: Set<string>; bodies?: string[]; listFails?: boolean };
+const MARK_RE = /\n\n<!-- ralph-intent:[A-Za-z0-9-]+ -->$/;
 
 function applyPr(
     disk: { file: string | null },
@@ -534,16 +539,23 @@ function applyPr(
             commentOnPullRequest: g(
                 (_n: number, c: { body: string; anchor?: { path: string; line?: number } }) =>
                     c.anchor
-                        ? `comment:${c.anchor.path}:${String(c.anchor.line)}:${c.body}`
-                        : `comment:${c.body}`,
+                        ? `comment:${c.anchor.path}:${String(c.anchor.line)}:${c.body.replace(MARK_RE, '')}`
+                        : `comment:${c.body.replace(MARK_RE, '')}`,
                 (_n: number, c: { body: string; anchor?: { path: string; line?: number } }) => {
+                    const body = c.body.replace(MARK_RE, '');
+                    (forge.bodies ??= []).push(c.body);
                     forge.effects.push(
                         c.anchor
-                            ? `comment:${c.anchor.path}:${String(c.anchor.line)}:${c.body}`
-                            : `comment:${c.body}`,
+                            ? `comment:${c.anchor.path}:${String(c.anchor.line)}:${body}`
+                            : `comment:${body}`,
                     );
                 },
             ),
+            listPullRequestComments: () => {
+                w.alive();
+                if (forge.listFails === true) throw new Error('HTTP 502');
+                return (forge.bodies ?? []).map((body) => ({ body, isSummary: false }));
+            },
             addBlockedLabel: g(
                 () => 'label:blocked',
                 () => {
@@ -573,7 +585,11 @@ function prKiller(kind: TPrKind, at: TKillAt): (op: string) => 'before' | 'after
     const effects = PR_EFFECTS[kind];
     const target = jsonl(PR_REQUEST[kind]);
     return (op) => {
-        if (at === 'before-marker' && op === `write:${IN_FLIGHT_MARKER}\n${target}\n`) {
+        if (
+            at === 'before-marker' &&
+            op.startsWith(`write:${IN_FLIGHT_PREFIX}`) &&
+            op.split('\n')[1] === target
+        ) {
             return 'before';
         }
         if (at === 'before-effect' && op === effects[0]) return 'before';
@@ -606,76 +622,89 @@ describe('#87 матрица «убить до / после»: намерени�
             expect(disk.file).toBeNull();
         });
 
+        // #94: замечание несёт метку намерения, и рестарт сверяет её с лентой PR. Убит до
+        // эффекта — метки в ленте нет, замечание ложится один раз; после — метка есть, и
+        // повтора нет. Стопа нет ни в одной клетке: исход решает форж, а не человек.
         it.each<TKillAt>(['before-effect', 'after-effect'])(
-            'убит %s — рестарт не повторяет замечание и не теряет его, а останавливается',
+            'убит %s — рестарт сверяет с лентой PR: замечание ровно одно, стопа нет',
             (at) => {
                 const disk = { file: batch as string | null };
                 const forge: TPrForge = { effects: [], labels: new Set() };
                 const chat: string[] = [];
                 expect(applyPr(disk, forge, chat, prKiller(kind, at)).dead).toBe(true);
-                const before = [...forge.effects];
+                expect(chat).toEqual([]);
 
                 const { stopped, applied } = restartPr(disk, forge, chat);
-                expect(forge.effects).toEqual(before);
-                expect(stopped).toBe(true);
-                expect(applied.outcomeUnknown).toBe(true);
-                // Приёмка: причина, само начатое намерение и вопрос человеку.
-                const msg = chat[0];
-                expect(msg).toMatch(/^⛔ Ralph: /);
-                expect(msg).toContain(REASON_TITLES['intent-unknown']);
-                expect(msg).toContain(jsonl(PR_REQUEST[kind]));
-                expect(msg).toMatch(/перезапусти loop/);
-                expect(disk.file).not.toContain(jsonl(EARLIER_PR));
+                expect(stopped).toBe(false);
+                expect(applied.failed).toBe(false);
+                expect(applied.outcomeUnknown).toBeUndefined();
+                expect(applied.prBlocked).toBe(kind === 'pr-block');
+                // Каждое замечание в ленте ровно один раз — и раннее, и проверяемое.
+                const comments = forge.effects.filter((e) => e.startsWith('comment:'));
+                expect(comments).toEqual([
+                    EARLIER_PR_EFFECT,
+                    ...PR_EFFECTS[kind].filter((e) => e.startsWith('comment:')),
+                ]);
+                if (kind === 'pr-block') expect(forge.labels.has('blocked')).toBe(true);
+                expect(chat).toEqual([]);
+                expect(disk.file).toBeNull();
             },
         );
+
+        it('убит после эффекта, а лента PR не читается — стоп с причиной, повтора нет', () => {
+            const disk = { file: batch as string | null };
+            const forge: TPrForge = { effects: [], labels: new Set() };
+            const chat: string[] = [];
+            expect(applyPr(disk, forge, chat, prKiller(kind, 'after-effect')).dead).toBe(true);
+            const before = [...forge.effects];
+            forge.listFails = true;
+
+            const { stopped, applied } = restartPr(disk, forge, chat);
+            // Старт не встаёт: вид сверяемый, а лента читается уже при применении.
+            expect(stopped).toBe(false);
+            expect(forge.effects).toEqual(before);
+            expect(applied.outcomeUnknown).toBe(true);
+            const msg = chat[0];
+            expect(msg).toMatch(/^⛔ Ralph: /);
+            expect(msg).toContain(REASON_TITLES['intent-unknown']);
+            expect(msg).toContain(jsonl(PR_REQUEST[kind]));
+            expect(msg).toContain('лента форжа не прочиталась: HTTP 502');
+            expect(msg).toMatch(/перезапусти loop/);
+            expect(disk.file).not.toContain(jsonl(EARLIER_PR));
+        });
     });
 
-    // `pr-block` — два эффекта. Убит между ними — стоп, как у `close`. Но здесь развилка
-    // человека решает о мердже: «эффект лёг» снимает намерение целиком, и если первой
-    // легла не метка, а комментарий, человек, увидевший комментарий, снял бы и метку —
-    // гейт смерджил бы фазу с блокером, о котором ревью сказало прямо. Поэтому метка
-    // ставится первой, и обе развилки кончаются меткой на PR.
-    describe('pr-block, убит между эффектами: при любой развилке человека метка на PR', () => {
-        const stuck = () => {
+    // `pr-block` — два эффекта, и метка из них решает о мердже, поэтому ложится первой.
+    // Убит между ними — в ленте нет комментария с меткой намерения, и рестарт применяет
+    // блок заново: метка идемпотентна, комментарий ложится один раз.
+    describe('pr-block, убит между эффектами: метка на PR, комментарий один', () => {
+        const stuck = (listFails = false) => {
             const disk = { file: `${jsonl(PR_REQUEST['pr-block'])}\n` as string | null };
-            const forge: TPrForge = { effects: [], labels: new Set() };
+            const forge: TPrForge = { effects: [], labels: new Set(), listFails };
             const chat: string[] = [];
             applyPr(disk, forge, chat, (op) => (op === PR_EFFECTS['pr-block'][0] ? 'after' : null));
             expect(forge.effects).toEqual([PR_EFFECTS['pr-block'][0]]);
-            const { stopped } = restartPr(disk, forge, chat);
-            expect(stopped).toBe(true);
             return { disk, forge, chat };
         };
-        const dropLines = (file: string, n: number): string =>
-            `${file
-                .split('\n')
-                .filter((l) => l.trim() !== '')
-                .slice(n)
-                .join('\n')}\n`;
 
-        it('пуш называет, по чему судить: у pr-block эффект — метка blocked', () => {
-            const { chat } = stuck();
-            expect(chat[0]).toMatch(/pr-block.*метк[аи] blocked/s);
-        });
-
-        it('«лёг» — убраны метка начатого и строка: метка blocked на PR осталась', () => {
+        it('рестарт сверяет: комментария нет — блок довершён, метка на PR', () => {
             const { disk, forge, chat } = stuck();
-            disk.file = dropLines(String(disk.file), 2);
-            const { stopped, applied } = restartPr(disk, forge, chat);
-            expect(stopped).toBe(false);
-            expect(applied.failed).toBe(false);
-            expect(forge.labels.has('blocked')).toBe(true);
-        });
-
-        it('«не лёг» — убрана только метка начатого: блок применён заново, метка на PR', () => {
-            const { disk, forge, chat } = stuck();
-            disk.file = dropLines(String(disk.file), 1);
             const { stopped, applied } = restartPr(disk, forge, chat);
             expect(stopped).toBe(false);
             expect(applied.failed).toBe(false);
             expect(applied.prBlocked).toBe(true);
             expect(forge.labels.has('blocked')).toBe(true);
-            expect(forge.effects.at(-1)).toBe(PR_EFFECTS['pr-block'][1]);
+            expect(forge.effects.filter((e) => e.startsWith('comment:'))).toEqual([
+                PR_EFFECTS['pr-block'][1],
+            ]);
+        });
+
+        it('лента не читается — пуш называет, по чему судить: у pr-block эффект — метка blocked', () => {
+            const { disk, forge, chat } = stuck(true);
+            const { applied } = restartPr(disk, forge, chat);
+            expect(applied.outcomeUnknown).toBe(true);
+            expect(chat[0]).toMatch(/pr-block.*метк[аи] blocked/s);
+            expect(forge.labels.has('blocked')).toBe(true);
         });
     });
 });

@@ -83,10 +83,21 @@ describe('defaultState — канонический полный state из пе
 // как отсутствующий — петля начинала с первой фазы поверх незаконченной.
 describe('inspectState — версия схемы и форма state', () => {
     const v1 = { schemaVersion: 1, count: 2, milestone: 'M1', submitted: false };
+    const v2 = { schemaVersion: 2, count: 2, milestone: 'M1', submitStages: [] };
 
-    it('годный v1 — ok без миграции', () => {
+    it('годный v2 — ok без миграции', () => {
+        const r = inspectState(JSON.stringify(v2));
+        expect(r).toMatchObject({ status: 'ok', migrated: false });
+        if (r.status !== 'ok') return;
+        expect(r.state).toMatchObject({ schemaVersion: 2, count: 2, milestone: 'M1' });
+        expect(r.state.submitted).toBe(false);
+    });
+
+    it('годный v1 — проверенная миграция в v2', () => {
         const r = inspectState(JSON.stringify(v1));
-        expect(r).toEqual({ status: 'ok', state: v1, migrated: false });
+        expect(r).toMatchObject({ status: 'ok', migrated: true });
+        if (r.status !== 'ok') return;
+        expect(r.state.schemaVersion).toBe(STATE_SCHEMA_VERSION);
     });
 
     it('без версии, но годной формы — проверенная миграция в текущую версию', () => {
@@ -130,8 +141,8 @@ describe('inspectState — версия схемы и форма state', () => {
 
     it('другая версия схемы — отдельный исход, форма не проверяется', () => {
         // Будущая схема вправе выглядеть иначе: «повреждён» здесь было бы ложью.
-        const r = inspectState(JSON.stringify({ schemaVersion: 2, phase: { name: 'M1' } }));
-        expect(r).toMatchObject({ status: 'foreign-version', found: 2 });
+        const r = inspectState(JSON.stringify({ schemaVersion: 3, phase: { name: 'M1' } }));
+        expect(r).toMatchObject({ status: 'foreign-version', found: 3 });
     });
 
     it('без milestone — старая схема (phaseIndex)', () => {
@@ -148,16 +159,22 @@ describe('inspectState — версия схемы и форма state', () => {
 describe('loadState — state с диска через инжектированный readFile', () => {
     it('валидный state (с milestone) возвращается как есть', () => {
         const state = {
-            schemaVersion: 1,
+            schemaVersion: 2,
             count: 5,
             milestone: 'M3',
-            submitted: true,
             noProgress: 1,
+            submitStages: [],
         };
         const { loadState } = createStateLock(
             makeEnv({ readFile: fileWith(JSON.stringify(state)) }),
         );
-        expect(loadState()).toEqual(state);
+        const { submitStages: _j, ...fields } = state;
+        expect(loadState()).toEqual({
+            ...fields,
+            submitted: false,
+            deployBlock: null,
+            reviewOfFixes: null,
+        });
     });
 
     it('нет файла (ENOENT) → штатный defaultState первой фазы', () => {
@@ -217,7 +234,7 @@ describe('loadState — state с диска через инжектирован�
         );
         const failFn = vi.fn();
         expect(() => loadState(failFn)).toThrow();
-        expect(failFn.mock.calls[0][0]).toMatch(/схемы v7, а этот раннер знает v1/);
+        expect(failFn.mock.calls[0][0]).toMatch(/схемы v7, а этот раннер знает v2/);
     });
 
     it('state без версии → проверенная миграция с строкой в логе', () => {
@@ -228,9 +245,9 @@ describe('loadState — state с диска через инжектирован�
                 readFile: fileWith(JSON.stringify({ count: 1, milestone: 'M2', submitted: false })),
             }),
         );
-        expect(loadState()).toMatchObject({ schemaVersion: 1, milestone: 'M2', count: 1 });
+        expect(loadState()).toMatchObject({ schemaVersion: 2, milestone: 'M2', count: 1 });
         expect(log).toHaveBeenCalledWith(
-            expect.stringMatching(/без версии схемы — форма проверена/),
+            expect.stringMatching(/прежней схемы — форма проверена.*перенесены в журнал этапов/),
         );
     });
 
@@ -356,6 +373,86 @@ describe('resetState — --reset не теряет улику и не снима
             makeEnv({ readFile: fileWith(JSON.stringify(state)) }),
         );
         expect(() => resetState({ deployResolved: false, failFn: () => {} })).toThrow(/барьере/);
+    });
+
+    // #93: в v2 барьер живёт этапом журнала, а не полем — --reset на повреждённом v2
+    // обязан найти его там, иначе снял бы барьер без --deploy-resolved.
+    const v2Barrier = (extra: Record<string, unknown>, stages: unknown) => ({
+        schemaVersion: 2,
+        count: 0,
+        milestone: 'M2',
+        submitStages: stages,
+        ...extra,
+    });
+    const deployStop = [
+        { v: 1, track: 'submit', milestone: 'M1', stage: 'pr', event: 'start', at: 't' },
+        {
+            v: 1,
+            track: 'submit',
+            milestone: 'M1',
+            stage: 'pr',
+            event: 'outcome',
+            outcome: 'ok',
+            at: 't',
+        },
+        ...['review', 'fixes', 'fix-review', 'arbiter', 'gate', 'merge'].flatMap((stage) => [
+            { v: 1, track: 'submit', milestone: 'M1', stage, event: 'start', at: 't' },
+            {
+                v: 1,
+                track: 'submit',
+                milestone: 'M1',
+                stage,
+                event: 'outcome',
+                outcome: 'ok',
+                at: 't',
+            },
+        ]),
+        { v: 1, track: 'submit', milestone: 'M1', stage: 'deploy', event: 'start', at: 't' },
+        {
+            v: 1,
+            track: 'submit',
+            milestone: 'M1',
+            stage: 'deploy',
+            event: 'outcome',
+            outcome: 'stop',
+            detail: { milestone: 'M1', reason: 'деплой красный' },
+            at: 't',
+        },
+    ];
+
+    it('повреждённый v2 с барьером в журнале → отказ без --deploy-resolved', () => {
+        const copyFile = vi.fn();
+        const { resetState } = createStateLock(
+            makeEnv({
+                readFile: fileWith(JSON.stringify(v2Barrier({ count: -1 }, deployStop))),
+                copyFile,
+            }),
+        );
+        expect(() => resetState({ deployResolved: false, failFn: () => {} })).toThrow(
+            /активном барьере красного деплоя фазы "M1" \(деплой красный\)/,
+        );
+        expect(copyFile).not.toHaveBeenCalled();
+    });
+
+    it('v2 с неразбираемым журналом — барьер неизвестен, --reset требует флаг', () => {
+        const { resetState } = createStateLock(
+            makeEnv({ readFile: fileWith(JSON.stringify(v2Barrier({}, [{ v: 7 }]))) }),
+        );
+        expect(() => resetState({ deployResolved: false, failFn: () => {} })).toThrow(
+            /не прочитать/,
+        );
+    });
+
+    it('v2 с этапом деплоя без детали — барьер читается неизвестным, а не снятым', () => {
+        const noDetail = deployStop.map((r) =>
+            r.stage === 'deploy' && r.event === 'outcome' ? { ...r, detail: undefined } : r,
+        );
+        const { resetState } = createStateLock(
+            makeEnv({ readFile: fileWith(JSON.stringify(v2Barrier({ count: -1 }, noDetail))) }),
+        );
+        expect(() => resetState({ deployResolved: false, failFn: () => {} })).toThrow(
+            /барьере красного деплоя фазы "M1" \(барьер деплоя без записанной причины/,
+        );
     });
 
     it('dry: копию не пишет и state не перезаписывает', () => {

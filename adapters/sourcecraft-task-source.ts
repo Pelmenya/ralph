@@ -485,6 +485,16 @@ export function createSourcecraftTaskSource(deps: SourcecraftTaskSourceDeps): Ta
                         'у якоря обязательна позиция в диффе.',
                 );
             }
+            // #41: старая сторона диффа. Живым ответом площадки проверена только `source`
+            // (новая версия); значение для старой не проверено ничем, и угаданное имя
+            // повесило бы замечание к удалённой строке на чужой код. Отказ — и ядро само
+            // спустится по ступеням к сводке с местом.
+            if (anchor?.line !== undefined && anchor.side === 'LEFT') {
+                throw new Error(
+                    `Комментарий к удалённой строке (${anchor.path}:${String(anchor.line)}) ` +
+                        'площадка в этом адаптере не поддерживает: сторона старой версии не проверена.',
+                );
+            }
             const created = api('POST', `${base}/pulls/${String(prNumber)}/comments`, {
                 body: input.body,
                 publish: true,

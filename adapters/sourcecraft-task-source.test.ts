@@ -320,6 +320,19 @@ describe('комментарий в PR: публикация и якорь — �
         });
     });
 
+    // #41: значение старой стороны у площадки не проверено — угаданное повесило бы
+    // замечание к удалённой строке на чужой код. Отказ, а ядро спустится к сводке с местом.
+    it('#41 якорь со стороной LEFT — отказ без запроса, а не угаданная сторона', () => {
+        const { adapter, calls } = build();
+        expect(() =>
+            adapter.commentOnPullRequest(55, {
+                body: 'x',
+                anchor: { path: 'src/a.ts', line: 42, side: 'LEFT' },
+            }),
+        ).toThrow(/удалённой строке/);
+        expect(post(calls)).toBeUndefined();
+    });
+
     it('без якоря поля anchor в теле нет вовсе — это сводка прохода', () => {
         const { adapter, calls } = build();
         adapter.commentOnPullRequest(55, { body: 'сводка' });

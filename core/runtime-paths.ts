@@ -23,6 +23,7 @@ export type TRuntimePaths = {
     sessions: string;
     requests: string;
     stopRequest: string;
+    stages: string;
 };
 
 export function runtimePathsIn(runtimeDir: string): TRuntimePaths {
@@ -38,5 +39,7 @@ export function runtimePathsIn(runtimeDir: string): TRuntimePaths {
         requests: path.join(runtimeDir, 'ralph.requests.jsonl'),
         // #88: запрос мягкой остановки — его кладёт человек, снимает раннер на границе шага.
         stopRequest: path.join(runtimeDir, 'ralph.stop'),
+        // #92: журнал этапов текущей кодер-попытки — по нему рестарт продолжает с этапа.
+        stages: path.join(runtimeDir, 'ralph.stages.jsonl'),
     };
 }

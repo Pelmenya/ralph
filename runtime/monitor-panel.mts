@@ -62,6 +62,7 @@ const { pushEvent } = ralph;
 // (в мониторе) — импёровая половина: чтение файла, «сейчас» и сравнение с порогом.
 import { classifyActivity, silenceThresholdMs, type Activity } from './deadman.ts';
 import { formatStopMessage } from '../core/stop-message.ts';
+import { submittedOf, type TSubmitRecord } from '../core/submit-journal.ts';
 import { formatMetricDayLine } from './product-metric.ts';
 import { summarizeRuntime } from './metric.mts';
 
@@ -163,9 +164,20 @@ type ResolvedConfig = {
 // state фазы (ralph.state.json): milestone === null — штатный конец очереди (#THS8M).
 type PhaseState = {
     milestone?: string | null;
+    // v0/v1 — флаг полем; v2 (#93) — проекция журнала сдачи, поля в файле нет.
     submitted?: boolean;
+    submitStages?: TSubmitRecord[];
     count?: number;
 } | null;
+
+// #93: панель читает файл state напрямую, без миграции раннера — поэтому обе формы.
+function submittedOfState(state: PhaseState): boolean {
+    if (!state) return false;
+    if (Array.isArray(state.submitStages)) {
+        return submittedOf(state.submitStages, state.milestone ?? null);
+    }
+    return state.submitted === true;
+}
 
 // Результат детекта тишины (#147/#148). Поля nullable: ветка no-log отдаёт null'ы —
 // сам детект тогда не алертит (silent:false), см. evalDeadman.
@@ -669,7 +681,7 @@ function snapshot(): void {
     out.push(
         `Фаза: ${milestoneName}` +
             (ms && ms.idx !== -1 ? `  (${ms.idx + 1}/${ms.total})` : '') +
-            `   submitted=${state?.submitted ? 'да' : 'нет'}   iter=${state?.count ?? '?'}`,
+            `   submitted=${submittedOfState(state) ? 'да' : 'нет'}   iter=${state?.count ?? '?'}`,
     );
     out.push(`git: ${branch} @ ${head}`);
     // Профиль и статус доставки пушей. Операционный шов: ручной перезапуск монитора без

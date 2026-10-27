@@ -51,7 +51,8 @@ import type { AdapterRegistries, AdapterConfig } from '../adapters/adapters-impl
 import type { ReviewComment } from '../adapters/adapters.ts';
 import type { DeployOutcome } from './deploy-check.ts';
 import type { RalphState } from './state-lock.ts';
-import { COMMENT_NOTICE_THRESHOLD } from './session-requests.ts';
+import { COMMENT_NOTICE_THRESHOLD, IN_FLIGHT_PREFIX } from './session-requests.ts';
+import { attachSubmitJournal, finishStage, startStage } from './submit-journal.ts';
 import { MODEL_PROXY_RETRIES } from './runtime-availability.ts';
 
 // #204: состав чеков гейта переехал в ralph.config.json. gateChecksFor и tryMergePhase
@@ -3637,6 +3638,54 @@ describe('preflight — валидация конфига/среды и подг
         expect(saveStateFn).toHaveBeenCalledWith(state);
     });
 
+    // #93: попытка, не дошедшая до гейта, держит оба флага ложными — сброс флагов журнал
+    // не трогал, и «полный повтор» продолжал с правок без нового ревью.
+    it('#93 resubmit=true снимает журнал попытки, не дошедшей до гейта', () => {
+        const at = 't';
+        let stages = startStage([], 'M1', 'pr', at);
+        stages = finishStage(stages, 'M1', 'pr', 'ok', at);
+        stages = finishStage(stages, 'M1', 'review', 'ok', at);
+        stages = finishStage(stages, 'M1', 'fixes', 'stop', at, { base: 'a'.repeat(40) });
+        const state = attachSubmitJournal({
+            count: 2,
+            milestone: 'M1',
+            noProgress: 0,
+            submitStages: stages,
+        } as never as RalphState);
+        expect(state.submitted).toBe(false);
+        const saveStateFn = vi.fn();
+        preflight(validCfg(), okDeps({ loadStateFn: () => state, saveStateFn, resubmit: true }));
+        expect(state.submitStages).toEqual([]);
+        expect(saveStateFn).toHaveBeenCalledWith(state);
+    });
+
+    it('#93 resubmit=true не трогает попытку, дошедшую до мерджа: там барьер деплоя', () => {
+        const at = 't';
+        let stages: ReturnType<typeof startStage> = [];
+        for (const s of [
+            'pr',
+            'review',
+            'fixes',
+            'fix-review',
+            'arbiter',
+            'gate',
+            'merge',
+        ] as const)
+            stages = finishStage(stages, 'M1', s, 'ok', at);
+        const kept = [...stages];
+        const state = attachSubmitJournal({
+            count: 0,
+            milestone: 'M1',
+            noProgress: 0,
+            submitStages: stages,
+        } as never as RalphState);
+        preflight(
+            validCfg(),
+            okDeps({ loadStateFn: () => state, saveStateFn: vi.fn(), resubmit: true }),
+        );
+        expect(state.submitStages).toEqual(kept);
+    });
+
     it('#165 барьер: state.deployBlock задан → пуш на старте + fail (следующая фаза не начинается)', () => {
         const state = {
             count: 0,
@@ -4838,6 +4887,182 @@ describe('runLoop — основной while-цикл: итерации коде
         expect(pushEventFn.mock.calls[0][0]).toMatch(
             /диагноз: 3 итераций подряд без коммита и без закрытого issue \(Issue #7\)/,
         );
+    });
+
+    // #67: сессия прислала close + битое необязательное намерение — батч отвергнут целиком,
+    // карточка осталась открытой, следующая итерация взяла её же. HEAD при этом двигается
+    // каждую итерацию (коммиты сессии), так что noProgress круг не видит.
+    describe('#67: брейкер серии по одному issue', () => {
+        const movingHead = () => {
+            let n = 0;
+            return () => `HEAD_${String(n++)}`;
+        };
+
+        it('три круга по одной карточке → стоп перед четвёртым, причина названа', () => {
+            const logs: string[] = [];
+            const state = mkState();
+            const pushEventFn = vi.fn();
+            const runClaudeFn = vi.fn(() => 0);
+            runLoop(
+                validCfg(),
+                ctx(state),
+                deps(logs, {
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                    shFn: movingHead(),
+                    runClaudeFn,
+                    applySessionRequestsFn: () => ({ applied: 0, failed: true }),
+                    pushEventFn,
+                }),
+            );
+            expect(runClaudeFn).toHaveBeenCalledTimes(3);
+            // Стоп до спавна: четвёртая итерация не потрачена.
+            expect(state.count).toBe(3);
+            expect(pushEventFn).toHaveBeenCalledTimes(1);
+            const msg = String(pushEventFn.mock.calls[0][0]);
+            expect(msg).toContain('(breaker)');
+            expect(msg).toMatch(/Issue #7 взят 3 итерации подряд/);
+            // Последний батч намерений по карточке не применился — вероятная причина, но
+            // названа нейтрально: `failed` бывает не только у отказа разбора.
+            expect(msg).toMatch(/батч намерений применён не до конца/);
+            expect(msg).not.toMatch(/отказ разбора/);
+        });
+
+        it('намерения применились, но карточка осталась открытой — стоп тот же, без ложной причины', () => {
+            const logs: string[] = [];
+            const pushEventFn = vi.fn();
+            const runClaudeFn = vi.fn(() => 0);
+            runLoop(
+                validCfg(),
+                ctx(mkState()),
+                deps(logs, {
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                    shFn: movingHead(),
+                    runClaudeFn,
+                    pushEventFn,
+                }),
+            );
+            expect(runClaudeFn).toHaveBeenCalledTimes(3);
+            const msg = String(pushEventFn.mock.calls[0][0]);
+            expect(msg).toMatch(/Issue #7 взят 3 итерации подряд/);
+            expect(msg).not.toMatch(/батч намерений|выбыло/);
+        });
+
+        it('порог из конфига (maxSameIssue)', () => {
+            const logs: string[] = [];
+            const runClaudeFn = vi.fn(() => 0);
+            runLoop(
+                validCfg({ maxSameIssue: 2 }),
+                ctx(mkState()),
+                deps(logs, {
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                    shFn: movingHead(),
+                    runClaudeFn,
+                    pushEventFn: vi.fn(),
+                }),
+            );
+            expect(runClaudeFn).toHaveBeenCalledTimes(2);
+        });
+
+        it('выбывшее close (#41) названо причиной круга, хотя батч не failed', () => {
+            const logs: string[] = [];
+            const pushEventFn = vi.fn();
+            runLoop(
+                validCfg(),
+                ctx(mkState()),
+                deps(logs, {
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                    shFn: movingHead(),
+                    runClaudeFn: vi.fn(() => 0),
+                    applySessionRequestsFn: () => ({
+                        applied: 0,
+                        failed: false,
+                        dropped: [{ kind: 'close', what: 'close #7 — HTTP 403' }],
+                    }),
+                    pushEventFn,
+                }),
+            );
+            const msg = String(pushEventFn.mock.calls[0][0]);
+            expect(msg).toMatch(/`close` выбыло.*close #7 — HTTP 403/s);
+        });
+
+        it.each([['5'], [0], [-1], [2.5]])(
+            'битый maxSameIssue (%j) — стоп на старте с причиной, а не дефолт',
+            (v) => {
+                const failFn = vi.fn((m: string) => {
+                    throw new Error(m);
+                });
+                expect(() =>
+                    ralph.resolveMaxSameIssue({ maxSameIssue: v } as never, failFn),
+                ).toThrow(/maxSameIssue = .* целое положительное/);
+            },
+        );
+
+        it('maxSameIssue ниже coderTurnRetries + 1 — стоп на старте, а не молчаливый подъём', () => {
+            const failFn = vi.fn((m: string) => {
+                throw new Error(m);
+            });
+            expect(() =>
+                ralph.resolveMaxSameIssue(
+                    { maxSameIssue: 2, coderTurnRetries: 3 } as never,
+                    failFn,
+                ),
+            ).toThrow(/ниже coderTurnRetries \+ 1 = 4/);
+            // Ключа нет — дефолт не ниже числа законных заходов.
+            expect(ralph.resolveMaxSameIssue({ coderTurnRetries: 3 } as never, failFn)).toBe(4);
+        });
+
+        it('порог не режет повторы по бюджету ходов (coderTurnRetries)', () => {
+            const logs: string[] = [];
+            const runClaudeFn = vi.fn(() => 0);
+            runLoop(
+                validCfg({ maxSameIssue: 4, coderTurnRetries: 3 }),
+                ctx(mkState()),
+                deps(logs, {
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                    shFn: movingHead(),
+                    runClaudeFn,
+                    pushEventFn: vi.fn(),
+                }),
+            );
+            // Первая сессия + три повтора по ходам = четыре захода на карточку.
+            expect(runClaudeFn).toHaveBeenCalledTimes(4);
+        });
+
+        it('чередование карточек серию сбрасывает — брейкер не срабатывает', () => {
+            const logs: string[] = [];
+            const pushEventFn = vi.fn();
+            const runClaudeFn = vi.fn(() => 0);
+            const seq = [7, 7, 8, 7, 7, 8];
+            runLoop(
+                validCfg(),
+                ctx(mkState(), { maxIterations: 6 }),
+                deps(logs, {
+                    phaseIndexOfFn: () => 0,
+                    // 7, 7, 8, 7, 7, 8 — ни одна карточка не берётся трижды подряд.
+                    // Очередь зовётся и до сессии, и после (оценка прогресса), поэтому
+                    // номер берётся по числу уже прошедших сессий, а не по числу вызовов.
+                    openIssuesFn: () => [
+                        {
+                            number: seq[Math.min(runClaudeFn.mock.calls.length, 5)],
+                            title: 't',
+                            labels: [],
+                        },
+                    ],
+                    shFn: movingHead(),
+                    runClaudeFn,
+                    pushEventFn,
+                }),
+            );
+            expect(runClaudeFn).toHaveBeenCalledTimes(6);
+            expect(pushEventFn.mock.calls.map((c) => String(c[0])).join('\n')).not.toMatch(
+                /подряд/,
+            );
+        });
     });
 
     it('пустая очередь, но открыты blocked/чужие issues → сдача отложена, гейт не зовётся', () => {
@@ -12172,6 +12397,14 @@ describe('applySessionRequests: намерения сессии применяе
     });
 
     // #45: намерения ревью-сессии по PR. Фейк шва тот же, плюс PR ветки фазы и метки на нём.
+    // #94: на диске после отказа ушедшего запроса — метка начатого и хвост за ней.
+    const diskTail = (text: unknown) => {
+        const lines = String(text).trim().split('\n');
+        const marker = lines[0].startsWith(IN_FLIGHT_PREFIX) ? lines[0] : null;
+        return { marker, requests: lines.slice(marker ? 1 : 0).map((l) => JSON.parse(l)) };
+    };
+    const unmark = (body: string): string =>
+        body.replace(/\n\n<!-- ralph-intent:[A-Za-z0-9-]+ -->$/, '');
     const prTaskSource = (over: Record<string, unknown> = {}) => {
         const calls: string[] = [];
         const labels: Array<{ name: string }> = [];
@@ -12184,9 +12417,11 @@ describe('applySessionRequests: намерения сессии применяе
                 blockIssue: () => {},
                 createIssue: () => 1,
                 findOpenPullRequest: () => ({ number: 55, labels }),
+                // #94: метка намерения в теле снимается при записи вызова — её форму и
+                // наличие проверяют свои тесты, здесь важен текст замечания.
                 commentOnPullRequest: (n: number, input: { body: string; anchor?: unknown }) =>
                     calls.push(
-                        `pr-comment:${n}:${JSON.stringify(input.anchor ?? null)}:${input.body}`,
+                        `pr-comment:${n}:${JSON.stringify(input.anchor ?? null)}:${unmark(input.body)}`,
                     ),
                 addBlockedLabel: () => {
                     calls.push('pr-block-label');
@@ -12385,7 +12620,7 @@ describe('applySessionRequests: намерения сессии применяе
         const { ts, calls } = prTaskSource({
             commentOnPullRequest: (n: number, input: { body: string; anchor?: unknown }) => {
                 if (input.anchor) throw new Error('gh: Validation Failed (HTTP 422)');
-                calls.push(`pr-comment:${n}:null:${input.body}`);
+                calls.push(`pr-comment:${n}:null:${unmark(input.body)}`);
             },
         });
         const logFn = vi.fn();
@@ -12457,7 +12692,7 @@ describe('applySessionRequests: намерения сессии применяе
                     throw new Error('gh: Validation Failed (HTTP 422)');
                 }
                 calls.push(
-                    `pr-comment:${String(n)}:${input.anchor ? `file:${input.anchor.path}` : 'null'}:${input.body}`,
+                    `pr-comment:${String(n)}:${input.anchor ? `file:${input.anchor.path}` : 'null'}:${unmark(input.body)}`,
                 );
             },
         });
@@ -12503,7 +12738,7 @@ describe('applySessionRequests: намерения сессии применяе
                 // Ни строка, ни файл: голова PR недоступна, оба якорных вызова падают
                 // с одной и той же сетевой ошибкой.
                 if (input.anchor) throw new Error('gh: could not resolve head sha (timeout)');
-                calls.push(`pr-comment:${String(n)}:null:${input.body}`);
+                calls.push(`pr-comment:${String(n)}:null:${unmark(input.body)}`);
             },
         });
         const logFn = vi.fn();
@@ -12540,7 +12775,7 @@ describe('applySessionRequests: намерения сессии применяе
         const { ts, calls } = prTaskSource({
             commentOnPullRequest: (n: number, input: { body: string; anchor?: unknown }) => {
                 if (input.anchor) throw new Error('gh: Validation Failed (HTTP 422)');
-                calls.push(`pr-comment:${String(n)}:null:${input.body}`);
+                calls.push(`pr-comment:${String(n)}:null:${unmark(input.body)}`);
             },
         });
         const logFn = vi.fn();
@@ -12616,8 +12851,11 @@ describe('applySessionRequests: намерения сессии применяе
             logFn: () => {},
             pushEventFn: () => {},
         });
-        // Последняя запись — то, что осталось на диске (до неё — метка начатого, #86).
-        const tail = JSON.parse(String(written.at(-1)).trim());
+        // Последняя запись — то, что осталось на диске: запрос к форжу ушёл, поэтому
+        // метка начатого остаётся первой строкой (#94), за ней — хвост.
+        const { marker, requests } = diskTail(written.at(-1));
+        expect(marker).not.toBeNull();
+        const tail = requests[0];
         expect(tail).toMatchObject({ kind: 'pr-comment', path: 'src/a.ts', line: 42 });
         expect(tail.anchor).toBeUndefined();
     });
@@ -12829,12 +13067,288 @@ describe('applySessionRequests: намерения сессии применяе
         // В файле — ровно неприменённый хвост: повтор всего батча продублировал бы
         // уже поставленный комментарий, а пустой файл потерял бы остаток. Последняя
         // запись — то, что осталось на диске; до неё шёл журнал «начато / применено» (#86).
-        const tail = String(written.at(-1))
-            .trim()
-            .split('\n')
-            .map((l) => JSON.parse(l));
-        expect(tail.map((r: { kind: string }) => r.kind)).toEqual(['close', 'comment']);
+        // Закрытие бросило ПОСЛЕ комментария, который вернулся в этом же процессе: он
+        // лёг точно, а статус идемпотентен. Это не неизвестный исход и не стоп (#94), а
+        // метка с `landed: comment` — повтор доведёт только закрытие.
+        const { marker, requests } = diskTail(written.at(-1));
+        expect(JSON.parse(String(marker))).toMatchObject({ landed: 'comment' });
+        expect(requests.map((r: { kind: string }) => r.kind)).toEqual(['close', 'comment']);
+        expect(res.outcomeUnknown).toBeUndefined();
         expect(pushEventFn).toHaveBeenCalledTimes(1);
+        expect(pushEventFn.mock.calls[0][0]).toMatch(
+            /^⚠ Ralph: .*легло частично.*форж отверг закрытие/s,
+        );
+
+        // Повтор: комментарий не задваивается, доводится только статус — без сверки.
+        const second = fakeTaskSource();
+        const res2 = ralph.applySessionRequests({
+            cfg: CFG,
+            dry: false,
+            readFn: () => String(written.at(-1)),
+            writeFn: () => {},
+            removeFn: () => {},
+            taskSource: second.ts,
+            logFn: () => {},
+            pushEventFn: vi.fn(),
+        });
+        expect(second.calls).toEqual(['close:7', 'comment:8:третье']);
+        expect(res2.failed).toBe(false);
+    });
+
+    it('#94 пометка landed не записалась — пуш не обещает сверку, которой у шва нет', () => {
+        const { ts } = fakeTaskSource({
+            closeIssue: () => {
+                throw new Error('форж отверг закрытие');
+            },
+        });
+        const pushEventFn = vi.fn();
+        ralph.applySessionRequests({
+            cfg: CFG,
+            dry: false,
+            readFn: () => line({ kind: 'close', issue: 7, comment: 'готово' }),
+            writeFn: (t: string) => {
+                if (t.includes('"landed"')) throw new Error('ENOSPC');
+            },
+            taskSource: ts,
+            logFn: () => {},
+            pushEventFn,
+        });
+        expect(pushEventFn).toHaveBeenCalledTimes(1);
+        const text = String(pushEventFn.mock.calls[0][0]);
+        expect(text).toMatch(/НЕ УДАЛОСЬ \(ENOSPC\)/);
+        expect(text).not.toMatch(/повтор сверит её с форжем/);
+        expect(text).toMatch(/шов форжа не умеет читать комментарии карточки.*стопом/s);
+    });
+
+    it('#94 отказ до соединения — запрос не ушёл: голый хвост, без метки и без стопа', () => {
+        const { ts } = fakeTaskSource({
+            commentOnIssue: () => {
+                throw Object.assign(new Error('Command failed: gh issue comment 7 --body x'), {
+                    stderr: 'error connecting to api.github.com\ndial tcp: lookup api.github.com: no such host',
+                });
+            },
+        });
+        const written: string[] = [];
+        const pushEventFn = vi.fn();
+        const res = ralph.applySessionRequests({
+            cfg: CFG,
+            dry: false,
+            readFn: () => line({ kind: 'close', issue: 7, comment: 'готово' }),
+            writeFn: (t: string) => written.push(t),
+            removeFn: () => {},
+            taskSource: ts,
+            logFn: () => {},
+            pushEventFn,
+        });
+        expect(res.failed).toBe(true);
+        expect(res.outcomeUnknown).toBeUndefined();
+        const { marker, requests } = diskTail(written.at(-1));
+        expect(marker).toBeNull();
+        expect(requests.map((r: { kind: string }) => r.kind)).toEqual(['close']);
+        expect(String(pushEventFn.mock.calls[0][0])).toMatch(/Остаток сохранён/);
+    });
+
+    it('#41 close: комментарий лёг, закрытие отвергнуто по существу — выбыло «частично»', () => {
+        const { ts } = fakeTaskSource({
+            closeIssue: () => {
+                throw new Error('gh: Resource not accessible by integration (HTTP 403)');
+            },
+        });
+        const pushEventFn = vi.fn();
+        const res = ralph.applySessionRequests({
+            cfg: CFG,
+            dry: false,
+            readFn: () => line({ kind: 'close', issue: 7, comment: 'готово' }),
+            writeFn: () => {},
+            removeFn: () => {},
+            taskSource: ts,
+            logFn: () => {},
+            pushEventFn,
+        });
+        expect(res.dropped?.[0]).toMatchObject({ kind: 'close' });
+        expect(res.dropped?.[0].what).toMatch(/лёг частично: комментарий есть, статус отвергнут/);
+        expect(String(pushEventFn.mock.calls[0][0])).toMatch(/лёг частично/);
+    });
+
+    // #41: отказ по существу (карточка удалена, прав нет) повтор не лечит — одно такое
+    // намерение раньше загораживало собой весь хвост батча на каждой итерации.
+    it('#41 детерминированный отказ одного намерения — остальные применены, причина в логе', () => {
+        const { ts, calls } = fakeTaskSource({
+            commentOnIssue: (n: number, body: string) => {
+                if (n === 8)
+                    throw new Error(
+                        'gh: Could not resolve to an issue or pull request with the number of 8. (HTTP 404)',
+                    );
+                calls.push(`comment:${n}:${body}`);
+            },
+        });
+        const logFn = vi.fn();
+        const pushEventFn = vi.fn();
+        const written: string[] = [];
+        const removeFn = vi.fn();
+        const res = ralph.applySessionRequests({
+            cfg: CFG,
+            dry: false,
+            readFn: () =>
+                [
+                    line({ kind: 'comment', issue: 7, comment: 'первое' }),
+                    line({ kind: 'comment', issue: 8, comment: 'удалённой карточке' }),
+                    line({ kind: 'close', issue: 9, comment: 'третье' }),
+                ].join('\n'),
+            writeFn: (t: string) => written.push(t),
+            removeFn,
+            taskSource: ts,
+            logFn,
+            pushEventFn,
+        });
+        expect(calls).toEqual(['comment:7:первое', 'comment:9:третье', 'close:9']);
+        expect(res.failed).toBe(false);
+        expect(res.applied).toBe(2);
+        expect(res.closedIssues).toEqual([9]);
+        expect(res.dropped).toHaveLength(1);
+        expect(res.dropped?.[0]).toMatchObject({
+            kind: 'comment',
+            what: expect.stringMatching(/comment #8/),
+        });
+        const logged = logFn.mock.calls.map((c) => String(c[0])).join('\n');
+        expect(logged).toMatch(/comment #8 выбыло.*HTTP 404/);
+        // Выбывшее не повторится: после него в файле только хвост без него, а в конце
+        // файл снят целиком.
+        expect(String(written.at(-1))).not.toMatch(/удалённой карточке/);
+        expect(removeFn).toHaveBeenCalledTimes(1);
+        // Невыполненное намерение — пушем, а не только строкой лога.
+        expect(pushEventFn).toHaveBeenCalledTimes(1);
+        expect(String(pushEventFn.mock.calls[0][0])).toMatch(/1 из 3 .*выбыли/s);
+    });
+
+    it('#41 транзиентный отказ — хвост сохранён, как раньше', () => {
+        const { ts, calls } = fakeTaskSource({
+            commentOnIssue: (n: number, body: string) => {
+                if (n === 8) throw new Error('gh: Bad Gateway (HTTP 502)');
+                calls.push(`comment:${n}:${body}`);
+            },
+        });
+        const pushEventFn = vi.fn();
+        const written: string[] = [];
+        const removeFn = vi.fn();
+        const res = ralph.applySessionRequests({
+            cfg: CFG,
+            dry: false,
+            readFn: () =>
+                [
+                    line({ kind: 'comment', issue: 7, comment: 'первое' }),
+                    line({ kind: 'comment', issue: 8, comment: 'второе' }),
+                    line({ kind: 'close', issue: 9, comment: 'третье' }),
+                ].join('\n'),
+            writeFn: (t: string) => written.push(t),
+            removeFn,
+            taskSource: ts,
+            logFn: () => {},
+            pushEventFn,
+        });
+        expect(calls).toEqual(['comment:7:первое']);
+        expect(res.failed).toBe(true);
+        expect(res.applied).toBe(1);
+        // #94: хвост сохранён ПОД МЕТКОЙ — 502 пришёл на ушедший запрос, и комментарий
+        // мог лечь. Ленты карточки фейк не читает — неизвестный исход, стоп с причиной.
+        const { marker, requests } = diskTail(written.at(-1));
+        expect(marker).not.toBeNull();
+        expect(requests.map((r: { issue: number }) => r.issue)).toEqual([8, 9]);
+        expect(res.outcomeUnknown).toBe(true);
+        expect(removeFn).not.toHaveBeenCalled();
+    });
+
+    it('#41 pr-block не выбывает и на отказе по существу — метка решает о мердже', () => {
+        const { ts } = prTaskSource({
+            addBlockedLabel: () => {
+                throw new Error('gh: Resource not accessible by integration (HTTP 403)');
+            },
+        });
+        const written: string[] = [];
+        const res = ralph.applySessionRequests({
+            cfg: CFG,
+            phase: PHASE,
+            dry: false,
+            readFn: () =>
+                [
+                    line({ kind: 'pr-block', comment: 'блокер' }),
+                    line({ kind: 'pr-comment', comment: 'сводка' }),
+                ].join('\n'),
+            writeFn: (t: string) => written.push(t),
+            removeFn: () => {},
+            taskSource: ts,
+            logFn: () => {},
+            pushEventFn: () => {},
+        });
+        expect(res.failed).toBe(true);
+        expect(res.dropped ?? []).toEqual([]);
+        // Лента PR сверяема — метка остаётся, стопа нет: повтор пройдёт через сверку.
+        const { marker, requests } = diskTail(written.at(-1));
+        expect(marker).not.toBeNull();
+        expect(res.outcomeUnknown).toBeUndefined();
+        expect(requests.map((r: { kind: string }) => r.kind)).toEqual(['pr-block', 'pr-comment']);
+    });
+
+    it('#41 замечание к удалённой строке уходит в шов со стороной LEFT', () => {
+        const { ts, calls } = prTaskSource();
+        const res = ralph.applySessionRequests({
+            cfg: CFG,
+            phase: PHASE,
+            dry: false,
+            readFn: () =>
+                line({
+                    kind: 'pr-comment',
+                    comment: 'удалено зря',
+                    path: 'src/a.ts',
+                    line: 12,
+                    side: 'LEFT',
+                }),
+            writeFn: () => {},
+            removeFn: () => {},
+            taskSource: ts,
+            logFn: () => {},
+            pushEventFn: () => {},
+        });
+        expect(res.failed).toBe(false);
+        expect(calls).toEqual([
+            `pr-comment:55:${JSON.stringify({ path: 'src/a.ts', line: 12, side: 'LEFT' })}:удалено зря`,
+        ]);
+    });
+
+    // SourceCraft отказывает на LEFT, а файловый комментарий там бросает всегда: каждое
+    // LEFT-замечание деградирует до сводки, и место в ней обязано назвать старую версию.
+    it('#41 LEFT деградировал до сводки — место названо старой версией', () => {
+        const calls: string[] = [];
+        const logFn = vi.fn();
+        const { ts } = prTaskSource({
+            commentOnPullRequest: (_n: number, input: { body: string; anchor?: unknown }) => {
+                if (input.anchor) throw new Error('форж не принимает этот якорь');
+                calls.push(unmark(input.body));
+            },
+        });
+        const res = ralph.applySessionRequests({
+            cfg: CFG,
+            phase: PHASE,
+            dry: false,
+            readFn: () =>
+                line({
+                    kind: 'pr-comment',
+                    comment: 'удалено зря',
+                    path: 'src/a.ts',
+                    line: 42,
+                    side: 'LEFT',
+                }),
+            writeFn: () => {},
+            removeFn: () => {},
+            taskSource: ts,
+            logFn,
+            pushEventFn: () => {},
+        });
+        expect(res.failed).toBe(false);
+        expect(calls).toEqual(['удалено зря\n\n— место: src/a.ts:42 (старая версия)']);
+        expect(logFn.mock.calls.map((c) => String(c[0])).join('\n')).toMatch(
+            /Инлайн-якорь src\/a\.ts:42 \(старая версия\) не прошёл/,
+        );
     });
 
     it('НЕГАТИВНЫЙ: не удалось сохранить хвост — петля не падает, хвост уходит в пуш', () => {

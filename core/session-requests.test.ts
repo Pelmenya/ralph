@@ -10,8 +10,14 @@ import {
     MAX_MUTATION_REQUESTS,
     MAX_COMMENT_REQUESTS,
     MAX_REQUEST_LINES,
+    classifyIntentFailure,
+    intentFailureText,
     classifySessionRequests,
+    inFlightEntry,
+    inFlightMarker,
     parseSessionRequests,
+    reconcileInFlight,
+    withIntentMark,
     serializeSessionRequest,
 } from './session-requests.ts';
 
@@ -388,5 +394,200 @@ describe('classifySessionRequests: неклассифицированный kind
         >[0];
         expect(() => classifySessionRequests(future)).toThrow(/pr-approve/);
         expect(() => classifySessionRequests(future)).toThrow(/MUTATION_KINDS|COMMENT_KINDS/);
+    });
+});
+
+// #41: сторона диффа у якоря — без неё замечание к удалённой строке ложилось на строку
+// того же номера в НОВОЙ версии файла.
+describe('#41 сторона диффа у pr-comment', () => {
+    it('side=LEFT разбирается в якорь и переживает round-trip хвоста', () => {
+        const raw = line({
+            kind: 'pr-comment',
+            comment: 'x',
+            path: 'src/a.ts',
+            line: 7,
+            side: 'LEFT',
+        });
+        const [req] = parseSessionRequests(raw, opts);
+        expect(req).toEqual({
+            kind: 'pr-comment',
+            comment: 'x',
+            anchor: { path: 'src/a.ts', line: 7, side: 'LEFT' },
+        });
+        expect(parseSessionRequests(serializeSessionRequest(req), opts)).toEqual([req]);
+    });
+
+    it('без side — якорь без стороны, как до #41', () => {
+        const raw = line({ kind: 'pr-comment', comment: 'x', path: 'src/a.ts', line: 7 });
+        expect(parseSessionRequests(raw, opts)[0]).toEqual({
+            kind: 'pr-comment',
+            comment: 'x',
+            anchor: { path: 'src/a.ts', line: 7 },
+        });
+    });
+
+    it('НЕГАТИВНЫЙ: незнакомая сторона — отказ батча', () => {
+        const raw = line({ kind: 'pr-comment', comment: 'x', path: 'a.ts', line: 1, side: 'old' });
+        expect(() => parseSessionRequests(raw, opts)).toThrow(/сторона диффа/);
+    });
+
+    it('НЕГАТИВНЫЙ: side без path+line — отказ, а не молча выброшенное поле', () => {
+        const raw = line({ kind: 'pr-comment', comment: 'x', side: 'LEFT' });
+        expect(() => parseSessionRequests(raw, opts)).toThrow(/только при паре path\+line/);
+    });
+});
+
+// #41: что выбывает из хвоста, а что его сохраняет. Умолчание — сохранить: незнакомая
+// формулировка не должна молча отнимать у намерения повтор.
+describe('#41 classifyIntentFailure', () => {
+    it.each([
+        'Command failed: gh issue comment 5\nGraphQL: Could not resolve to an issue or pull request with the number of 5.',
+        "Command failed: gh issue edit 5 --add-label x\ncould not add label: 'x' not found",
+        'gh: Resource not accessible by integration (HTTP 403)',
+        'gh: Not Found (HTTP 404)',
+        'SourceCraft POST /issues/5/comments: curl вернул 22 — curl: (22) The requested URL returned error: 404',
+        'SourceCraft PATCH /issues/5: curl вернул 22 — curl: (22) The requested URL returned error: 403',
+        'gh: Validation Failed (HTTP 422)',
+    ])('по существу: %s', (msg) => {
+        expect(classifyIntentFailure(msg)).toBe('deterministic');
+    });
+
+    it.each([
+        'gh: API rate limit exceeded for user ID 1 (HTTP 403)',
+        'gh: You have exceeded a secondary rate limit (HTTP 403)',
+        'gh: Bad Gateway (HTTP 502)',
+        'curl: (22) The requested URL returned error: 503',
+        'connect ETIMEDOUT 10.0.0.1:443',
+        'read ECONNRESET',
+        'форж отверг закрытие',
+    ])('повтор (хвост сохраняется): %s', (msg) => {
+        expect(classifyIntentFailure(msg)).toBe('retry');
+    });
+
+    it.each([
+        'getaddrinfo ENOTFOUND api.example.com',
+        'connect ECONNREFUSED 10.0.0.1:443',
+        'curl: (6) Could not resolve host: api.example.com',
+        'dial tcp: lookup api.github.com: no such host',
+    ])('до соединения (запрос не ушёл): %s', (msg) => {
+        expect(classifyIntentFailure(msg)).toBe('unsent');
+    });
+
+    it.each([
+        'HTTP 403: You have triggered an abuse detection mechanism',
+        'read: connection reset by peer (HTTP 404 упомянут в ответе прокси)',
+        'socket hang up',
+        'net/http: TLS handshake timeout',
+        'read tcp 10.0.0.1:443: i/o timeout',
+    ])('транзиент мерджевого набора и устаревший вторичный лимит: %s', (msg) => {
+        expect(classifyIntentFailure(msg)).toBe('retry');
+    });
+
+    it('тело комментария из argv в класс не попадает: обрыв сети при «HTTP 404» в теле', () => {
+        const e = Object.assign(
+            new Error(
+                'Command failed: gh issue comment 5 --body форж отвечал HTTP 404 на закрытие\n' +
+                    'read: connection reset by peer',
+            ),
+            { stderr: 'read: connection reset by peer\n' },
+        );
+        expect(intentFailureText(e)).toBe('read: connection reset by peer');
+        expect(classifyIntentFailure(intentFailureText(e))).toBe('retry');
+        // Без stderr сообщение-команду не читаем вовсе: отделить тело от ответа нечем.
+        const bare = new Error('Command failed: gh issue close 5 --body HTTP 404');
+        expect(intentFailureText(bare)).toBe('');
+        expect(classifyIntentFailure(intentFailureText(bare))).toBe('retry');
+        // Ошибка адаптера без процесса — её сообщение и есть ответ форжа.
+        expect(intentFailureText(new Error('gh: Not Found (HTTP 404)'))).toBe(
+            'gh: Not Found (HTTP 404)',
+        );
+    });
+
+    it('номер в тексте команды без HTTP-кода отказом по существу не считается', () => {
+        expect(classifyIntentFailure('Command failed: gh issue close 404')).toBe('retry');
+    });
+});
+
+// #94: метка с идентификатором попытки и сверка начатого намерения с лентой форжа.
+describe('#94 метка намерения и сверка', () => {
+    const started = '{"kind":"comment","issue":7,"comment":"x"}';
+    const rest = '{"kind":"comment","issue":8,"comment":"y"}';
+
+    it('метка с id разбирается: id, начатое и хвост за ним', () => {
+        const raw = `${inFlightMarker('intent-0001')}\n${started}\n${rest}\n`;
+        expect(inFlightEntry(raw)).toEqual({
+            marker: '{"ralph":"in-flight","id":"intent-0001"}',
+            id: 'intent-0001',
+            landed: null,
+            started,
+            rest: `${rest}\n`,
+        });
+    });
+
+    it('метка с landed: comment — комментарий лёг по записи раннера, иное landed — порча', () => {
+        const raw = `${inFlightMarker('intent-0001', 'comment')}\n${started}\n`;
+        expect(inFlightEntry(raw)).toMatchObject({ id: 'intent-0001', landed: 'comment' });
+        const bad = `{"ralph":"in-flight","id":"intent-0001","landed":"all"}\n${started}\n`;
+        expect(inFlightEntry(bad)).toMatchObject({ id: null, landed: null });
+    });
+
+    it('метка без id, с лишним полем или не первой строкой — id не признаётся', () => {
+        expect(inFlightEntry(`{"ralph":"in-flight"}\n${started}\n`)?.id).toBeNull();
+        expect(
+            inFlightEntry(`{"ralph":"in-flight","id":"intent-0001","x":1}\n${started}\n`)?.id,
+        ).toBeNull();
+        expect(
+            inFlightEntry(`${rest}\n${inFlightMarker('intent-0001')}\n${started}\n`)?.id,
+        ).toBeNull();
+        expect(inFlightEntry(`${rest}\n`)).toBeNull();
+    });
+
+    it('идентификатор не по форме метку не собирает', () => {
+        expect(() => inFlightMarker('a"b')).toThrow();
+    });
+
+    const comment = { kind: 'comment' as const, issue: 7, comment: 'x' };
+    const source = (bodies: string[], issueBodies?: string[]) => ({
+        listPullRequestComments: () => bodies.map((body) => ({ body })),
+        findOpenPullRequest: () => ({ number: 55 }),
+        ...(issueBodies ? { listIssueComments: () => issueBodies } : {}),
+    });
+
+    it('лента карточки: метка есть — лёг; у close — лёг только комментарий', () => {
+        const s = source([], [withIntentMark('x', 'intent-0001')]);
+        expect(reconcileInFlight(comment, 'intent-0001', s, undefined)).toEqual({
+            verdict: 'landed',
+            landed: 'all',
+        });
+        expect(
+            reconcileInFlight({ ...comment, kind: 'close' }, 'intent-0001', s, undefined),
+        ).toEqual({ verdict: 'landed', landed: 'comment' });
+        expect(reconcileInFlight(comment, 'intent-0002', s, undefined)).toEqual({
+            verdict: 'landed',
+            landed: 'none',
+        });
+    });
+
+    it('сверить нечем — unknown с причиной, а не «не лёг»', () => {
+        expect(reconcileInFlight(comment, 'intent-0001', source([]), undefined).verdict).toBe(
+            'unknown',
+        );
+        const issue = { kind: 'new-issue' as const, title: 't', body: 'b', labels: ['x'] };
+        expect(reconcileInFlight(issue, 'intent-0001', source([], []), undefined)).toMatchObject({
+            verdict: 'unknown',
+            why: expect.stringContaining('поиска карточки'),
+        });
+        const pr = { kind: 'pr-comment' as const, comment: 'c' };
+        expect(reconcileInFlight(pr, 'intent-0001', source([]), undefined).verdict).toBe('unknown');
+        const broken = {
+            ...source([]),
+            listPullRequestComments: () => {
+                throw new Error('HTTP 502');
+            },
+        };
+        expect(reconcileInFlight(pr, 'intent-0001', broken, { branch: 'b' })).toMatchObject({
+            verdict: 'unknown',
+            why: expect.stringContaining('HTTP 502'),
+        });
     });
 });

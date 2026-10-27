@@ -19,7 +19,11 @@ import path from 'node:path';
 // @ts-expect-error — JS-entry раннера без деклараций типов (тот же приём, что в
 // orchestrator.test.ts, #366): дефолт ralph.js — ре-экспорт runtime фабрики.
 import ralph from '../ralph.js';
-import { IN_FLIGHT_MARKER, parseSessionRequests } from '../core/session-requests.ts';
+import {
+    IN_FLIGHT_PREFIX,
+    inFlightMarker,
+    parseSessionRequests,
+} from '../core/session-requests.ts';
 import { REASON_TITLES } from '../core/stop-message.ts';
 import { world } from './crash-world.ts';
 
@@ -121,6 +125,8 @@ function restart(disk: { file: string | null }, forge: string[], chat: string[])
         readFn: () => disk.file,
         pushEventFn: w.chat(chat),
         logFn: () => {},
+        // Шов фейка ленту карточки не читает — сверять нечем, старт обязан встать.
+        taskSource: {},
     }) as boolean;
     const applied = apply(disk, forge, chat);
     return { stopped, applied: applied.res };
@@ -132,7 +138,11 @@ function killer(kind: TKind, at: TKillAt): (op: string) => 'before' | 'after' | 
     const target = line(REQUEST[kind]);
     return (op) => {
         // Метка, первой строкой за которой стоит проверяемое намерение.
-        if (at === 'before-marker' && op === `write:${IN_FLIGHT_MARKER}\n${target}\n`) {
+        if (
+            at === 'before-marker' &&
+            op.startsWith(`write:${IN_FLIGHT_PREFIX}`) &&
+            op.split('\n')[1] === target
+        ) {
             return 'before';
         }
         // До эффекта: первый же вызов шва по этому намерению (метка уже на диске).
@@ -194,12 +204,12 @@ describe('#86 матрица «убить до / после»: намерени�
                 expect(msg).toMatch(/^⛔ Ralph: /);
                 expect(msg).toContain(REASON_TITLES['intent-unknown']);
                 expect(msg).toContain(line(REQUEST[kind]));
-                expect(msg).toContain(IN_FLIGHT_MARKER);
+                expect(msg).toContain(IN_FLIGHT_PREFIX);
                 expect(msg).toMatch(/перезапусти loop/);
                 // Предыдущее, уже подтверждённое, в файле не числится — человек решает
                 // только про начатое.
                 expect(disk.file).not.toContain(line(EARLIER));
-                expect(disk.file).toContain(IN_FLIGHT_MARKER);
+                expect(disk.file).toContain(IN_FLIGHT_PREFIX);
             },
         );
     });
@@ -295,7 +305,7 @@ describe('#86 матрица «убить до / после»: намерени�
         // Метка без `kind` — битая строка для парсера намерений. Даже если проверку метки
         // однажды забудут, файл отвергнется разбором, а не применится.
         expect(() =>
-            parseSessionRequests(`${IN_FLIGHT_MARKER}\n${line(REQUEST.close)}\n`, {
+            parseSessionRequests(`${inFlightMarker('a1b2c3d4-e5f6')}\n${line(REQUEST.close)}\n`, {
                 labelAllowlist: [],
             }),
         ).toThrow();
@@ -332,6 +342,8 @@ describe('#86 проводка: метку проверяют до первой 
         const at = source.indexOf('const intents = applySessionRequestsFn({');
         expect(at).toBeGreaterThan(-1);
         const next = source.slice(at, at + 2000);
-        expect(next).toContain('if (intents.outcomeUnknown === true) break;');
+        // #92: перед стопом этап применения получает исход «stop» в журнале этапов —
+        // стоп обязан остаться в том же блоке, а не уехать за запись журнала.
+        expect(next).toMatch(/if \(intents\.outcomeUnknown === true\) \{[^}]*break;\s*\}/);
     });
 });
