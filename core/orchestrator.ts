@@ -306,12 +306,13 @@ import {
     type AdapterRegistries,
     type AdapterSelection,
 } from '../adapters/adapters-impl.ts';
+import { CONSUMER_CONFIG_REL } from './consumer-config-path.ts';
 
 const CLAUDE_DIR = '.claude';
 // Прежняя раскладка: и продукт, и состояние в одном каталоге внутри дерева. Пока секции
 // `roots` в конфиге нет, всё остаётся здесь — умолчание, названное вслух (канон, задача 21).
 const LEGACY_DIR = path.join(CLAUDE_DIR, 'ralph');
-const CONFIG_PATH = path.join(LEGACY_DIR, 'ralph.config.json');
+const CONFIG_PATH = CONSUMER_CONFIG_REL;
 
 /**
  * Пути СОСТОЯНИЯ экземпляра — один объект вместо россыпи констант, и собирается он той же

@@ -21,6 +21,7 @@ import {
     runnerRevision,
     writeCoreLock,
 } from './core/core-install.ts';
+import { CONSUMER_CONFIG_REL } from './core/consumer-config-path.ts';
 import { supportedVersions } from './core/compat.ts';
 import { commitLockOnBranch, type TRunArgvFn } from './core/core-update.ts';
 import { runLauncher, type TLauncherDeps } from './core/launcher.ts';
@@ -52,10 +53,8 @@ const { default: coreRuntime } = (await import(CORE_ENTRY)) as {
     };
 };
 
-const CONFIG_REL = join('.claude', 'ralph', 'ralph.config.json');
-
 const readConfig = (consumerRoot: string): unknown =>
-    JSON.parse(readFileSync(join(consumerRoot, CONFIG_REL), 'utf8')) as unknown;
+    JSON.parse(readFileSync(join(consumerRoot, CONSUMER_CONFIG_REL), 'utf8')) as unknown;
 const throwFail = (m: string): never => {
     throw new Error(m);
 };
@@ -138,7 +137,7 @@ const deps: TLauncherDeps = {
     runtimeDirOfFn: (consumerRoot, profile) => {
         // Каталог состояния решает тот же резолвер профиля, что у ядра: вторая копия правил
         // слияния `common` и профиля однажды разошлась бы с первой молча.
-        const configPath = join(consumerRoot, CONFIG_REL);
+        const configPath = join(consumerRoot, CONSUMER_CONFIG_REL);
         const raw = JSON.parse(readFileSync(configPath, 'utf8')) as unknown;
         const cfg = coreRuntime.resolveProfile(raw, profile ?? undefined, (m) => {
             throw new Error(m);
