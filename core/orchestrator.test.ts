@@ -4737,6 +4737,146 @@ describe('runLoop — основной while-цикл: итерации коде
         });
     });
 
+    // #38: lock ядра сменился, пока петля работала. Подменить код под живым Node нельзя,
+    // поэтому петля на границе итерации называет расхождение и выходит на рестарт — но
+    // только на подтверждённой границе: посреди сессии сверки нет, посреди сдачи рестарта нет.
+    describe('#38 lock новее исполняемой ревизии — рестарт на границе', () => {
+        const drift = {
+            lockSha: 'b'.repeat(40),
+            reason: `lock новее исполняемой ревизии — нужен рестарт: исполняется ${'a'.repeat(40)}`,
+        };
+
+        it('lock сменился посреди сессии → шаг доведён, на границе стоп с причиной и кодом рестарта', () => {
+            const state = mkState();
+            let lockMoved = false;
+            const order: string[] = [];
+            const pushes: string[] = [];
+            const saved: FakeState[] = [];
+            const coreDriftFn = vi.fn(() => {
+                order.push('drift-check');
+                return lockMoved ? drift : null;
+            });
+            const runClaudeFn = vi.fn<RunClaudeFake>(() => {
+                order.push('session');
+                // Lock правится посреди сессии: петля внутри spawnSync и сверить не может.
+                lockMoved = true;
+                return 0;
+            });
+            const exit = runLoop(
+                validCfg(),
+                ctx(state),
+                deps([], {
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn: () => [{ number: 5, title: 'задача', labels: [] }],
+                    applySessionRequestsFn: () => ({
+                        applied: 1,
+                        failed: false,
+                        closedIssues: [5],
+                    }),
+                    runClaudeFn,
+                    saveStateFn: (s: FakeState) => saved.push({ ...s }),
+                    pushEventFn: (m: string) => pushes.push(m),
+                    coreDriftFn,
+                }),
+            );
+            expect(exit).toBe('activation-restart');
+            // Сверка — до сессии и после неё, а не посреди: сессия одна и доведена.
+            expect(order).toEqual(['drift-check', 'session', 'drift-check']);
+            expect(saved.at(-1)?.count).toBe(1);
+            // Молчаливого продолжения нет: причина ушла уведомлением (и в лог через pushEvent).
+            expect(pushes.at(-1)).toMatch(
+                /^🔁 Ralph: lock новее исполняемой ревизии — нужен рестарт.*итерация 1: шаг доведён, state сохранён/,
+            );
+        });
+
+        it('lock совпадает → петля работает как прежде, кода рестарта нет', () => {
+            const exit = runLoop(
+                validCfg(),
+                ctx(mkState()),
+                deps([], {
+                    phaseIndexOfFn: () => 0,
+                    stopRequestedFn: () => true,
+                    coreDriftFn: () => null,
+                }),
+            );
+            expect(exit).toBeUndefined();
+        });
+
+        it('сдача не доведена → рестарта нет: расхождение названо один раз, петля идёт дальше', () => {
+            const at = 't';
+            let stages = startStage([], 'M1', 'pr', at);
+            stages = finishStage(stages, 'M1', 'pr', 'ok', at);
+            stages = startStage(stages, 'M1', 'review', at);
+            const state = attachSubmitJournal({
+                ...mkState(),
+                submitStages: stages,
+            } as never as RalphState) as never as FakeState;
+            const pushes: string[] = [];
+            let tops = 0;
+            const exit = runLoop(
+                validCfg(),
+                ctx(state),
+                deps([], {
+                    phaseIndexOfFn: () => 0,
+                    pushEventFn: (m: string) => pushes.push(m),
+                    // Страховка от бесконечного цикла, если рестарт сработает не там.
+                    stopRequestedFn: () => ++tops >= 5,
+                    coreDriftFn: () => drift,
+                }),
+            );
+            expect(exit).toBeUndefined();
+            const noted = pushes.filter((m) => m.startsWith('🔁'));
+            expect(noted).toHaveLength(1);
+            expect(noted[0]).toMatch(/нужен рестарт.*сдача фазы не доведена \(этап «review»\)/);
+            // Сдача пошла дальше на прежней ревизии (здесь её гасит фейковый гейт), а не
+            // оборвалась рестартом посреди.
+            expect(pushes.some((m) => /выходит на рестарт/.test(m))).toBe(false);
+            expect(pushes.at(-1)).toMatch(/не прошла авто-мердж/);
+        });
+
+        it('dry-run на расхождении встаёт и ничего не пишет', () => {
+            const logs: string[] = [];
+            const saveStateFn = vi.fn();
+            const pushEventFn = vi.fn();
+            const exit = runLoop(
+                validCfg(),
+                ctx(mkState()),
+                deps(logs, {
+                    dry: true,
+                    phaseIndexOfFn: () => 0,
+                    saveStateFn,
+                    pushEventFn,
+                    coreDriftFn: () => drift,
+                }),
+            );
+            expect(exit).toBeUndefined();
+            expect(saveStateFn).not.toHaveBeenCalled();
+            expect(pushEventFn).not.toHaveBeenCalled();
+            expect(logs.join('\n')).toMatch(/💤 DRY: lock новее исполняемой ревизии/);
+        });
+
+        it('main() передаёт петле сверку с lock и выходит кодом рестарта', () => {
+            // Дефолт `runLoop` — «совпали»; без проводки в main расхождение молча
+            // перестало бы называться при зелёном сьюте.
+            const src = stripComments(
+                fs.readFileSync(path.join(import.meta.dirname, 'orchestrator.ts'), 'utf8'),
+            );
+            const call = src.slice(src.indexOf('const exit = runLoop(config, ctx, {'));
+            expect(call.slice(0, call.indexOf('});'))).toMatch(/\bcoreDriftFn,/);
+            expect(src).toMatch(/\(\) => checkLockDrift\(coreCheck\.sha, driftConsumer\)/);
+            expect(src).toMatch(
+                /if \(exit === 'activation-restart'\) process\.exit\(ACTIVATION_RESTART_EXIT\)/,
+            );
+            // Журнал активации пишется под локом: после взятия лока, до первой сессии.
+            const lockAt = src.indexOf('if (!acquireRunnerLock()) return;');
+            const recordAt = src.indexOf('activated = recordActivation(');
+            const preflightAt = src.indexOf('const ctx = preflight(config);');
+            expect(lockAt).toBeGreaterThan(0);
+            expect(recordAt).toBeGreaterThan(lockAt);
+            expect(preflightAt).toBeGreaterThan(recordAt);
+        });
+    });
+
     // #65: форж отдаёт список issue с задержкой — карточка, закрытая намерением секунду
     // назад, ещё числится открытой. Петля брала её повторно и жгла целую сессию на уже
     // сделанной работе (поймано здесь трижды: после #423, #424 и #425). Здесь шов

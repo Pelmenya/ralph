@@ -26,6 +26,7 @@ import {
 // его можно.
 import { FIX_SEVERITY_LEVELS } from './review-of-fixes.ts';
 import { resolveRoots, type TRootsInput } from './roots.ts';
+import { productRootFromLock } from './core-install.ts';
 
 // fail() боевой уходит в process.exit(1); тестовый failFn может вернуть значение или
 // бросить — поэтому возврат unknown, а не never (мягкий результат пробрасывается наверх).
@@ -42,6 +43,11 @@ export type ConfigProfileEnv = {
     // валидатор живёт в review.ts, сюда приходит уже собранным из его фабрики.
     assertKnownReviewModels: AssertKnownReviewModelsFn;
 };
+
+/** Каталог ядра из lock потребителя (`core-install.ts`); подменяется в тестах. */
+export type TLockRootFn = (
+    consumerRoot: string,
+) => { ok: true; path: string } | { ok: false; reason: string };
 
 export function isPlainObject(v: unknown): v is Record<string, unknown> {
     return v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -618,19 +624,45 @@ export function createConfigProfile(env: ConfigProfileEnv) {
      * каждом месте, где корень понадобится, — с шансом получить другой ответ, если дерево
      * между вызовами изменилось (ревью !18). Отсутствие секции — `null`: «раскладки нет»
      * и «раскладка пустая» должны различаться на вкус вызывающего.
+     *
+     * Исключение из «целиком» одно — `productRoot` (#134): его launcher выводит из lock
+     * (`productRootFromLock`), потому что при ядре из установки ключ был второй копией SHA и
+     * требовал ручной правки на каждой смене ревизии. Вывод — не догадка от места запуска:
+     * lock нет — отказ с причиной. Откуда взят путь, уходит вызывающему (`productRootFrom`):
+     * старт сверяет с исполняемым ядром и выведенный путь, а не только заданный.
      */
     function assertValidRoots(
         cfg: Record<string, unknown>,
         profileName: string,
         failFn: FailFn = fail,
+        lockRootFn: TLockRootFn = productRootFromLock,
     ): unknown {
         const raw = cfg.roots;
-        if (raw === undefined) return { rootsResolved: null };
+        if (raw === undefined) return { rootsResolved: null, productRootFrom: null };
         if (!isPlainObject(raw)) {
             return failFn(`ralph.config.json: "roots" в профиле "${profileName}" — не объект.`);
         }
+        const input = { ...raw } as TRootsInput;
+        const pinned = typeof raw.productRoot === 'string' && raw.productRoot.trim() !== '';
+        const consumer = typeof raw.consumerRoot === 'string' ? raw.consumerRoot.trim() : '';
+        // Без годного consumerRoot lock искать негде — резолв ниже назовёт сам consumerRoot.
+        if (!pinned && path.isAbsolute(consumer)) {
+            const fromLock = lockRootFn(consumer);
+            if (!fromLock.ok) {
+                return failFn(
+                    `ralph.config.json: "roots" в профиле "${profileName}": roots.productRoot не ` +
+                        `задан, а вывести его из lock нельзя (${fromLock.reason}). Ядро из ` +
+                        `установки — поставь ревизию: ./ralph install; ядро-клон или подмодуль — ` +
+                        `задай roots.productRoot явно.`,
+                );
+            }
+            input.productRoot = fromLock.path;
+        }
         try {
-            return { rootsResolved: resolveRoots(raw as TRootsInput) };
+            return {
+                rootsResolved: resolveRoots(input),
+                productRootFrom: pinned ? 'config' : 'lock',
+            };
         } catch (e) {
             return failFn(
                 `ralph.config.json: "roots" в профиле "${profileName}": ${(e as Error).message}`,
@@ -786,7 +818,12 @@ export function createConfigProfile(env: ConfigProfileEnv) {
         return { consumerScriptsResolved: resolved };
     }
 
-    function resolveProfile(raw: unknown, name: unknown, failFn: FailFn = fail): unknown {
+    function resolveProfile(
+        raw: unknown,
+        name: unknown,
+        failFn: FailFn = fail,
+        lockRootFn: TLockRootFn = productRootFromLock,
+    ): unknown {
         if (!isPlainObject(raw)) return failFn('ralph.config.json: ожидался JSON-объект.');
         if (!isPlainObject(raw.common)) {
             return failFn('ralph.config.json: нет блока "common" — общие поля профилей.');
@@ -869,7 +906,7 @@ export function createConfigProfile(env: ConfigProfileEnv) {
         if (promptOk !== true) return promptOk; // мягкий failFn — наверх как есть
         // Канон, задача 21: раскладка корней. Последней в ряду — она про место на диске,
         // и осмысленна только когда остальная схема уже признана целой.
-        const rootsOk = assertValidRoots(merged, wanted, failFn);
+        const rootsOk = assertValidRoots(merged, wanted, failFn, lockRootFn);
         if (!isPlainObject(rootsOk) || !('rootsResolved' in rootsOk)) return rootsOk; // мягкий failFn
         const roots = rootsOk.rootsResolved as { consumerRoot?: string } | null;
         // Канон, задача 23: скрипты потребителя — ПОСЛЕ корней: их пути якорятся к
@@ -887,6 +924,7 @@ export function createConfigProfile(env: ConfigProfileEnv) {
             ...merged,
             profileName: wanted,
             rootsResolved: rootsOk.rootsResolved,
+            productRootFrom: rootsOk.productRootFrom,
             consumerScriptsResolved: scriptsOk.consumerScriptsResolved,
         };
     }

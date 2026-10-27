@@ -1,7 +1,18 @@
 // Решения команд launcher на подменённых коллабораторах (#100). Сквозной путь на настоящем
 // диске, git и раннере — `tests/launcher-scenarios.test.ts`; здесь — каждая развилка.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import {
+    existsSync,
+    lstatSync,
+    mkdirSync,
+    mkdtempSync,
+    readdirSync,
+    readFileSync,
+    readlinkSync,
+    renameSync,
+    rmSync,
+    writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -10,11 +21,22 @@ import {
     formatCoreLock,
     formatManifest,
     INSTALL_MANIFEST,
+    installRevision,
     treeHashOf,
+    verifyInstalledTree,
     type TCoreLock,
+    type TInstallFs,
 } from './core-install.ts';
 import { supportedVersions } from './compat.ts';
-import { formatCheck, parseLauncherArgv, runLauncher, type TLauncherDeps } from './launcher.ts';
+import { ACTIVATION_RESTART_EXIT } from './core-activation.ts';
+import {
+    formatCheck,
+    parseLauncherArgv,
+    runLauncher,
+    runUpdateCommand,
+    SAME_RESTART_WORK_MS,
+    type TLauncherDeps,
+} from './launcher.ts';
 
 const SHA = 'a'.repeat(40);
 const OTHER = 'b'.repeat(40);
@@ -83,11 +105,16 @@ function world(over: Partial<TLauncherDeps> = {}, opts: { lock?: string | null }
         resolveRevFn: vi.fn(() => SHA),
         versionsOfFn: vi.fn(() => supportedVersions()),
         runCoreFn: vi.fn(() => 0),
+        nowFn: vi.fn(() => 0),
         runtimeDirOfFn: vi.fn(() => '/run/ralph'),
-        ralphAliveFn: vi.fn(() => true),
+        ralphRevisionFn: vi.fn((): string | null => SHA),
         writeStopFn: vi.fn((p: string) => {
             files.set(p, 'stop');
         }),
+        rawConfigFn: vi.fn(() => ({ configVersion: 1 })),
+        pushLockBranchFn: vi.fn(() => 'c'.repeat(40)),
+        openPrFn: vi.fn(() => 7),
+        findOpenPrFn: vi.fn(() => null),
         ...over,
     };
     return { files, dirs, out, deps };
@@ -126,7 +153,7 @@ describe('parseLauncherArgv', () => {
         [['--consumer', 'app', 'start'], /--consumer <абсолютный путь> не задан/],
         [['--consumer', CONSUMER, 'install', '--rev'], /--rev без значения/],
         [['--consumer', CONSUMER, 'install', '--rev', '--source'], /--rev без значения/],
-        [['--consumer', CONSUMER, 'start', '--rev', 'x'], /флаги install, а не start/],
+        [['--consumer', CONSUMER, 'start', '--rev', 'x'], /флаги install и update, а не start/],
         [['--consumer', CONSUMER, 'install', '--force'], /install не знает флага "--force"/],
         [['--consumer', CONSUMER, 'version', 'x'], /version не знает флага "x"/],
         [['--consumer', CONSUMER, 'stop', '--now'], /stop не знает флага "--now"/],
@@ -273,6 +300,116 @@ describe('start', () => {
         expect(w.out[0]).toMatch(/^❌ дерево: .*extra\.ts: лишний файл/);
         expect(w.out.at(-1)).toMatch(/^⛔ start отменён/);
         expect(w.deps.runCoreFn).not.toHaveBeenCalled();
+    });
+});
+
+describe('start — активация рестартом (#38)', () => {
+    /** Вторая настоящая ревизия рядом с первой и lock на неё. */
+    function installOther(w: TWorld): string {
+        const other = join(dataDir, OTHER);
+        mkdirSync(other, { recursive: true });
+        writeFileSync(join(other, 'ralph.js'), 'entry 2\n');
+        const manifest = formatManifest(buildManifest(other));
+        writeFileSync(join(other, INSTALL_MANIFEST), manifest);
+        w.dirs.add(other);
+        w.files.set(
+            LOCK_PATH,
+            formatCoreLock({ ...lock, sha: OTHER, treeHash: treeHashOf(manifest) }),
+        );
+        return other;
+    }
+
+    it('ядро вышло на рестарт → start сверяет lock заново и запускает новую ревизию', () => {
+        const codes = [ACTIVATION_RESTART_EXIT, 0];
+        let other = '';
+        const w = world({
+            runCoreFn: vi.fn(() => {
+                // Lock сменился, пока петля шла: ядро увидело это на границе и вышло.
+                if (other === '') other = installOther(w);
+                return codes.shift() ?? 1;
+            }),
+        });
+        expect(run(w, 'start')).toBe(0);
+        expect(w.deps.runCoreFn).toHaveBeenNthCalledWith(1, dir, [], CONSUMER);
+        expect(w.deps.runCoreFn).toHaveBeenNthCalledWith(2, other, [], CONSUMER);
+        expect(w.out).toEqual([
+            `▶ Ralph ${SHA} из ${dir}`,
+            `🔁 Рестарт: ${SHA} → ${OTHER} из ${other}`,
+        ]);
+    });
+
+    // Один рестарт в ту же ревизию — транзиент (lock не прочитался ядром посреди pull),
+    // второй подряд — устойчивое расхождение взгляда ядра и launcher (ревью Фазы 13).
+    it('рестарт в ту же ревизию: один повтор, второй подряд — отказ с причиной', () => {
+        const w = world({ runCoreFn: vi.fn(() => ACTIVATION_RESTART_EXIT) });
+        expect(run(w, 'start')).toBe(1);
+        expect(w.deps.runCoreFn).toHaveBeenCalledTimes(2);
+        expect(w.out.slice(0, 2)).toEqual([
+            `▶ Ralph ${SHA} из ${dir}`,
+            `🔁 Рестарт: ${SHA} → ${SHA} из ${dir}`,
+        ]);
+        expect(w.out.at(-1)).toMatch(
+            new RegExp(
+                `^⛔ рестарт отменён: ядро ${SHA} второй раз подряд.*lock его не показывает`,
+            ),
+        );
+    });
+
+    // Счёт «подряд» обнуляет работа ядра между рестартами: два транзиента, разнесённых
+    // сутками, — не тугая петля (ревью Фазы 13, проход 2).
+    it('два рестарта в ту же ревизию, разнесённые работой ядра, — не отказ', () => {
+        const codes = [ACTIVATION_RESTART_EXIT, ACTIVATION_RESTART_EXIT, 0];
+        let clock = 0;
+        const w = world({
+            runCoreFn: vi.fn(() => {
+                clock += SAME_RESTART_WORK_MS + 1;
+                return codes.shift() ?? 1;
+            }),
+            nowFn: vi.fn(() => clock),
+        });
+        expect(run(w, 'start')).toBe(0);
+        expect(w.deps.runCoreFn).toHaveBeenCalledTimes(3);
+        expect(w.out.filter((l) => l.startsWith('⛔'))).toEqual([]);
+    });
+
+    it('рестарт в ту же ревизию на пороге работы — ещё серия, второй — отказ', () => {
+        let clock = 0;
+        const w = world({
+            runCoreFn: vi.fn(() => {
+                clock += SAME_RESTART_WORK_MS;
+                return ACTIVATION_RESTART_EXIT;
+            }),
+            nowFn: vi.fn(() => clock),
+        });
+        expect(run(w, 'start')).toBe(1);
+        expect(w.deps.runCoreFn).toHaveBeenCalledTimes(2);
+    });
+
+    it('рестарт в ту же ревизию, затем код 0 — транзиент пережит', () => {
+        const codes = [ACTIVATION_RESTART_EXIT, 0];
+        const w = world({ runCoreFn: vi.fn(() => codes.shift() ?? 1) });
+        expect(run(w, 'start')).toBe(0);
+        expect(w.deps.runCoreFn).toHaveBeenCalledTimes(2);
+    });
+
+    it('новой ревизии в установке нет → отказ с советом, прежняя не запускается', () => {
+        const w = world({
+            runCoreFn: vi.fn(() => {
+                w.files.set(LOCK_PATH, formatCoreLock({ ...lock, sha: OTHER }));
+                return ACTIVATION_RESTART_EXIT;
+            }),
+        });
+        expect(run(w, 'start')).toBe(1);
+        expect(w.deps.runCoreFn).toHaveBeenCalledTimes(1);
+        expect(w.out.at(-1)).toMatch(
+            new RegExp(`^⛔ рестарт после ${SHA} отменён.*провалы выше.*\\./ralph doctor`),
+        );
+    });
+
+    it('стоп по существу (код 1) — не рестарт', () => {
+        const w = world({ runCoreFn: vi.fn(() => 1) });
+        expect(run(w, 'start')).toBe(1);
+        expect(w.deps.runCoreFn).toHaveBeenCalledTimes(1);
     });
 });
 
@@ -425,22 +562,35 @@ describe('stop', () => {
     });
 
     it('лок брошен (владелец мёртв) — отказ: запрос остановил бы следующий старт', () => {
-        const w = world({ ralphAliveFn: vi.fn(() => false) });
+        const w = world({ ralphRevisionFn: vi.fn(() => null) });
         w.files.set('/run/ralph/ralph.lock', '4242\n');
         expect(run(w, 'stop')).toBe(1);
-        // Живость сверяется с entry ревизии из lock, а не с подстрокой `ralph.js`.
-        expect(w.deps.ralphAliveFn).toHaveBeenCalledWith(4242, join(dir, 'ralph.js'));
+        // Живость сверяется с entry в каталоге установок, а не с подстрокой `ralph.js`.
+        expect(w.deps.ralphRevisionFn).toHaveBeenCalledWith(4242, dataDir);
         expect(w.deps.writeStopFn).not.toHaveBeenCalled();
         expect(w.out[0]).toMatch(
-            /лок \/run\/ralph\/ralph\.lock брошен — раннера .*ralph\.js с pid 4242 нет/,
+            /лок \/run\/ralph\/ralph\.lock брошен — раннера .*<ревизия>\/ralph\.js с pid 4242 нет/,
         );
+    });
+
+    it('lock сменили после старта: жив раннер другой ревизии — не «брошен», запрос кладётся (#136)', () => {
+        const w = world({ ralphRevisionFn: vi.fn(() => OTHER) });
+        w.files.set('/run/ralph/ralph.lock', '4242\n');
+        expect(run(w, 'stop')).toBe(0);
+        expect(w.deps.writeStopFn).toHaveBeenCalledWith('/run/ralph/ralph.stop');
+        expect(w.out.join('\n')).not.toMatch(/брошен/);
+        expect(w.out[0]).toBe(
+            `ℹ️ Петля с pid 4242 идёт на ревизии ${OTHER}, а lock называет ${SHA} ` +
+                '(lock сменили после её старта) — запрос кладётся ей же.',
+        );
+        expect(w.out[1]).toMatch(/Запрос остановки положен/);
     });
 
     it('lock потребителя не читается — отказ: чей раннер держит лок, не проверить', () => {
         const w = world({}, { lock: null });
         w.files.set('/run/ralph/ralph.lock', '4242\n');
         expect(run(w, 'stop')).toBe(1);
-        expect(w.deps.ralphAliveFn).not.toHaveBeenCalled();
+        expect(w.deps.ralphRevisionFn).not.toHaveBeenCalled();
         expect(w.deps.writeStopFn).not.toHaveBeenCalled();
         expect(w.out[0]).toMatch(/core\.lock нет — чей раннер держит лок, не проверить/);
     });
@@ -449,7 +599,7 @@ describe('stop', () => {
         const w = world({ env: { RALPH_LAUNCHER_VERSION: '1' } });
         w.files.set('/run/ralph/ralph.lock', '4242\n');
         expect(run(w, 'stop')).toBe(1);
-        expect(w.deps.ralphAliveFn).not.toHaveBeenCalled();
+        expect(w.deps.ralphRevisionFn).not.toHaveBeenCalled();
         expect(w.out[0]).toMatch(/Каталог установок ядра не задан.*не проверить/);
     });
 
@@ -483,7 +633,7 @@ describe('stop', () => {
         const w = world();
         w.files.set('/run/ralph/ralph.lock', '{}');
         expect(run(w, 'stop')).toBe(1);
-        expect(w.deps.ralphAliveFn).not.toHaveBeenCalled();
+        expect(w.deps.ralphRevisionFn).not.toHaveBeenCalled();
         expect(w.deps.writeStopFn).not.toHaveBeenCalled();
         expect(w.out[0]).toMatch(/не pid .* запрос не кладётся/);
     });
@@ -539,4 +689,609 @@ describe('version', () => {
 
 it('formatCheck: знак по исходу', () => {
     expect(formatCheck({ name: 'n', status: 'skip', detail: 'd' })).toBe('⏭ n: d');
+});
+
+describe('update (#102)', () => {
+    // Fs установки без предохранителя побочек: запись во временный каталог теста и есть
+    // предмет проверки — исполняемая ревизия рядом не должна измениться ни байтом.
+    const installFs: TInstallFs = {
+        readdir: (d) => readdirSync(d),
+        lstat: (p) => lstatSync(p),
+        readFile: (p) => readFileSync(p),
+        readlink: (p) => readlinkSync(p),
+        exists: (p) => existsSync(p),
+        mkdir: (d) => mkdirSync(d, { recursive: true }),
+        writeFile: (p, t) => writeFileSync(p, t, { flag: 'wx' }),
+        rename: (a, b) => renameSync(a, b),
+        rm: (p) => rmSync(p, { recursive: true, force: true }),
+    };
+    const realInstall: TLauncherDeps['installFn'] = ({ sha, dataDir: d }) =>
+        installRevision({
+            sha,
+            dataDir: d,
+            fs: installFs,
+            exportFn: (_sha, dest) => {
+                mkdirSync(join(dest, 'core'), { recursive: true });
+                writeFileSync(join(dest, 'ralph.js'), 'entry v2\n');
+                writeFileSync(join(dest, 'core', 'a.ts'), 'a v2\n');
+            },
+        });
+    const uworld = (over: Partial<TLauncherDeps> = {}) =>
+        world({ resolveRevFn: vi.fn(() => OTHER), installFn: vi.fn(realInstall), ...over });
+    const update = (w: TWorld, ...argv: string[]) => run(w, 'update', '--source', '/src', ...argv);
+    const snapshot = (d: string) => formatManifest(buildManifest(d));
+
+    it('во время работающей петли: ревизия ставится рядом, исполняемая и lock не тронуты', () => {
+        const before = snapshot(dir);
+        const lockBefore = formatCoreLock(lock);
+        const w = uworld({ installFn: vi.fn(realInstall) });
+        expect(update(w, 'v2')).toBe(0);
+
+        expect(snapshot(dir)).toBe(before);
+        expect(verifyInstalledTree(dir, lock)).toEqual({ ok: true });
+        expect(existsSync(join(dataDir, OTHER, INSTALL_MANIFEST))).toBe(true);
+        // Петлю не останавливают и не перезапускают, lock человека не пишется.
+        expect(w.deps.runCoreFn).not.toHaveBeenCalled();
+        expect(w.deps.writeStopFn).not.toHaveBeenCalled();
+        expect(w.deps.writeLockFn).not.toHaveBeenCalled();
+        expect(w.files.get(LOCK_PATH)).toBe(lockBefore);
+        expect(w.out.at(-1)).toMatch(/Петля работает на прежней ревизии/);
+    });
+
+    it('lock меняется только в ветке PR: новая ревизия, её хэш и версии — в коммит ветки', () => {
+        const w = uworld({ installFn: vi.fn(realInstall) });
+        expect(update(w, 'v2')).toBe(0);
+        const newDir = join(dataDir, OTHER);
+        const next: TCoreLock = {
+            schema: CORE_LOCK_SCHEMA,
+            sha: OTHER,
+            treeHash: treeHashOf(readFileSync(join(newDir, INSTALL_MANIFEST), 'utf8')),
+            versions: supportedVersions(),
+        };
+        const branch = `ralph/core-${OTHER.slice(0, 12)}`;
+        expect(w.deps.pushLockBranchFn).toHaveBeenCalledWith({
+            consumerRoot: CONSUMER,
+            branch,
+            lock: next,
+            message: expect.stringContaining(`стало: \`${OTHER}\``) as string,
+        });
+        expect(w.deps.openPrFn).toHaveBeenCalledWith(
+            CONSUMER,
+            {
+                branch,
+                title: `chore(core): ревизия ядра ${OTHER.slice(0, 12)}`,
+                body: expect.stringContaining(`было: \`${SHA}\``) as string,
+            },
+            null,
+        );
+        expect(w.deps.writeLockFn).not.toHaveBeenCalled();
+        expect(w.out.at(-1)).toMatch(new RegExp(`PR #7 из ${branch}`));
+    });
+
+    it('ревизия названа --rev, а источник — RALPH_SOURCE', () => {
+        const w = uworld();
+        w.deps.env.RALPH_SOURCE = '/env-src';
+        expect(run(w, 'update', '--rev', 'v2')).toBe(0);
+        expect(w.deps.resolveRevFn).toHaveBeenCalledWith('/env-src', 'v2');
+        expect(w.deps.installFn).toHaveBeenCalledWith({
+            sha: OTHER,
+            dataDir,
+            source: '/env-src',
+        });
+    });
+
+    it('roots.productRoot конфига на исполняемой ревизии — предупреждение с новым путём', () => {
+        const w = uworld({
+            rawConfigFn: vi.fn(() => ({
+                common: { roots: { productRoot: dir } },
+                profiles: { prod: { roots: { productRoot: dir } }, dev: {}, bad: 1 },
+            })),
+        });
+        expect(update(w, 'v2')).toBe(0);
+        const warn = w.out.filter((l) => l.startsWith('⚠'));
+        expect(warn).toEqual([
+            `⚠ common.roots.productRoot конфига указывает на ревизию из lock ${dir}: вместе с мерджем PR убери ключ (launcher выводит его из lock) или поправь его на ${join(dataDir, OTHER)}, иначе рестарт откажет расхождением.`,
+            expect.stringMatching(/^⚠ profiles\.prod\.roots\.productRoot конфига/) as string,
+        ]);
+    });
+
+    it('конфиг без roots — без предупреждения', () => {
+        const w = uworld({ rawConfigFn: vi.fn(() => ({ configVersion: 1, profiles: [] })) });
+        expect(update(w, 'v2')).toBe(0);
+        expect(w.out.some((l) => l.startsWith('⚠'))).toBe(false);
+    });
+
+    it('форж не назвал номер PR — успех без номера', () => {
+        const w = uworld({ openPrFn: vi.fn(() => null) });
+        expect(update(w, 'v2')).toBe(0);
+        expect(w.out.at(-1)).toMatch(/^🔀 PR из ralph\/core-/);
+    });
+
+    it.each([
+        [
+            'launcher',
+            { launcher: 2 },
+            {},
+            /launcher: ревизия ждёт v2, у потребителя v1 — сначала обнови шим/,
+        ],
+        ['config', { config: 2 }, {}, /config: ревизия ждёт v2, у потребителя v1/],
+        ['шим без версии', {}, { RALPH_LAUNCHER_VERSION: '' }, /launcher: версия не определена/],
+    ])('несовместимая ревизия (%s) отвергнута до PR с причиной', (_n, versions, env, why) => {
+        const w = uworld({ versionsOfFn: vi.fn(() => ({ ...supportedVersions(), ...versions })) });
+        Object.assign(w.deps.env, env);
+        expect(update(w, 'v2')).toBe(1);
+        expect(w.out.join('\n')).toMatch(why);
+        expect(w.out.at(-1)).toMatch(/несовместима с этим потребителем.*PR не заведён/);
+        expect(w.deps.pushLockBranchFn).not.toHaveBeenCalled();
+        expect(w.deps.openPrFn).not.toHaveBeenCalled();
+    });
+
+    it('ревизия читает state старше того, что пишет нынешняя, — отказ до PR', () => {
+        const st = supportedVersions().state;
+        const newer = { ...lock, versions: { ...lock.versions, state: st + 1 } };
+        const w = world(
+            { resolveRevFn: vi.fn(() => OTHER), installFn: vi.fn(realInstall) },
+            { lock: formatCoreLock(newer) },
+        );
+        expect(update(w, 'v2')).toBe(1);
+        expect(w.out[0]).toBe(
+            `❌ state: нынешняя ревизия пишет v${String(st + 1)}, новая читает только до v${String(st)} — откат схемы state не поддерживается`,
+        );
+        expect(w.deps.pushLockBranchFn).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        ['битый', () => ({ configVersion: 'x' }), /config: версия не определена \(configVersion/],
+        ['не объект', () => [], /конфиг не объект/],
+        [
+            'не читается',
+            () => {
+                throw new Error('ENOENT');
+            },
+            /конфиг не прочитан: ENOENT/,
+        ],
+    ])('конфиг %s — отказ до PR', (_n, rawConfigFn, why) => {
+        const w = uworld({ rawConfigFn: vi.fn(rawConfigFn) });
+        expect(update(w, 'v2')).toBe(1);
+        expect(w.out.join('\n')).toMatch(why);
+        expect(w.deps.pushLockBranchFn).not.toHaveBeenCalled();
+    });
+
+    it('недоскачанная ревизия: установка оборвалась — отказ до PR', () => {
+        const w = uworld({
+            installFn: vi.fn(() => {
+                throw new Error('git checkout: обрыв');
+            }),
+        });
+        expect(update(w, 'v2')).toBe(1);
+        expect(w.out[0]).toMatch(/ревизия b+ не установлена — git checkout: обрыв.*PR не заведён/);
+        expect(w.deps.versionsOfFn).not.toHaveBeenCalled();
+        expect(w.deps.pushLockBranchFn).not.toHaveBeenCalled();
+    });
+
+    it('каталог ревизии уже лежал и разошёлся со своим манифестом — его код не исполняется', () => {
+        const other = join(dataDir, OTHER);
+        mkdirSync(other, { recursive: true });
+        writeFileSync(join(other, 'ralph.js'), 'правлено\n');
+        writeFileSync(join(other, INSTALL_MANIFEST), formatManifest(buildManifest(dir)));
+        const w = uworld({
+            installFn: vi.fn(() => ({
+                status: 'present' as const,
+                dir: other,
+                treeHash: lock.treeHash,
+            })),
+        });
+        expect(update(w, 'v2')).toBe(1);
+        expect(w.out[0]).toMatch(/не цела: .*Убери каталог и повтори update/);
+        expect(w.deps.versionsOfFn).not.toHaveBeenCalled();
+        expect(w.deps.pushLockBranchFn).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        [
+            'бросила',
+            () => {
+                throw new Error('код 1');
+            },
+            /не назвала свои версии: код 1/,
+        ],
+        ['ответила не по контракту', () => 'v2', /не назвала свои версии: ответ не по контракту/],
+    ])('ревизия %s на запрос версий — отказ до PR', (_n, versionsOfFn, why) => {
+        const w = uworld({ versionsOfFn: vi.fn(versionsOfFn) });
+        expect(update(w, 'v2')).toBe(1);
+        expect(w.out[0]).toMatch(why);
+        expect(w.deps.pushLockBranchFn).not.toHaveBeenCalled();
+    });
+
+    it('lock уже называет эту ревизию — менять нечего, ничего не ставится', () => {
+        const w = world();
+        expect(update(w, 'v1')).toBe(0);
+        expect(w.out[0]).toMatch(/уже называет a+ — менять нечего/);
+        expect(w.deps.installFn).not.toHaveBeenCalled();
+        expect(w.deps.pushLockBranchFn).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        ['без источника', [], {}, /источник не задан/],
+        [
+            'битый lock',
+            ['--source', '/src'],
+            { lock: '{' },
+            /обновлять нечего, сначала почини lock/,
+        ],
+        ['нет lock', ['--source', '/src'], { lock: null }, /core\.lock нет — обновлять нечего/],
+    ])('отказ до установки: %s', (_n, extra, opts, why) => {
+        const w = world({}, opts as { lock?: string | null });
+        expect(run(w, 'update', ...extra, 'v2')).toBe(1);
+        expect(w.out[0]).toMatch(why);
+        expect(w.deps.installFn).not.toHaveBeenCalled();
+    });
+
+    // Парсер без ревизии update не пропускает; страж в самой команде — для вызова мимо него.
+    it('отказ до установки: ревизия не названа', () => {
+        const w = world();
+        const args = {
+            command: 'update' as const,
+            consumerRoot: CONSUMER,
+            source: '/src',
+            rev: null,
+            profile: null,
+            passthrough: [],
+        };
+        expect(runUpdateCommand(args, w.deps)).toBe(1);
+        expect(w.out[0]).toMatch(/ревизия не названа\. PR не заведён/);
+        expect(w.deps.installFn).not.toHaveBeenCalled();
+    });
+
+    it('ревизии нет в источнике — отказ с причиной', () => {
+        const w = world({
+            resolveRevFn: vi.fn(() => {
+                throw new Error('ревизии v9 нет в /src');
+            }),
+        });
+        expect(update(w, 'v9')).toBe(1);
+        expect(w.out[0]).toBe('⛔ update: ревизии v9 нет в /src. PR не заведён.');
+    });
+
+    it('каталог установок не задан — отказ', () => {
+        const w = world();
+        w.deps.env.RALPH_DATA_DIR = 'rel';
+        expect(update(w, 'v2')).toBe(1);
+        expect(w.out[0]).toMatch(/RALPH_DATA_DIR=rel не абсолютный путь/);
+    });
+
+    it('ветка не запушена — отказ, PR не заводится', () => {
+        const w = uworld({
+            pushLockBranchFn: vi.fn(() => {
+                throw new Error('non-fast-forward');
+            }),
+        });
+        expect(update(w, 'v2')).toBe(1);
+        expect(w.out[0]).toMatch(
+            /ветка ralph\/core-b+ с правкой lock не запушена — non-fast-forward/,
+        );
+        expect(w.deps.openPrFn).not.toHaveBeenCalled();
+    });
+
+    it('ветка запушена, PR не заведён — ветка названа по имени', () => {
+        const w = uworld({
+            openPrFn: vi.fn(() => {
+                throw new Error('HTTP 403');
+            }),
+        });
+        expect(update(w, 'v2')).toBe(1);
+        expect(w.out[0]).toMatch(
+            /ветка ralph\/core-b+ \(c+\) запушена, но PR не заведён — HTTP 403/,
+        );
+    });
+
+    it('PR ветки уже открыт (повтор после обрыва) — второй не заводится (#104)', () => {
+        const w = uworld({ findOpenPrFn: vi.fn(() => 9) });
+        expect(update(w, 'v2')).toBe(0);
+        expect(w.deps.findOpenPrFn).toHaveBeenCalledWith(
+            CONSUMER,
+            'ralph/core-' + OTHER.slice(0, 12),
+            null,
+        );
+        expect(w.deps.openPrFn).not.toHaveBeenCalled();
+        expect(w.out.at(-1)).toMatch(/PR #9 из ralph\/core-b+ \(c+\) уже открыт/);
+    });
+
+    it('PR ветки не прочитался — отказ с именем ветки, второй PR не заводится вслепую', () => {
+        const w = uworld({
+            findOpenPrFn: vi.fn(() => {
+                throw new Error('HTTP 502');
+            }),
+        });
+        expect(update(w, 'v2')).toBe(1);
+        expect(w.out[0]).toMatch(
+            /ветка ralph\/core-b+ \(c+\) запушена, но PR не заведён — PR ветки не прочитан: HTTP 502/,
+        );
+        expect(w.deps.openPrFn).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        [['update'], /ровно одну ревизию/],
+        [['update', 'a', 'b'], /ровно одну ревизию/],
+        [['update', '--rev', 'a', 'b'], /ровно одну ревизию/],
+        [['update', 'a', '--force'], /update не знает флага "--force"/],
+    ])('разбор %j — отказ', (argv, why) => {
+        const r = parseLauncherArgv(['--consumer', CONSUMER, ...argv]);
+        expect(r.ok).toBe(false);
+        expect(r.ok ? '' : r.reason).toMatch(why);
+    });
+
+    it('разбор: позиционная ревизия уходит в rev', () => {
+        const r = parseLauncherArgv(['--consumer', CONSUMER, 'update', 'v2']);
+        expect(r).toMatchObject({
+            ok: true,
+            args: { command: 'update', rev: 'v2', passthrough: [] },
+        });
+    });
+});
+
+describe('rollback (#103)', () => {
+    const RUNTIME = '/run/ralph';
+    const JOURNAL = join(RUNTIME, 'ralph.activations.jsonl');
+    const STATE = join(RUNTIME, 'ralph.state.json');
+    const stateText = (schemaVersion: number) =>
+        JSON.stringify({ schemaVersion, count: 3, milestone: 'Ф13', submitStages: [] });
+    const at = '2026-10-27T00:00:00.000Z';
+    const journalText = [
+        JSON.stringify({ at, sha: OTHER, from: null }),
+        JSON.stringify({ at, sha: SHA, from: OTHER }),
+        '',
+    ].join('\n');
+
+    let prevDir: string;
+    let prevTreeHash: string;
+    // Прежняя ревизия лежит в каталоге установок рядом с исполняемой — так её и оставляет
+    // чистка (`core-rollback.test.ts`).
+    beforeEach(() => {
+        prevDir = join(dataDir, OTHER);
+        mkdirSync(join(prevDir, 'core'), { recursive: true });
+        writeFileSync(join(prevDir, 'ralph.js'), 'entry v0\n');
+        writeFileSync(join(prevDir, 'core', 'a.ts'), 'a v0\n');
+        const manifest = formatManifest(buildManifest(prevDir));
+        writeFileSync(join(prevDir, INSTALL_MANIFEST), manifest);
+        prevTreeHash = treeHashOf(manifest);
+    });
+
+    const rworld = (
+        over: Partial<TLauncherDeps> = {},
+        opts: { lock?: string | null; journal?: string | null; state?: string | null } = {},
+    ) => {
+        const w = world(
+            {
+                installFn: vi.fn(({ sha }) => ({
+                    status: 'present' as const,
+                    dir: join(dataDir, sha),
+                    treeHash: prevTreeHash,
+                })),
+                ...over,
+            },
+            { lock: opts.lock },
+        );
+        const j = opts.journal === undefined ? journalText : opts.journal;
+        if (j !== null) w.files.set(JOURNAL, j);
+        const s = opts.state === undefined ? stateText(supportedVersions().state) : opts.state;
+        if (s !== null) w.files.set(STATE, s);
+        return w;
+    };
+    const rollback = (w: TWorld, ...argv: string[]) => run(w, 'rollback', ...argv);
+    const untouched = (w: TWorld) => {
+        expect(w.deps.pushLockBranchFn).not.toHaveBeenCalled();
+        expect(w.deps.openPrFn).not.toHaveBeenCalled();
+        expect(w.deps.writeLockFn).not.toHaveBeenCalled();
+        expect(w.files.get(LOCK_PATH)).toBe(formatCoreLock(lock));
+    };
+
+    it('без миграции: lock в ветке PR возвращается на прежнюю ревизию, state сохранён', () => {
+        const w = rworld();
+        const stateBefore = w.files.get(STATE);
+        expect(rollback(w)).toBe(0);
+        const prev: TCoreLock = {
+            schema: CORE_LOCK_SCHEMA,
+            sha: OTHER,
+            treeHash: prevTreeHash,
+            versions: supportedVersions(),
+        };
+        const branch = `ralph/rollback-${OTHER.slice(0, 12)}`;
+        expect(w.deps.pushLockBranchFn).toHaveBeenCalledWith({
+            consumerRoot: CONSUMER,
+            branch,
+            lock: prev,
+            message: expect.stringContaining(`стало: \`${OTHER}\``) as string,
+        });
+        expect(w.deps.openPrFn).toHaveBeenCalledWith(
+            CONSUMER,
+            {
+                branch,
+                title: `revert(core): откат ревизии ядра на ${OTHER.slice(0, 12)}`,
+                body: expect.stringContaining(`было: \`${SHA}\``) as string,
+            },
+            null,
+        );
+        // State, lock человека и исполняемая ревизия не тронуты, петля не остановлена.
+        expect(w.files.get(STATE)).toBe(stateBefore);
+        expect(w.files.get(LOCK_PATH)).toBe(formatCoreLock(lock));
+        expect(w.deps.writeLockFn).not.toHaveBeenCalled();
+        expect(w.deps.writeStopFn).not.toHaveBeenCalled();
+        expect(w.deps.runCoreFn).not.toHaveBeenCalled();
+        expect(verifyInstalledTree(dir, lock)).toEqual({ ok: true });
+        expect(w.deps.installFn).toHaveBeenCalledWith({ sha: OTHER, dataDir, source: null });
+        expect(w.out.at(-1)).toMatch(new RegExp(`PR #7 из ${branch}`));
+    });
+
+    it('через необратимую миграцию state (схема поднята в lock) — отказ до правки lock', () => {
+        const st = supportedVersions().state;
+        lock = { ...lock, versions: { ...lock.versions, state: st + 1 } };
+        const w = rworld({}, { state: stateText(st + 1) });
+        expect(rollback(w)).toBe(1);
+        expect(w.out.join('\n')).toMatch(/необратимая миграция/);
+        expect(w.out.join('\n')).toMatch(/фикс вперёд/);
+        expect(w.out.at(-1)).toMatch(/⛔ rollback: .*Lock не тронут, PR не заведён\./);
+        untouched(w);
+    });
+
+    it('state на диске новее, чем читает прежняя ревизия, — отказ до правки lock', () => {
+        const w = rworld({}, { state: stateText(supportedVersions().state + 1) });
+        expect(rollback(w)).toBe(1);
+        expect(w.out.join('\n')).toMatch(/на диске схема v\d+, цель отката читает только до/);
+        untouched(w);
+    });
+
+    it('state нет — откат идёт', () => {
+        expect(rollback(rworld({}, { state: null }))).toBe(0);
+    });
+
+    it('журнала активации нет — отказ: откатываться не на что', () => {
+        const w = rworld({}, { journal: null });
+        expect(rollback(w)).toBe(1);
+        expect(w.out[0]).toMatch(/журнал активации пуст/);
+        untouched(w);
+        expect(w.deps.installFn).not.toHaveBeenCalled();
+    });
+
+    it('битый журнал — отказ с номером строки', () => {
+        const w = rworld({}, { journal: 'мусор\n' });
+        expect(rollback(w)).toBe(1);
+        expect(w.out[0]).toMatch(/строка 1: не JSON — без журнала цель отката неизвестна/);
+        untouched(w);
+    });
+
+    it('журнал не читается — отказ, а не «журнала нет»', () => {
+        const base = rworld();
+        const w = rworld({
+            readFn: (p) => {
+                if (p === JOURNAL) throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
+                return base.deps.readFn(p);
+            },
+        });
+        expect(rollback(w)).toBe(1);
+        expect(w.out[0]).toMatch(/журнал активации .* не читается — EACCES/);
+        untouched(w);
+    });
+
+    it('битый lock — отказ', () => {
+        const w = rworld({}, { lock: 'мусор' });
+        expect(rollback(w)).toBe(1);
+        expect(w.out[0]).toMatch(/откатывать нечего/);
+        expect(w.deps.pushLockBranchFn).not.toHaveBeenCalled();
+    });
+
+    it('каталог состояния не определён — отказ', () => {
+        const w = rworld({
+            runtimeDirOfFn: vi.fn(() => {
+                throw new Error('нет секции roots');
+            }),
+        });
+        expect(rollback(w)).toBe(1);
+        expect(w.out[0]).toMatch(/нет секции roots/);
+        untouched(w);
+    });
+
+    it('прежней ревизии нет и источника нет — отказ с причиной установки', () => {
+        const w = rworld({
+            installFn: vi.fn(() => {
+                throw new Error('источника нет');
+            }),
+        });
+        expect(rollback(w)).toBe(1);
+        expect(w.out[0]).toMatch(/прежняя ревизия b+ не установлена — источника нет/);
+        untouched(w);
+    });
+
+    it('прежняя ревизия разошлась со своим манифестом — её код не исполняется', () => {
+        writeFileSync(join(prevDir, 'ralph.js'), 'правка\n');
+        const w = rworld();
+        expect(rollback(w)).toBe(1);
+        expect(w.out[0]).toMatch(/не цела/);
+        expect(w.deps.versionsOfFn).not.toHaveBeenCalled();
+        untouched(w);
+    });
+
+    it('прежняя ревизия не назвала версий — отказ', () => {
+        const w = rworld({ versionsOfFn: vi.fn(() => ({ launcher: 'x' })) });
+        expect(rollback(w)).toBe(1);
+        expect(w.out[0]).toMatch(/не назвала свои версии: ответ не по контракту/);
+        untouched(w);
+    });
+
+    it('шим не той версии, что ждёт прежняя ревизия, — отказ', () => {
+        const w = rworld();
+        w.deps.env.RALPH_LAUNCHER_VERSION = '99';
+        expect(rollback(w)).toBe(1);
+        expect(w.out[0]).toMatch(/^❌ launcher: ревизия ждёт v1, у потребителя v99/);
+        untouched(w);
+    });
+
+    it('roots.productRoot на ревизии из lock — предупреждение с путём прежней', () => {
+        const w = rworld({
+            rawConfigFn: vi.fn(() => ({
+                configVersion: 1,
+                common: { roots: { productRoot: dir } },
+            })),
+        });
+        expect(rollback(w)).toBe(0);
+        expect(w.out.at(-1)).toMatch(/⚠ common\.roots\.productRoot .* поправь его на .*b{40}/);
+    });
+
+    it('ветка не запушена — отказ, PR не заводится', () => {
+        const w = rworld({
+            pushLockBranchFn: vi.fn(() => {
+                throw new Error('non-fast-forward');
+            }),
+        });
+        expect(rollback(w)).toBe(1);
+        expect(w.out[0]).toMatch(/ветка ralph\/rollback-b+ с правкой lock не запушена/);
+        expect(w.deps.openPrFn).not.toHaveBeenCalled();
+    });
+
+    it('ветка запушена, PR не заведён — ветка названа по имени', () => {
+        const w = rworld({
+            openPrFn: vi.fn(() => {
+                throw new Error('HTTP 403');
+            }),
+        });
+        expect(rollback(w)).toBe(1);
+        expect(w.out[0]).toMatch(/ветка ralph\/rollback-b+ \(c+\) запушена, но PR не заведён/);
+    });
+
+    // Адаптеры форжа — из профиля команды, а не профиля по умолчанию (ревью Фазы 13).
+    it('--profile доезжает до шва форжа: поиск и заведение PR', () => {
+        const w = rworld();
+        expect(rollback(w, '--profile', 'night')).toBe(0);
+        const branch = `ralph/rollback-${OTHER.slice(0, 12)}`;
+        expect(w.deps.findOpenPrFn).toHaveBeenCalledWith(CONSUMER, branch, 'night');
+        expect(w.deps.openPrFn).toHaveBeenCalledWith(CONSUMER, expect.anything(), 'night');
+    });
+
+    it('PR ветки уже открыт (повтор после обрыва) — второй не заводится (#104)', () => {
+        const w = rworld({ findOpenPrFn: vi.fn(() => 9) });
+        expect(rollback(w)).toBe(0);
+        expect(w.deps.openPrFn).not.toHaveBeenCalled();
+        expect(w.out.at(-1)).toMatch(/PR #9 из ralph\/rollback-b+ \(c+\) уже открыт/);
+    });
+
+    it('форж не назвал номер PR — успех без номера', () => {
+        const w = rworld({ openPrFn: vi.fn(() => null) });
+        expect(rollback(w)).toBe(0);
+        expect(w.out.at(-1)).toMatch(/^🔀 PR из ralph\/rollback-/);
+    });
+
+    it('профиль уходит в адрес каталога состояния', () => {
+        const w = rworld();
+        expect(rollback(w, '--profile', 'night')).toBe(0);
+        expect(w.deps.runtimeDirOfFn).toHaveBeenCalledWith(CONSUMER, 'night');
+    });
+
+    it.each([
+        [['rollback', '--force'], /rollback не знает флага "--force"/],
+        [['rollback', '--rev', 'x'], /флаги install и update, а не rollback/],
+    ])('разбор %j — отказ', (argv, why) => {
+        const r = parseLauncherArgv(['--consumer', CONSUMER, ...argv]);
+        expect(r.ok).toBe(false);
+        expect(r.ok ? '' : r.reason).toMatch(why);
+    });
 });

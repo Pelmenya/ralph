@@ -514,29 +514,37 @@ export function pidAlive(
 }
 
 /**
- * Жив ли раннер, запущенный ИМЕННО этим entry: номер занят и в argv процесса есть элемент,
- * равный пути `ralph.js`. Подстрока «ralph.js» здесь не годится: при pid-reuse за живую
- * петлю сошли бы `vim ralph.js`, тест или раннер другой ревизии — а `./ralph stop` положил
- * бы запрос, который остановит следующий старт. Так же сверяет путь entry и ядро
- * (`lockAlive`, `PRODUCT.entries`); `/proc` не читается — «не наш», запрос не кладётся.
+ * Ревизия живого раннера из этого каталога установок: номер занят и в argv процесса есть
+ * элемент, равный `<dataDir>/<полный SHA>/ralph.js`; иначе `null`. Подстрока «ralph.js»
+ * здесь не годится: при pid-reuse за живую петлю сошли бы `vim ralph.js` или тест — а
+ * `./ralph stop` положил бы запрос, который остановит следующий старт. Так же сверяет путь
+ * entry и ядро (`lockAlive`, `PRODUCT.entries`); `/proc` не читается — «не наш».
+ *
+ * Возвращается именно ревизия, а не «совпал ли entry из lock» (#136): lock лежит в дереве
+ * потребителя под git, и `git pull`, сменивший в нём `sha`, не трогает петлю, идущую на
+ * прежней ревизии. Сверка с entry ТЕКУЩЕГО lock назвала бы такую петлю брошенной.
  */
-export function runnerAlive(
+export function runnerRevision(
     pid: number,
-    entry: string,
+    dataDir: string,
     deps: {
         killFn?: (pid: number, sig: 0) => unknown;
         readFn?: (p: string) => string;
     } = {},
-): boolean {
-    if (!pidAlive(pid, deps.killFn)) return false;
+): string | null {
+    if (!pidAlive(pid, deps.killFn)) return null;
     const read = deps.readFn ?? ((p: string) => readFileSync(p, 'utf8'));
+    let argv: string[];
     try {
-        return read(`/proc/${String(pid)}/cmdline`)
-            .split('\0')
-            .includes(entry);
+        argv = read(`/proc/${String(pid)}/cmdline`).split('\0');
     } catch {
-        return false;
+        return null;
     }
+    for (const arg of argv) {
+        const sha = basename(dirname(arg));
+        if (SHA_RE.test(sha) && arg === join(dataDir, sha, 'ralph.js')) return sha;
+    }
+    return null;
 }
 
 const isAlive = (pid: number): boolean => pidAlive(pid);
@@ -781,16 +789,51 @@ export function installPlaceOf(
 }
 
 /**
- * `roots.productRoot` конфига против каталога ядра, которое исполняется. При ядре из
- * установки это вторая копия SHA рядом с lock (`<каталог установок>/<sha>`), и при смене
- * ревизии она расходилась с ним молча: lock и исполняемое ядро сверены, а проверка
- * пересечений корней (`roots.ts`) шла по устаревшему пути. Отказ называет обе стороны.
- * Сравнение — по каноническим путям: симлинк на каталог установок расхождением не считается.
+ * `roots.productRoot`, выведенный из lock: `<каталог установок>/<sha из .ralph/core.lock>`
+ * (#134). Ключ в конфиге был второй копией SHA рядом с lock, и человек после `./ralph
+ * install` вписывал путь руками — и снова руками на каждой смене ревизии, хотя смена
+ * (`update`/`rollback`) меняет только lock. Теперь ключ необязателен: нет его — путь
+ * выводится отсюда. Lock нет или он битый — отказ с причиной, а не догадка о каталоге:
+ * без lock ядро не из установки, и где оно лежит, знает только конфиг.
+ */
+export function productRootFromLock(
+    consumerRoot: string,
+    deps: {
+        readFn?: (p: string) => string;
+        env?: Record<string, string | undefined>;
+    } = {},
+): { ok: true; path: string } | { ok: false; reason: string } {
+    // Боевой дефолт резолва конфига: тест с `roots` без `productRoot`, забывший подать
+    // `lockRootFn`, иначе молча читал бы живой lock и окружение машины (ревью Фазы 13).
+    if (deps.readFn === undefined || deps.env === undefined) {
+        guardSideEffect(
+            `productRootFromLock(${consumerRoot})`,
+            'Подай lockRootFn резолву конфига или readFn и env сюда.',
+        );
+    }
+    const r = readCoreLock(consumerRoot, deps.readFn);
+    if (!r.ok) return { ok: false, reason: r.reason };
+    try {
+        return { ok: true, path: join(resolveDataDir(deps.env ?? process.env), r.lock.sha) };
+    } catch (e) {
+        return { ok: false, reason: (e as Error).message };
+    }
+}
+
+/**
+ * `roots.productRoot` против каталога ядра, которое исполняется. Заданный в конфиге ключ
+ * при ядре из установки — вторая копия SHA рядом с lock, и при смене ревизии она
+ * расходилась с ним молча: lock и исполняемое ядро сверены, а проверка пересечений корней
+ * (`roots.ts`) шла по устаревшему пути. Выведенный из lock путь (`from: 'lock'`) тоже
+ * сверяется: ядро, запущенное не из того каталога установок, иначе работало бы с корнями
+ * чужой раскладки. Отказ называет обе стороны и не выбирает ни одну молча. Сравнение — по
+ * каноническим путям: симлинк на каталог установок расхождением не считается.
  */
 export function productRootMismatch(
     configured: string,
     running: string,
     realpathFn: (p: string) => string = (p) => realpathSync(p),
+    from: 'config' | 'lock' = 'config',
 ): string | null {
     const canon = (p: string): string => {
         try {
@@ -800,9 +843,15 @@ export function productRootMismatch(
         }
     };
     if (canon(configured) === canon(running)) return null;
+    if (from === 'lock') {
+        return (
+            `roots.productRoot выведен из ${CORE_LOCK_PATH} — ${configured}, а исполняется ядро ` +
+            `${running}: запусти ядро ревизии из lock (./ralph start) или задай roots.productRoot явно`
+        );
+    }
     return (
         `roots.productRoot конфига — ${configured}, а исполняется ядро ${running}: ` +
-        'поправь roots.productRoot на каталог ревизии из lock'
+        'убери ключ (launcher выводит его из lock) или поправь на каталог ревизии из lock'
     );
 }
 

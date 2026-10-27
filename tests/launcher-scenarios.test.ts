@@ -79,7 +79,8 @@ echo "кодер-сессия песочницы отработала"
 `;
 }
 
-function config(w: TWorld, maxIterations: number): unknown {
+/** `productRoot` конфига: `undefined` — каталог ревизии из lock, `null` — ключа нет (#134). */
+function config(w: TWorld, maxIterations: number, productRoot?: string | null): unknown {
     return {
         defaultProfile: 'playground',
         common: {
@@ -121,7 +122,9 @@ function config(w: TWorld, maxIterations: number): unknown {
             roots: {
                 consumerRoot: w.consumer,
                 executionRoot: path.join(w.root, 'consumer-ralph'),
-                productRoot: path.join(w.dataDir, w.sha),
+                ...(productRoot === null
+                    ? {}
+                    : { productRoot: productRoot ?? path.join(w.dataDir, w.sha) }),
                 runtimeDir: w.runtimeDir,
             },
         },
@@ -134,7 +137,9 @@ function config(w: TWorld, maxIterations: number): unknown {
  * `./ralph`, конфигом и барьером сессий из будущей установки. SHA источника известен до
  * установки — им адресуется `productRoot` конфига.
  */
-function buildWorld(opts: { coderScript?: string; maxIterations?: number } = {}): TWorld {
+function buildWorld(
+    opts: { coderScript?: string; maxIterations?: number; productRoot?: string | null } = {},
+): TWorld {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-launcher-')));
     const w: TWorld = {
         root,
@@ -163,7 +168,7 @@ function buildWorld(opts: { coderScript?: string; maxIterations?: number } = {})
     fs.mkdirSync(path.join(w.consumer, '.claude', 'ralph'), { recursive: true });
     fs.writeFileSync(
         path.join(w.consumer, '.claude', 'ralph', 'ralph.config.json'),
-        JSON.stringify(config(w, opts.maxIterations ?? 1), null, 4),
+        JSON.stringify(config(w, opts.maxIterations ?? 1, opts.productRoot), null, 4),
     );
     // Барьер сессий — из установки по абсолютному пути: в дереве потребителя ядра нет.
     const guard = path.join(w.dataDir, w.sha, '.claude', 'hooks', 'guard.cjs');
@@ -317,6 +322,50 @@ function install(w: TWorld): void {
     if (r.code !== 0) throw new Error(`install в песочнице не прошёл:\n${r.output}`);
 }
 
+describe('launcher: roots.productRoot выводится из lock (#134)', () => {
+    let w: TWorld;
+    const configPath = () => path.join(w.consumer, '.claude', 'ralph', 'ralph.config.json');
+    beforeAll(() => {
+        w = buildWorld({ productRoot: null });
+        install(w);
+    });
+    afterAll(() => {
+        fs.rmSync(w.root, { recursive: true, force: true });
+    });
+
+    it('конфиг без roots.productRoot: doctor зелёный, start --dry-run планирует фазу', () => {
+        const d = ralph(w, ['doctor']);
+        expect(d.output).toMatch(/🩺 doctor: все проверки прошли/);
+        expect(d.code).toBe(0);
+        const r = ralph(w, ['start', '--dry-run']);
+        expect(r.output).toMatch(new RegExp(`🔐 Ядро ${w.sha} сверено с lock`));
+        expect(r.output).toMatch(/🔄 Песочница · Фаза 1 \| итерация 1\/1 \| Issue #101/);
+        expect(r.code).toBe(0);
+    });
+
+    it('roots.productRoot мимо исполняемого каталога — отказ doctor и start с обоими путями', () => {
+        const stale = path.join(w.dataDir, 'b'.repeat(40));
+        const running = path.join(w.dataDir, w.sha);
+        const saved = fs.readFileSync(configPath(), 'utf8');
+        try {
+            fs.writeFileSync(configPath(), JSON.stringify(config(w, 1, stale), null, 4));
+            const both = new RegExp(
+                `roots\\.productRoot конфига — ${stale}, а исполняется ядро ${running}`,
+            );
+            const d = ralph(w, ['doctor']);
+            expect(d.code).not.toBe(0);
+            expect(d.output).toMatch(both);
+            expect(d.output).toMatch(/❌ ядро: ralph\.js --doctor вышел с кодом/);
+            const r = ralph(w, ['start', '--dry-run']);
+            expect(r.code).not.toBe(0);
+            expect(r.output).toMatch(both);
+            expect(r.output).not.toMatch(/🔄 Песочница · Фаза 1/);
+        } finally {
+            fs.writeFileSync(configPath(), saved);
+        }
+    });
+});
+
 describe('launcher: doctor на сломанной установке (#100)', () => {
     let w: TWorld;
     beforeAll(() => {
@@ -405,5 +454,21 @@ describe('launcher: stop не прерывает сессию — останов
         expect(r.code).toBe(0);
         // Запрос снят петлёй: следующий старт не встанет на нём сразу.
         expect(fs.existsSync(path.join(w.runtimeDir, 'ralph.stop'))).toBe(false);
+    });
+
+    it('живой старт записал журнал активации, doctor его читает (#38)', () => {
+        const lines = fs
+            .readFileSync(path.join(w.runtimeDir, 'ralph.activations.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((l) => JSON.parse(l) as { sha: string; from: string | null });
+        expect(lines).toEqual([expect.objectContaining({ sha: w.sha, from: null })]);
+        const r = ralph(w, ['doctor']);
+        expect(r.output).toMatch(
+            new RegExp(
+                `✅ журнал активации: последняя — ${w.sha} \\(.*\\), прежней в журнале нет; записей 1`,
+            ),
+        );
+        expect(r.code, r.output).toBe(0);
     });
 });

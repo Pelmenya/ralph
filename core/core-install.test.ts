@@ -31,7 +31,7 @@ import {
     describeStartCheck,
     installPlaceOf,
     pidAlive,
-    runnerAlive,
+    runnerRevision,
     currentCoreVersions,
     formatCoreLock,
     formatManifest,
@@ -42,6 +42,7 @@ import {
     parseCoreLock,
     parseManifest,
     productRootMismatch,
+    productRootFromLock,
     readCoreLock,
     resolveDataDir,
     treeHashOf,
@@ -724,32 +725,32 @@ describe('живость владельца', () => {
         ).toBe(true);
         expect(pidAlive(1, esrch)).toBe(false);
     });
-    it('runnerAlive: argv с тем же entry — жив; подстрока ralph.js — нет', () => {
+    it('runnerRevision: entry любой ревизии этого каталога — её SHA; подстрока ralph.js — нет', () => {
         const proc = (cmd: string[]) => () => `${cmd.join('\0')}\0`;
         const kill = () => true;
-        expect(runnerAlive(7, ENTRY, { killFn: kill, readFn: proc(['node', ENTRY]) })).toBe(true);
-        expect(runnerAlive(7, ENTRY, { killFn: kill, readFn: proc(['vim', 'ralph.js']) })).toBe(
-            false,
-        );
+        const rev = (cmd: string[]) =>
+            runnerRevision(7, '/data', { killFn: kill, readFn: proc(cmd) });
+        expect(rev(['node', ENTRY])).toBe(SHA);
+        // Раннер прежней ревизии после смены lock — жив, и названа его ревизия (#136).
+        expect(rev(['node', `/data/${OTHER_SHA}/ralph.js`])).toBe(OTHER_SHA);
+        expect(rev(['vim', 'ralph.js'])).toBeNull();
+        expect(rev(['node', `/elsewhere/${SHA}/ralph.js`])).toBeNull();
+        expect(rev(['node', '/data/abc/ralph.js'])).toBeNull();
+        expect(rev(['node', `/data/${SHA}/other.js`])).toBeNull();
         expect(
-            runnerAlive(7, ENTRY, {
-                killFn: kill,
-                readFn: proc(['node', `/data/${OTHER_SHA}/ralph.js`]),
-            }),
-        ).toBe(false);
-        expect(
-            runnerAlive(7, ENTRY, {
+            runnerRevision(7, '/data', {
                 killFn: kill,
                 readFn: () => {
                     throw new Error('EACCES');
                 },
             }),
-        ).toBe(false);
-        expect(runnerAlive(7, ENTRY, { killFn: esrch, readFn: proc(['node', ENTRY]) })).toBe(false);
+        ).toBeNull();
+        expect(
+            runnerRevision(7, '/data', { killFn: esrch, readFn: proc(['node', ENTRY]) }),
+        ).toBeNull();
     });
-    it('runnerAlive: боевые дефолты узнают сам процесс теста по его argv[1]', () => {
-        expect(runnerAlive(process.pid, process.argv[1] ?? '')).toBe(true);
-        expect(runnerAlive(process.pid, '/nope/ralph.js')).toBe(false);
+    it('runnerRevision: боевые дефолты читают argv живого процесса — тест не раннер', () => {
+        expect(runnerRevision(process.pid, '/nope')).toBeNull();
     });
 });
 
@@ -775,6 +776,8 @@ describe('проводка в main()', () => {
         // Расхождение `roots.productRoot` с исполняемым ядром — отказ и старту, и doctor.
         const doctor = src.indexOf('if (DOCTOR)', main);
         expect(src.slice(check, doctor)).toMatch(/productRootMismatch\(/);
+        // Выведенный из lock путь (#134) сверяется с исполняемым ядром и у клона.
+        expect(src.slice(check, doctor)).toMatch(/productRootFrom === 'lock'/);
         expect(src.slice(doctor, mkdir)).toMatch(/if \(productRootDrift\) fail\(/);
     });
 });
@@ -789,8 +792,54 @@ describe('productRootMismatch', () => {
     it('другая ревизия — отказ называет обе стороны', () => {
         expect(productRootMismatch(`/data/${OTHER_SHA}`, `/data/${SHA}`, id)).toBe(
             `roots.productRoot конфига — /data/${OTHER_SHA}, а исполняется ядро /data/${SHA}: ` +
-                'поправь roots.productRoot на каталог ревизии из lock',
+                'убери ключ (launcher выводит его из lock) или поправь на каталог ревизии из lock',
         );
+    });
+    it('путь выведен из lock — отказ называет lock и обе стороны (#134)', () => {
+        expect(productRootMismatch(`/data/${SHA}`, '/clone', id, 'lock')).toBe(
+            `roots.productRoot выведен из .ralph/core.lock — /data/${SHA}, а исполняется ядро ` +
+                '/clone: запусти ядро ревизии из lock (./ralph start) или задай roots.productRoot явно',
+        );
+        expect(productRootMismatch(`/data/${SHA}`, `/data/${SHA}`, id, 'lock')).toBeNull();
+    });
+});
+
+describe('productRootFromLock (#134)', () => {
+    const lockText = (sha: string) => formatCoreLock(lockFor(`sha256:${'1'.repeat(64)}`, sha));
+    it('каталог установок из окружения + SHA из lock', () => {
+        const r = productRootFromLock('/app', {
+            readFn: () => lockText(SHA),
+            env: { RALPH_DATA_DIR: '/data' },
+        });
+        expect(r).toEqual({ ok: true, path: `/data/${SHA}` });
+    });
+    it('lock нет — отказ с путём lock', () => {
+        const r = productRootFromLock('/app', {
+            readFn: () => {
+                throw Object.assign(new Error('nope'), { code: 'ENOENT' });
+            },
+            env: { RALPH_DATA_DIR: '/data' },
+        });
+        expect(r).toEqual({ ok: false, reason: '/app/.ralph/core.lock нет' });
+    });
+    // Боевой дефолт резолва конфига: без поданных readFn и env он читал бы живой lock и
+    // окружение машины — под предохранителем это побочка (ревью Фазы 13).
+    it('без readFn или env — побочка под предохранителем, а не чтение живого lock', () => {
+        expect(() => productRootFromLock('/app')).toThrow(/побочка/);
+        expect(() => productRootFromLock('/app', { readFn: () => lockText(SHA) })).toThrow(
+            /побочка/,
+        );
+        expect(sideEffectAttempts.splice(0)).toEqual([
+            'productRootFromLock(/app)',
+            'productRootFromLock(/app)',
+        ]);
+    });
+    it('каталог установок не задан — отказ, а не путь от места запуска', () => {
+        const r = productRootFromLock('/app', { readFn: () => lockText(SHA), env: {} });
+        expect(r).toEqual({
+            ok: false,
+            reason: expect.stringMatching(/Каталог установок ядра не задан/),
+        });
     });
     it('путь не разрешается — сравнение как есть, а не падение', () => {
         const boom = () => {

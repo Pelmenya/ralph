@@ -11,16 +11,18 @@
  * Пути — от `import.meta.dirname`: ревизия знает себя сама, где бы её ни запустили.
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
     gitCheckoutExport,
     installRevision,
     isFullSha,
-    runnerAlive,
+    runnerRevision,
     writeCoreLock,
 } from './core/core-install.ts';
 import { supportedVersions } from './core/compat.ts';
+import { commitLockOnBranch, type TRunArgvFn } from './core/core-update.ts';
 import { runLauncher, type TLauncherDeps } from './core/launcher.ts';
 
 const argv = process.argv.slice(2);
@@ -36,10 +38,43 @@ const CORE_ENTRY = './ralph.js';
 const { default: coreRuntime } = (await import(CORE_ENTRY)) as {
     default: {
         resolveProfile: (raw: unknown, name: unknown, failFn: (m: string) => never) => unknown;
+        observerTaskSource: (
+            adapters: unknown,
+            failFn: (m: string) => never,
+        ) => {
+            createPullRequest: (pr: {
+                branch: string;
+                title: string;
+                body: string;
+            }) => number | null;
+            findOpenPullRequest: (branch: string) => { number: number } | null;
+        };
     };
 };
 
 const CONFIG_REL = join('.claude', 'ralph', 'ralph.config.json');
+
+const readConfig = (consumerRoot: string): unknown =>
+    JSON.parse(readFileSync(join(consumerRoot, CONFIG_REL), 'utf8')) as unknown;
+const throwFail = (m: string): never => {
+    throw new Error(m);
+};
+
+// argv без шелла со stdin, окружением и сроком — форма `shArgv` ядра для update.
+const runArgv: TRunArgvFn = (file, args, opts = {}) => {
+    const r = spawnSync(file, args, {
+        encoding: 'utf8',
+        input: opts.input,
+        env: opts.env ?? process.env,
+        ...(opts.timeoutMs === undefined ? {} : { timeout: opts.timeoutMs, killSignal: 'SIGKILL' }),
+    });
+    if (r.status !== 0) {
+        throw new Error(
+            `${file} ${args.join(' ')}: код ${String(r.status)} ${(r.stderr || String(r.error ?? '')).trim()}`,
+        );
+    }
+    return r.stdout.trim();
+};
 
 const deps: TLauncherDeps = {
     env: process.env,
@@ -99,6 +134,7 @@ const deps: TLauncherDeps = {
         });
         return r.status ?? 1;
     },
+    nowFn: () => Date.now(),
     runtimeDirOfFn: (consumerRoot, profile) => {
         // Каталог состояния решает тот же резолвер профиля, что у ядра: вторая копия правил
         // слияния `common` и профиля однажды разошлась бы с первой молча.
@@ -114,9 +150,62 @@ const deps: TLauncherDeps = {
         }
         return cfg.rootsResolved.runtimeDir;
     },
-    ralphAliveFn: (pid, entry) => runnerAlive(pid, entry),
+    ralphRevisionFn: (pid, dataDir) => runnerRevision(pid, dataDir),
     writeStopFn: (p) =>
         writeFileSync(p, `${new Date().toISOString()} ./ralph stop\n`, { flag: 'wx' }),
+    rawConfigFn: readConfig,
+    pushLockBranchFn: ({ consumerRoot, branch, lock, message }) => {
+        // Временный индекс — вне репозитория: индекс человека update не трогает.
+        const tmp = mkdtempSync(join(tmpdir(), 'ralph-update-'));
+        try {
+            return commitLockOnBranch({
+                runArgvFn: runArgv,
+                consumerRoot,
+                env: process.env,
+                indexFile: join(tmp, 'index'),
+                branch,
+                lock,
+                message,
+            });
+        } finally {
+            rmSync(tmp, { recursive: true, force: true });
+        }
+    },
+    openPrFn: (consumerRoot, pr, profile) => {
+        const adapters = forgeOf(consumerRoot, profile);
+        return adapters.taskSource.createPullRequest(pr);
+    },
+    findOpenPrFn: (consumerRoot, branch, profile) => {
+        const adapters = forgeOf(consumerRoot, profile);
+        return adapters.taskSource.findOpenPullRequest(branch)?.number ?? null;
+    },
 };
+
+type TForge = { taskSource: ReturnType<typeof coreRuntime.observerTaskSource> };
+let forge: { key: string; adapters: TForge } | null = null;
+
+/**
+ * Шов форжа — тот же, что у петли, выбранный `adapters` профиля команды (`--profile`, иначе
+ * по умолчанию). Собирается один раз на процесс: поиск PR и его заведение идут подряд, а
+ * резолв конфига с #134 каждый раз заново читает lock.
+ */
+function forgeOf(consumerRoot: string, profile: string | null): TForge {
+    const key = `${consumerRoot}\0${profile ?? ''}`;
+    if (forge?.key === key) return forge.adapters;
+    const cfg = coreRuntime.resolveProfile(
+        readConfig(consumerRoot),
+        profile ?? undefined,
+        throwFail,
+    ) as { adapters?: unknown };
+    // CLI форжа берёт репозиторий от места запуска, а шов cwd не принимает, — поэтому
+    // процесс launcher переходит в дерево потребителя. Это единственный chdir launcher, и
+    // после шагов форжа других шагов у update/rollback нет.
+    process.chdir(consumerRoot);
+    forge = {
+        key,
+        adapters: { taskSource: coreRuntime.observerTaskSource(cfg.adapters, throwFail) },
+    };
+    return forge.adapters;
+}
 
 process.exit(runLauncher(argv, deps));

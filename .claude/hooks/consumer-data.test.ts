@@ -191,6 +191,16 @@ describe('guard на правилах из данных потребителя',
             'grep -n mcp .claude/ralph/hooks.json',
             'jq . .claude/ralph/hooks.json',
             'git diff -- .claude/ralph/hooks.json',
+            'git -C .claude/ralph log -- hooks.json',
+            // `-c` у log — формат комбинированного диффа, а не глобальная опция.
+            'git log -c -- .claude/ralph/hooks.json',
+            // Флаги grep без `O` и чтение исполняющего ключа конфига — не запись.
+            'git grep -in mcp -- .claude/ralph/hooks.json',
+            'git grep --only-matching mcp -- .claude/ralph/hooks.json',
+            'git config --get core.pager',
+            'git config core.hooksPath',
+            'git config user.name "Ralph"',
+            'LC_ALL=C git diff -- .claude/ralph/hooks.json',
             'git add examples/hooks.json.example',
             'npx prettier --write examples/hooks.json.example',
             'git commit -m "docs: пример данных .claude/ralph/hooks.json"',
@@ -209,8 +219,78 @@ describe('guard на правилах из данных потребителя',
             'cp /tmp/x.json .claude/ralph/hooks.json',
             'tee .claude/ralph/hooks.json < /tmp/x.json',
             'git checkout other -- .claude/ralph/hooks.json',
+            // Глобальные опции git сдвигают подкоманду, `>|` пишет в обход noclobber
+            // (ревью Фазы 11, #133).
+            'git -C .claude/ralph checkout other -- hooks.json',
+            'git -c core.x=y checkout other -- .claude/ralph/hooks.json',
+            'git --git-dir .git --work-tree . restore .claude/ralph/hooks.json',
+            'git stash push -- .claude/ralph/hooks.json',
+            'echo {} >| .claude/ralph/hooks.json',
+            // Разрешённая подкоманда пишет файл опцией или исполняет команду из `-c`
+            // (ревью Фазы 13).
+            'git diff --output=.claude/ralph/hooks.json',
+            'git log -p --output=.claude/ralph/hooks.json',
+            'git diff --output .claude/ralph/hooks.json',
+            'git -c core.pager="tee .claude/ralph/hooks.json" log -- .claude/ralph/hooks.json',
+            'git --config-env=core.pager=P log -- .claude/ralph/hooks.json',
+            'git --exec-path=/tmp/x diff -- .claude/ralph/hooks.json',
+            'git grep -Ovim mcp -- .claude/ralph/hooks.json',
+            // Склеенный `-…O…` и сокращённый `--open…` у grep, `GIT_*` окружением и
+            // исполняющий ключ, записанный `git config` (ревью Фазы 13, проход 2).
+            'git grep -iOtee -- .claude/ralph/hooks.json',
+            'git grep --open=tee -- .claude/ralph/hooks.json',
+            'git grep --op tee -- .claude/ralph/hooks.json',
+            'GIT_EXTERNAL_DIFF="tee .claude/ralph/hooks.json" git diff -- .claude/ralph/hooks.json',
+            'env GIT_EXTERNAL_DIFF=x git diff -- .claude/ralph/hooks.json',
+            'export GIT_PAGER=tee; git log -- .claude/ralph/hooks.json',
+            'GIT_CONFIG_COUNT=1 git show HEAD -- .claude/ralph/hooks.json',
+            'git config diff.external tee',
+            'git config --local core.pager "tee x"',
+            'git config diff.json.textconv tee',
+            'git config core.hooksPath /tmp/h',
+            'git config include.path /tmp/evil.cfg',
+            // `declare -x`/`typeset -x` экспортируют аргументом, мимо присваиваний разбора.
+            'declare -x GIT_EXTERNAL_DIFF=tee; git diff -- .claude/ralph/hooks.json',
+            'typeset -x GIT_DIR=.git; git diff -- .claude/ralph/hooks.json',
         ]) {
             expect(decide('Bash', { command }, loop).blocked, command).toBe(true);
+        }
+    });
+
+    // Внешний diff получает путь от корня сам: без пути в строке `tee` писал файл данных,
+    // если тот менялся в диапазоне (ревью Фазы 13, проход 2).
+    it('оболочка: исполняющий вход git без пути данных — блок со своей причиной', () => {
+        const loop = { contour, loop: true };
+        for (const command of [
+            'GIT_EXTERNAL_DIFF=tee git diff HEAD~1',
+            'git -c diff.external=tee diff HEAD~1',
+            'GIT_EXTERNAL_DIFF=tee git show --ext-diff HEAD',
+            'typeset -x GIT_EXTERNAL_DIFF=tee; git diff HEAD~1',
+            'GIT_PAGER="tee x" git log',
+            'PAGER="sh -c x" git log',
+            'GIT_CONFIG_GLOBAL=/tmp/c git diff',
+            'git --config-env=core.pager=P log',
+            'git --config-env core.pager=P log',
+            'git --exec-path=/tmp/x diff',
+            'git config core.hooksPath /tmp/h',
+        ]) {
+            const verdict = decide('Bash', { command }, loop);
+            expect(verdict.blocked, command).toBe(true);
+            expect(verdict.reason, command).toContain('исполняющим входом');
+            expect(verdict.reason, command).not.toContain('(hooks.json)');
+            // Сессия человека вход не теряет.
+            expect(decide('Bash', { command }, { contour }).blocked, command).toBe(false);
+        }
+        for (const command of [
+            'GIT_PAGER=cat git log',
+            'PAGER=less git log -p',
+            'git -c core.pager=cat log',
+            'git -c core.quotepath=off status',
+            'git --exec-path',
+            'git log -c HEAD',
+            'git diff HEAD~1',
+        ]) {
+            expect(decide('Bash', { command }, loop).blocked, command).toBe(false);
         }
     });
 

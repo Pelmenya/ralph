@@ -1,5 +1,6 @@
 /**
- * Команды launcher `./ralph`: install, doctor, start, stop, version (Фаза 12, `#36` часть 1).
+ * Команды launcher `./ralph`: install, update, rollback, doctor, start, stop, version (Фаза 12, `#36`
+ * часть 1; update — Фаза 13, #102, `core-update.ts`; rollback — #103, `core-rollback.ts`).
  *
  * Пока человек вбивал SHA и пути руками, продукта не было — была инструкция по сборке
  * (PRD, сценарий владельца проекта). Здесь механизм доставки (`core-install.ts`) и контракт
@@ -11,6 +12,9 @@
  *     который есть, но не читается, install не перезаписывает: битый lock — повод
  *     разобраться, а не начать с чистого листа. Смена ревизии — `update` (Фаза 13), и
  *     `--rev`, разошедшийся с lock, — отказ, а не тихая переустановка.
+ *   - **rollback** — обратная смена ревизии тем же путём PR, что update; цель — из журнала
+ *     активации, а откат через необратимую миграцию state отвергается до правки lock
+ *     (`core-rollback.ts`).
  *   - **doctor** — те же проверки без старта, и проваленная проверка не прячет следующую:
  *     человек чинит установку за один заход, а не по одной причине на запуск. Проверка,
  *     которой нужен результат проваленной, не «проходит» и не молчит — она названа
@@ -18,12 +22,15 @@
  *     `--doctor` ядра спрашиваются только у дерева, совпавшего с lock.
  *   - **start** — те же проверки, затем `ralph.js` установленной ревизии. Ядро сверяет
  *     себя с lock ещё раз в `main()`: launcher отвечает за то, ЧТО запускать, ядро — за то,
- *     что запущено именно оно.
+ *     что запущено именно оно. Ядро, вышедшее на рестарт (lock сменился, #38), start
+ *     запускает заново по свежему lock — это и есть активация новой ревизии.
  *   - **stop** кладёт запрос мягкой остановки (`ralph.stop`, #88) и не шлёт ни одного
  *     сигнала: петля слышит запрос только на границе итерации, начатая сессия доводится.
  *     Сигнал прервал бы сессию посреди правки, и дерево осталось бы грязным. Лока нет или
  *     его владелец мёртв (брошен после `kill -9`, OOM) — отказ: запрос без живой петли
- *     остановил бы следующий старт на первом шаге.
+ *     остановил бы следующий старт на первом шаге. Живой владелец — раннер ЛЮБОЙ ревизии
+ *     каталога установок, а не только той, что сейчас в lock (#136): `git pull` меняет lock
+ *     под идущей петлёй, и та остаётся живой.
  *
  * Слой «launcher» в контракте совместимости — шим `./ralph` у потребителя
  * (`examples/ralph`), а не этот модуль: модуль едет с ревизией ядра и с ней совпадает по
@@ -50,10 +57,40 @@ import {
     type TInstallResult,
     type TTreeReadFs,
 } from './core-install.ts';
-import { COMPAT_LAYERS, LAUNCHER_VERSION_ENV, observeLauncher } from './compat.ts';
+import {
+    COMPAT_LAYERS,
+    inspectStateAt,
+    LAUNCHER_VERSION_ENV,
+    observeConfig,
+    observeLauncher,
+    observeState,
+    type TObservation,
+} from './compat.ts';
+import {
+    consumerLayerProblems,
+    describeVersions,
+    updateBranchName,
+    updateCompatProblems,
+    updatePrText,
+} from './core-update.ts';
+import { ACTIVATION_RESTART_EXIT, parseActivationJournal } from './core-activation.ts';
+import {
+    irreversibleStateProblem,
+    rollbackBranchName,
+    rollbackPrText,
+    rollbackTarget,
+} from './core-rollback.ts';
 import { runtimePathsIn } from './runtime-paths.ts';
 
-export const LAUNCHER_COMMANDS = ['install', 'doctor', 'start', 'stop', 'version'] as const;
+export const LAUNCHER_COMMANDS = [
+    'install',
+    'update',
+    'rollback',
+    'doctor',
+    'start',
+    'stop',
+    'version',
+] as const;
 export type TLauncherCommand = (typeof LAUNCHER_COMMANDS)[number];
 
 export type TLauncherArgs = {
@@ -69,7 +106,7 @@ export type TLauncherArgs = {
 export type TParsedArgs = { ok: true; args: TLauncherArgs } | { ok: false; reason: string };
 
 const USAGE =
-    'Команды: install [--rev <ревизия>], doctor, start [флаги ralph.js], stop [--profile <имя>], version.';
+    'Команды: install [--rev <ревизия>], update <ревизия>, rollback [--profile <имя>], doctor, start [флаги ralph.js], stop [--profile <имя>], version.';
 
 /**
  * Разбор командной строки launcher. Свои флаги (`--consumer`, `--source`, `--rev`) launcher
@@ -122,10 +159,29 @@ export function parseLauncherArgv(argv: readonly string[]): TParsedArgs {
         };
     }
     const cmd = command as TLauncherCommand;
-    if ((source !== null || rev !== null) && cmd !== 'install') {
-        return { ok: false, reason: `--source и --rev — флаги install, а не ${cmd}.` };
+    if ((source !== null || rev !== null) && cmd !== 'install' && cmd !== 'update') {
+        return { ok: false, reason: `--source и --rev — флаги install и update, а не ${cmd}.` };
     }
-    if (cmd === 'stop') {
+    if (cmd === 'update') {
+        // Ревизия — позиционным аргументом (`./ralph update <ref>`) или `--rev`, но одна:
+        // две разные молча выбрали бы одну из них.
+        const positional = rest.filter((a) => !a.startsWith('-'));
+        const flag = rest.find((a) => a.startsWith('-'));
+        if (flag !== undefined) {
+            return { ok: false, reason: `update не знает флага "${flag}". ${USAGE}` };
+        }
+        if (positional.length + (rev === null ? 0 : 1) !== 1) {
+            return {
+                ok: false,
+                reason: `update ждёт ровно одну ревизию: ./ralph update <ревизия>. ${USAGE}`,
+            };
+        }
+        rev = rev ?? positional[0];
+        rest.length = 0;
+    }
+    if (cmd === 'stop' || cmd === 'rollback') {
+        // Профиль у обеих — адрес каталога состояния: у stop там лок, у rollback — журнал
+        // активации и state, по которым решается, куда и можно ли откатиться.
         for (let i = 0; i < rest.length; i++) {
             if (rest[i] === '--profile') {
                 // Значение с `--` — следующий флаг, а не имя профиля: принятое как имя, оно
@@ -138,7 +194,7 @@ export function parseLauncherArgv(argv: readonly string[]): TParsedArgs {
                 i++;
                 continue;
             }
-            return { ok: false, reason: `stop не знает флага "${rest[i]}". ${USAGE}` };
+            return { ok: false, reason: `${cmd} не знает флага "${rest[i]}". ${USAGE}` };
         }
         rest.length = 0;
     }
@@ -172,16 +228,53 @@ export type TLauncherDeps = {
     versionsOfFn: (dir: string) => unknown;
     /** `node <dir>/ralph.js <args>` с cwd потребителя; код выхода. */
     runCoreFn: (dir: string, args: string[], consumerRoot: string) => number;
+    /** Часы, мс: сколько проработало ядро до рестарта в ту же ревизию. */
+    nowFn: () => number;
     /** `runtimeDir` экземпляра по конфигу потребителя и профилю. */
     runtimeDirOfFn: (consumerRoot: string, profile: string | null) => string;
     /**
-     * Жив ли раннер с этим pid, запущенный именно этим entry (`<dir>/ralph.js` ревизии из
-     * lock): `runnerAlive` в `core-install.ts`. Номер мёртвого владельца мог достаться
-     * постороннему процессу, и подстрока `ralph.js` его не отличила бы.
+     * Ревизия живого раннера с этим pid — по элементу argv `<dataDir>/<SHA>/ralph.js`;
+     * `null` — такого раннера нет: `runnerRevision` в `core-install.ts`. Номер мёртвого
+     * владельца мог достаться постороннему процессу, и подстрока `ralph.js` его не отличила бы.
      */
-    ralphAliveFn: (pid: number, entry: string) => boolean;
+    ralphRevisionFn: (pid: number, dataDir: string) => string | null;
     writeStopFn: (p: string) => void;
+    /** Сырой `ralph.config.json` потребителя — для сверки `configVersion` в update. */
+    rawConfigFn: (consumerRoot: string) => unknown;
+    /**
+     * Коммит с новым lock поверх свежего `main` и пуш в новую ветку без касания дерева,
+     * индекса и HEAD человека (`commitLockOnBranch`). SHA коммита; отказ — бросок.
+     */
+    pushLockBranchFn: (p: {
+        consumerRoot: string;
+        branch: string;
+        lock: TCoreLock;
+        message: string;
+    }) => string;
+    /**
+     * PR ветки в `main` швом форжа потребителя; номер или null, если форж его не назвал.
+     * Шов — из `adapters` того профиля, что назван командой (`--profile`), иначе по умолчанию.
+     */
+    openPrFn: TOpenLockPrFn;
+    /**
+     * Номер открытого PR ветки или null (`findOpenPullRequest` шва). Повтор update/rollback
+     * после обрыва находит PR прежней попытки и второй не заводит (#104). Сбой — бросок.
+     */
+    findOpenPrFn: TFindLockPrFn;
 };
+
+// Именованные алиасы, а не инлайновые типы: `=>` инлайнового типа скан дефолтов форжа
+// (`tests/seam-defaults.test.ts`) читает как `=` дефолта.
+export type TOpenLockPrFn = (
+    consumerRoot: string,
+    pr: { branch: string; title: string; body: string },
+    profile: string | null,
+) => number | null;
+export type TFindLockPrFn = (
+    consumerRoot: string,
+    branch: string,
+    profile: string | null,
+) => number | null;
 
 export type TCheckStatus = 'ok' | 'fail' | 'skip';
 export type TCheck = { name: string; status: TCheckStatus; detail: string };
@@ -190,10 +283,6 @@ const MARK: Record<TCheckStatus, string> = { ok: '✅', fail: '❌', skip: '⏭'
 
 export function formatCheck(c: TCheck): string {
     return `${MARK[c.status]} ${c.name}: ${c.detail}`;
-}
-
-function describeVersions(v: TCoreVersions): string {
-    return COMPAT_LAYERS.map((l) => `${l} v${String(v[l])}`).join(', ');
 }
 
 type TInstallation = {
@@ -354,19 +443,78 @@ export function runDoctorCommand(args: TLauncherArgs, deps: TLauncherDeps): numb
     return 1;
 }
 
+/**
+ * Сколько ядро должно проработать, чтобы его рестарт в ту же ревизию считался новым
+ * транзиентом, а не продолжением серии. Сверки старта (два хэша дерева, контракт, проба
+ * барьера) укладываются в минуты; итерация с сессией — дольше.
+ */
+export const SAME_RESTART_WORK_MS = 10 * 60_000;
+
+/**
+ * Старт и активация (#38). Ядро, увидевшее на границе итерации lock новее себя, выходит
+ * кодом `ACTIVATION_RESTART_EXIT` — и только им: стоп по существу перезапуском не лечится.
+ * На этот код start проходит ВСЮ проверку установки заново, по lock, который лежит сейчас,
+ * и запускает ревизию из него. Новой ревизии нет или она не сверилась — отказ с причиной,
+ * а не запуск прежней: прежняя уже не та, что называет lock.
+ *
+ * Перезапуск делает процесс launcher прежней ревизии: код новой в него не грузится, она
+ * стартует отдельным процессом, как и при обычном start.
+ *
+ * Рестарт в ту же ревизию допустим один раз подряд (ревью Фазы 13): lock, не прочитавшийся
+ * ядром посреди `git pull`, — транзиент. Второй подряд — отказ: ядро сверяет lock по
+ * `roots.consumerRoot` конфига, launcher — по своему `--consumer`, и при их расхождении
+ * без предела выходила тугая петля перезапусков с двумя сверками дерева на круг.
+ *
+ * «Подряд» — без работы между ними: ядро, проработавшее дольше `SAME_RESTART_WORK_MS`,
+ * счёт обнуляет. Иначе «второй подряд» значил «второй за жизнь процесса launcher», и два
+ * транзиента, разнесённых сутками, ночью останавливали петлю (ревью Фазы 13, проход 2).
+ * Тугую петлю от транзиента отличает именно это: ядро выходит на рестарт сразу, на
+ * сверках старта, не дойдя до итерации. Мерило — часы, а не отчёт ядра об итерациях:
+ * канала из ядра в launcher, кроме кода выхода, нет.
+ */
 export function runStartCommand(args: TLauncherArgs, deps: TLauncherDeps): number {
-    const inst = inspectInstallation(args.consumerRoot, deps);
-    if (!allOk(inst.checks) || inst.dir === null || inst.lock === null) {
-        for (const c of inst.checks) if (c.status !== 'ok') deps.out(formatCheck(c));
-        deps.out('⛔ start отменён: установка не прошла проверку — подробности: ./ralph doctor');
-        return 1;
+    let previous: string | null = null;
+    let sameRestarts = 0;
+    for (;;) {
+        const inst = inspectInstallation(args.consumerRoot, deps);
+        if (!allOk(inst.checks) || inst.dir === null || inst.lock === null) {
+            for (const c of inst.checks) if (c.status !== 'ok') deps.out(formatCheck(c));
+            deps.out(
+                previous === null
+                    ? '⛔ start отменён: установка не прошла проверку — подробности: ./ralph doctor'
+                    : `⛔ рестарт после ${previous} отменён: установка по lock не прошла проверку (провалы выше) — подробности: ./ralph doctor`,
+            );
+            return 1;
+        }
+        if (previous !== null && inst.lock.sha === previous) {
+            sameRestarts += 1;
+            if (sameRestarts > 1) {
+                deps.out(
+                    `⛔ рестарт отменён: ядро ${previous} второй раз подряд вышло на рестарт, а lock ` +
+                        `в ${args.consumerRoot} называет ту же ревизию — ядро видит расхождение, ` +
+                        'lock его не показывает. Сверь roots.consumerRoot конфига с каталогом ' +
+                        'запуска: ./ralph doctor',
+                );
+                return 1;
+            }
+        } else {
+            sameRestarts = 0;
+        }
+        deps.out(
+            previous === null
+                ? `▶ Ralph ${inst.lock.sha} из ${inst.dir}`
+                : `🔁 Рестарт: ${previous} → ${inst.lock.sha} из ${inst.dir}`,
+        );
+        // Дерево здесь уже сверено (`inspectInstallation`), и `main()` ядра сверит его ещё раз —
+        // хэшем всего дерева второй раз подряд. Это намеренно, не оптимизируй: launcher
+        // отвечает за то, ЧТО запускать, ядро — за то, что запущено именно оно, и сверка ядра
+        // обязана стоять и при прямом `node <dir>/ralph.js` мимо launcher.
+        const startedAt = deps.nowFn();
+        const code = deps.runCoreFn(inst.dir, args.passthrough, args.consumerRoot);
+        if (code !== ACTIVATION_RESTART_EXIT) return code;
+        if (deps.nowFn() - startedAt > SAME_RESTART_WORK_MS) sameRestarts = 0;
+        previous = inst.lock.sha;
     }
-    deps.out(`▶ Ralph ${inst.lock.sha} из ${inst.dir}`);
-    // Дерево здесь уже сверено (`inspectInstallation`), и `main()` ядра сверит его ещё раз —
-    // хэшем всего дерева второй раз подряд. Это намеренно, не оптимизируй: launcher отвечает
-    // за то, ЧТО запускать, ядро — за то, что запущено именно оно, и сверка ядра обязана
-    // стоять и при прямом `node <dir>/ralph.js` мимо launcher.
-    return deps.runCoreFn(inst.dir, args.passthrough, args.consumerRoot);
 }
 
 export function runInstallCommand(args: TLauncherArgs, deps: TLauncherDeps): number {
@@ -461,6 +609,319 @@ export function runInstallCommand(args: TLauncherArgs, deps: TLauncherDeps): num
     return runDoctorCommand({ ...args, passthrough: [] }, deps);
 }
 
+/**
+ * update (#102): новая ревизия ставится рядом с исполняемой, сверяется на совместимость с
+ * тем, что встретит у потребителя, и уходит PR с правкой lock. Работающую петлю команда не
+ * останавливает и её ревизии не касается: каталог исполняемой ревизии — другое имя, а lock в
+ * дереве человека не пишется вовсе — только в ветке PR. Любой отказ до PR — с причиной, и PR
+ * не заводится: ревизия, которая не встала бы после мерджа, человеку на одобрение не идёт.
+ */
+export function runUpdateCommand(args: TLauncherArgs, deps: TLauncherDeps): number {
+    const refuse = (why: string) => {
+        deps.out(`⛔ update: ${why} PR не заведён.`);
+        return 1;
+    };
+    // Источник — флагом или `RALPH_SOURCE`: шим передаёт `--source` только install, а
+    // окружение человека видит и launcher.
+    const source = args.source ?? (deps.env.RALPH_SOURCE || null);
+    if (source === null) {
+        return refuse('источник не задан — RALPH_SOURCE=<клон канона> ./ralph update <ревизия>.');
+    }
+    if (args.rev === null) return refuse('ревизия не названа.');
+    const cur = readCoreLock(args.consumerRoot, deps.readFn);
+    if (!cur.ok) {
+        return refuse(`${cur.reason} — обновлять нечего, сначала почини lock (./ralph doctor).`);
+    }
+    let dataDir: string;
+    let sha: string;
+    try {
+        dataDir = resolveDataDir(deps.env);
+        sha = deps.resolveRevFn(source, args.rev);
+    } catch (e) {
+        return refuse(`${(e as Error).message}.`);
+    }
+    if (sha === cur.lock.sha) {
+        deps.out(`✅ update: ${cur.path} уже называет ${sha} — менять нечего.`);
+        return 0;
+    }
+
+    const inst = installedVersions('update', `ревизия ${sha}`, { sha, dataDir, source }, deps);
+    if (!inst.ok) return refuse(inst.why);
+    const { res, versions } = inst;
+    const { config, pinned } = observeConsumerConfig(args.consumerRoot, dataDir, cur.lock, deps);
+    const problems = updateCompatProblems({
+        next: versions,
+        current: cur.lock,
+        launcher: observeLauncher(deps.env),
+        config,
+    });
+    if (problems.length > 0) {
+        for (const p of problems) deps.out(`❌ ${p}`);
+        return refuse(
+            `ревизия ${sha} несовместима с этим потребителем (${String(problems.length)}).`,
+        );
+    }
+
+    const next: TCoreLock = {
+        schema: CORE_LOCK_SCHEMA,
+        sha,
+        treeHash: res.treeHash,
+        versions,
+    };
+    const branch = updateBranchName(sha);
+    const pub = publishLockChange('update', args, branch, next, updatePrText(cur.lock, next), deps);
+    if (!pub.ok) return pub.refused ? refuse(pub.why) : 1;
+    deps.out(
+        `📦 Ревизия ${sha} ${statusWord(res)} в ${res.dir} рядом с исполняемой ${cur.lock.sha}.`,
+    );
+    deps.out(
+        `${pub.line} Петля работает на прежней ревизии; после мерджа она выйдет на рестарт на границе итерации.`,
+    );
+    warnPinned(pinned, join(dataDir, cur.lock.sha), res.dir, deps);
+    return 0;
+}
+
+/**
+ * Установка ревизии смены (update, rollback) и её версии слоёв. Каталог мог уже лежать
+ * (прошлая попытка, оборванная после установки, или прежняя ревизия): его код исполняется
+ * здесь же (`versionsOfFn`), поэтому сначала — сверка с собственным манифестом, как у install.
+ */
+function installedVersions(
+    cmd: 'update' | 'rollback',
+    what: string,
+    req: { sha: string; dataDir: string; source: string | null },
+    deps: TLauncherDeps,
+): { ok: true; res: TInstallResult; versions: TCoreVersions } | { ok: false; why: string } {
+    let res: TInstallResult;
+    try {
+        res = deps.installFn(req);
+    } catch (e) {
+        return { ok: false, why: `${what} не установлена — ${(e as Error).message}.` };
+    }
+    const tree = verifyInstalledTree(res.dir, { treeHash: res.treeHash }, deps.fsr);
+    if (!tree.ok) {
+        return {
+            ok: false,
+            why: `${what} в ${res.dir} не цела: ${tree.reason}. Убери каталог и повтори ${cmd}.`,
+        };
+    }
+    try {
+        const vr = parseCoreVersions(deps.versionsOfFn(res.dir));
+        if (!vr.ok) throw new Error(`ответ не по контракту (${vr.reason})`);
+        return { ok: true, res, versions: vr.versions };
+    } catch (e) {
+        return { ok: false, why: `${what} не назвала свои версии: ${(e as Error).message}.` };
+    }
+}
+
+/**
+ * Вторая копия SHA — `roots.productRoot` конфига: lock в PR её не меняет, и рестарт после
+ * мерджа отказал бы расхождением (`productRootMismatch`). Молчать здесь значило бы узнать об
+ * этом от вставшей ночью петли. Конфиг смена ревизии не трогает (#134): ключ необязателен,
+ * без него путь выводится из lock, — это и советует предупреждение.
+ */
+function warnPinned(pinned: readonly string[], locked: string, next: string, deps: TLauncherDeps) {
+    for (const key of pinned) {
+        deps.out(
+            `⚠ ${key} конфига указывает на ревизию из lock ${locked}: ` +
+                `вместе с мерджем PR убери ключ (launcher выводит его из lock) или поправь его на ${next}, иначе рестарт откажет расхождением.`,
+        );
+    }
+}
+
+/**
+ * `configVersion` конфига потребителя и ключи `roots.productRoot`, указывающие на ревизию из
+ * lock: обе смены ревизии (update, rollback) сверяют одно и то же и предупреждают одинаково.
+ */
+function observeConsumerConfig(
+    consumerRoot: string,
+    dataDir: string,
+    current: TCoreLock,
+    deps: TLauncherDeps,
+): { config: TObservation; pinned: string[] } {
+    try {
+        const raw = deps.rawConfigFn(consumerRoot);
+        const pinned = pinnedProductRoots(raw, join(dataDir, current.sha));
+        const config: TObservation =
+            raw !== null && typeof raw === 'object' && !Array.isArray(raw)
+                ? observeConfig(raw as Record<string, unknown>)
+                : { kind: 'invalid', reason: 'конфиг не объект' };
+        return { config, pinned };
+    } catch (e) {
+        return {
+            config: { kind: 'invalid', reason: `конфиг не прочитан: ${(e as Error).message}` },
+            pinned: [],
+        };
+    }
+}
+
+/**
+ * rollback (#103): lock возвращается на предыдущую ревизию из журнала активации тем же путём,
+ * что update, — веткой и PR, без правки дерева человека и без остановки петли. Решения
+ * (цель, необратимость миграции state) — в `core-rollback.ts`; здесь порядок, и он
+ * содержателен: всё, что может отвергнуть откат, стоит ДО пуша ветки с правкой lock, а код
+ * прежней ревизии исполняется только после сверки её дерева с манифестом. State откат не
+ * переписывает вовсе: его схему он только читает.
+ */
+export function runRollbackCommand(args: TLauncherArgs, deps: TLauncherDeps): number {
+    const refuse = (why: string) => {
+        deps.out(`⛔ rollback: ${why} Lock не тронут, PR не заведён.`);
+        return 1;
+    };
+    const cur = readCoreLock(args.consumerRoot, deps.readFn);
+    if (!cur.ok) {
+        return refuse(`${cur.reason} — откатывать нечего, сначала почини lock (./ralph doctor).`);
+    }
+    let paths: ReturnType<typeof runtimePathsIn>;
+    let dataDir: string;
+    try {
+        paths = runtimePathsIn(deps.runtimeDirOfFn(args.consumerRoot, args.profile));
+        dataDir = resolveDataDir(deps.env);
+    } catch (e) {
+        return refuse(`${(e as Error).message}.`);
+    }
+    let journalText: string | null;
+    try {
+        journalText = deps.readFn(paths.activations);
+    } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
+            return refuse(
+                `журнал активации ${paths.activations} не читается — ${(e as Error).message}.`,
+            );
+        }
+        journalText = null;
+    }
+    let target: ReturnType<typeof rollbackTarget>;
+    try {
+        target = rollbackTarget(
+            journalText === null ? [] : parseActivationJournal(journalText),
+            cur.lock.sha,
+        );
+    } catch (e) {
+        return refuse(`${(e as Error).message} — без журнала цель отката неизвестна.`);
+    }
+    if (!target.ok) return refuse(`${target.reason}.`);
+    const sha = target.sha;
+
+    // Прежняя ревизия обычно лежит (чистка её не трогает); нет — ставится из источника.
+    const source = deps.env.RALPH_SOURCE || null;
+    const inst = installedVersions(
+        'rollback',
+        `прежняя ревизия ${sha}`,
+        { sha, dataDir, source },
+        deps,
+    );
+    if (!inst.ok) return refuse(inst.why);
+    const { res, versions } = inst;
+    const { config, pinned } = observeConsumerConfig(args.consumerRoot, dataDir, cur.lock, deps);
+    const problems = consumerLayerProblems(versions, observeLauncher(deps.env), config);
+    const migration = irreversibleStateProblem({
+        target: versions,
+        current: cur.lock,
+        state: observeState(inspectStateAt(paths.state, deps.readFn)),
+    });
+    if (migration !== null) problems.push(migration);
+    if (problems.length > 0) {
+        for (const p of problems) deps.out(`❌ ${p}`);
+        return refuse(`откат на ${sha} отвергнут (${String(problems.length)}).`);
+    }
+
+    const prev: TCoreLock = { schema: CORE_LOCK_SCHEMA, sha, treeHash: res.treeHash, versions };
+    const branch = rollbackBranchName(sha);
+    const pub = publishLockChange(
+        'rollback',
+        args,
+        branch,
+        prev,
+        rollbackPrText(cur.lock, prev),
+        deps,
+    );
+    if (!pub.ok) return pub.refused ? refuse(pub.why) : 1;
+    deps.out(`⏪ Откат ${cur.lock.sha} → ${sha}: прежняя ревизия ${statusWord(res)} в ${res.dir}.`);
+    deps.out(
+        `${pub.line} Петля работает на ревизии прежнего lock; после мерджа она выйдет на рестарт на границе итерации.`,
+    );
+    warnPinned(pinned, join(dataDir, cur.lock.sha), res.dir, deps);
+    return 0;
+}
+
+type TPublished = { ok: true; line: string } | { ok: false; refused: boolean; why: string };
+
+/**
+ * Последние шаги смены ревизии — ветка с lock и PR — общие для update и rollback. Повтор
+ * после обрыва (#104) их доводит: ветка прежней попытки с тем же lock берётся как есть
+ * (`commitLockOnBranch`), открытый PR ветки — тоже, второй не заводится. Отказ пуша — это
+ * отказ всей команды (`refused`: PR не заведён и lock не тронут); отказ после пуша уже
+ * назван строкой здесь, с именем ветки — повтор команды найдёт её и доведёт PR.
+ */
+function publishLockChange(
+    cmd: 'update' | 'rollback',
+    { consumerRoot, profile }: TLauncherArgs,
+    branch: string,
+    lock: TCoreLock,
+    text: { title: string; body: string; message: string },
+    deps: TLauncherDeps,
+): TPublished {
+    let commit: string;
+    try {
+        commit = deps.pushLockBranchFn({ consumerRoot, branch, lock, message: text.message });
+    } catch (e) {
+        return {
+            ok: false,
+            refused: true,
+            why: `ветка ${branch} с правкой lock не запушена — ${(e as Error).message}.`,
+        };
+    }
+    let pr: number | null;
+    let existing = false;
+    try {
+        try {
+            pr = deps.findOpenPrFn(consumerRoot, branch, profile);
+        } catch (e) {
+            // «Не прочитал» не значит «PR нет»: второй PR на ту же ветку — дубль у человека.
+            throw new Error(`PR ветки не прочитан: ${(e as Error).message}`);
+        }
+        existing = pr !== null;
+        if (!existing)
+            pr = deps.openPrFn(
+                consumerRoot,
+                { branch, title: text.title, body: text.body },
+                profile,
+            );
+    } catch (e) {
+        deps.out(
+            `⛔ ${cmd}: ветка ${branch} (${commit}) запушена, но PR не заведён — ` +
+                `${(e as Error).message}. Повтори ${cmd} или заведи PR из неё в main руками.`,
+        );
+        return { ok: false, refused: false, why: '' };
+    }
+    const num = pr === null ? '' : ` #${String(pr)}`;
+    return {
+        ok: true,
+        line: `🔀 PR${num} из ${branch} (${commit})${existing ? ' уже открыт' : ''}: правка ${CORE_LOCK_PATH}.`,
+    };
+}
+
+/**
+ * Где сырой конфиг называет каталог ревизии `roots.productRoot` — в `common` и профилях.
+ * Сравнение по строке: конфиг пишет путь как есть, а канонизация потребовала бы диска.
+ */
+export function pinnedProductRoots(raw: unknown, revisionDir: string): string[] {
+    const obj = (v: unknown): Record<string, unknown> | null =>
+        v !== null && typeof v === 'object' && !Array.isArray(v)
+            ? (v as Record<string, unknown>)
+            : null;
+    const root = obj(raw);
+    if (root === null) return [];
+    const blocks: [string, unknown][] = [['common', root.common]];
+    for (const [name, p] of Object.entries(obj(root.profiles) ?? {})) {
+        blocks.push([`profiles.${name}`, p]);
+    }
+    return blocks
+        .filter(([, b]) => obj(obj(b)?.roots)?.productRoot === revisionDir)
+        .map(([where]) => `${where}.roots.productRoot`);
+}
+
 function statusWord(res: TInstallResult): string {
     return res.status === 'installed' ? 'установлена' : 'уже стояла';
 }
@@ -501,21 +962,31 @@ export function runStopCommand(args: TLauncherArgs, deps: TLauncherDeps): number
         );
         return 1;
     }
-    // Живая петля — это `ralph.js` ревизии из lock: её путь и сверяется с argv владельца.
-    const entry = lockedEntry(args.consumerRoot, deps);
+    // Живая петля — это `ralph.js` ревизии из этого каталога установок. Не обязательно из
+    // lock (#136): lock в дереве потребителя под git, и `git pull`, сменивший `sha`, петлю на
+    // прежней ревизии не трогает. Её запрос остановки услышит так же — он лежит в каталоге
+    // состояния, а не в каталоге ревизии; назвать «брошенной» живую петлю было бы ложью.
+    const entry = lockedRevision(args.consumerRoot, deps);
     if (!entry.ok) {
         deps.out(
             `⛔ stop: ${entry.reason} — чей раннер держит лок, не проверить, и запрос не кладётся.`,
         );
         return 1;
     }
-    if (!deps.ralphAliveFn(owner, entry.path)) {
+    const running = deps.ralphRevisionFn(owner, entry.dataDir);
+    if (running === null) {
         deps.out(
-            `⛔ stop: лок ${paths.lock} брошен — раннера ${entry.path} с pid ${String(owner)} нет, ` +
-                'петля здесь не идёт. Следующий старт снимет лок сам; запрос не кладётся, иначе ' +
-                'он остановил бы этот старт на первом шаге.',
+            `⛔ stop: лок ${paths.lock} брошен — раннера ${join(entry.dataDir, '<ревизия>', 'ralph.js')} ` +
+                `с pid ${String(owner)} нет, петля здесь не идёт. Следующий старт снимет лок сам; ` +
+                'запрос не кладётся, иначе он остановил бы этот старт на первом шаге.',
         );
         return 1;
+    }
+    if (running !== entry.sha) {
+        deps.out(
+            `ℹ️ Петля с pid ${String(owner)} идёт на ревизии ${running}, а lock называет ${entry.sha} ` +
+                '(lock сменили после её старта) — запрос кладётся ей же.',
+        );
     }
     const already = () =>
         deps.out(
@@ -544,15 +1015,15 @@ export function runStopCommand(args: TLauncherArgs, deps: TLauncherDeps): number
     return 0;
 }
 
-/** `<каталог установок>/<sha из lock>/ralph.js` — entry раннера, который держит лок. */
-function lockedEntry(
+/** Каталог установок и ревизия из lock — с чем сверяется раннер, который держит лок. */
+function lockedRevision(
     consumerRoot: string,
     deps: TLauncherDeps,
-): { ok: true; path: string } | { ok: false; reason: string } {
+): { ok: true; dataDir: string; sha: string } | { ok: false; reason: string } {
     const r = readCoreLock(consumerRoot, deps.readFn);
     if (!r.ok) return { ok: false, reason: r.reason };
     try {
-        return { ok: true, path: join(resolveDataDir(deps.env), r.lock.sha, 'ralph.js') };
+        return { ok: true, dataDir: resolveDataDir(deps.env), sha: r.lock.sha };
     } catch (e) {
         return { ok: false, reason: (e as Error).message };
     }
@@ -584,6 +1055,10 @@ export function runLauncher(argv: readonly string[], deps: TLauncherDeps): numbe
     switch (a.command) {
         case 'install':
             return runInstallCommand(a, deps);
+        case 'update':
+            return runUpdateCommand(a, deps);
+        case 'rollback':
+            return runRollbackCommand(a, deps);
         case 'doctor':
             return runDoctorCommand(a, deps);
         case 'start':

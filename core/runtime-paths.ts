@@ -30,6 +30,7 @@ export type TRuntimePaths = {
     dryEvents: string;
     dryHeartbeat: string;
     sessionSettings: string;
+    activations: string;
 };
 
 export function runtimePathsIn(runtimeDir: string): TRuntimePaths {
@@ -62,5 +63,7 @@ export function runtimePathsIn(runtimeDir: string): TRuntimePaths {
         // пересобирается перед каждой сессией, и лежит здесь, а не в дереве сессии: файл в
         // дереве, которое правит PR, снова был бы настройкой, которую правит код под проверкой.
         sessionSettings: path.join(runtimeDir, 'ralph.session-settings.json'),
+        // #38: журнал активации ревизий ядра — какая исполнялась, когда, с какой снята.
+        activations: path.join(runtimeDir, 'ralph.activations.jsonl'),
     };
 }

@@ -1043,6 +1043,63 @@ describe('resolveProfile — раскладка корней (канон, зад
     it('"roots" не объект — отказ, а не молчаливое игнорирование', () => {
         expect(() => resolveProfile(withRoots('/path/to/app'), 'prod', boom)).toThrow(/roots/);
     });
+
+    // #134: productRoot при ядре из установки — вторая копия SHA рядом с lock; его выводит
+    // launcher, а ключ в конфиге необязателен.
+    const { productRoot: _pr, ...noProduct } = LEGAL;
+    const fromLock = (p: string) => ({
+        ok: true as const,
+        path: `${p}/.ralph/data/${'a'.repeat(40)}`,
+    });
+
+    it('productRoot не задан — выведен из lock потребителя, источник назван', () => {
+        const seen: string[] = [];
+        const cfg = resolveProfile(withRoots(noProduct), 'prod', boom, (p: string) => {
+            seen.push(p);
+            return fromLock(p);
+        });
+        expect(seen).toEqual(['/path/to/app']);
+        expect(cfg.rootsResolved.productRoot).toBe(`/path/to/app/.ralph/data/${'a'.repeat(40)}`);
+        expect(cfg.productRootFrom).toBe('lock');
+    });
+
+    it('productRoot не задан и lock нет — отказ с причиной, а не догадка о каталоге', () => {
+        const noLock = () => ({ ok: false as const, reason: '/path/to/app/.ralph/core.lock нет' });
+        expect(() => resolveProfile(withRoots(noProduct), 'prod', boom, noLock)).toThrow(
+            /roots\.productRoot не задан, а вывести его из lock нельзя \(\/path\/to\/app\/\.ralph\/core\.lock нет\)/,
+        );
+    });
+
+    // Монитор передаёт мягкий `() => null`: отказ корней уезжает наверх как есть, а не
+    // становится конфигом без раскладки и без скриптов потребителя.
+    it('мягкий failFn: отказ вывода из lock и негодные корни — наверх как есть', () => {
+        const noLock = () => ({ ok: false as const, reason: 'нет lock' });
+        expect(resolveProfile(withRoots(noProduct), 'prod', () => null, noLock)).toBe(null);
+        expect(resolveProfile(withRoots('/path/to/app'), 'prod', () => null)).toBe(null);
+    });
+
+    it('productRoot задан — lock не читается, источник — конфиг', () => {
+        const never = () => {
+            throw new Error('lock читать не должны');
+        };
+        const cfg = resolveProfile(withRoots(LEGAL), 'prod', boom, never);
+        expect(cfg.rootsResolved.productRoot).toBe(LEGAL.productRoot);
+        expect(cfg.productRootFrom).toBe('config');
+    });
+
+    it('без consumerRoot lock искать негде — отказ называет consumerRoot', () => {
+        const { consumerRoot: _c, ...bare } = noProduct;
+        const never = () => {
+            throw new Error('lock читать не должны');
+        };
+        expect(() => resolveProfile(withRoots(bare), 'prod', boom, never)).toThrow(
+            /consumerRoot не задан/,
+        );
+    });
+
+    it('секции нет — источник productRoot тоже null', () => {
+        expect(resolveProfile(withRoots(undefined), 'prod', boom).productRootFrom).toBe(null);
+    });
 });
 
 describe('resolveProfile — скрипты потребителя (канон, задача 23)', () => {
@@ -1240,5 +1297,7 @@ describe('resolveProfile — скрипты потребителя (канон, 
         // Монитор передаёт `() => null` — отказ обязан уехать наверх как есть, а не стать
         // конфигом с половиной проверенных полей.
         expect(resolveProfile(withScripts({}), 'prod', () => null)).toBe(null);
+        // Форма секции цела, отказ — дальше, на привязке к площадке.
+        expect(resolveProfile(cfgWith(LEGAL, { adapters: 5 }), 'prod', () => null)).toBe(null);
     });
 });

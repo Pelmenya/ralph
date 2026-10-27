@@ -251,6 +251,16 @@ import type {
 import { underRoot, writeFileAtomic, type TResolvedRoots } from './roots.ts';
 import { checkCoreBeforeStart, describeStartCheck, productRootMismatch } from './core-install.ts';
 import {
+    ACTIVATION_RESTART_EXIT,
+    activationBoundary,
+    activationFileStore,
+    checkLockDrift,
+    describeActivation,
+    doctorActivationLine,
+    recordActivation,
+    type TLockDrift,
+} from './core-activation.ts';
+import {
     checkCompatibility,
     compatLockOf,
     describeCompat,
@@ -586,6 +596,9 @@ export function assertPhaseIssuesFormat(
 // ── Типы контрактов ──────────────────────────────────────────────────────────
 // Фаза в форме, которую хранит config.phases.
 type Phase = { milestone: string; branch: string };
+// #38: исход runLoop. `activation-restart` — lock назвал другую ревизию, петля встала на
+// подтверждённой границе и ждёт рестарта; иначе цикл кончился штатно или стопом.
+type TLoopExit = 'activation-restart' | undefined;
 
 // #376 (фаза 6): один элемент provider-aware modelRouting — либо строка (обратная
 // совместимость: claude-модель, провайдер НЕ меняется — берётся статический
@@ -607,6 +620,8 @@ export type RalphConfig = {
     // месте, где корень понадобится. `null` означает старую раскладку «всё в каталоге ядра»,
     // и это не то же самое, что «раскладка пустая».
     rootsResolved?: TResolvedRoots | null;
+    /** Откуда взят `rootsResolved.productRoot`: ключ конфига или вывод из lock (#134). */
+    productRootFrom?: 'config' | 'lock' | null;
     // Скрипты ПОТРЕБИТЕЛЯ, которые зовёт ядро: их нет в каноне, и путь к ним — часть
     // контракта потребителя, а не зашитая строка (канон, задача 23). `consumerScripts` —
     // то, что написано в файле; исполняется РЕЗОЛВНУТОЕ, где относительный путь уже
@@ -5545,6 +5560,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
         quarantineSessionRequestsFn?: typeof quarantineSessionRequests;
         stopRequestedFn?: () => boolean;
         clearStopRequestFn?: () => void;
+        // #38: исполняемая ревизия против `.ralph/core.lock` на границе итерации. Дефолт
+        // «совпали» по той же причине, что у stopRequestedFn: чтение lock — чтение боевого
+        // файла; main передаёт боевую сверку только ядру из установки.
+        coreDriftFn?: () => TLockDrift | null;
         // #92: журнал этапов кодер-попытки. Умолчание — в памяти, по той же причине, что
         // у stopRequestedFn: чтение боевого файла в тесте — побочка; main передаёт боевой.
         stageJournal?: TStageJournal;
@@ -5676,11 +5695,12 @@ export function createOrchestrator(env: OrchestratorEnv) {
             // передаёт, сторожит структурный тест в core/orchestrator.test.ts (#88).
             stopRequestedFn = () => false,
             clearStopRequestFn = () => {},
+            coreDriftFn = () => null,
             stageJournal = createStageJournal(memoryStageJournalStore()),
             monitorConfigPath,
             monitorExecutionRoot,
         }: RunLoopDeps = {},
-    ): void {
+    ): TLoopExit {
         // ── Main loop ────────────────────────────────────────────────────────
 
         // #93: чекпоинты сдачи — проекции журнала этапов. State с диска уже переведён на
@@ -5696,6 +5716,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // HITL-итерации тоже засчитываются в бюджет, а «ровно одна итерация» в ONCE
         // гарантируется локальным счётчиком, breaker в ONCE не срабатывает.
         let iterationsThisRun = 0;
+        // #38: ревизия lock, о расхождении с которой посреди сдачи уже сказано.
+        let driftNoted: string | null = null;
         // #65: номера, закрытые намерениями сессий в этом прогоне (см. фильтр очереди ниже).
         const closedThisRun = new Set<number>();
         // #20: сколько повторов «по бюджету ходов» уже потрачено на карточку. Живёт в
@@ -6085,6 +6107,36 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     { logFn },
                 );
                 break;
+            }
+
+            // #38: та же граница — единственное место, где петля сверяет исполняемую ревизию
+            // с lock. Посреди сессии сверки нет вовсе, а незаконченная сдача границей не
+            // считается: расхождение названо, сдача доводится на прежней ревизии, рестарт — на
+            // первой вершине цикла после неё. Пуш о незаконченной сдаче — один раз на
+            // ревизию lock, иначе каждый круг сдачи слал бы тот же текст.
+            const drift = coreDriftFn();
+            if (drift !== null) {
+                const boundary = activationBoundary(summarizeSubmit(state.submitStages ?? []));
+                if (!boundary.ok) {
+                    if (driftNoted !== (drift.lockSha ?? '')) {
+                        driftNoted = drift.lockSha ?? '';
+                        pushEventFn(`🔁 Ralph: ${drift.reason}. ${boundary.reason}.`, cfg, {
+                            logFn,
+                        });
+                    }
+                } else if (dry) {
+                    logFn(`💤 DRY: ${drift.reason} — dry-run встаёт.`);
+                    break;
+                } else {
+                    saveStateFn(state);
+                    pushEventFn(
+                        `🔁 Ralph: ${drift.reason}. Фаза "${phase.milestone}", итерация ${state.count}: ` +
+                            'шаг доведён, state сохранён — петля выходит на рестарт новой ревизии.',
+                        cfg,
+                        { logFn },
+                    );
+                    return 'activation-restart';
+                }
             }
 
             if (!once && state.count >= maxIterations) {
@@ -10058,10 +10110,18 @@ export function createOrchestrator(env: OrchestratorEnv) {
             adapters: observeAdapters(),
         };
         // Ядро из установки: `roots.productRoot` обязан называть каталог, который исполняется,
-        // — иначе это вторая копия SHA, разошедшаяся с lock молча (ревью Фазы 12).
+        // — иначе это вторая копия SHA, разошедшаяся с lock молча (ревью Фазы 12). Выведенный
+        // из lock путь (#134) сверяется всегда: ядро-клон при lock в дереве иначе работало бы
+        // с корнями установки, которая не исполняется.
+        const productRootFrom = config.productRootFrom ?? 'config';
         const productRootDrift =
-            coreCheck.status === 'ok' && config.rootsResolved
-                ? productRootMismatch(config.rootsResolved.productRoot, PRODUCT_DIR)
+            config.rootsResolved && (coreCheck.status === 'ok' || productRootFrom === 'lock')
+                ? productRootMismatch(
+                      config.rootsResolved.productRoot,
+                      PRODUCT_DIR,
+                      undefined,
+                      productRootFrom,
+                  )
                 : null;
         if (DOCTOR) {
             // Тот же код, что у старта, — и до первой записи: doctor спрашивают как раз
@@ -10070,12 +10130,24 @@ export function createOrchestrator(env: OrchestratorEnv) {
             // ниже отказывают старту: зелёный doctor обязан значить «старт их пройдёт».
             const wt = resolveWorktreePath(config);
             const roots0 = config.rootsResolved;
-            const startChecks = doctorStartChecks({
-                productRootDrift,
-                productRoot: PRODUCT_DIR,
-                humanRoot: roots0?.consumerRoot ?? null,
-                installed: coreCheck.status === 'ok',
-            });
+            const startChecks = [
+                ...doctorStartChecks({
+                    productRootDrift,
+                    productRoot: PRODUCT_DIR,
+                    humanRoot: roots0?.consumerRoot ?? null,
+                    installed: coreCheck.status === 'ok',
+                }),
+                // #38: журнал активации — какая ревизия исполнялась и с какой снята. Битый
+                // журнал отвергает и старт (запись ниже), поэтому и здесь он провал.
+                ...(coreCheck.status === 'ok' && roots0
+                    ? [
+                          doctorActivationLine(
+                              activationFileStore(runtimePathsIn(roots0.runtimeDir).activations),
+                              coreCheck.lock.sha,
+                          ),
+                      ]
+                    : []),
+            ];
             process.exit(
                 runDoctorMode({
                     flags: { ...flags },
@@ -10205,6 +10277,25 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // раннера. С заданным runtimeDir путь уже абсолютен, и resolve здесь безвреден.
         // null в DRY: --dry-run лок не берёт (C1) — снимать нечего.
         const lockPathAbs = DRY ? null : path.resolve(RUNTIME.lock);
+        // #38: журнал активации — под локом и до первой сессии: строка «какая ревизия, когда,
+        // с какой снята» обязана лечь раньше, чем новая ревизия успеет упасть. Только ядро из
+        // установки: у клона нет ревизии, которую сверяет lock. Битый журнал — стоп, а не
+        // пропуск: строка поверх него солгала бы, с какой ревизии снята эта.
+        let activated: ReturnType<typeof recordActivation> = null;
+        if (!DRY && roots && coreCheck.status === 'ok') {
+            try {
+                activated = recordActivation(
+                    coreCheck.sha,
+                    activationFileStore(RUNTIME.activations),
+                    () => new Date().toISOString(),
+                );
+            } catch (e) {
+                fail(
+                    `🔁 Журнал активации ${RUNTIME.activations} не записан: ${(e as Error).message}. ` +
+                        'Почини или убери битую строку — иначе разбор падения не найдёт исполнявшуюся ревизию.',
+                );
+            }
+        }
         // #369: пересобираем набор швов с ВЫБОРОМ из config.adapters (fail-closed на
         // неизвестном шве/имени/незарегистрированной реализации — как остальные проверки
         // конфига). Дефолтная сборка выше дала рабочий набор для юнит-тестов; здесь — боевой
@@ -10243,6 +10334,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // профиле шёл прогон, не сверяясь с историей команд.
         log(`⚙️  Профиль: ${config.profileName}`);
         log(describeStartCheck(coreCheck));
+        if (activated) log(describeActivation(activated));
         if (roots) log(`🗂  Состояние экземпляра: ${roots.runtimeDir}`);
 
         // #44: рантайм кодера — до worktree и установки зависимостей (докблок
@@ -10425,11 +10517,19 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // этому моменту тот же, по которому его потом читает применение.
         if (stopOnInFlightIntent({ cfg: config })) return;
 
-        runLoop(config, ctx, {
+        // #38: сверка с lock на границе итерации — только у ядра из установки: lock
+        // называет ревизию установки, а клон канона ему не подчинён.
+        const driftConsumer = coreCheck.status === 'ok' ? (roots?.consumerRoot ?? null) : null;
+        const coreDriftFn =
+            coreCheck.status === 'ok' && driftConsumer !== null
+                ? () => checkLockDrift(coreCheck.sha, driftConsumer)
+                : undefined;
+        const exit = runLoop(config, ctx, {
             monitorConfigPath: runnerConfigPath,
             monitorExecutionRoot: sessionTree,
             stopRequestedFn: stopRequested,
             clearStopRequestFn: clearStopRequest,
+            coreDriftFn,
             stageJournal: createStageJournal(stageJournalStore, { where: RUNTIME.stages }),
             ensureMonitorAliveFn: (o) => {
                 const fresh = ensureMonitorAlive(o);
@@ -10437,6 +10537,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 return fresh;
             },
         });
+        // Отдельный код выхода: рестарт решает launcher (`./ralph start`) по нему одному, а
+        // exit-хендлер выше снимет лок и монитор так же, как при штатном конце.
+        if (exit === 'activation-restart') process.exit(ACTIVATION_RESTART_EXIT);
     }
 
     // #204: тест-хук. Часть функций (gateChecksFor, tryMergePhase→gateChecksFor) читают
