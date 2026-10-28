@@ -49,7 +49,12 @@ const DATA_PATH = path.join('.claude', 'ralph', 'hooks.json');
  */
 function emptyData() {
     return {
-        mcp: { writeAllowed: new Set(), neverExceptions: new Set() },
+        mcp: {
+            writeAllowed: new Set(),
+            neverExceptions: new Set(),
+            tools: new Map(),
+            toolsDeclared: false,
+        },
         skills: { files: [], commands: [] },
     };
 }
@@ -61,15 +66,16 @@ function fail(file, what) {
 /** Ключи каждого уровня — закрытый перечень; лишний ключ — опечатка, а не расширение. */
 const KNOWN_KEYS = {
     '': ['$comment', 'mcp', 'skills'],
-    mcp: ['writeAllowed', 'neverExceptions', 'notes'],
+    mcp: ['writeAllowed', 'neverExceptions', 'notes', 'tools'],
     skills: ['files', 'commands'],
+    tool: ['effect'],
 };
 
-function onlyKnownKeys(file, value, where) {
+function onlyKnownKeys(file, value, where, label = where) {
     const known = KNOWN_KEYS[where];
     const extra = Object.keys(value).filter((key) => !known.includes(key));
     if (extra.length > 0) {
-        const at = where === '' ? 'верхний уровень' : where;
+        const at = where === '' ? 'верхний уровень' : label;
         fail(file, `${at}: незнакомые ключи ${extra.join(', ')} (известны: ${known.join(', ')})`);
     }
 }
@@ -107,6 +113,54 @@ function skillRows(file, value, where) {
     });
 }
 
+/**
+ * Эффекты MCP-инструментов (#185, Фаза 16c): `mcp.tools.<полное имя>.effect` — `read` или
+ * `write`. Контракт харнесса (`docs/harness-contract.md`) судит MCP по эффекту из политики, а
+ * не по префиксу `List`/`Get` имени: префикс — догадка о чужом API, и `ListSecrets` по ней
+ * «чтение». Guard на событии (#186) судит MCP по эффектам, если данные их заявили
+ * (`toolsDeclared`); данные прежней формы, без `tools`, судятся прежним правилом до миграции
+ * (`mcp-effects.cjs`): применяет её доверенный launcher, а не сессия, и переключение без неё
+ * отняло бы у живой петли разрешённые чтения.
+ *
+ * `unknown` в данных не пишется: это отсутствие записи, а не значение. Любое другое значение,
+ * лишний ключ записи, имя без `mcp__` — отказ. Пока `writeAllowed` жив рядом, два источника
+ * обязаны совпадать: каждая мутация `writeAllowed` — запись `write`, каждая запись `write` —
+ * в `writeAllowed`. Заявленный `tools` судится целиком, и пустой тоже: `{}` при непустом
+ * `writeAllowed` — неполные данные, а не «эффектов нет». Расхождение — «неполные
+ * данные», и это блок: после переключения половина, о которой забыли, молча стала бы
+ * правилом.
+ */
+const EFFECTS = ['read', 'write'];
+
+function mcpTools(file, value, writeAllowed) {
+    const tools = new Map();
+    if (value === undefined) return tools;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        fail(file, 'mcp.tools — не объект');
+    }
+    for (const [name, entry] of Object.entries(value)) {
+        const at = `mcp.tools.${name}`;
+        if (!/^mcp__./i.test(name)) fail(file, `${at} — имя не MCP-инструмента (нет mcp__)`);
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+            fail(file, `${at} — не объект`);
+        }
+        onlyKnownKeys(file, entry, 'tool', at);
+        if (!EFFECTS.includes(entry.effect)) {
+            fail(file, `${at}.effect — не ${EFFECTS.join('/')} (${JSON.stringify(entry.effect)})`);
+        }
+        tools.set(name, entry.effect);
+    }
+    const missing = [...writeAllowed].filter((n) => tools.get(n) !== 'write');
+    if (missing.length > 0) {
+        fail(file, `mcp.tools неполон: нет эффекта write у ${missing.join(', ')}`);
+    }
+    const stray = [...tools].filter(([n, e]) => e === 'write' && !writeAllowed.has(n));
+    if (stray.length > 0) {
+        fail(file, `mcp.tools: write вне mcp.writeAllowed — ${stray.map(([n]) => n).join(', ')}`);
+    }
+    return tools;
+}
+
 /** Разбор текста данных. Чистая функция: тесты подают текст, а не файл. */
 function parseConsumerData(text, file = DATA_PATH) {
     let raw;
@@ -131,10 +185,14 @@ function parseConsumerData(text, file = DATA_PATH) {
     ) {
         fail(file, 'mcp.notes — не объект');
     }
+    const writeAllowed = new Set(stringList(file, mcp.writeAllowed, 'mcp.writeAllowed'));
+    const neverExceptions = new Set(stringList(file, mcp.neverExceptions, 'mcp.neverExceptions'));
     return {
         mcp: {
-            writeAllowed: new Set(stringList(file, mcp.writeAllowed, 'mcp.writeAllowed')),
-            neverExceptions: new Set(stringList(file, mcp.neverExceptions, 'mcp.neverExceptions')),
+            writeAllowed,
+            neverExceptions,
+            tools: mcpTools(file, mcp.tools, writeAllowed),
+            toolsDeclared: mcp.tools !== undefined,
         },
         skills: {
             files: skillRows(file, skills.files, 'skills.files'),

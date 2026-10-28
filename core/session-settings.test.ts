@@ -39,6 +39,8 @@ import {
     HOOKS_DATA_ENV,
     buildSessionSettings,
     canonHookCommand,
+    GUARD_ADAPTER_ENV,
+    guardAdapterValue,
     coreShaPolicy,
     describeSessionSettingsStart,
     doctorStartChecks,
@@ -52,10 +54,27 @@ import {
     shellQuote,
     type TGitInDirFn,
 } from './session-settings.ts';
+import { heldRun } from '../tests/guard-fake.ts';
+import {
+    HARNESSES_DIR,
+    HARNESS_REGISTRY,
+    normalizerPathIn,
+    SESSION_SETTINGS_HARNESS,
+} from '../adapters/harness-registry.ts';
 
 const CANON_ROOT = path.resolve(import.meta.dirname, '..');
 /** Значение контракта в юнитах — только форма SHA. */
 const SHA = 'a'.repeat(40);
+/** Контекст сессии в юнитах (#184): форма та, что собирает раннер. */
+const CONTEXT = JSON.stringify({
+    sessionId: 's-1',
+    loop: true,
+    coreRevision: SHA,
+    roots: { consumer: '/h', execution: '/s' },
+});
+/** Контекст живой сессии: корни — настоящие каталоги теста. */
+const liveContext = (consumer: string, execution: string, coreRevision: string) =>
+    JSON.stringify({ sessionId: 's-1', loop: true, coreRevision, roots: { consumer, execution } });
 
 /** Живой git в каталоге — как боевой, но мимо предохранителя побочек. */
 const liveGit: TGitInDirFn = (dir, args) => {
@@ -80,7 +99,7 @@ const spawnHook: TRunHookFn = (hook, payload, projectDir, opts = {}) => {
         input: payload,
         encoding: 'utf-8',
         timeout: hook.timeoutSec * 1000,
-        env: hookEnv(projectDir, opts.projectDirEnv !== false),
+        env: { ...hookEnv(projectDir, opts.projectDirEnv !== false), ...opts.env },
     });
     return { status: r.status, stderr: r.stderr ?? '' };
 };
@@ -97,6 +116,13 @@ const CONSUMER_HOOKS = {
 
 // Барьер скиллов в регистрации не-Claude харнессов не переносится: транскрипта у них нет
 // (`guardHooksOf`, ревью Фазы 16b).
+/** Путь нормализатора пакета Claude Code от корня ядра — по реестру, а не литералом. */
+const CLAUDE_NORMALIZER_REL = (() => {
+    const found = normalizerPathIn(HARNESS_REGISTRY, SESSION_SETTINGS_HARNESS, '/');
+    if (!found.ok) throw new Error(found.reason);
+    return found.path.slice(1);
+})();
+
 const HARNESS_HOOK_MATCHERS = CANON_SESSION_HOOKS.filter((h) => h.file !== 'skill-barrier.cjs').map(
     (h) => h.matcher,
 );
@@ -114,7 +140,10 @@ describe('сборка settings сессии', () => {
         const guard = hooksFor(s, 'Bash').map((h) => h.command);
         const env = `${CORE_SHA_ENV}='${SHA}' ${HOOKS_DATA_ENV}='/path/to/app/.claude/ralph/hooks.json'`;
         expect(guard).toEqual([
-            `${env} node '/path/to/core/.claude/hooks/guard.cjs'`,
+            // Guard судит событие нормализатора пакета (#186): путь его команды — из реестра,
+            // перенесённый в каталог исполняемого ядра.
+            `${env} ${GUARD_ADAPTER_ENV}='/path/to/core/${CLAUDE_NORMALIZER_REL}' ` +
+                `node '/path/to/core/.claude/hooks/guard.cjs'`,
             `${env} node '/path/to/core/.claude/hooks/skill-barrier.cjs'`,
         ]);
         expect(JSON.stringify(s)).not.toContain('CLAUDE_PROJECT_DIR');
@@ -302,6 +331,7 @@ describe('подготовка перед сессией', () => {
         coreSha: SHA,
         sessionTree: '/s',
         outPath: '/r/s.json',
+        sessionContext: CONTEXT,
     };
 
     it('проба прошла — файл записан и путь отдан', () => {
@@ -309,11 +339,8 @@ describe('подготовка перед сессией', () => {
         const r = prepareSessionSettings(roots, {
             readFileFn: () => JSON.stringify({ hooks: CONSUMER_HOOKS }),
             writeFileFn: (p, t) => written.push([p, t]),
-            runHookFn: (hook, payload) => ({
-                status:
-                    hook.command.includes('guard.cjs') && !payload.includes('git status') ? 2 : 0,
-                stderr: '',
-            }),
+            runHookFn: (hook, payload) =>
+                hook.command.includes('guard.cjs') ? heldRun(payload) : { status: 0, stderr: '' },
         });
         expect(r).toEqual({ ok: true, path: '/r/s.json' });
         expect(written).toHaveLength(1);
@@ -352,11 +379,8 @@ describe('подготовка перед сессией', () => {
             writeFileFn: () => {
                 throw new Error('ENOSPC');
             },
-            runHookFn: (hook, payload) => ({
-                status:
-                    hook.command.includes('guard.cjs') && !payload.includes('git status') ? 2 : 0,
-                stderr: '',
-            }),
+            runHookFn: (hook, payload) =>
+                hook.command.includes('guard.cjs') ? heldRun(payload) : { status: 0, stderr: '' },
         });
         expect(!r.ok && r.reason).toMatch(/не записан в \/r\/s\.json \(ENOSPC\)/);
     });
@@ -392,7 +416,14 @@ describe('живые хуки: дерево сессии не решает за 
         const humanRoot = tmp('human');
         const out = path.join(tmp('runtime'), 'session-settings.json');
         const r = prepareSessionSettings(
-            { productRoot, humanRoot, coreSha, sessionTree, outPath: out },
+            {
+                productRoot,
+                humanRoot,
+                coreSha,
+                sessionTree,
+                outPath: out,
+                sessionContext: liveContext(humanRoot, sessionTree, coreSha),
+            },
             { writeFileFn: (p, t) => writeFileSync(p, t), runHookFn: spawnHook },
         );
         return { r, out, humanRoot };
@@ -408,6 +439,9 @@ describe('живые хуки: дерево сессии не решает за 
         cpSync(path.join(CANON_ROOT, '.claude', 'hooks'), path.join(p, '.claude', 'hooks'), {
             recursive: true,
         });
+        // Пакеты харнессов — часть установки: guard судит событие их нормализатора (#186).
+        const packages = path.relative(CANON_ROOT, HARNESSES_DIR);
+        cpSync(HARNESSES_DIR, path.join(p, packages), { recursive: true });
         return { root: p, sha: initRepo(p) };
     };
 
@@ -456,6 +490,73 @@ describe('живые хуки: дерево сессии не решает за 
         expect(!r.ok && r.reason).toMatch(/безобидная команда/);
     });
 
+    // #184: раскладка с внешними `roots`. Канонический guard из установки узнаёт петлю по
+    // контракту, guard дерева сессии (`${CLAUDE_PROJECT_DIR}` из настроек человека — на
+    // каноне это тот же репозиторий) — по контексту в окружении. Проба перед сессией требует
+    // контекст от КАЖДОЙ регистрации guard; дошёл не до всех — settings не пишется.
+    const prepareWithHuman = (core: { root: string; sha: string }, humanCommand: string) => {
+        const humanRoot = tmp('human');
+        const sessionTree = tmp('session');
+        cpSync(
+            path.join(CANON_ROOT, '.claude', 'hooks'),
+            path.join(sessionTree, '.claude', 'hooks'),
+            {
+                recursive: true,
+            },
+        );
+        mkdirSync(path.join(humanRoot, '.claude'), { recursive: true });
+        writeFileSync(
+            path.join(humanRoot, '.claude', 'settings.json'),
+            JSON.stringify({
+                hooks: {
+                    PreToolUse: [
+                        {
+                            matcher: 'Bash|Read|Edit|Write',
+                            hooks: [{ type: 'command', command: humanCommand, timeout: 10 }],
+                        },
+                    ],
+                },
+            }),
+        );
+        const out = path.join(tmp('runtime'), 'session-settings.json');
+        const r = prepareSessionSettings(
+            {
+                productRoot: core.root,
+                humanRoot,
+                coreSha: core.sha,
+                sessionTree,
+                outPath: out,
+                sessionContext: liveContext(humanRoot, sessionTree, core.sha),
+            },
+            { writeFileFn: (p, t) => writeFileSync(p, t), runHookFn: spawnHook },
+        );
+        return { r, out };
+    };
+
+    it.skipIf(!coreIsRepoRoot())(
+        'roots: guard дерева сессии получает контекст наравне с хуком установки — проба зелёная',
+        () => {
+            const { r, out } = prepareWithHuman(
+                installedCore(),
+                'node "${CLAUDE_PROJECT_DIR}/.claude/hooks/guard.cjs"',
+            );
+            expect(r).toEqual({ ok: true, path: out });
+        },
+    );
+
+    it.skipIf(!coreIsRepoRoot())(
+        'roots: регистрация guard, которой контекст не дошёл, — отказ, settings не записан',
+        () => {
+            const command =
+                'env -u RALPH_SESSION_CONTEXT node "${CLAUDE_PROJECT_DIR}/.claude/hooks/guard.cjs"';
+            const { r, out } = prepareWithHuman(installedCore(), command);
+            expect(r.ok).toBe(false);
+            expect(!r.ok && r.reason).toMatch(/не получила контекст сессии/);
+            expect(!r.ok && r.reason).toContain(command);
+            expect(() => readFileSync(out)).toThrow();
+        },
+    );
+
     /** Каталог «ядра» с подменёнными хуками: guard задан телом, барьер скиллов пропускает. */
     const productWith = (guardBody: string | null) => {
         const p = tmp('product');
@@ -480,7 +581,11 @@ describe('живые хуки: дерево сессии не решает за 
     it('исправный подменённый хук — проба зелёная: красное выше — от хука, а не от сборки', () => {
         const { r } = prepare(
             productWith(
-                'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.exit(s.includes("git status")?0:2));',
+                // Исправный — значит, и запрещённое называет своим кодом причины (#183).
+                'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{if(s.includes("git status"))process.exit(0);' +
+                    'const c=/mcp__/.test(s)?"mcp-not-allowed":/hooks\\.json/.test(s)?"contour-data":' +
+                    '/rm -rf/.test(s)?"destructive":"secret-env";' +
+                    'process.stderr.write("ralph-reason-code: "+c+"\\n");process.exit(2)});',
             ),
             tmp('session'),
         );
@@ -496,7 +601,7 @@ describe('prepareCodexGuardArgs — регистрация барьера Codex 
     const codexGuard: TRunHookFn = (_h, payload) => {
         const p = JSON.parse(payload) as { turn_id?: string; tool_input: { command?: string } };
         if (!p.turn_id) return { status: 1, stderr: 'не форма Codex' };
-        return { status: p.tool_input.command === 'git status' ? 0 : 2, stderr: '' };
+        return heldRun(payload);
     };
 
     it('при корнях — хуки из установки ядра с контрактом, флаги доверия и включения', () => {
@@ -510,7 +615,13 @@ describe('prepareCodexGuardArgs — регистрация барьера Codex 
         expect(hooks.map((h) => h.matcher)).toEqual(HARNESS_HOOK_MATCHERS);
         expect(hooks[0].command).toContain("CLAUDE_PROJECT_DIR='/work'");
         expect(hooks[0].command).toContain(
-            canonHookCommand('/core', 'guard.cjs', '/app', 'a'.repeat(40)),
+            canonHookCommand(
+                '/core',
+                'guard.cjs',
+                '/app',
+                'a'.repeat(40),
+                guardAdapterValue('/core'),
+            ),
         );
     });
 
@@ -572,7 +683,7 @@ describe('prepareKimiNativeHome — дом Kimi Code с барьером пер�
             tool_input: { command?: string };
         };
         if (p.client_type !== 'kimi_code_cli') return { status: 1, stderr: 'не форма Kimi' };
-        return { status: p.tool_input.command === 'git status' ? 0 : 2, stderr: '' };
+        return heldRun(payload);
     };
     const HUMAN_TOML = 'default_model = "kimi-code/kimi-for-coding"\n';
     const fakeFs = () => {
@@ -611,7 +722,9 @@ describe('prepareKimiNativeHome — дом Kimi Code с барьером пер�
         const { hooks } = kimiHooksFromToml(toml);
         expect(hooks.map((h) => h.matcher)).toEqual(HARNESS_HOOK_MATCHERS);
         expect(hooks[0].command).toContain("CLAUDE_PROJECT_DIR='/work'");
-        expect(hooks[0].command).toContain(canonHookCommand('/core', 'guard.cjs', '/app', SHA));
+        expect(hooks[0].command).toContain(
+            canonHookCommand('/core', 'guard.cjs', '/app', SHA, guardAdapterValue('/core')),
+        );
         // Отсутствующий у человека файл ссылкой не становится.
         expect(f.links).toEqual([
             ['/h/.kimi-code/credentials', '/r/home/credentials'],
@@ -807,10 +920,7 @@ const spawnPlugin: TRunPluginFn = (source, event, projectDir) => {
 describe('prepareOpencodeSession — каталог OpenCode с барьером перед сессией (#121)', () => {
     const roots = { productRoot: '/core', humanRoot: '/app', coreSha: SHA };
     /** 2 на запрещённом, 0 на безобидном; судит по аргументам в форме OpenCode. */
-    const pluginGuard: TRunPluginFn = (_src, ev) => {
-        const args = JSON.stringify(ev.output.args);
-        return { status: args.includes('git status') ? 0 : 2, stderr: '' };
-    };
+    const pluginGuard: TRunPluginFn = (_src, ev) => heldRun(JSON.stringify(ev));
     const SKILL = '/work/.claude/skills/vitest/SKILL.md';
     const fakeFs = (seen: string[] = [SKILL]) => {
         const writes = new Map<string, string>();
@@ -854,7 +964,9 @@ describe('prepareOpencodeSession — каталог OpenCode с барьером
         const plugin = f.writes.get('/r/opencode/config/plugin/ralph-guard.js') ?? '';
         const { hooks } = opencodeHooksFromPlugin(plugin);
         expect(hooks.map((h) => h.matcher)).toEqual(HARNESS_HOOK_MATCHERS);
-        expect(hooks[0].command).toContain(canonHookCommand('/core', 'guard.cjs', '/app', SHA));
+        expect(hooks[0].command).toContain(
+            canonHookCommand('/core', 'guard.cjs', '/app', SHA, guardAdapterValue('/core')),
+        );
         const cfg = JSON.parse(f.writes.get('/r/opencode/config/opencode.json') ?? '{}') as {
             permission?: unknown;
         };
@@ -1166,11 +1278,10 @@ describe('session-settings: краевые формы отказов', () => {
         coreSha: '',
         sessionTree: '/work',
         outPath: '/r/s.json',
+        sessionContext: CONTEXT,
     };
-    const holds = (hook: { command: string }, payload: string) => ({
-        status: hook.command.includes('guard.cjs') && !payload.includes('git status') ? 2 : 0,
-        stderr: '',
-    });
+    const holds = (hook: { command: string }, payload: string) =>
+        hook.command.includes('guard.cjs') ? heldRun(payload) : { status: 0, stderr: '' };
 
     it('проба без контракта ревизии не прошла — причина говорит «без контракта»', () => {
         const r = prepareSessionSettings(roots, {
@@ -1243,10 +1354,7 @@ describe('session-settings: краевые формы отказов', () => {
 describe('подготовка сессий харнессов: боевые умолчания', () => {
     const missing = '/nonexistent-ralph-core';
     const roots = { productRoot: missing, humanRoot: missing, coreSha: 'a'.repeat(40) };
-    const blockAll: TRunHookFn = (_h, payload) => ({
-        status: payload.includes('git status') ? 0 : 2,
-        stderr: '',
-    });
+    const blockAll: TRunHookFn = (_h, payload) => heldRun(payload);
 
     it('Codex: настройки человека читаются с диска — нет файла, есть хуки установки ядра', () => {
         const r = prepareCodexGuardArgs({ roots, sessionTree: missing }, { runHookFn: blockAll });
@@ -1282,10 +1390,7 @@ describe('подготовка сессий харнессов: боевые у�
     });
 
     it('OpenCode: скиллы дерева ищутся на диске, каталог сессии — громкая побочка', () => {
-        const pluginOk: TRunPluginFn = (_s, ev) => ({
-            status: JSON.stringify(ev.output.args).includes('git status') ? 0 : 2,
-            stderr: '',
-        });
+        const pluginOk: TRunPluginFn = (_s, ev) => heldRun(JSON.stringify(ev));
         const r = prepareOpencodeSession(
             { roots, sessionTree: missing, configDir: '/r/opencode/config', baseEnv: {} },
             { readFileFn: () => '{}', runPluginFn: pluginOk },

@@ -183,6 +183,7 @@ function decide({
     if (transcriptLines === null) {
         return {
             blocked: true,
+            code: 'skill-barrier-fault',
             reason:
                 '[skill-barrier.cjs] Сессия петли заявлена контрактом запуска, а транскрипт ' +
                 'не назван — проверить вызов Skill нечем, правка заблокирована fail-closed.',
@@ -196,6 +197,7 @@ function decide({
         .join('\n');
     return {
         blocked: true,
+        code: 'skill-required',
         reason:
             '[skill-barrier.cjs] Правка заблокирована: до первой правки этого файла в сессии ' +
             `обязан быть вызван инструмент Skill. Не хватает:\n${list}\n` +
@@ -215,8 +217,15 @@ function readStdin() {
     });
 }
 
-function block(reason) {
-    process.stderr.write(reason);
+/**
+ * Префикс машинной строки кода причины (#183) — литералом, как в `guard.cjs`; равенство с
+ * контрактом держит `adapters/barrier-reason.test.ts`.
+ */
+const REASON_LINE_PREFIX = 'ralph-reason-code: ';
+
+/** Отказ: текст агенту, последней строкой — код причины для пробы. */
+function block(code, reason) {
+    process.stderr.write(`${reason}\n${REASON_LINE_PREFIX}${code}\n`);
     process.exit(EXIT_BLOCKED);
 }
 
@@ -226,6 +235,7 @@ async function main() {
         input = JSON.parse((await readStdin()) || '{}');
     } catch (error) {
         block(
+            'skill-barrier-fault',
             `[skill-barrier.cjs] Вход не разобрался (${describeError(error)}) — вызов заблокирован.`,
         );
     }
@@ -242,6 +252,7 @@ async function main() {
     }
     if (revision.error) {
         block(
+            'skill-barrier-fault',
             `[skill-barrier.cjs] Ревизия хука не сверилась с ядром: ${revision.error} ` +
                 'Вызов заблокирован: хук не той ревизии — не тот барьер, который ревьюили.',
         );
@@ -252,6 +263,7 @@ async function main() {
         rules = require('./consumer-data.cjs').loadConsumerData().skills;
     } catch (error) {
         block(
+            'skill-barrier-fault',
             `[skill-barrier.cjs] Таблица скиллов не загрузилась (${describeError(error)}) — ` +
                 'вызов заблокирован fail-closed.',
         );
@@ -265,6 +277,7 @@ async function main() {
             transcriptLines = fs.readFileSync(input.transcript_path, 'utf-8').split('\n');
         } catch (error) {
             block(
+                'skill-barrier-fault',
                 `[skill-barrier.cjs] Транскрипт ${input.transcript_path} не читается ` +
                     `(${describeError(error)}) — судить о сессии нечем, вызов заблокирован fail-closed.`,
             );
@@ -279,7 +292,7 @@ async function main() {
         /* маркеров ещё нет */
     }
     const verdict = decide({ toolName, toolInput, transcriptLines, cached, rules });
-    if (verdict.blocked) block(verdict.reason);
+    if (verdict.blocked) block(verdict.code, verdict.reason);
     if (verdict.loaded) {
         try {
             fs.mkdirSync(dir, { recursive: true });
@@ -303,6 +316,9 @@ if (require.main === module) {
     main().then(
         () => process.exit(0),
         (error) =>
-            block(`[skill-barrier.cjs] Ошибка барьера: ${describeError(error)} — заблокировано.`),
+            block(
+                'skill-barrier-fault',
+                `[skill-barrier.cjs] Ошибка барьера: ${describeError(error)} — заблокировано.`,
+            ),
     );
 }

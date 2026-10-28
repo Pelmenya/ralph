@@ -28,6 +28,7 @@ const run = (stdin: string, guardPath = GUARD) =>
         env: {
             ...process.env,
             RALPH_CORE_SHA: '',
+            RALPH_GUARD_INPUT: '',
             CLAUDE_PROJECT_DIR: path.join(HOOKS, '..', '..'),
         },
     });
@@ -38,13 +39,20 @@ const run = (stdin: string, guardPath = GUARD) =>
  * причине.
  */
 const withSiblings = (dir: string) => {
-    for (const name of ['consumer-data.cjs', 'core-revision.cjs']) {
+    for (const name of ['consumer-data.cjs', 'core-revision.cjs', 'session-context.cjs']) {
         copyFileSync(path.join(HOOKS, name), path.join(dir, name));
     }
 };
 
+/** Вход в форме Claude Code: с #186 guard судит его через нормализатор пакета, а `cwd` — его поле. */
 const payload = (toolName: string, toolInput: Record<string, unknown>) =>
-    JSON.stringify({ tool_name: toolName, tool_input: toolInput });
+    JSON.stringify({
+        session_id: 'guard-test',
+        cwd: path.join(HOOKS, '..', '..'),
+        hook_event_name: 'PreToolUse',
+        tool_name: toolName,
+        tool_input: toolInput,
+    });
 
 /**
  * Копия хука в пустом каталоге: рядом нет файла правил, то есть они не грузятся.
@@ -169,12 +177,21 @@ describe('отказ самого барьера — fail-closed (#172)', () => 
         }
     });
 
-    it('битые данные потребителя блокируют вызов, а не дают контур по умолчанию', () => {
+    // #185: неполные эффекты MCP (мутация без записи `write`) — те же битые данные.
+    it.each([
+        ['битые данные', '{"mcp": []}', 'Bash', { command: 'npm run lint' }],
+        [
+            'неполные эффекты MCP',
+            '{"mcp": {"writeAllowed": ["mcp__forge__CreateIssue"], "tools": {}}}',
+            'mcp__forge__ListIssues',
+            {},
+        ],
+    ])('%s потребителя блокируют вызов, а не дают контур по умолчанию', (_, data, tool, input) => {
         const project = mkdtempSync(path.join(tmpdir(), 'guard-bad-data-'));
         mkdirSync(path.join(project, '.claude/ralph'), { recursive: true });
-        writeFileSync(path.join(project, '.claude/ralph/hooks.json'), '{"mcp": []}');
+        writeFileSync(path.join(project, '.claude/ralph/hooks.json'), data);
         const r = spawnSync(process.execPath, [GUARD], {
-            input: payload('Bash', { command: 'npm run lint' }),
+            input: payload(tool, input),
             encoding: 'utf-8',
             env: { ...process.env, RALPH_CORE_SHA: '', CLAUDE_PROJECT_DIR: project },
         });
@@ -182,28 +199,30 @@ describe('отказ самого барьера — fail-closed (#172)', () => 
         expect(r.stderr).toContain('данные хуков');
     });
 
-    // Контракт `RALPH_CORE_SHA` получают только хуки из установки (#132), а guard дерева
-    // сессии — нет: забор данных этого дерева узнаёт петлю ещё и переходным признаком —
-    // строкой `ralph.md` в промпте транскрипта.
-    it('без контракта сессия петли узнаётся по транскрипту, и правка данных — блок', () => {
+    // #184: транскриптный признак петли снят. Guard дерева сессии узнаёт петлю по
+    // доверенному контексту раннера в окружении (`session-context.cjs`), а промпт со строкой
+    // `ralph.md` в сессии человека ничего не заявляет.
+    it('транскрипт, похожий на петлю, без контекста петлю не заявляет', () => {
         const dir = mkdtempSync(path.join(tmpdir(), 'guard-transcript-'));
-        const transcript = (name: string, prompt: string) => {
-            const file = path.join(dir, `${name}.jsonl`);
-            writeFileSync(file, JSON.stringify({ type: 'user', message: { content: prompt } }));
-            return file;
-        };
+        const file = path.join(dir, 'loop.jsonl');
+        writeFileSync(
+            file,
+            JSON.stringify({
+                type: 'user',
+                message: { content: 'Работай по .claude/ralph/ralph.md' },
+            }),
+        );
         const call = (transcriptPath: string) =>
             JSON.stringify({
+                session_id: 'guard-test',
+                cwd: path.join(HOOKS, '..', '..'),
+                hook_event_name: 'PreToolUse',
                 tool_name: 'Write',
                 tool_input: { file_path: '.claude/ralph/hooks.json' },
                 transcript_path: transcriptPath,
             });
-        const loop = run(call(transcript('loop', 'Работай по .claude/ralph/ralph.md')));
-        expect(loop.status).toBe(2);
-        expect(loop.stderr).toContain('данных контура');
-        expect(run(call(transcript('human', 'поправь пример'))).status).toBe(0);
-        // Транскрипт назван, но не читается — петлёй считается, канал не открывается.
-        expect(run(call(path.join(dir, 'missing.jsonl'))).status).toBe(2);
+        expect(run(call(file)).status).toBe(0);
+        expect(run(call(path.join(dir, 'missing.jsonl'))).status).toBe(0);
     });
 
     it('отсутствующие правила блокируют вызов, а не открывают канал целиком', () => {

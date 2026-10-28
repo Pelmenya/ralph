@@ -36,6 +36,13 @@ import { runtimeSectionProblems } from './runtime-capabilities.ts';
 
 export const OPENCODE_BIN = 'opencode';
 
+/**
+ * Ключ рантайма OpenCode в реестре `coderRuntime` и имя его каталога сессии. Тем же словом
+ * назван пакет харнесса (`harnesses/opencode/`, #213), и литерал в ядре читался бы ветвлением
+ * по харнессу (`tests/harness-identity.test.ts`) — ядро берёт ключ отсюда.
+ */
+export const OPENCODE_RUNTIME = 'opencode';
+
 /** Файл настроек сессии — сливается с конфигом человека и дерева. */
 export const OPENCODE_CONFIG_ENV = 'OPENCODE_CONFIG';
 /** Каталог внешних плагинов (`<каталог>/plugin/*.js`). */

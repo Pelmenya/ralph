@@ -1,0 +1,232 @@
+{
+    "schemaVersion": 1,
+    "harness": "claude-code",
+    "cliVersion": "2.1.312",
+    "normalizer": "normalize.ts",
+    "toolMap": {
+        "Bash": "exec",
+        "Monitor": "exec",
+        "Read": "read",
+        "Write": "write",
+        "Edit": "write",
+        "MultiEdit": "write",
+        "NotebookEdit": "write",
+        "Glob": "search",
+        "Grep": "search",
+        "WebFetch": "fetch",
+        "Task": "agent",
+        "Agent": "agent",
+        "Workflow": "agent",
+        "TodoWrite": "inert",
+        "Skill": "inert",
+        "ToolSearch": "inert",
+        "WebSearch": "fetch",
+        "TaskStop": "inert",
+        "ScheduleWakeup": "inert",
+        "CronCreate": "inert",
+        "CronDelete": "inert",
+        "CronList": "inert",
+        "ListAgents": "inert",
+        "PushNotification": "inert",
+        "ReportFindings": "inert"
+    },
+    "argMap": {
+        "Bash": {
+            "command": "command"
+        },
+        "Monitor": {
+            "command": "command"
+        },
+        "Read": {
+            "path": "file_path"
+        },
+        "Write": {
+            "path": "file_path"
+        },
+        "Edit": {
+            "path": "file_path"
+        },
+        "MultiEdit": {
+            "path": "file_path"
+        },
+        "NotebookEdit": {
+            "path": "notebook_path"
+        },
+        "Glob": {
+            "root": "path",
+            "pathGlob": "pattern"
+        },
+        "Grep": {
+            "root": "path",
+            "contentPattern": "pattern",
+            "pathGlob": "glob"
+        },
+        "WebFetch": {
+            "url": "url"
+        },
+        "WebSearch": {
+            "url": "query"
+        },
+        "Workflow": {
+            "path": "scriptPath"
+        }
+    },
+    "allowedFields": {
+        "envelope": [
+            "session_id",
+            "transcript_path",
+            "cwd",
+            "scratchpad_dir",
+            "prompt_id",
+            "permission_mode",
+            "agent_id",
+            "agent_type",
+            "effort",
+            "hook_event_name",
+            "tool_name",
+            "tool_input",
+            "tool_use_id",
+            "mcp_server"
+        ],
+        "tools": {
+            "Bash": [
+                "command",
+                "description",
+                "timeout",
+                "run_in_background",
+                "dangerouslyDisableSandbox"
+            ],
+            "Monitor": ["command", "description", "timeout_ms"],
+            "Read": ["file_path", "offset", "limit", "pages", "allow_large"],
+            "Write": ["file_path", "content"],
+            "Edit": ["file_path", "old_string", "new_string", "replace_all"],
+            "MultiEdit": ["file_path", "edits"],
+            "NotebookEdit": ["notebook_path", "new_source", "cell_id", "cell_type", "edit_mode"],
+            "Glob": ["pattern", "path"],
+            "Grep": [
+                "pattern",
+                "path",
+                "glob",
+                "type",
+                "output_mode",
+                "-A",
+                "-B",
+                "-C",
+                "-n",
+                "-i",
+                "multiline",
+                "head_limit"
+            ],
+            "WebFetch": ["url", "prompt", "offset"],
+            "Task": ["description", "prompt", "subagent_type"],
+            "Agent": [
+                "description",
+                "prompt",
+                "subagent_type",
+                "model",
+                "run_in_background",
+                "isolation",
+                "effort"
+            ],
+            "Workflow": [
+                "description",
+                "name",
+                "script",
+                "scriptPath",
+                "args",
+                "title",
+                "resumeFromRunId"
+            ],
+            "TodoWrite": ["todos"],
+            "Skill": ["skill", "args"],
+            "ToolSearch": ["query", "max_results"],
+            "WebSearch": ["query", "mode", "allowed_domains", "blocked_domains"],
+            "TaskStop": ["task_id", "shell_id"],
+            "ScheduleWakeup": ["delaySeconds", "noop", "prompt", "reason", "stop"],
+            "CronCreate": ["cron", "prompt", "recurring", "durable"],
+            "CronDelete": ["id"],
+            "CronList": [],
+            "ListAgents": ["channel", "q"],
+            "PushNotification": ["message", "status"],
+            "ReportFindings": ["findings", "level"]
+        }
+    },
+    "eventCoverage": {
+        "PreToolUse": {
+            "mode": "intercepted",
+            "evidence": "hooks.PreToolUse в settings, собранном раннером; проба на собранном перед каждой сессией (core/session-settings.ts)"
+        }
+    },
+    "configSurfaces": [".claude/settings.json", ".claude/settings.local.json", ".mcp.json"],
+    "forbiddenEnv": [],
+    "mcpNames": {},
+    "skillEvidence": {
+        "source": "транскрипт сессии: вызов Skill в JSONL (.claude/hooks/skill-barrier.cjs)"
+    },
+    "rules": ["CLAUDE.md"],
+    "probeInputs": {
+        "Monitor": {
+            "description": "ralph-probe"
+        },
+        "Write": {
+            "content": "ralph-probe\n"
+        },
+        "Edit": {
+            "old_string": "ralph-probe",
+            "new_string": "ralph-probe"
+        },
+        "MultiEdit": {
+            "edits": []
+        },
+        "NotebookEdit": {
+            "new_source": ""
+        },
+        "Glob": {
+            "pattern": "*"
+        },
+        "WebFetch": {
+            "prompt": "ralph-probe"
+        },
+        "Task": {
+            "description": "ralph-probe",
+            "prompt": "ralph-probe"
+        },
+        "Agent": {
+            "description": "ralph-probe",
+            "prompt": "ralph-probe"
+        },
+        "Workflow": {
+            "description": "ralph-probe"
+        },
+        "TodoWrite": {
+            "todos": []
+        },
+        "Skill": {
+            "skill": "ralph-probe"
+        },
+        "ToolSearch": {
+            "query": "ralph-probe",
+            "max_results": 1
+        },
+        "TaskStop": {
+            "task_id": "ralph-probe"
+        },
+        "ScheduleWakeup": {
+            "stop": true
+        },
+        "CronCreate": {
+            "cron": "0 0 1 1 *",
+            "prompt": "ralph-probe"
+        },
+        "CronDelete": {
+            "id": "ralph-probe"
+        },
+        "PushNotification": {
+            "message": "ralph-probe"
+        },
+        "ReportFindings": {
+            "findings": []
+        }
+    },
+    "inventorySource": "CLI 2.1.312: конверт PreToolUse — схема входа хука в бинаре (поля общего входа, tool_use_id, mcp_server); инструменты и поля — схемы инструментов, которые CLI отдаёт модели, и вызовы в транскриптах сессий петли (adapters/harnesses/__fixtures__/claude-code-loop.json). Grep, Glob, MultiEdit, Task и TodoWrite — из прежних версий CLI, в 2.1.312 модели не отдаются. Сверка с инвентарём CLI машиной — Фаза 16f"
+}

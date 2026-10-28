@@ -8,7 +8,13 @@ export type TSkillRule = {
     why: string;
 };
 
-export type TSkillVerdict = { blocked: boolean; reason?: string; loaded?: string[] };
+export type TSkillVerdict = {
+    blocked: boolean;
+    reason?: string;
+    /** Код причины блока из перечня контракта (`adapters/barrier-reason.ts`). */
+    code?: string;
+    loaded?: string[];
+};
 
 export type TSkillRules = { files: TSkillRule[]; commands: TSkillRule[] };
 

@@ -60,12 +60,12 @@
         ],
         "PreToolUse": [
             {
-                "matcher": "Bash|Read|Edit|Write|MultiEdit|NotebookEdit|Grep|mcp__.*",
+                "matcher": ".*",
                 "hooks": [
                     {
                         "type": "command",
                         "command": "node \"${CLAUDE_PROJECT_DIR}/.claude/hooks/guard.cjs\"",
-                        "timeout": 10
+                        "timeout": 30
                     }
                 ]
             },

@@ -27,10 +27,19 @@
 // вовсе. Теперь правило — «харнесс без доказанного guard не стартует»: регистрация барьера
 // строится в формате CLI (`adapters/harness-guard.ts` — argv Codex, `config.toml` Kimi Code,
 // плагин OpenCode) из тех же настроек, что получит сессия Claude Code, читается обратно и
-// исполняется на событиях в форме этого CLI. Харнесс неизвестен или его регистрация не
-// передаётся CLI при запуске (`GUARD_WIRED_HARNESSES`) — отказ с местом в конфиге. Kimi
+// исполняется на событиях в форме этого CLI. Харнесс неизвестен или у него нет принятого
+// пакета — регистрация не передаётся CLI при запуске — отказ с местом в конфиге. Kimi
 // через Claude CLI (`kimi`) — харнесс Claude Code и наследует его guard; Kimi Code родным
 // харнессом (`kimi-native`) — свой `config.toml` в доме CLI.
+//
+// Харнесс выбирает реестр пакетов, а не ветвление здесь (Фаза 16c, #180). Пакет
+// (`adapters/harness-registry.ts`) сам отвечает, что его CLI позовёт, на каком входе и по
+// какому matcher; модуль только исполняет хуки и судит исходы — по имени он не знает ни
+// одного харнесса, у которого есть пакет. Codex и Kimi Code сняты с временного моста 16b
+// пакетами (#181), OpenCode — вместе с самим мостом (#213): его регистрация — плагин, и пакет
+// объявляет это полем `plugin`, а проба выбирает способ исполнения по полю, а не по имени.
+// Пакет, который реестр не принял (несовместимая версия интерфейса, описание не по схеме), —
+// отказ старта с причинами реестра, если конфиг может отправить в него сессию.
 //
 // TS-модуль без билд-шага: исполняется нативным type stripping Node 24 (erasable-only
 // синтаксис). Standalone-экспорты, как у workspace-trust.ts: контекста фабрики модулю не
@@ -41,25 +50,24 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { guardSideEffect } from '../shared/side-effect-guard.ts';
 import {
-    HARNESS_PROBES,
     OPENCODE_PLUGIN_DRIVER,
-    opencodeClaudeToolName,
-    codexGuardArgs,
     codexGuardFromArgs,
-    CODEX_GUARD_LIMIT,
     SKILL_BARRIER_LIMIT,
-    harnessHookPayload,
-    harnessMatcherCovers,
     kimiHooksFromToml,
-    kimiHooksToml,
-    opencodeEvent,
-    opencodeGuardPlugin,
-    opencodeHooksFromPlugin,
     type GuardHook,
-    type Harness,
     type HarnessProbe,
 } from '../adapters/harness-guard.ts';
 import { RUNTIME_IDENTITIES } from '../adapters/runtime-profile.ts';
+import {
+    ALL_PACKAGES,
+    HARNESS_REGISTRY,
+    SESSION_SETTINGS_HARNESS,
+    selectHarness,
+    type HarnessRegistry,
+} from '../adapters/harness-registry.ts';
+import type { HarnessPackage, RegisteredGuardHook } from '../adapters/harness-package.ts';
+import { reasonCodeOf } from '../adapters/barrier-reason.ts';
+import { SESSION_CONTEXT_ENV } from './session-context.ts';
 
 type LogFn = (msg: string) => void;
 type FailFn = (msg: string) => unknown;
@@ -67,8 +75,15 @@ type FailFn = (msg: string) => unknown;
 /** Один вызов пробы: что подаём хукам и чего от них ждём (в терминах харнесса). */
 export type TGuardProbe = HarnessProbe;
 
-/** Состав пробы Claude Code; у остальных харнессов — свой, `HARNESS_PROBES`. */
-export const GUARD_PROBES: readonly TGuardProbe[] = HARNESS_PROBES['claude-code'];
+/**
+ * Пакет харнесса, в чьём формате собраны настройки сессии. Не принят реестром — `null`:
+ * разбор настроек тогда пуст, и проба называет причину реестра (`harnessGuardProblems`).
+ */
+const settingsPackage = (registry: HarnessRegistry = HARNESS_REGISTRY): HarnessPackage | null =>
+    registry.packages.get(SESSION_SETTINGS_HARNESS)?.pkg ?? null;
+
+/** Состав пробы харнесса настроек сессии; у остальных харнессов — свой, `HARNESS_PROBES`. */
+export const GUARD_PROBES: readonly TGuardProbe[] = settingsPackage()?.probes ?? [];
 
 /**
  * Хук из настроек: команда оболочки, её таймаут в секундах и почему он НЕ вправе считаться
@@ -89,63 +104,57 @@ export type TRunHookFn = (
     hook: THookCommand,
     payload: string,
     projectDir: string,
-    opts?: { projectDirEnv?: boolean },
+    opts?: { projectDirEnv?: boolean; env?: Record<string, string> },
 ) => THookRun;
-
-// Claude Code ждёт хук 60 секунд, если таймаут в настройках не задан.
-const DEFAULT_TIMEOUT_SEC = 60;
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
     return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
-/** Семантика matcher у Claude Code (`harnessMatcherCovers` знает и остальные харнессы). */
+/** Семантика matcher харнесса настроек сессии — её знает его пакет. */
 export function matcherCovers(matcher: unknown, toolName: string): boolean {
-    return harnessMatcherCovers('claude-code', matcher, toolName);
+    return settingsPackage()?.matcherCovers(matcher, toolName) ?? false;
 }
 
 /**
- * Поля записи, при которых exit 2 хука ещё не значит, что сессия будет заблокирована:
- * асинхронный ответ приходит, когда инструмент уже отработал; `once` срабатывает раз за
- * сессию; `if` зовёт хук не на всё. Тот же перечень сторожит сверка проводки
- * (`checkGuardWiring`), но она судит текст, а проба — исход (ревью Kimi).
- */
-function cannotBlock(hook: Record<string, unknown>): string | null {
-    if (hook.async === true) return 'async: асинхронный хук не блокирует вызов';
-    if (hook.once === true) return 'once: срабатывает один раз за сессию';
-    if (hook.if !== undefined) return 'if: хук зовут не на каждый вызов';
-    return null;
-}
-
-/**
- * PreToolUse-хуки, которые Claude Code позовёт на этот инструмент. Битая форма записи
- * пропускается молча: её хук не позовут и в сессии, а отказ пробы назовёт итог — «хука
- * нет», — то есть ровно то, что увидит человек.
+ * Хуки настроек сессии, которые CLI позовёт на этот инструмент. Разбор — у пакета: битая
+ * форма записи пропускается молча, её хук не позовут и в сессии.
  */
 export function hooksFor(settings: unknown, toolName: string): THookCommand[] {
-    if (!isPlainObject(settings) || !isPlainObject(settings.hooks)) return [];
-    const entries = settings.hooks.PreToolUse;
-    if (!Array.isArray(entries)) return [];
-    const out: THookCommand[] = [];
-    for (const entry of entries) {
-        if (!isPlainObject(entry) || !matcherCovers(entry.matcher, toolName)) continue;
-        if (!Array.isArray(entry.hooks)) continue;
-        for (const hook of entry.hooks) {
-            if (!isPlainObject(hook) || hook.type !== 'command') continue;
-            if (typeof hook.command !== 'string' || hook.command.trim() === '') continue;
-            const timeoutSec =
-                typeof hook.timeout === 'number' && hook.timeout > 0
-                    ? hook.timeout
-                    : DEFAULT_TIMEOUT_SEC;
-            out.push({ command: hook.command, timeoutSec, cannotBlock: cannotBlock(hook) });
-        }
-    }
-    return out;
+    const pkg = settingsPackage();
+    if (!pkg) return [];
+    return pkg
+        .guardRegistration(settings)
+        .hooks.filter((h) => pkg.matcherCovers(h.matcher, toolName))
+        .map(({ command, timeoutSec, cannotBlock }) => ({ command, timeoutSec, cannotBlock }));
 }
 
-/** Вход хука в той форме, что подаёт Claude Code. Транскрипта у пробы нет. */
+/** Вход хука в той форме, что подаёт CLI настроек сессии. Транскрипта у пробы нет. */
 export function probePayload(probe: TGuardProbe, projectDir: string): string {
-    return harnessHookPayload('claude-code', probe, projectDir);
+    return settingsPackage()?.hookPayload(probe, projectDir) ?? '';
+}
+
+/**
+ * Окружение хука под пробой: окружение раннера, каталог дерева и то, что проба кладёт явно.
+ * Чистая функция — по ней тест проверяет, что снято, без запуска хука.
+ */
+export function probeHookEnv(
+    base: NodeJS.ProcessEnv,
+    projectDir: string,
+    opts: { projectDirEnv?: boolean; env?: Record<string, string> } = {},
+): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = { ...base, CLAUDE_PROJECT_DIR: projectDir };
+    // Унаследованная от места запуска переменная тоже снимается: раннер, запущенный из
+    // сессии Claude Code, иначе подложил бы её хуку и снова спрятал бы ту же поломку.
+    if (opts.projectDirEnv === false) delete env.CLAUDE_PROJECT_DIR;
+    // Контекст сессии (#184) хук получает только тем, что проба кладёт явно: унаследованный
+    // из окружения раннера, он прятал бы регистрацию, которой контекст не дошёл бы. Так же
+    // снимаются переменные команды хука: сессия их не получает (`withSkillGuard`), и раннер,
+    // запущенный с `RALPH_CORE_SHA` в окружении, проходил бы пробу хука дерева контрактом,
+    // которого у живой сессии нет. Свою команду хук ядра несёт литералом — ему это не мешает.
+    delete env[SESSION_CONTEXT_ENV];
+    for (const k of HOOK_COMMAND_ONLY_ENV) delete env[k];
+    return Object.assign(env, opts.env ?? {});
 }
 
 /**
@@ -154,10 +163,7 @@ export function probePayload(probe: TGuardProbe, projectDir: string): string {
  */
 export const runHook: TRunHookFn = (hook, payload, projectDir, opts = {}) => {
     guardSideEffect(`guard-probe: ${hook.command}`, 'Подмени runHookFn в тесте.');
-    const env: NodeJS.ProcessEnv = { ...process.env, CLAUDE_PROJECT_DIR: projectDir };
-    // Унаследованная от места запуска переменная тоже снимается: раннер, запущенный из
-    // сессии Claude Code, иначе подложил бы её хуку и снова спрятал бы ту же поломку.
-    if (opts.projectDirEnv === false) delete env.CLAUDE_PROJECT_DIR;
+    const env = probeHookEnv(process.env, projectDir, opts);
     const r = spawnSync('sh', ['-c', hook.command], {
         cwd: projectDir,
         input: payload,
@@ -172,25 +178,28 @@ export const runHook: TRunHookFn = (hook, payload, projectDir, opts = {}) => {
 const brief = (s: string) => s.replace(/\s+/g, ' ').trim().slice(0, 200);
 
 /** Хук, который проба исполняет: команда, таймаут, matcher харнесса. */
-type TProbedHook = THookCommand & { matcher: unknown };
+type TProbedHook = RegisteredGuardHook;
+
+/** Что проба знает о харнессе: состав, семантика matcher, форма входа и окружение хука. */
+type TProbeSpec = Pick<
+    HarnessPackage,
+    'probes' | 'matcherCovers' | 'hookPayload' | 'setsProjectDirEnv'
+>;
 
 /**
- * Вердикт пробы на списке хуков одного харнесса. Запрещённое: хоть один хук, вправе
- * блокировать, вышел 2. Безобидное: все вышли 0 — барьер fail-closed, и упавшие правила
- * блокируют всё подряд; сессия на таком барьере сожгла бы итерацию на отказах.
+ * Вердикт пробы на списке хуков одного харнесса. Запрещённое: хоть один хук, вправе блокировать,
+ * вышел 2 с кодом причины этой пробы. Безобидное: все вышли 0 — барьер fail-closed, и упавшие
+ * правила блокируют всё подряд; сессия на таком барьере сожгла бы итерацию на отказах.
  */
 function probeHookList(
-    harness: Harness,
+    spec: TProbeSpec,
     hooks: readonly TProbedHook[],
     projectDir: string,
     runHookFn: TRunHookFn,
-    payloadFn: (probe: TGuardProbe) => string,
 ): string[] {
     const problems: string[] = [];
-    for (const probe of HARNESS_PROBES[harness]) {
-        const covering = hooks.filter((h) =>
-            harnessMatcherCovers(harness, h.matcher, probe.toolName),
-        );
+    for (const probe of spec.probes) {
+        const covering = hooks.filter((h) => spec.matcherCovers(h.matcher, probe.toolName));
         if (covering.length === 0) {
             problems.push(
                 `${probe.what} (${probe.toolName}): ни один PreToolUse-хук не накрывает ` +
@@ -198,10 +207,10 @@ function probeHookList(
             );
             continue;
         }
-        const payload = payloadFn(probe);
-        // `CLAUDE_PROJECT_DIR` в окружение хука кладёт только Claude Code — остальным
-        // харнессам проба его не подкладывает: регистрация обязана нести каталог сама.
-        const projectDirEnv = harness === 'claude-code';
+        const payload = spec.hookPayload(probe, projectDir);
+        // `CLAUDE_PROJECT_DIR` в окружение хука кладёт не каждый CLI — тем, кто не кладёт,
+        // проба его не подкладывает: регистрация обязана нести каталог сама.
+        const projectDirEnv = spec.setsProjectDirEnv;
         const runs = covering.map((hook) => ({
             hook,
             run: runHookFn(hook, payload, projectDir, { projectDirEnv }),
@@ -216,7 +225,22 @@ function verdictProblems(
     runs: readonly { hook: THookCommand; run: THookRun }[],
 ): string[] {
     if (probe.expect === 'blocked') {
-        if (runs.some(({ hook, run }) => run.status === 2 && hook.cannotBlock === null)) return [];
+        const blocking = runs.filter(
+            ({ hook, run }) => run.status === 2 && hook.cannotBlock === null,
+        );
+        // Двойка засчитывается только со своим кодом причины (#183): барьер fail-closed, и
+        // правила, не загрузившиеся по сбою, блокируют запрещённое той же двойкой — проба
+        // была зелёной ровно потому, что барьер сломан. Хук потребителя, блокирующий своим
+        // кодом или без кода, пробу не портит: хватает одного хука, назвавшего правило.
+        const reads = blocking.map(({ run }) => reasonCodeOf(run.stderr));
+        if (reads.some((r) => r.code === probe.reasonCode)) return [];
+        if (blocking.length > 0) {
+            const got = reads.map((r) => r.code ?? r.why).join('; ');
+            return [
+                `${probe.what} (${probe.toolName}): вызов заблокирован, но не правилом — ` +
+                    `ждали код причины ${probe.reasonCode}, получили: ${got}`,
+            ];
+        }
         const seen = runs
             .map(({ hook, run }) =>
                 hook.cannotBlock
@@ -240,40 +264,171 @@ function verdictProblems(
 }
 
 /**
- * PreToolUse-хуки настроек Claude Code, которые проба исполняет. Битая форма записи
- * пропускается молча: её хук не позовут и в сессии, а отказ пробы назовёт итог.
+ * Хуки настроек сессии, которые проба исполняет, — регистрация пакета харнесса настроек.
+ * Пакет не принят — хуков нет, а причину называет проба этого харнесса.
  */
 function settingsHooks(settings: unknown): TProbedHook[] {
-    if (!isPlainObject(settings) || !isPlainObject(settings.hooks)) return [];
-    const entries = settings.hooks.PreToolUse;
-    if (!Array.isArray(entries)) return [];
-    const out: TProbedHook[] = [];
-    for (const entry of entries) {
-        if (!isPlainObject(entry)) continue;
-        const one = { hooks: { PreToolUse: [{ ...entry, matcher: '' }] } };
-        for (const hook of hooksFor(one, '')) out.push({ ...hook, matcher: entry.matcher });
-    }
-    return out;
+    return settingsPackage()?.guardRegistration(settings).hooks ?? [];
 }
 
 /**
- * Проблемы пробы Claude Code для уже прочитанных настроек. Пустой список — барьер держит.
- * Чистая функция над `runHookFn`: тест подаёт фейковые исходы, а не живые процессы.
+ * Проба харнесса пакетом: регистрация, прочитанная пакетом обратно, исполнена на его
+ * событиях. Регистрация непригодна целиком (CLI не запустит ни одного хука) — её причины,
+ * хуки не запускаются: проба, запустившая их сама, увидела бы барьер, которого нет. Пакет с
+ * регистрацией плагином (`plugin`) пробуется исполнением плагина, а не хуков в обход него.
+ */
+function packageProblems(
+    pkg: HarnessPackage,
+    settings: unknown,
+    projectDir: string,
+    { runHookFn, runPluginFn }: { runHookFn: TRunHookFn; runPluginFn: TRunPluginFn },
+): string[] {
+    const guardHooks = guardHooksOf(settings, projectDir);
+    if (pkg.plugin) {
+        return pluginProblems(pkg, pkg.plugin.source(guardHooks), projectDir, runPluginFn);
+    }
+    const registration = pkg.guardRegistration(settings, guardHooks);
+    if (registration.problems.length > 0) return registration.problems;
+    return probeHookList(pkg, registration.hooks, projectDir, runHookFn);
+}
+
+/**
+ * Проблемы пробы харнесса настроек сессии для уже прочитанных настроек. Пустой список —
+ * барьер держит. Чистая функция над `runHookFn`: тест подаёт фейковые исходы.
  */
 export function probeProblems(
     settings: unknown,
     projectDir: string,
+    {
+        runHookFn = runHook,
+        registry = HARNESS_REGISTRY,
+    }: { runHookFn?: TRunHookFn; registry?: HarnessRegistry } = {},
+): string[] {
+    return harnessGuardProblems(SESSION_SETTINGS_HARNESS, settings, projectDir, {
+        runHookFn,
+        registry,
+    });
+}
+
+/**
+ * Регистрация общего guard'а: канонический хук установки или хук дерева — по имени файла.
+ * Заглушка живого цикла у копии ядра лежит под тем же именем в своём каталоге
+ * (`tests/__fixtures__/stub-guard/guard.cjs`): боевой разбор о фикстуре не знает, а хук
+ * потребителя с похожим именем (`secret-guard.cjs`) регистрацией guard не считается.
+ */
+const GUARD_HOOK_RE = /(?:^|[\s/'"])guard\.cjs(?:$|[\s'"])/;
+
+/**
+ * Предел пробы контекста (#184), сказанный строкой старта, а не абзацем: регистрации Codex,
+ * Kimi Code и OpenCode получают контекст тем же env сессии, но что их CLI отдаёт его хуку,
+ * проба не проверяет — у неё нет их сессии. Без `roots` guard их дерева узнаёт петлю только по
+ * контексту, и правка данных контура в их сессии держится недоказанным. Строка снимается с
+ * пакетами 16d, когда проба контекста пойдёт по событиям их CLI.
+ */
+export const CONTEXT_UNPROVEN_LIMIT =
+    'контекст сессии петли до их регистрации guard пробой не доказан — забор данных контура ' +
+    'в их сессии держится на том, что CLI передаёт env хуку (до пакетов 16d)';
+
+/** Правка данных контура — запрещённое ТОЛЬКО в сессии петли: по ней видно, дошёл ли контекст. */
+const CONTOUR_CODE = 'contour-data';
+const CONTOUR_WRITE: TGuardProbe = {
+    what: 'правка данных контура в сессии петли',
+    toolName: 'Write',
+    toolInput: { file_path: '.claude/ralph/hooks.json', content: '{}' },
+    expect: 'blocked',
+    reasonCode: CONTOUR_CODE,
+};
+
+/**
+ * Каждая регистрация guard'а в настройках сессии обязана получить контекст сессии (#184):
+ * проба подаёт КАЖДОЙ правку данных контура с тем окружением, которое раннер даст сессии, и
+ * ждёт от каждой блок кодом `contour-data`. Регистрация, до которой контекст не дошёл, сочла
+ * бы сессию сессией человека и пропустила бы правку — это отказ preflight, а не `loop=false`.
+ * Не «хоть один хук», как у общей пробы: прежде петлю такой хук узнавал по транскрипту, и
+ * признак снят только при условии, что ни одна регистрация без контекста не осталась.
+ * Доказывает проба это у хуков без контракта — хуков дерева и копии ядра без git. Канонический
+ * хук установки несёт `RALPH_CORE_SHA` литералом в команде, петлю узнаёт по нему и блок дал бы
+ * и без контекста; контекст ему не нужен, и снять контракт из окружения проба не может.
+ */
+export function sessionContextProblems(
+    settings: unknown,
+    projectDir: string,
+    contextValue: string,
     { runHookFn = runHook }: { runHookFn?: TRunHookFn } = {},
 ): string[] {
-    // Один флаг в корне выключает ВСЕ хуки, не тронув ни одной записи: запусти проба хуки
-    // сама, она увидела бы исправный барьер, которого в сессии нет вовсе.
-    if (isPlainObject(settings) && settings.disableAllHooks === true) {
-        return ['disableAllHooks: true — Claude Code не запустит ни одного хука в сессии'];
+    const pkg = settingsPackage();
+    if (!pkg)
+        return ['пакет харнесса настроек сессии не принят — регистрацию guard проверить нечем'];
+    const guards = pkg
+        .guardRegistration(settings)
+        .hooks.filter(
+            (h) => GUARD_HOOK_RE.test(h.command) && pkg.matcherCovers(h.matcher, 'Write'),
+        );
+    if (guards.length === 0) {
+        return [
+            `${CONTOUR_WRITE.what}: в настройках сессии нет регистрации guard.cjs на Write — ` +
+                'контекст сессии получить некому',
+        ];
     }
-    return probeHookList('claude-code', settingsHooks(settings), projectDir, runHookFn, (p) =>
-        probePayload(p, projectDir),
-    );
+    const payload = pkg.hookPayload(CONTOUR_WRITE, projectDir);
+    const contextEnv = { [SESSION_CONTEXT_ENV]: contextValue };
+    return guards.flatMap((hook) => {
+        const run = runHookFn(hook, payload, projectDir, {
+            projectDirEnv: pkg.setsProjectDirEnv,
+            env: contextEnv,
+        });
+        const read = run.status === 2 ? reasonCodeOf(run.stderr) : null;
+        if (read?.code === CONTOUR_CODE) return [];
+        const got =
+            read === null
+                ? `код выхода ${String(run.status)}`
+                : `код причины ${read.code ?? read.why}`;
+        return [
+            `${CONTOUR_WRITE.what}: регистрация «${hook.command}» не получила контекст сессии ` +
+                `или не держит забор (${got}; ждали ${CONTOUR_CODE})`,
+        ];
+    });
 }
+
+/**
+ * Вход guard в регистрациях Codex, Kimi Code и OpenCode (#186): переменная, которую читает
+ * `guard.cjs`, и значение совместимого входа 16b. Нормализаторы Codex, Kimi Code и OpenCode —
+ * заглушки до пакетов 16d, и через событие их сессии блокировались бы целиком; совместимый вход
+ * держит их запреты 16b прежним правилом, а снимается при переводе каждого пакета. Литералы сверяет
+ * тест с хуком.
+ */
+export const GUARD_INPUT_ENV = 'RALPH_GUARD_INPUT';
+export const GUARD_COMPAT_INPUT = 'compat-16b';
+
+/** Переменная, которой хук получает путь данных контура (читает `consumer-data.cjs`). */
+export const HOOKS_DATA_ENV = 'RALPH_HOOKS_DATA';
+
+/**
+ * Путь команды нормализатора пакета харнесса настроек для guard (#186, читает `guard.cjs`).
+ * Без него guard судит совместимым входом 16b: так его зовут копии хуков в деревьях.
+ */
+export const GUARD_ADAPTER_ENV = 'RALPH_GUARD_ADAPTER';
+
+/** Контракт запуска петли: ожидаемая ревизия ядра (читает `core-revision.cjs`). */
+export const CORE_SHA_ENV = 'RALPH_CORE_SHA';
+
+/**
+ * Переменные, которые раннер кладёт только в команду своего хука. В env сессии их быть не
+ * должно: его наследуют и хуки дерева сессии, и унаследованное из окружения раннера значение
+ * дало бы им чужой контракт или чужие данные контура (`withSkillGuard` в оркестраторе). Проба
+ * снимает их с окружения хука по той же причине (`runHook`): иначе она шла бы на том, чего
+ * сессия не получит.
+ */
+export const HOOK_COMMAND_ONLY_ENV: readonly string[] = [
+    CORE_SHA_ENV,
+    HOOKS_DATA_ENV,
+    // Путь нормализатора (#186) — тоже только в команде: хук дерева сессии, получивший его
+    // наследованием, судил бы событие пакетом, которого в его дереве может не быть.
+    GUARD_ADAPTER_ENV,
+    // Совместимый вход guard (#186) — только в команде хука моста: унаследованный сессией
+    // Claude Code, он перевёл бы её guard со строгого события на прежний вход 16b.
+    GUARD_INPUT_ENV,
+];
 
 /** Хук, которому для вердикта нужен транскрипт Claude Code: вне Claude Code он не исполним. */
 const TRANSCRIPT_HOOK_RE = /(?:^|[\s/'"])skill-barrier\.cjs(?:$|[\s'"])/;
@@ -304,13 +459,21 @@ const quote = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
  * (`SKILL_BARRIER_LIMIT`), а не умолчан. Узнаётся хук по имени файла — и канонический
  * (абсолютный путь в установке ядра), и хук дерева (`${CLAUDE_PROJECT_DIR}/.claude/hooks/…`).
  * Цена: у этих харнессов каталог хуков сверяет с ревизией ядра один `guard.cjs`, а не два.
+ *
+ * Та же строка `export` ставит этим хукам совместимый вход guard (`GUARD_INPUT_ENV`, #186):
+ * регистрация из настроек Claude Code без неё судила бы вход Codex, Kimi Code и OpenCode
+ * нормализатором Claude Code, а их нормализаторы до 16d — заглушки.
  */
 export function guardHooksOf(settings: unknown, projectDir: string): GuardHook[] {
+    // Регистрации остальных пакетов строятся из регистрации харнесса настроек — её читает его
+    // пакет.
     return settingsHooks(settings)
         .filter((h) => h.cannotBlock === null && !TRANSCRIPT_HOOK_RE.test(h.command))
         .map((h) => ({
             matcher: typeof h.matcher === 'string' ? h.matcher : '',
-            command: `export CLAUDE_PROJECT_DIR=${quote(projectDir)}; ${h.command}`,
+            command:
+                `export CLAUDE_PROJECT_DIR=${quote(projectDir)} ` +
+                `${GUARD_INPUT_ENV}=${GUARD_COMPAT_INPUT}; ${h.command}`,
             timeoutSec: h.timeoutSec,
         }));
 }
@@ -338,51 +501,89 @@ export const runOpencodePlugin: TRunPluginFn = (source, event, projectDir) => {
 };
 
 /**
+ * Харнессы рантаймов, чью готовую регистрацию собирают сборщики `session-settings.ts` (argv Codex,
+ * дом Kimi Code, плагин OpenCode). Имя — из профиля рантайма у адаптеров, а не строкой ядра: выбор
+ * пакета остаётся у реестра. Сборщики переезжают в пакеты в Фазе 16d.
+ */
+const CODEX_RUNTIME_HARNESS = RUNTIME_IDENTITIES.openai.harness;
+const KIMI_NATIVE_RUNTIME_HARNESS = RUNTIME_IDENTITIES['kimi-native'].harness;
+const OPENCODE_RUNTIME_HARNESS = RUNTIME_IDENTITIES.opencode.harness;
+
+/**
+ * Проба готовой регистрации пакетом харнесса: хуки, прочитанные из текста, который уйдёт в
+ * CLI, исполнены на событиях его формы. Причины разбора идут вместе с исходами хуков — так
+ * их называла проба 16b. Пакет не принят — отказ с причиной реестра, а не проба наугад.
+ */
+function readBackProblems(
+    harness: string,
+    read: { hooks: GuardHook[]; problems: string[] },
+    projectDir: string,
+    runHookFn: TRunHookFn,
+    registry: HarnessRegistry,
+): string[] {
+    const selected = selectHarness(registry, harness);
+    if (!selected.ok) return [`${selected.reason} — доказать guard нечем`];
+    const probed = read.hooks.map((h) => ({ ...h, cannotBlock: null }));
+    return [
+        ...read.problems,
+        ...probeHookList(selected.harness.pkg, probed, projectDir, runHookFn),
+    ];
+}
+
+/**
  * Проба регистрации Codex на argv, который уйдёт в `codex exec`: флаги доверия и включения
  * хуков на месте, хуки из `-c` разобраны и исполнены на событиях формы Codex.
  */
 export function codexArgsProblems(
     argv: readonly string[],
     projectDir: string,
-    { runHookFn = runHook }: { runHookFn?: TRunHookFn } = {},
+    {
+        runHookFn = runHook,
+        registry = HARNESS_REGISTRY,
+    }: { runHookFn?: TRunHookFn; registry?: HarnessRegistry } = {},
 ): string[] {
-    const { hooks, problems } = codexGuardFromArgs(argv);
-    const probed = hooks.map((h) => ({ ...h, cannotBlock: null }));
-    return [
-        ...problems,
-        ...probeHookList('codex', probed, projectDir, runHookFn, (p) =>
-            harnessHookPayload('codex', p, projectDir),
-        ),
-    ];
+    return readBackProblems(
+        CODEX_RUNTIME_HARNESS,
+        codexGuardFromArgs(argv),
+        projectDir,
+        runHookFn,
+        registry,
+    );
 }
 
 /** Проба регистрации Kimi Code на тексте `config.toml` его дома. */
 export function kimiTomlProblems(
     toml: string,
     projectDir: string,
-    { runHookFn = runHook }: { runHookFn?: TRunHookFn } = {},
+    {
+        runHookFn = runHook,
+        registry = HARNESS_REGISTRY,
+    }: { runHookFn?: TRunHookFn; registry?: HarnessRegistry } = {},
 ): string[] {
-    const { hooks, problems } = kimiHooksFromToml(toml);
-    const probed = hooks.map((h) => ({ ...h, cannotBlock: null }));
-    return [
-        ...problems,
-        ...probeHookList('kimi-code', probed, projectDir, runHookFn, (p) =>
-            harnessHookPayload('kimi-code', p, projectDir),
-        ),
-    ];
+    return readBackProblems(
+        KIMI_NATIVE_RUNTIME_HARNESS,
+        kimiHooksFromToml(toml),
+        projectDir,
+        runHookFn,
+        registry,
+    );
 }
 
 /**
- * Проба регистрации OpenCode на исходнике плагина: исполняется САМ плагин — он и есть
- * разбор события, — а не хуки в обход него. Не загрузившийся плагин (код 3) не блокирует:
- * OpenCode такой плагин пропускает (стенд, `crash`).
+ * Проба регистрации плагином на его исходнике: исполняется САМ плагин — он и есть разбор
+ * события, — а не хуки в обход него. Плагин без списка хуков — причина, плагин не
+ * запускается. Не загрузившийся плагин (код 3) не блокирует: OpenCode такой плагин
+ * пропускает (стенд, `crash`).
  */
-export function opencodePluginProblems(
+function pluginProblems(
+    pkg: HarnessPackage,
     source: string,
     projectDir: string,
-    { runPluginFn = runOpencodePlugin }: { runPluginFn?: TRunPluginFn } = {},
+    runPluginFn: TRunPluginFn,
 ): string[] {
-    const { hooks, problems } = opencodeHooksFromPlugin(source);
+    const plugin = pkg.plugin;
+    if (!plugin) return [`пакет харнесса «${pkg.harness}» регистрирует барьер не плагином`];
+    const { hooks, problems } = plugin.read(source);
     if (problems.length > 0) return problems;
     const pluginHook: THookCommand = {
         command: 'плагин OpenCode',
@@ -390,64 +591,70 @@ export function opencodePluginProblems(
         cannotBlock: null,
     };
     const out: string[] = [];
-    for (const probe of HARNESS_PROBES.opencode) {
+    for (const probe of pkg.probes) {
         const name = probe.toolName;
-        const covered = hooks.some((h) =>
-            harnessMatcherCovers('opencode', h.matcher, opencodeClaudeToolName(name)),
-        );
-        if (!covered) {
+        if (!hooks.some((h) => pkg.matcherCovers(h.matcher, name))) {
             out.push(`${probe.what} (${name}): ни один хук плагина не накрывает инструмент`);
             continue;
         }
-        const run = runPluginFn(source, opencodeEvent(probe), projectDir);
+        const run = runPluginFn(source, plugin.event(probe), projectDir);
         out.push(...verdictProblems(probe, [{ hook: pluginHook, run }]));
     }
     return out;
 }
 
-/** Исполнители пробы: хуки процессом и плагин OpenCode процессом. */
-export type TProbeRunners = { runHookFn?: TRunHookFn; runPluginFn?: TRunPluginFn };
+/**
+ * Проба регистрации OpenCode на исходнике плагина, который ляжет в каталог CLI, — пакетом
+ * харнесса рантайма. Пакет не принят — отказ с причиной реестра, а не проба наугад.
+ */
+export function opencodePluginProblems(
+    source: string,
+    projectDir: string,
+    {
+        runPluginFn = runOpencodePlugin,
+        registry = HARNESS_REGISTRY,
+    }: { runPluginFn?: TRunPluginFn; registry?: HarnessRegistry } = {},
+): string[] {
+    const selected = selectHarness(registry, OPENCODE_RUNTIME_HARNESS);
+    if (!selected.ok) return [`${selected.reason} — доказать guard нечем`];
+    return pluginProblems(selected.harness.pkg, source, projectDir, runPluginFn);
+}
+
+/** Исполнители пробы: хуки процессом и плагин процессом; реестр пакетов. */
+export type TProbeRunners = {
+    runHookFn?: TRunHookFn;
+    runPluginFn?: TRunPluginFn;
+    registry?: HarnessRegistry;
+};
 
 /**
- * Проба барьера харнесса на его регистрации, построенной из настроек сессии. Харнесс без
- * регистрации — отказ: доказать его guard нечем.
+ * Проба барьера харнесса на его регистрации, построенной из настроек сессии, — пакетом
+ * реестра. Харнесс без пакета — отказ: доказать его guard нечем; пакет, который реестр не
+ * принял, — отказ с причинами реестра. Временного моста 16b больше нет (#213): харнесс,
+ * которого реестр не знает, не стартует, а не пробуется таблицей ядра.
  */
 export function harnessGuardProblems(
     harness: string,
     settings: unknown,
     projectDir: string,
-    { runHookFn = runHook, runPluginFn = runOpencodePlugin }: TProbeRunners = {},
+    {
+        runHookFn = runHook,
+        runPluginFn = runOpencodePlugin,
+        registry = HARNESS_REGISTRY,
+    }: TProbeRunners = {},
 ): string[] {
-    const hooks = guardHooksOf(settings, projectDir);
-    switch (harness) {
-        case 'claude-code':
-            return probeProblems(settings, projectDir, { runHookFn });
-        case 'codex':
-            return codexArgsProblems(codexGuardArgs(hooks), projectDir, { runHookFn });
-        case 'kimi-code':
-            return kimiTomlProblems(kimiHooksToml(hooks), projectDir, { runHookFn });
-        case 'opencode':
-            return opencodePluginProblems(opencodeGuardPlugin(hooks), projectDir, { runPluginFn });
-        default:
-            return [
-                `харнесс «${harness}»: регистрации барьера для него нет — доказать guard нечем`,
-            ];
+    const selected = selectHarness(registry, harness);
+    if (selected.ok) {
+        return packageProblems(selected.harness.pkg, settings, projectDir, {
+            runHookFn,
+            runPluginFn,
+        });
     }
+    if (registry.problems.has(harness) || registry.problems.has(ALL_PACKAGES)) {
+        return [`${selected.reason} — доказать guard нечем`];
+    }
+    return [`харнесс «${harness}»: регистрации барьера для него нет — доказать guard нечем`];
 }
-
-/**
- * Харнессы, чью регистрацию барьера раннер ПЕРЕДАЁТ в CLI при запуске сессии. Проба
- * доказывает регистрацию, а не намерение: зелёная проба харнесса при адаптере, не отдающем
- * регистрацию CLI, была бы ложью о сессии. Kimi Code проведён адаптером `kimi-native` (#120):
- * дом CLI с `[[hooks]]` собирает и пробует раннер перед каждой сессией. OpenCode — адаптером
- * `opencode` (#121): плагин в каталоге `OPENCODE_CONFIG_DIR`, так же перед каждой сессией.
- */
-export const GUARD_WIRED_HARNESSES: ReadonlySet<string> = new Set([
-    'claude-code',
-    'codex',
-    'kimi-code',
-    'opencode',
-]);
 
 /**
  * Выбор рантайма кодера в форме конфига: статический `adapters.coderRuntime` и маршруты
@@ -512,15 +719,25 @@ export function harnessRoutes(
  * или его регистрация не передаётся CLI. Это отказ, а не предупреждение: сессия без
  * подтверждений и без барьера — ровно то, что закрывает задача 6.
  */
-export function unguardedRoutes(routes: readonly THarnessRoute[]): string[] {
+export function unguardedRoutes(
+    routes: readonly THarnessRoute[],
+    registry: HarnessRegistry = HARNESS_REGISTRY,
+): string[] {
     return routes
-        .filter((r) => r.harness === null || !GUARD_WIRED_HARNESSES.has(r.harness))
-        .map((r) =>
-            r.harness === null
-                ? `${r.where}: харнесс рантайма неизвестен — guard не доказан, сессия не стартует`
-                : `${r.where}: регистрация guard харнесса «${r.harness}» не передаётся CLI — ` +
-                  'сессия пошла бы мимо барьера',
-        );
+        .filter((r) => r.harness === null || !registry.packages.has(r.harness))
+        .map((r) => {
+            if (r.harness === null) {
+                return `${r.where}: харнесс рантайма неизвестен — guard не доказан, сессия не стартует`;
+            }
+            const selected = selectHarness(registry, r.harness);
+            if (!selected.ok && registry.problems.has(r.harness)) {
+                return `${r.where}: ${selected.reason} — сессия не стартует`;
+            }
+            return (
+                `${r.where}: регистрация guard харнесса «${r.harness}» не передаётся CLI — ` +
+                'сессия пошла бы мимо барьера'
+            );
+        });
 }
 
 /**
@@ -540,12 +757,16 @@ export function ensureGuardHolds(
         runPluginFn = runOpencodePlugin,
         runtimes = {},
         settings: given,
+        sessionContext,
+        registry = HARNESS_REGISTRY,
     }: {
         failFn: FailFn;
         logFn: LogFn;
         readFileFn?: (p: string) => string;
         runtimes?: TRuntimeSelection;
         settings?: unknown;
+        /** Контекст сессии петли (#184): задан — каждая регистрация guard обязана его получить. */
+        sessionContext?: string;
     } & TProbeRunners,
 ): void {
     const settingsPath = path.join(projectDir, '.claude', 'settings.json');
@@ -562,23 +783,30 @@ export function ensureGuardHolds(
         }
     }
     const routes = harnessRoutes(runtimes);
-    // Claude Code пробуется всегда: из его настроек строятся регистрации остальных, и битые
-    // настройки — отказ независимо от того, какой харнесс выбран.
+    // Харнесс настроек сессии пробуется всегда: из его настроек строятся регистрации
+    // остальных, и битые настройки — отказ независимо от того, какой харнесс выбран.
     const harnesses = [
         ...new Set([
-            'claude-code',
+            SESSION_SETTINGS_HARNESS,
             ...routes
                 .map((r) => r.harness)
-                .filter((h): h is string => h !== null && GUARD_WIRED_HARNESSES.has(h)),
+                .filter((h): h is string => h !== null && registry.packages.has(h)),
         ]),
     ];
     const problems = [
-        ...unguardedRoutes(routes),
+        ...unguardedRoutes(routes, registry),
         ...harnesses.flatMap((h) =>
-            harnessGuardProblems(h, settings, projectDir, { runHookFn, runPluginFn }).map(
-                (p) => `${h}: ${p}`,
-            ),
+            harnessGuardProblems(h, settings, projectDir, {
+                runHookFn,
+                runPluginFn,
+                registry,
+            }).map((p) => `${h}: ${p}`),
         ),
+        ...(sessionContext === undefined
+            ? []
+            : sessionContextProblems(settings, projectDir, sessionContext, { runHookFn }).map(
+                  (p) => `${SESSION_SETTINGS_HARNESS}: ${p}`,
+              )),
     ];
     if (problems.length > 0) {
         failFn(
@@ -591,7 +819,21 @@ export function ensureGuardHolds(
     logFn(
         `🛡  Проба барьера пройдена (${harnesses.join(', ')}): запрещённое заблокировано, безобидное пропущено`,
     );
-    if (harnesses.includes('codex')) logFn(`⚠ ${CODEX_GUARD_LIMIT}`);
-    const noSkillBarrier = harnesses.filter((h) => h !== 'claude-code');
+    for (const h of harnesses) {
+        const limit = registry.packages.get(h)?.pkg.guardLimit;
+        if (limit) logFn(`⚠ ${limit}`);
+    }
+    const noSkillBarrier = harnesses.filter((h) => !registry.packages.get(h)?.pkg.skillBarrier);
     if (noSkillBarrier.length > 0) logFn(`⚠ ${noSkillBarrier.join(', ')}: ${SKILL_BARRIER_LIMIT}`);
+    // Первый в списке — харнесс настроек сессии: контекст доказан пробой только у него.
+    const [, ...contextUnproven] = harnesses;
+    if (sessionContext !== undefined && contextUnproven.length > 0) {
+        logFn(`⚠ ${contextUnproven.join(', ')}: ${CONTEXT_UNPROVEN_LIMIT}`);
+    }
+    // Отвергнутый пакет, в который конфиг сессию не отправит, старт не держит, но молчать о
+    // нём нельзя: переключение рантайма в конфиге упёрлось бы в него посреди ночи.
+    for (const [name, reasons] of registry.problems) {
+        if (!harnesses.includes(name))
+            logFn(`⚠ пакет харнесса «${name}» не принят реестром: ${reasons.join('; ')}`);
+    }
 }

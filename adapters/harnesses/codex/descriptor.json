@@ -1,0 +1,42 @@
+{
+    "schemaVersion": 1,
+    "harness": "codex",
+    "cliVersion": "0.163.0",
+    "normalizer": "normalize.ts",
+    "toolMap": {
+        "Bash": "exec"
+    },
+    "argMap": {
+        "Bash": { "command": "command" }
+    },
+    "allowedFields": {
+        "envelope": [
+            "session_id",
+            "turn_id",
+            "transcript_path",
+            "cwd",
+            "hook_event_name",
+            "model",
+            "permission_mode",
+            "tool_name",
+            "tool_input"
+        ],
+        "tools": {
+            "Bash": ["command"]
+        }
+    },
+    "eventCoverage": {
+        "PreToolUse": {
+            "mode": "intercepted",
+            "evidence": "-c hooks.PreToolUse в argv codex exec с --dangerously-bypass-hook-trust и --enable hooks; проба на том argv перед каждой сессией (core/session-settings.ts, prepareCodexGuardArgs); хук зовётся только на оболочке — apply_patch мимо него (CODEX_GUARD_LIMIT)"
+        }
+    },
+    "configSurfaces": [".codex/config.toml"],
+    "forbiddenEnv": [],
+    "mcpNames": {},
+    "skillEvidence": {
+        "source": "заглушка: доказательства загрузки скилла нет — транскрипт rollout без вызова Skill (SKILL_BARRIER_LIMIT); поставщик — Фаза 16e"
+    },
+    "rules": ["AGENTS.md"],
+    "inventorySource": "заглушка: перечень — вход хука со стенда Фазы 11 (adapters/__fixtures__/hook-events.json); исследование CLI и нормализатор — Фаза 16d"
+}

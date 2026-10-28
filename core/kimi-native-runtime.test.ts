@@ -9,6 +9,7 @@ import { createOrchestrator } from './orchestrator.ts';
 import { KIMI_HOME_ENV, KIMI_MAX_STEPS_ENV, kimiStreamText } from '../adapters/kimi-native.ts';
 import { stripComments } from '../tests/strip-comments.ts';
 import { sideEffectAttempts } from '../shared/side-effect-guard.ts';
+import { heldRun } from '../tests/guard-fake.ts';
 
 type SpawnSyncFn = typeof import('node:child_process').spawnSync;
 type SpawnCall = [string, string[], { env?: Record<string, string | undefined>; stdio?: unknown }];
@@ -458,10 +459,7 @@ describe('kimiNativeHomeFor — дом с барьером перед каждо
         const home = build().kimiNativeHomeFor(
             {
                 readFileFn: () => '{}',
-                runHookFn: (_h: unknown, payload: string) => ({
-                    status: payload.includes('git status') ? 0 : 2,
-                    stderr: '',
-                }),
+                runHookFn: (_h: unknown, payload: string) => heldRun(payload),
                 writeFileFn: () => {},
                 mkdirFn: () => {},
                 linkFn: () => {},

@@ -15,6 +15,7 @@ import {
 import { stripComments } from '../tests/strip-comments.ts';
 import { sideEffectAttempts } from '../shared/side-effect-guard.ts';
 import { listOpencodeSkills } from './session-settings.ts';
+import { heldRun } from '../tests/guard-fake.ts';
 
 type SpawnSyncFn = typeof import('node:child_process').spawnSync;
 type SpawnCall = [
@@ -546,10 +547,8 @@ describe('opencodeConfigDirFor — каталог с барьером перед
         const dir = build().opencodeConfigDirFor(
             {
                 readFileFn: () => '{}',
-                runPluginFn: (_src: string, ev: { output: Record<string, unknown> }) => ({
-                    status: JSON.stringify(ev.output.args).includes('git status') ? 0 : 2,
-                    stderr: '',
-                }),
+                runPluginFn: (_src: string, ev: { output: Record<string, unknown> }) =>
+                    heldRun(JSON.stringify(ev)),
                 writeFileFn: () => {},
                 mkdirFn: () => {},
                 listDirFn: () => [],

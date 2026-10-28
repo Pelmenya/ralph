@@ -1,0 +1,38 @@
+{
+    "schemaVersion": 1,
+    "harness": "opencode",
+    "cliVersion": "1.19.4",
+    "normalizer": "normalize.ts",
+    "toolMap": {
+        "bash": "exec",
+        "read": "read",
+        "grep": "search"
+    },
+    "argMap": {
+        "bash": { "command": "command" },
+        "read": { "path": "filePath" },
+        "grep": { "root": "path", "contentPattern": "pattern" }
+    },
+    "allowedFields": {
+        "envelope": ["tool", "sessionID", "callID", "args"],
+        "tools": {
+            "bash": ["command"],
+            "read": ["filePath"],
+            "grep": ["pattern", "path"]
+        }
+    },
+    "eventCoverage": {
+        "tool.execute.before": {
+            "mode": "intercepted",
+            "evidence": "плагин барьера в каталоге OPENCODE_CONFIG_DIR, который собирает раннер; проба исполняет тот исходник на событиях OpenCode перед каждой сессией (core/session-settings.ts, prepareOpencodeSession)"
+        }
+    },
+    "configSurfaces": [".opencode", "opencode.json"],
+    "forbiddenEnv": [],
+    "mcpNames": {},
+    "skillEvidence": {
+        "source": "заглушка: доказательства загрузки скилла нет — транскрипта плагин хуку не отдаёт (SKILL_BARRIER_LIMIT); поставщик — Фаза 16e"
+    },
+    "rules": ["AGENTS.md"],
+    "inventorySource": "заглушка: перечень — событие живого прогона адаптера (adapters/__fixtures__/hook-events.json) и состав пробы 16b (adapters/harness-guard.ts); фикстуры и нормализатор — Фаза 16d"
+}

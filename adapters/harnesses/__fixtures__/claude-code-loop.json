@@ -1,0 +1,79 @@
+{
+    "source": "Собранные фикстуры (assembled): конверт — живое событие Claude Code 2.1.311 со стенда Фазы 11 (adapters/__fixtures__/hook-events.json) плюс tool_use_id из схемы входа хука CLI 2.1.312; tool_input каждого инструмента — набор полей самого полного вызова этого инструмента в транскриптах сессий петли канона и потребителя (снято 28.10). Значения полей заменены абстрактными, имена полей и их типы — как в транскриптах.",
+    "assembled": true,
+    "envelope": {
+        "session_id": "7b5698f5-8ee4-4343-a501-b31c1832d936",
+        "transcript_path": "/path/to/transcript.jsonl",
+        "cwd": "/path/to/loop",
+        "prompt_id": "22476180-ebaa-43fa-980e-a29d144ea6f1",
+        "permission_mode": "bypassPermissions",
+        "effort": { "level": "medium" },
+        "hook_event_name": "PreToolUse",
+        "tool_use_id": "toolu_01ExampleExampleExample"
+    },
+    "calls": [
+        {
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "git status",
+                "description": "Показать состояние дерева",
+                "run_in_background": false,
+                "timeout": 600000
+            }
+        },
+        {
+            "tool_name": "Read",
+            "tool_input": { "file_path": "/path/to/loop/core/gate.ts", "offset": 1, "limit": 40 }
+        },
+        {
+            "tool_name": "Write",
+            "tool_input": { "file_path": "/path/to/loop/core/a.ts", "content": "export {};\n" }
+        },
+        {
+            "tool_name": "Edit",
+            "tool_input": {
+                "file_path": "/path/to/loop/core/a.ts",
+                "old_string": "a",
+                "new_string": "b",
+                "replace_all": false
+            }
+        },
+        { "tool_name": "Skill", "tool_input": { "skill": "vitest", "args": "" } },
+        {
+            "tool_name": "ToolSearch",
+            "tool_input": { "query": "select:Monitor", "max_results": 1 }
+        },
+        {
+            "tool_name": "Agent",
+            "tool_input": {
+                "description": "Обзор каталога",
+                "model": "opus",
+                "prompt": "Найди, где собирается settings сессии",
+                "run_in_background": false,
+                "subagent_type": "Explore"
+            }
+        },
+        {
+            "tool_name": "ScheduleWakeup",
+            "tool_input": {
+                "delaySeconds": 1200,
+                "noop": true,
+                "prompt": "проверь лог",
+                "reason": "ждём прогон"
+            }
+        },
+        {
+            "tool_name": "Monitor",
+            "tool_input": {
+                "command": "tail -f /path/to/loop/run.log",
+                "description": "лог прогона",
+                "timeout_ms": 600000
+            }
+        },
+        { "tool_name": "TaskStop", "tool_input": { "task_id": "b0example" } },
+        {
+            "tool_name": "mcp__sourcecraft__GetIssue",
+            "tool_input": { "org_slug": "your-org", "repo_slug": "your-project", "issue_slug": "1" }
+        }
+    ]
+}

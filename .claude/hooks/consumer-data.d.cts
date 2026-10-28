@@ -2,7 +2,13 @@
 export type TSkillRow = { test: (subject: string) => boolean; skills: string[]; why: string };
 
 export type TConsumerData = {
-    mcp: { writeAllowed: Set<string>; neverExceptions: Set<string> };
+    mcp: {
+        writeAllowed: Set<string>;
+        neverExceptions: Set<string>;
+        tools: Map<string, 'read' | 'write'>;
+        /** Данные заявили `mcp.tools`: guard судит MCP по эффектам, а не по префиксу имени. */
+        toolsDeclared: boolean;
+    };
     skills: { files: TSkillRow[]; commands: TSkillRow[] };
 };
 

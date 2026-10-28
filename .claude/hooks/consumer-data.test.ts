@@ -204,6 +204,19 @@ describe('guard на правилах из данных потребителя',
             'git add examples/hooks.json.example',
             'npx prettier --write examples/hooks.json.example',
             'git commit -m "docs: пример данных .claude/ralph/hooks.json"',
+            // Каталог данных — только `.claude` и `.claude/ralph`, и только у переносящих (#187).
+            'ls -la .claude/ralph',
+            'mv .claude-template/x .claude-template/y',
+            'rm -r .claude/ralph/cache',
+            'rm build/*',
+            'git diff .claude',
+            // Каталог вызова судится только у заменяющих пути (ревью 16c, проход 3).
+            "find -name '*.ts' -exec grep -l foo {} +",
+            'find . -name x',
+            'find src -delete',
+            'tar -xf x.tar -C src',
+            'git add .',
+            'ls ..',
         ]) {
             expect(decide('Bash', { command }, loop).blocked, command).toBe(false);
         }
@@ -218,7 +231,21 @@ describe('guard на правилах из данных потребителя',
             `node -e "require('fs').writeFileSync('hooks.json', '{}')"`,
             'cp /tmp/x.json .claude/ralph/hooks.json',
             'tee .claude/ralph/hooks.json < /tmp/x.json',
+            // Каталог данных переносится или удаляется целиком, не называя файла (#187).
+            'mv .claude/ralph /tmp/old',
+            'mv .claude bak',
+            'rm -r ./.claude/ralph/',
+            'cp -r /tmp/evil .claude',
             'git checkout other -- .claude/ralph/hooks.json',
+            // Путь-каталог у git, find с удалением, tar с извлечением и шаблон оболочки,
+            // раскрывающийся в каталог данных (ревью 16c).
+            'git checkout main -- .claude',
+            'git restore --source=HEAD~3 .claude',
+            'git -C .claude checkout other -- ralph',
+            'git archive other .claude | tar -x',
+            'find .claude -delete',
+            'mv .c?aude bak',
+            'cp -r evil/. .c*',
             // Глобальные опции git сдвигают подкоманду, `>|` пишет в обход noclobber
             // (ревью Фазы 11, #133).
             'git -C .claude/ralph checkout other -- hooks.json',
@@ -252,6 +279,42 @@ describe('guard на правилах из данных потребителя',
             // `declare -x`/`typeset -x` экспортируют аргументом, мимо присваиваний разбора.
             'declare -x GIT_EXTERNAL_DIFF=tee; git diff -- .claude/ralph/hooks.json',
             'typeset -x GIT_DIR=.git; git diff -- .claude/ralph/hooks.json',
+            // Pathspec git шире шаблона оболочки (ревью 16c, проход 1).
+            "git checkout other -- '*'",
+            "git checkout other -- '*hooks.json'",
+            "git checkout other -- ':/'",
+            "git restore --source=HEAD~3 '*.json'",
+            // `{}` резал аргументы `find`; регистр pathspec — опцией git (проход 2).
+            'find .claude/ralph -type f -exec cat {} + -exec cp /tmp/evil {} +',
+            'find .claude -exec cat {} + -delete',
+            'git --icase-pathspecs checkout other -- .CLAUDE/RALPH/HOOKS.JSON',
+            'git --icase-pathspecs restore --source=HEAD~1 .CLAUDE',
+            // Ревью 16c, проход 3: режим pathspec окружением, `-m` как `--merge` у checkout и
+            // restore, алиас git вне перечня подкоманд.
+            'GIT_ICASE_PATHSPECS=1 git checkout other -- .CLAUDE/RALPH/HOOKS.JSON',
+            'GIT_ICASE_PATHSPECS=1 git restore --source=HEAD~1 .CLAUDE',
+            'export GIT_ICASE_PATHSPECS=1; git restore --source=HEAD~1 .CLAUDE',
+            'env GIT_ICASE_PATHSPECS=1 git restore --source=HEAD~1 .CLAUDE',
+            'env GIT_GLOB_PATHSPECS=1 git restore --source=HEAD~1 .CLAUDE',
+            'GIT_GLOB_PATHSPECS=1 git checkout other -- x',
+            'GIT_WORK_TREE=.claude git checkout other -- ralph',
+            "git checkout -m '*hooks.json'",
+            "git checkout -m '*'",
+            "git restore -m '*'",
+            "git restore --worktree --staged -m '*'",
+            "git co HEAD~1 '*hooks.json'",
+            "git -c alias.co=checkout co HEAD~1 '*hooks.json'",
+            // Без точки старта GNU find обходит `.` (ревью 16c, проход 3).
+            "find -name 'hooks.j*' -exec cp /tmp/evil {} ;",
+            'find -execdir cp /tmp/e {} ;',
+            'find -delete',
+            'find -L -delete',
+            // Строкой каталог вызова не разрешить: `.` и `..` — предок данных.
+            "find . -name 'hooks.j*' -exec cp /tmp/evil {} ;",
+            'find .. -delete',
+            'tar -xf x.tar',
+            'mv . ../x',
+            'git checkout other -- .',
         ]) {
             expect(decide('Bash', { command }, loop).blocked, command).toBe(true);
         }

@@ -199,6 +199,14 @@ describe('находки ревью Codex terra, проход 5', () => {
         expect(blocked("find . -name '*.log' -exec cat {} +")).toBe(false);
     });
 
+    // Ревью 16c, проход 2: `{}` резал аргументы `find`, второй `-exec` уходил в вызов `+`.
+    it('каждое -exec у find — свой вызов, а группа `{ …; }` остаётся группой', () => {
+        expect(blocked('find . -exec cat {} + -exec rm -rf {} +')).toBe(true);
+        expect(blocked('find . -exec cat {} \\; -ok rm -rf {} \\;')).toBe(true);
+        expect(blocked('{ rm -rf /tmp/x; }')).toBe(true);
+        expect(blocked('find . -exec cat {} + -exec wc -l {} +')).toBe(false);
+    });
+
     it('here-string оболочке — её программа', () => {
         expect(blocked("bash <<< 'rm -rf /tmp/x'")).toBe(true);
         expect(blocked("cat <<< 'rm -rf /tmp/x'")).toBe(false);

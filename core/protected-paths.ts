@@ -94,6 +94,16 @@ export const PROTECTED_PATHS: readonly ProtectedPath[] = [
         why: '`.claude/hooks/**` — сами хуки сессии',
     },
     {
+        // С #186 guard судит событие, которое отдаёт нормализатор пакета, а `toolMap` описания
+        // решает, что барьер не судит вовсе (`inert`). Перевод инструмента в `inert` или
+        // потерянное поле пути снимают правило целиком, и предстартовая проба заметит это
+        // только у инструментов из своего состава — не у нового, заведённого сразу `inert`.
+        path: 'adapters/harnesses/claude-code/descriptor.json',
+        exact: false,
+        pattern: 'adapters/harnesses/**',
+        why: '`adapters/harnesses/**` — описания и нормализаторы пакетов: что и как судит guard',
+    },
+    {
         path: '.sourcecraft/review.yaml',
         exact: false,
         pattern: '.sourcecraft/**',

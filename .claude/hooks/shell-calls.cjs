@@ -30,6 +30,9 @@ const MAX_DEPTH = 3;
  */
 const SEGMENT_CHARS = new Set([';', '|', '&', '\n', '(', ')', '{', '}']);
 
+/** Действия `find`, которые исполняют над найденным программу. */
+const FIND_EXEC_ACTIONS = new Set(['-exec', '-execdir', '-ok', '-okdir']);
+
 /**
  * Токен и то, как он был записан: содержимое ОДИНАРНЫХ кавычек оболочка не раскрывает,
  * значит подстановку внутри него исполнять не будет — а из двойных будет.
@@ -73,7 +76,8 @@ function segmentsOf(text) {
     const segments = [];
     let current = '';
     let quote = null;
-    for (const ch of text) {
+    for (let i = 0; i < text.length; i += 1) {
+        const ch = text[i];
         if (quote) {
             current += ch;
             if (ch === quote) quote = null;
@@ -88,6 +92,14 @@ function segmentsOf(text) {
         // разделителем не является (ревью, проход 5).
         if (ch === '&' && /[<>]$/.test(current)) {
             current += ch;
+            continue;
+        }
+        // `{}` — слово, а не группа: группу оболочка открывает `{` с пробелом после. Разрез
+        // на нём уносил хвост `find … -exec cat {} + -exec cp x {} +` в вызов с именем `+`,
+        // и второе действие `find` не видел никто (ревью 16c, проход 2).
+        if (ch === '{' && text[i + 1] === '}') {
+            current += '{}';
+            i += 1;
             continue;
         }
         if (SEGMENT_CHARS.has(ch) && !current.endsWith('\\')) {
@@ -353,18 +365,21 @@ function shellCalls(command, depth = 0) {
         if (SHELL_NAMES.has(call.name)) nested.push(commandFlagArgument(call.args));
         nested.push(...substitutionsOf(segment));
         // `find … -exec rm -rf {} +` — команда, которую запустит find, а не его аргументы.
+        // Действий с командой у `find` бывает несколько — каждое своим вызовом.
         if (call.name === 'find') {
             const argv = call.args.map(({ value }) => value);
-            const at = argv.findIndex((arg) => arg === '-exec' || arg === '-execdir');
-            if (at >= 0) {
-                const until = argv.findIndex((arg, i) => i > at && (arg === ';' || arg === '+'));
-                const inner = argv.slice(at + 1, until < 0 ? argv.length : until);
+            for (let at = 0; at < argv.length; at += 1) {
+                if (!FIND_EXEC_ACTIONS.has(argv[at])) continue;
+                const rest = argv.slice(at + 1);
+                const end = rest.findIndex((arg) => arg === ';' || arg === '\\;' || arg === '+');
+                const inner = rest.slice(0, end < 0 ? rest.length : end);
                 // Разбираем как обычный вызов: после `-exec` бывают и обёртки, и
                 // присваивания окружения (`env LC_ALL=C rm -rf`), и путь к бинарнику.
                 if (inner.length) {
                     const execCall = callOf(inner.join(' '));
                     if (execCall.name || execCall.assignments.length) calls.push(execCall);
                 }
+                at += inner.length;
             }
         }
     }

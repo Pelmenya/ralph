@@ -37,7 +37,7 @@ export const PRODUCT_ROOT = path.resolve(import.meta.dirname, '..');
 // идёт под синтетическим исправным хуком — сценарии проверяют код ядра, а не guard.
 const DEFAULT_GUARD_HOOK = coreIsRepoRoot()
     ? 'node "${CLAUDE_PROJECT_DIR}/.claude/ralph/.claude/hooks/guard.cjs"'
-    : 'node "${CLAUDE_PROJECT_DIR}/.claude/ralph/tests/__fixtures__/stub-guard.cjs"';
+    : 'node "${CLAUDE_PROJECT_DIR}/.claude/ralph/tests/__fixtures__/stub-guard/guard.cjs"';
 
 /** Что в песочнице лежит и куда смотреть после прогона. */
 export type LiveSandbox = {

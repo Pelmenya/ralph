@@ -13957,6 +13957,7 @@ describe('syncProjectBoard', () => {
 import path from 'node:path';
 import { createOrchestrator, pickLiveCandidate } from './orchestrator.ts';
 import { stripComments } from '../tests/strip-comments.ts';
+import { heldRun } from '../tests/guard-fake.ts';
 
 // Платформенное: тест опирается на POSIX-механизмы, которых на Windows нет
 // (/proc/<pid>/cmdline, пути соседнего worktree, /bin/sh). Раннер живёт на
@@ -16441,10 +16442,7 @@ describe('codexGuardArgsFor: регистрация барьера Codex пер�
         const args = ralph.codexGuardArgsFor(
             {
                 readFileFn: () => '{}',
-                runHookFn: (_h: unknown, payload: string) => ({
-                    status: payload.includes('git status') ? 0 : 2,
-                    stderr: '',
-                }),
+                runHookFn: (_h: unknown, payload: string) => heldRun(payload),
             },
             {
                 tree: '/work',
@@ -16483,6 +16481,33 @@ describe('codexGuardArgsFor: регистрация барьера Codex пер�
     });
 });
 
+// Ревью Фазы 16c: версия CLI, с которой снято описание пакета, не сверялась, а перечни полей
+// строгие — автообновление CLI блокировало бы каждый вызов, и старт этого не видел.
+describe('версия CLI против описания пакета — строка ⚠ один раз на версию', () => {
+    it('расхождение названо однажды, совпадение и «не прочиталась» — молчат', () => {
+        const registry = {
+            packages: new Map([['h', { descriptor: { cliVersion: '1.0.0' } }]]),
+            problems: new Map(),
+        } as never;
+        const lines: string[] = [];
+        const warn = (v: string) =>
+            ralph.warnCliVersionDrift('h', v, { logFn: (m: string) => lines.push(m), registry });
+        warn('1.0.0');
+        warn('unknown');
+        warn('1.1.0');
+        warn('1.1.0');
+        expect(lines).toHaveLength(1);
+        expect(lines[0]).toMatch(/^⚠ описание пакета «h» снято с CLI 1\.0\.0, исполняется 1\.1\.0/);
+    });
+
+    it('проводка: версия перед сессией сверяется с описанием', () => {
+        const src = fs.readFileSync(path.join(import.meta.dirname, 'orchestrator.ts'), 'utf-8');
+        const start = src.indexOf('    function sessionCliVersion(');
+        const body = src.slice(start, src.indexOf('\n    }\n', start));
+        expect(body).toMatch(/driftFn\(id\.harness, v\.version\)/);
+    });
+});
+
 // Ревью Фазы 12: в раскладке без `roots` контракта нет, и барьер скиллов в сессиях петли
 // снимался молча. Раннер включает его переключателем в env сессии.
 describe('барьер скиллов без roots — переключатель в env сессии', () => {
@@ -16517,6 +16542,82 @@ describe('барьер скиллов без roots — переключател�
         expect(base.RALPH_CORE_SHA).toBe('f'.repeat(40));
     });
 
+    // #184: доверенный контекст сессии едет в env каждой сессии петли; унаследованный из
+    // окружения раннера (раннер запущен из сессии петли) — не проходит.
+    it('контекст сессии — в env сессии, унаследованный снимается', () => {
+        const ctx = '{"loop":true}';
+        expect(ralph.withSkillGuard(undefined, { A: '1' }, false, ctx)).toEqual({
+            A: '1',
+            RALPH_SESSION_CONTEXT: ctx,
+        });
+        expect(
+            ralph.withSkillGuard(
+                undefined,
+                { A: '1', RALPH_SESSION_CONTEXT: 'чужой' },
+                false,
+                null,
+            ),
+        ).toEqual({ A: '1' });
+        expect(ralph.withSkillGuard({ RALPH_SESSION_CONTEXT: 'чужой' }, {}, true, ctx)).toEqual({
+            RALPH_SKILL_GUARD: 'on',
+            RALPH_SESSION_CONTEXT: ctx,
+        });
+    });
+
+    it('контекст: вне main() его нет, с деревом — оба корня, без абсолютного дерева — стоп', () => {
+        expect(ralph.sessionContextValue({ tree: null, roots: null })).toBeNull();
+        const noRoots = JSON.parse(
+            ralph.sessionContextValue({ tree: '/path/to/app', roots: null }) as string,
+        );
+        expect(noRoots).toMatchObject({
+            loop: true,
+            coreRevision: '',
+            roots: { consumer: '/path/to/app', execution: '/path/to/app' },
+        });
+        const withRoots = JSON.parse(
+            ralph.sessionContextValue({
+                tree: '/path/to/app-ralph',
+                roots: {
+                    productRoot: '/core',
+                    humanRoot: '/path/to/app',
+                    sessionTree: '/path/to/app-ralph',
+                    coreSha: 'a'.repeat(40),
+                },
+            }) as string,
+        );
+        expect(withRoots.roots).toEqual({
+            consumer: '/path/to/app',
+            execution: '/path/to/app-ralph',
+        });
+        const pushes: string[] = [];
+        expect(() =>
+            ralph.sessionContextValue({
+                tree: 'app',
+                roots: null,
+                persistFn: null,
+                pushEventFn: (msg: string) => {
+                    pushes.push(msg);
+                    return false;
+                },
+                exitFn: (code: number): never => {
+                    throw new Error(`exit ${String(code)}`);
+                },
+            }),
+        ).toThrow('exit 1');
+        expect(pushes[0]).toMatch(/Контекст сессии не собран/);
+    });
+
+    it('проводка: main() собирает контекст до пробы старта и отдаёт его пробе', () => {
+        const src = fs.readFileSync(path.join(import.meta.dirname, 'orchestrator.ts'), 'utf-8');
+        const main = src.slice(src.indexOf('function main('));
+        const built = main.indexOf('const startContext = loopSessionContext(');
+        const probe = main.indexOf('ensureGuardHolds(sessionTree, {');
+        expect(built).toBeGreaterThan(-1);
+        expect(probe).toBeGreaterThan(built);
+        expect(main.slice(probe, probe + 400)).toMatch(/sessionContext: startContext/);
+        expect(main.slice(built, probe)).toMatch(/if \(!startContext\.ok\) fail\(/);
+    });
+
     it('проводка: main() включает его в ветке без roots, оба claude-спавна идут через него', () => {
         const src = fs.readFileSync(path.join(import.meta.dirname, 'orchestrator.ts'), 'utf-8');
         const main = src.slice(src.indexOf('function main('));
@@ -16527,6 +16628,40 @@ describe('барьер скиллов без roots — переключател�
         expect(noRoots - on).toBeLessThan(100);
         expect(src).toMatch(/withSkillGuard\(claudeSessionEnv\(authToken\)\)/);
         expect(src).toMatch(/withSkillGuard\(buildKimiSpawnEnv\(/);
+    });
+
+    // Ревью Фазы 16c: сторожились только два claude-спавна, и снятие `withSkillGuard` у Codex,
+    // Kimi Code или OpenCode проходило зелёным — их сессия шла бы без контекста петли.
+    it.each([
+        ['runKimiOnce', 'spawnClaude', /withSkillGuard\(buildKimiSpawnEnv\(/],
+        ['runOpenAIOnce', 'spawnCodex', /withSkillGuard\(openaiEnv\)/],
+        ['runKimiNativeOnce', 'spawnKimiNative', /withSkillGuard\(buildKimiNativeSpawnEnv\(/],
+        ['runOpencodeOnce', 'spawnOpencode', /withSkillGuard\(buildOpencodeSpawnEnv\(/],
+    ])('проводка: %s отдаёт %s env из withSkillGuard', (fn, spawn, guarded) => {
+        const src = fs.readFileSync(path.join(import.meta.dirname, 'orchestrator.ts'), 'utf-8');
+        const start = src.indexOf(`    function ${fn}(`);
+        expect(start).toBeGreaterThan(-1);
+        const body = src.slice(start, src.indexOf('\n    }\n', start));
+        expect(body).toMatch(new RegExp(`const env = ${guarded.source}`));
+        // Спавн получает именно этот env, а не собранный рядом мимо него.
+        expect(body).toMatch(new RegExp(`${spawn}\\([^;]*\\benv\\b`));
+        expect(body).not.toMatch(/\benv:\s*process\.env\b[^;]*\bprompt\b/);
+    });
+
+    it('живой env Codex-сессии несёт контекст петли (#184)', () => {
+        const ctx = '{"loop":true}';
+        const env = ralph.withSkillGuard({ OPENAI_API_KEY: 'k' }, {}, false, ctx);
+        expect(env).toEqual({ OPENAI_API_KEY: 'k', RALPH_SESSION_CONTEXT: ctx });
+    });
+
+    it('проводка: проба settings и env сессии — один контекст, null не прячется приведением', () => {
+        const src = fs.readFileSync(path.join(import.meta.dirname, 'orchestrator.ts'), 'utf-8');
+        const start = src.indexOf('    function sessionSettingsArgs(');
+        const body = src.slice(start, src.indexOf('\n    }\n', start));
+        expect(body).not.toMatch(/context as string/);
+        expect(body).toMatch(/if \(context === null\)/);
+        expect(body).toMatch(/probedSessionContext = context;/);
+        expect(src).toMatch(/context: string \| null = takeSessionContext\(\)/);
     });
 });
 

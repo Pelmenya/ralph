@@ -3,9 +3,6 @@ export type TRevisionVerdict = { loop: boolean; error: string | null };
 
 export declare const CORE_SHA_ENV: string;
 export declare const SHA_RE: RegExp;
-export declare const LOOP_PROMPT_RE: RegExp;
-export declare function firstUserPrompt(lines: string[]): string;
-export declare function isLoopPrompt(lines: string[]): boolean;
 export declare function expectedSha(env?: Record<string, string | undefined>): string;
 export declare function blobHash(content: Buffer | string, sha: string): string;
 export declare function lsTree(dir: string, sha: string): Map<string, string>;

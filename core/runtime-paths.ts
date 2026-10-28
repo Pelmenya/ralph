@@ -6,6 +6,7 @@
 // файлов во втором месте разъехалось бы с ней на первом же новом файле состояния.
 
 import path from 'node:path';
+import { OPENCODE_RUNTIME } from '../adapters/opencode.ts';
 
 /**
  * Пути состояния ВНУТРИ заданного `runtimeDir` — чистая функция, чтобы состав переехавших
@@ -31,7 +32,7 @@ export type TRuntimePaths = {
     dryHeartbeat: string;
     sessionSettings: string;
     kimiNative: string;
-    opencode: string;
+    opencodeSession: string;
     activations: string;
 };
 
@@ -71,7 +72,7 @@ export function runtimePathsIn(runtimeDir: string): TRuntimePaths {
         kimiNative: path.join(runtimeDir, 'kimi-native'),
         // #121: КАТАЛОГ сессии `opencode` — `config/` для `OPENCODE_CONFIG_DIR`: плагин барьера
         // и настройки сессии. Пересобирается перед каждой сессией, как дом `kimi-native`.
-        opencode: path.join(runtimeDir, 'opencode'),
+        opencodeSession: path.join(runtimeDir, OPENCODE_RUNTIME),
         // #38: журнал активации ревизий ядра — какая исполнялась, когда, с какой снята.
         activations: path.join(runtimeDir, 'ralph.activations.jsonl'),
     };

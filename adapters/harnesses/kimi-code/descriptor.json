@@ -1,0 +1,46 @@
+{
+    "schemaVersion": 1,
+    "harness": "kimi-code",
+    "cliVersion": "2.3.2",
+    "normalizer": "normalize.ts",
+    "toolMap": {
+        "Bash": "exec",
+        "Read": "read",
+        "Grep": "search"
+    },
+    "argMap": {
+        "Bash": { "command": "command" },
+        "Read": { "path": "path" },
+        "Grep": { "root": "path", "contentPattern": "pattern" }
+    },
+    "allowedFields": {
+        "envelope": [
+            "hook_event_name",
+            "session_id",
+            "cwd",
+            "client_type",
+            "tool_name",
+            "tool_input",
+            "tool_call_id"
+        ],
+        "tools": {
+            "Bash": ["command"],
+            "Read": ["path"],
+            "Grep": ["pattern", "path", "output_mode"]
+        }
+    },
+    "eventCoverage": {
+        "PreToolUse": {
+            "mode": "intercepted",
+            "evidence": "[[hooks]] в config.toml дома CLI, который собирает раннер; проба на том тексте перед каждой сессией (core/session-settings.ts, prepareKimiNativeHome)"
+        }
+    },
+    "configSurfaces": [],
+    "forbiddenEnv": [],
+    "mcpNames": {},
+    "skillEvidence": {
+        "source": "заглушка: доказательства загрузки скилла нет — транскрипта хуку CLI не отдаёт (SKILL_BARRIER_LIMIT); поставщик — Фаза 16e"
+    },
+    "rules": ["AGENTS.md"],
+    "inventorySource": "заглушка: перечень — вход хука со стенда Фазы 11 и состав пробы 16b (adapters/harness-guard.ts); фикстуры и нормализатор — Фаза 16d"
+}

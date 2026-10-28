@@ -74,6 +74,8 @@ const { touchesHostService } = require('./guard-host-services.cjs');
 const { killsForeignProcess } = require('./guard-process-kill.cjs');
 const { argValues, basenameOf } = require('./shell-calls.cjs');
 const { emptyData } = require('./consumer-data.cjs');
+const fs = require('node:fs');
+const path = require('node:path');
 
 // --- MCP -------------------------------------------------------------------
 //
@@ -140,6 +142,22 @@ function mcpAllowed(toolName, mcp = emptyData().mcp) {
     return mcp.writeAllowed.has(toolName);
 }
 
+/**
+ * Разрешён ли MCP-вызов по эффектам политики (`mcp.tools`, #185). Его зовут guard на событии
+ * (`mcpEventAllowed`, когда данные заявили эффекты — `toolsDeclared`) и мигратор
+ * (`mcp-effects.cjs`), доказывая, что мигрированные данные решают так же, как префикс.
+ *
+ * Нет записи — эффект `unknown`, блок: инструмент, о котором политика молчит, не читается
+ * по имени. Запрет ядра по слову остаётся сильнее эффекта, вычет — по полному имени и только
+ * для заявленной мутации, как у `mcpAllowed`.
+ */
+function mcpAllowedByEffect(toolName, mcp = emptyData().mcp) {
+    const effect = mcp.tools.get(toolName);
+    if (effect === undefined) return false;
+    if (mcp.neverExceptions.has(toolName)) return effect === 'write';
+    return !MCP_NEVER_RE.test(toolName);
+}
+
 const ALLOWED = { blocked: false, reason: null };
 
 /** Инструменты, у которых в аргументах — путь к файлу. */
@@ -147,6 +165,32 @@ const WRITE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
 
 // Данные контура (`DATA_PATH`) в пути вызова — с любым началом и разделителем.
 const DATA_PATH_RE = /(^|[\\/])\.claude[\\/]ralph[\\/]hooks\.json$/;
+
+// Каталог-предок данных контура строкой: `.claude`, `.claude/ralph`, с хвостовыми `/`.
+// Перенос или удаление такого каталога уносит данные, не называя файла (#187).
+const DATA_ANCESTOR_RE = /(^|[\\/])\.claude(?:[\\/]ralph)?[\\/]*$/;
+// Путь из одних `.` и `..`: каталог вызова или выше. Строкой не узнать, нет ли в нём данных,
+// и забор без файловой системы считает его предком данных.
+const CALL_DIR_RE = /^\.\.?(?:[\\/]+\.\.?)*[\\/]*$/;
+// Команды, которые переносят, удаляют или заменяют путь целиком. Источник и назначение у
+// них не различаются: `cp -r .claude/ralph /tmp/x` — копия наружу, а не правка, но
+// разбор `-t`/`--target-directory` у каждой утилиты свой, и ошибка в нём — дыра, а
+// лишний отказ на копии каталога хуков петле ничего не стоит.
+const TREE_MOVERS = new Set(['mv', 'rm', 'rmdir', 'cp', 'rsync', 'ln', 'install', 'unlink']);
+// Действия `find`, которые удаляют найденное или пишут файл: `-delete` уносит каталог данных
+// так же, как `rm`, `-fprint` пишет в файл по имени.
+const FIND_WRITE_RE = /^-(?:delete|fprint0?|fprintf|fls)$/;
+// Действия `find`, которые исполняют над найденным программу: `-exec rm {} +` уносит каталог
+// данных, а вызова `rm` разбор в строке не видит. Читающая программа из `DATA_READERS`
+// заменой не считается: `find . -exec grep -l foo {} +` — частый приём только для чтения, и
+// отказ на нём с причиной про данные контура уводил разбор не туда (ревью 16c, проход 1).
+// Судится КАЖДОЕ действие: `-exec cat {} + -exec cp x {} +` и `-exec cat {} + -delete` —
+// замена; разбор видит их, потому что `{}` больше не режет аргументы `find` (проход 2).
+const FIND_EXEC_RE = /^-(?:exec|execdir|ok|okdir)$/;
+// Хвосты пути данных по сегментам: каталог-предок или сам файл. Шаблон оболочки в аргументе
+// судится по ним посегментно — строкой `.c?aude` не совпадает ни с одним регексом пути.
+const DATA_TAILS = [['.claude'], ['.claude', 'ralph'], ['.claude', 'ralph', 'hooks.json']];
+const GLOB_CHARS_RE = /[*?[]/;
 
 // Имя данных отдельным словом: `hooks.json.example` и `myhooks.json` — другие файлы.
 const DATA_NAME_RE = /(?:^|[^\w.-])hooks\.json(?![\w.-])/;
@@ -204,14 +248,19 @@ const GIT_VALUE_OPTIONS = new Set([
 
 /** Подкоманда git: первый аргумент вне глобальных опций и значений тех, что их берут. */
 function gitSubcommand(args) {
+    return args[gitSubcommandAt(args)];
+}
+
+/** Индекс подкоманды git в аргументах; нет подкоманды — длина аргументов. */
+function gitSubcommandAt(args) {
     for (let i = 0; i < args.length; i += 1) {
         if (GIT_VALUE_OPTIONS.has(args[i])) {
             i += 1;
             continue;
         }
-        if (!args[i].startsWith('-')) return args[i];
+        if (!args[i].startsWith('-')) return i;
     }
-    return undefined;
+    return args.length;
 }
 
 // Глобальные опции git, которые меняют исполняемое: `-c core.pager=…`/`diff.external=…`
@@ -355,6 +404,164 @@ function gitLeavesDataAlone(args) {
     return !args.some((arg) => GIT_WRITE_OPTIONS_RE.test(arg));
 }
 
+/** `tar` в режиме извлечения: `--extract`/`--get`, `-x…` или буква `x` в слове режима первым. */
+function tarExtracts(args) {
+    return args.some(
+        (arg, i) =>
+            arg === '--extract' ||
+            arg === '--get' ||
+            (/^-[A-Za-z]+$/.test(arg) && arg.includes('x')) ||
+            (i === 0 && /^[A-Za-z]+$/.test(arg) && arg.includes('x')),
+    );
+}
+
+/** `find`, у которого хоть одно действие удаляет, пишет файл или зовёт программу вне читающих. */
+function findReplacesPaths(args) {
+    return args.some(
+        (arg, i) =>
+            FIND_WRITE_RE.test(arg) || (FIND_EXEC_RE.test(arg) && !DATA_READERS.has(args[i + 1])),
+    );
+}
+
+// Аргумент git, который git читает pathspec'ом шире, чем его прочла бы оболочка: в pathspec
+// `*` проходит и `/`, и ведущую точку, а ведущее `:` — магия (`:/` — корень дерева,
+// `:(top)`, `:(glob)`, `:!`). `git checkout <ref> -- '*'` и `-- ':/'` возвращали из истории
+// старый `.claude/ralph/hooks.json` мимо посегментного разбора оболочки (ревью 16c,
+// проход 1, проверено на живом git). Раскрывать pathspec по правилам git барьер не берётся:
+// база зависит от `-C`, `cd` и подкаталога вызова, — такой аргумент у git вне разрешённых
+// подкоманд в петле считается совпавшим с данными, как и список путей из файла.
+const GIT_PATHSPEC_WIDE_RE = /^:|[*?[]/;
+const GIT_PATHSPEC_FILE_RE = /^--pathspec-from-file(?:=|$)/;
+// Глобальные опции, с которыми git сравнивает pathspec без учёта регистра или как шаблон:
+// `git --icase-pathspecs checkout HEAD~1 -- .CLAUDE` вернул старый контур из истории, а
+// `DATA_ANCESTOR_RE` регистрозависим (ревью 16c, проход 2). Вызов с ними — совпадение целиком.
+const GIT_PATHSPEC_MODE_RE = /^--(?:icase|glob)-pathspecs$/;
+// Окружение, которым git меняет чтение pathspec или его базу: `GIT_ICASE_PATHSPECS=1` — то
+// же, что `--icase-pathspecs` (ревью 16c, проход 3, проверено на живом git), `GIT_DIR`,
+// `GIT_WORK_TREE` — то же, что `-C`. Перечень опасных был бы fail-open к следующей такой
+// переменной, поэтому у git вне разрешённых подкоманд в петле совпадение с данными — любое
+// присваивание `GIT_*` в строке, кроме названных ниже: они имени пути не касаются, а
+// `GIT_EDITOR=true git rebase --continue` и автор коммита — обычные шаги петли.
+const GIT_PATH_NEUTRAL_ENV_RE =
+    /^GIT_(?:AUTHOR_\w+|COMMITTER_\w+|EDITOR|SEQUENCE_EDITOR|TERMINAL_PROMPT|PAGER|TRACE\w*)=/;
+// Шаблон и магия судятся везде, где git может прочесть pathspec: после `--` и позиционным
+// аргументом любой подкоманды, кроме известных ниже — у них позиционный аргумент шаблон
+// `--list`, refspec (`+refs/heads/*:…`, `:old-branch`) или ревизия, и отказ на нём с причиной
+// про данные контура уводил разбор не туда (ревью 16c, проход 2). Список — тех, у кого шаблон
+// пропускается, а не тех, у кого судится: алиас (`git co HEAD~1 '*hooks.json'`) и
+// незнакомая подкоманда в перечень не попадают никогда, и прежний закрытый список
+// pathspec-подкоманд пропускал их (проход 3). Литеральный предок данных судится везде.
+const GIT_NON_PATHSPEC_SUBCOMMANDS = new Set([
+    'branch',
+    'tag',
+    'fetch',
+    'push',
+    'pull',
+    'merge',
+    'rebase',
+    'remote',
+    'switch',
+    'cherry-pick',
+    'revert',
+    'config',
+    'for-each-ref',
+    'show-ref',
+    'rev-parse',
+    'describe',
+    'reflog',
+    'notes',
+]);
+// Подкоманды, у которых `-m`/`-F` берут значение — текст или файл сообщения. У `checkout` и
+// `restore` `-m` — флаг `--merge` без значения, и пропуск следующего аргумента выводил
+// pathspec из суда: `git checkout -m '*'` возвращал файл из индекса (проход 3).
+const GIT_MESSAGE_SUBCOMMANDS = new Set(['commit', 'merge', 'tag', 'stash', 'notes']);
+const GIT_MESSAGE_LONG = new Set(['--message', '--file']);
+// Склейка коротких флагов с `m`/`F` последней буквой берёт значение следующим аргументом:
+// `git stash push -qm 'wip?'`.
+const GIT_MESSAGE_SHORT_RE = /^-[A-Za-z]*[mF]$/;
+
+/** Аргумент git — опция, значение которой (следующий аргумент) текст сообщения, а не путь. */
+function gitMessageOption(subcommand, arg) {
+    if (!GIT_MESSAGE_SUBCOMMANDS.has(subcommand)) return false;
+    return GIT_MESSAGE_LONG.has(arg) || GIT_MESSAGE_SHORT_RE.test(arg);
+}
+
+/**
+ * Аргумент вызова git вне разрешённых подкоманд, который может назвать данные контура.
+ * `assignments` — присваивания всей строки (`assignmentsOf`): окружение git видно только там.
+ */
+function gitArgHittingData(args, assignments = []) {
+    const mode = gitGlobalOptions(args).find((arg) => GIT_PATHSPEC_MODE_RE.test(arg));
+    if (mode) return mode;
+    const env = assignments.find(
+        (a) => GIT_ENV_ASSIGNMENT_RE.test(a) && !GIT_PATH_NEUTRAL_ENV_RE.test(a),
+    );
+    if (env) return env;
+    const literal = args.find(
+        (arg) => DATA_ANCESTOR_RE.test(arg) || GIT_PATHSPEC_FILE_RE.test(arg),
+    );
+    if (literal) return literal;
+    const at = gitSubcommandAt(args);
+    const subcommand = args[at];
+    const takesPathspec = !GIT_NON_PATHSPEC_SUBCOMMANDS.has(subcommand);
+    for (let i = at + 1; i < args.length; i += 1) {
+        const arg = args[i];
+        if (arg === '--') return args.slice(i + 1).find((x) => GIT_PATHSPEC_WIDE_RE.test(x));
+        if (gitMessageOption(subcommand, arg)) {
+            i += 1;
+            continue;
+        }
+        if (arg.startsWith('-')) continue;
+        if (takesPathspec && GIT_PATHSPEC_WIDE_RE.test(arg)) return arg;
+    }
+    return undefined;
+}
+
+/**
+ * Вызов, который заменяет, переносит или удаляет пути своих аргументов целиком (ревью 16c):
+ * переносящие команды, git вне разрешённых подкоманд — `checkout <ref> -- .claude`,
+ * `restore --source=<rev> .claude`, `stash push -- .claude`, `mv`, `archive`, — `find` с
+ * удалением или командой и `tar` с извлечением. Опасны прежде всего checkout и restore: они
+ * возвращают из истории прежний, более мягкий контур. Путь-КАТАЛОГ у них прежде не судился:
+ * git проверялся только по базовому имени `hooks.json`, предок — только у `TREE_MOVERS`.
+ */
+function replacesPaths(name, args, gitEnvSet) {
+    if (TREE_MOVERS.has(name)) return true;
+    if (name === 'git') return gitEnvSet || !gitLeavesDataAlone(args);
+    if (name === 'find') return findReplacesPaths(args);
+    if (name === 'tar') return tarExtracts(args);
+    return false;
+}
+
+/**
+ * Может ли шаблон оболочки в аргументе раскрыться в путь данных или их предка: хвост
+ * шаблона посегментно против `DATA_TAILS`. Ведущую точку имени оболочка раскрывает только
+ * явной точкой в сегменте (без `dotglob`), поэтому `rm -rf dist/*` предка не задевает, а
+ * `mv .c?aude bak` и `cp -r evil/. .c*` — задевают. Неразобранный сегмент и `**` — совпадение.
+ */
+function globMayHitData(arg) {
+    if (!GLOB_CHARS_RE.test(arg)) return false;
+    const variants = expandBraces(arg);
+    if (variants === null) return true;
+    return variants.some((variant) => {
+        const segments = variant.split(/[\\/]+/).filter((x) => x !== '' && x !== '.');
+        return DATA_TAILS.some((tail) => {
+            if (segments.length < tail.length) return false;
+            const end = segments.slice(segments.length - tail.length);
+            return end.every((segment, i) => segmentMayName(segment, tail[i]));
+        });
+    });
+}
+
+/** Сегмент шаблона оболочки против имени: с правилом ведущей точки, `**` — любое имя. */
+function segmentMayName(segment, name) {
+    if (!GLOB_CHARS_RE.test(segment)) return segment === name;
+    if (segment.includes('**')) return true;
+    if (name.startsWith('.') && !segment.startsWith('.')) return false;
+    const re = segmentRegExp(segment);
+    return re === null || re.test(name);
+}
+
 /** Путь данных среди аргументов: базовое имя ровно `hooks.json` (и `cd …` перед ним). */
 function dataPathArg(args) {
     return args.some((arg) => basenameOf(arg) === 'hooks.json');
@@ -374,7 +581,8 @@ function shellWritesContourData(cmd, calls) {
     if (gitExecInput(calls)) return GIT_EXEC_INPUT;
     // `GIT_*=` где угодно в строке: префиксом, через `env`, `export` или `declare -x`
     // прежним сегментом — у git с путём данных разрешённой подкоманды тогда нет.
-    const gitEnvSet = assignmentsOf(calls).some((a) => GIT_ENV_ASSIGNMENT_RE.test(a));
+    const assignments = assignmentsOf(calls);
+    const gitEnvSet = assignments.some((a) => GIT_ENV_ASSIGNMENT_RE.test(a));
     for (const call of calls) {
         const args = argValues(call);
         if (INTERPRETERS_RE.test(call.name)) {
@@ -382,6 +590,20 @@ function shellWritesContourData(cmd, calls) {
             continue;
         }
         if (call.name === 'git' && gitConfigSetsExec(args)) return GIT_EXEC_INPUT;
+        if (replacesPaths(call.name, args, gitEnvSet)) {
+            const ancestor =
+                call.name === 'git'
+                    ? gitArgHittingData(args, assignments)
+                    : args.find((arg) => DATA_ANCESTOR_RE.test(arg) || globMayHitData(arg));
+            if (ancestor) return ancestor;
+            // Каталог вызова строкой: здесь он не известен, а корень дерева содержит данные.
+            // Пути вызова — те же, что судит событие: `find` без точки старта обходит `.`,
+            // `tar` без `-C` извлекает в каталог вызова (ревью 16c, проход 3).
+            const targets =
+                call.name === 'git' ? args : replacedTargets(call.name, args, '', null).paths;
+            const here = targets.find((arg) => CALL_DIR_RE.test(arg));
+            if (here !== undefined) return `${here} (каталог вызова)`;
+        }
         if (!dataPathArg(args) || DATA_READERS.has(call.name)) continue;
         if (call.name === 'git' && !gitEnvSet && gitLeavesDataAlone(args)) continue;
         return 'hooks.json';
@@ -399,6 +621,16 @@ function shellWritesContourData(cmd, calls) {
  * и доки про этот файл. Блок — перенаправление в файл, интерпретатор с именем в тексте
  * программы и любая команда вне читающих с аргументом базового имени `hooks.json`: так
  * `cd .claude/ralph && sed -i … hooks.json` пути не содержит, но остаётся записью.
+ * Переносящие команды (`mv`, `rm`, `cp`, …) с каталогом данных в аргументах — `.claude`
+ * или `.claude/ralph` — тоже правка: каталог уносит файл, не называя его (#187). Так же
+ * судятся git вне разрешённых подкоманд (`checkout <ref> -- .claude` возвращает старый
+ * контур из истории), `find` с удалением или командой и `tar` с извлечением, а шаблон
+ * оболочки в их аргументах — посегментно (`replacesPaths`, `globMayHitData`); у git шаблон
+ * и магия pathspec — совпадение целиком (`gitArgHittingData`): git читает их шире оболочки. На событии
+ * их аргументы ещё и разрешаются по файловой системе (`moverTouchesData`): псевдоним
+ * каталога симлинком строкой не виден. Смена дерева целиком без пути — `git checkout
+ * <ветка>`, `reset --hard`, `merge`, `rebase` — этим забором не судится: путь данных в
+ * вызове не назван, и запрет всех переключений остановил бы петлю; предел назван здесь.
  * Это забор по тексту, а не доказательство (путь, собранный по частям, он не видит), и
  * сказано это в докблоке `consumer-data.cjs`. Сессия человека правит данные как раньше.
  *
@@ -428,6 +660,125 @@ function touchesContourData(toolName, input) {
     return null;
 }
 
+/**
+ * Правила над командой оболочки — общие для прежнего входа (`decide`, инструмент `Bash`) и
+ * события (`decideEvent`, операция `exec`). Вердикт блока или null. Забор данных контура
+ * сюда не входит: его порядок относительно MCP у двух входов свой.
+ */
+function judgeShell(cmd, options) {
+    // Все правила ниже, кроме двух текстовых, судят СПИСОК ВЫЗОВОВ, а не строку.
+    const calls = shellCalls(cmd);
+
+    // Упоминание .env блокируем только вместе с командой, которая его читает
+    // или отправляет наружу: иначе запрет накрыл бы и разговор о файле.
+    if (CMD_ENV_RE.test(cmd) && SECRET_READER_RE.test(cmd)) {
+        return {
+            blocked: true,
+            code: 'secret-env',
+            reason: 'Команда заблокирована: чтение/копирование .env файлов запрещено (секреты).',
+        };
+    }
+    // То же по СПИСКУ ВЫЗОВОВ: любая команда вне нечитающих с путём env-файла в
+    // аргументах. Текстовое правило выше остаётся — оно видит перенаправление
+    // (`< .env`) и подстановки, которых в аргументах вызова нет.
+    const envReader = readsEnvFile(calls);
+    if (envReader) {
+        return {
+            blocked: true,
+            code: 'secret-env',
+            reason:
+                `Команда заблокирована: ${envReader} получает env-файл аргументом, а его ` +
+                'содержимое — секреты. Структуру переменных смотри в .env.example.',
+        };
+    }
+
+    // `--no-verify` отключает git-хуки, то есть и проверку сообщения коммита —
+    // а её обход стоит неснимаемой связи с чужой карточкой. Правило репозитория
+    // («--no-verify не используется») до сих пор держалось на дисциплине; теперь
+    // на барьере. Упал хук — правится причина.
+    // Правило смотрит ВЫЗОВ, как и соседние: разговор о команде вызовом не является,
+    // а `git commit` внутри `sh -c` — является (ревью, проход 5: здесь оставалась
+    // регулярка по строке, и журнал утверждал обратное).
+    if (skipsGitHooks(calls)) {
+        return {
+            blocked: true,
+            code: 'no-verify',
+            reason:
+                'git commit --no-verify запрещён: он отключает проверку сообщения ' +
+                'коммита, а её обход стоит неснимаемой связи PR с чужой карточкой. ' +
+                'Упал хук — правь причину, а не выключай хук.',
+        };
+    }
+
+    // Манифест правится ФАЙЛОМ, а не командой (#131).
+    //
+    // 20.08.2026 сессии понадобился SHA второй копии ядра. Прямой `git -C <чужое дерево>`
+    // тогда упирался в список разрешений (сессии ещё шли не под bypass; сегодня он
+    // не закрыт ничем — это отдельная тема, не эта), и она обошла его так: `npm pkg set
+    // scripts.tmp="node -e …"` → `npm run tmp` → `npm pkg delete scripts.tmp`. Кода
+    // в дифф не попало ни строки, а исполнилось всё.
+    //
+    // Барьер узкий намеренно: он закрывает не «выполнение произвольного кода» —
+    // под bypassPermissions его закрыть нечем, любая команда и так исполнится, —
+    // а его НЕВИДИМОСТЬ. Всё, что исполняется, обязано лежать в диффе: тогда его
+    // сторожат ревью и гейт. Побочно снимается гонка:
+    // упади сессия между `set` и `delete`, временный скрипт уехал бы в коммит.
+    //
+    // Правило смотрит на ВЫЗОВ, а не на строку: `rg -n "npm pkg set"` ищет по
+    // каталогу, а не мутирует манифест.
+    if (mutatesManifest(calls)) {
+        return {
+            blocked: true,
+            code: 'manifest-shell',
+            reason:
+                'Правка package.json из оболочки запрещена: она не попадает в дифф, ' +
+                'а значит мимо ревью и гейта. Нужен новый скрипт — правь файл через ' +
+                'Edit/Write. Нужен разовый расчёт — считай его прямо в команде.',
+        };
+    }
+
+    // Дальше правила смотрят на СПИСОК ВЫЗОВОВ (`shell-calls.cjs`): упоминание команды
+    // в тексте вызовом не является, а вложенные вызовы из `sh -c`, подстановки и
+    // heredoc'а, который читает оболочка, в список входят (#173).
+    const rawAddress = rawAddressTarget(calls);
+    if (rawAddress) {
+        return {
+            blocked: true,
+            code: 'raw-address',
+            reason:
+                `Сетевой вызов на голый адрес ${rawAddress} заблокирован. У адреса без ` +
+                'имени нечего проверить: ни домена, ни владельца. Ходи по имени хоста, ' +
+                'а если адрес действительно нужен — поднимай его сам и зови по localhost.',
+        };
+    }
+    const destructive = destructiveCall(calls);
+    if (destructive) {
+        return {
+            blocked: true,
+            code: 'destructive',
+            reason: `Команда заблокирована: ${destructive}`,
+        };
+    }
+
+    // Сессия петли идёт в оболочке ХОСТА, где рядом крутится прод (#299): она не
+    // ревьюер с ограниченным доступом, а полноценный шелл, и то, что для CI —
+    // «локальная проверка», для хоста — боевая служба. Правило смотрит на ВЫЗОВ,
+    // как соседние: `git log --grep 'systemctl stop caddy'` вызовом не является.
+    const hostService = touchesHostService(calls);
+    if (hostService) {
+        return { blocked: true, code: 'host-service', reason: hostService };
+    }
+
+    // Цель `kill` без имени в тексте (`kill $p`, `xargs kill`, `pkill`, `fuser -k`)
+    // барьер служб не видит — ей нечем совпасть с перечнем. Инцидент 22.09.2026:
+    // цикл по списку слушателей хоста снял Caddy, docker-proxy и privoxy (#196).
+    const foreignKill = killsForeignProcess(calls, options);
+    if (foreignKill) {
+        return { blocked: true, code: 'foreign-kill', reason: foreignKill };
+    }
+    return null;
+}
+
 const FILE_TOOLS = new Set(['Read', 'Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'Grep']);
 
 /**
@@ -435,14 +786,16 @@ const FILE_TOOLS = new Set(['Read', 'Edit', 'Write', 'MultiEdit', 'NotebookEdit'
  *
  * @param {string} toolName — имя инструмента из PreToolUse
  * @param {Record<string, unknown>} toolInput — его аргументы
- * @returns {{ blocked: boolean, reason: string | null }}
+ * @returns {{ blocked: boolean, reason: string | null, code?: string }} — у блока `code` —
+ *   код причины из перечня контракта (`adapters/barrier-reason.ts`): по нему проба
+ *   отличает «правило узнало вызов» от «барьер неисправен и блокирует всё».
  */
 /**
  * `options.contour` — данные контура потребителя (`consumer-data.cjs`); хук передаёт
  * загруженные, без них контур пустой — самый строгий. `options.loop` — сессия петли: тогда
- * данные контура сессии не правятся. Значение — булево или функция: хук узнаёт петлю ещё
- * и переходным признаком по транскрипту, а читать транскрипт на каждом вызове незачем —
- * функция зовётся, только когда вызов трогает данные.
+ * данные контура сессии не правятся. Значение — булево (хук узнаёт петлю по контракту
+ * запуска или доверенному контексту сессии, #184) или функция — её зовут, только когда
+ * вызов трогает данные.
  *
  * Остальное в `options` — подмена окружения ТОЛЬКО для тестов правила про kill (#196):
  * таблица процессов, pid хука и дерево сессии. Хук их не передаёт и читает живой `/proc`.
@@ -466,6 +819,7 @@ function decide(toolName, toolInput, options = {}) {
                   'обоснованием.';
         return {
             blocked: true,
+            code: 'mcp-not-allowed',
             reason: `Инструмент ${toolName} не в allowlist MCP: ${contourText}`,
         };
     }
@@ -475,6 +829,7 @@ function decide(toolName, toolInput, options = {}) {
     if (contourData === GIT_EXEC_INPUT && inLoop()) {
         return {
             blocked: true,
+            code: 'git-exec-input',
             reason:
                 'Вызов git с исполняющим входом из сессии петли заблокирован: внешний diff, ' +
                 'пейджер, `GIT_CONFIG_*`, `-c`/`--config-env` с исполняющим ключом, ' +
@@ -487,6 +842,7 @@ function decide(toolName, toolInput, options = {}) {
     if (contourData && inLoop()) {
         return {
             blocked: true,
+            code: 'contour-data',
             reason:
                 `Правка данных контура хуков (${contourData}) из сессии петли заблокирована: ` +
                 'они решают, какие MCP-мутации и скиллы требует барьер, и действовали бы со ' +
@@ -505,6 +861,7 @@ function decide(toolName, toolInput, options = {}) {
         if (filePath) {
             return {
                 blocked: true,
+                code: 'secret-env',
                 reason:
                     `Доступ к ${filePath} заблокирован: файлы .env содержат секреты. ` +
                     'Используй .env.example для структуры переменных.',
@@ -515,115 +872,610 @@ function decide(toolName, toolInput, options = {}) {
 
     if (toolName === 'Bash') {
         const cmd = typeof input.command === 'string' ? input.command : '';
-        // Все правила ниже, кроме двух текстовых, судят СПИСОК ВЫЗОВОВ, а не строку.
-        const calls = shellCalls(cmd);
-
-        // Упоминание .env блокируем только вместе с командой, которая его читает
-        // или отправляет наружу: иначе запрет накрыл бы и разговор о файле.
-        if (CMD_ENV_RE.test(cmd) && SECRET_READER_RE.test(cmd)) {
-            return {
-                blocked: true,
-                reason: 'Команда заблокирована: чтение/копирование .env файлов запрещено (секреты).',
-            };
-        }
-        // То же по СПИСКУ ВЫЗОВОВ: любая команда вне нечитающих с путём env-файла в
-        // аргументах. Текстовое правило выше остаётся — оно видит перенаправление
-        // (`< .env`) и подстановки, которых в аргументах вызова нет.
-        const envReader = readsEnvFile(calls);
-        if (envReader) {
-            return {
-                blocked: true,
-                reason:
-                    `Команда заблокирована: ${envReader} получает env-файл аргументом, а его ` +
-                    'содержимое — секреты. Структуру переменных смотри в .env.example.',
-            };
-        }
-
-        // `--no-verify` отключает git-хуки, то есть и проверку сообщения коммита —
-        // а её обход стоит неснимаемой связи с чужой карточкой. Правило репозитория
-        // («--no-verify не используется») до сих пор держалось на дисциплине; теперь
-        // на барьере. Упал хук — правится причина.
-        // Правило смотрит ВЫЗОВ, как и соседние: разговор о команде вызовом не является,
-        // а `git commit` внутри `sh -c` — является (ревью, проход 5: здесь оставалась
-        // регулярка по строке, и журнал утверждал обратное).
-        if (skipsGitHooks(calls)) {
-            return {
-                blocked: true,
-                reason:
-                    'git commit --no-verify запрещён: он отключает проверку сообщения ' +
-                    'коммита, а её обход стоит неснимаемой связи PR с чужой карточкой. ' +
-                    'Упал хук — правь причину, а не выключай хук.',
-            };
-        }
-
-        // Манифест правится ФАЙЛОМ, а не командой (#131).
-        //
-        // 20.08.2026 сессии понадобился SHA второй копии ядра. Прямой `git -C <чужое дерево>`
-        // тогда упирался в список разрешений (сессии ещё шли не под bypass; сегодня он
-        // не закрыт ничем — это отдельная тема, не эта), и она обошла его так: `npm pkg set
-        // scripts.tmp="node -e …"` → `npm run tmp` → `npm pkg delete scripts.tmp`. Кода
-        // в дифф не попало ни строки, а исполнилось всё.
-        //
-        // Барьер узкий намеренно: он закрывает не «выполнение произвольного кода» —
-        // под bypassPermissions его закрыть нечем, любая команда и так исполнится, —
-        // а его НЕВИДИМОСТЬ. Всё, что исполняется, обязано лежать в диффе: тогда его
-        // сторожат ревью и гейт. Побочно снимается гонка:
-        // упади сессия между `set` и `delete`, временный скрипт уехал бы в коммит.
-        //
-        // Правило смотрит на ВЫЗОВ, а не на строку: `rg -n "npm pkg set"` ищет по
-        // каталогу, а не мутирует манифест.
-        if (mutatesManifest(calls)) {
-            return {
-                blocked: true,
-                reason:
-                    'Правка package.json из оболочки запрещена: она не попадает в дифф, ' +
-                    'а значит мимо ревью и гейта. Нужен новый скрипт — правь файл через ' +
-                    'Edit/Write. Нужен разовый расчёт — считай его прямо в команде.',
-            };
-        }
-
-        // Дальше правила смотрят на СПИСОК ВЫЗОВОВ (`shell-calls.cjs`): упоминание команды
-        // в тексте вызовом не является, а вложенные вызовы из `sh -c`, подстановки и
-        // heredoc'а, который читает оболочка, в список входят (#173).
-        const rawAddress = rawAddressTarget(calls);
-        if (rawAddress) {
-            return {
-                blocked: true,
-                reason:
-                    `Сетевой вызов на голый адрес ${rawAddress} заблокирован. У адреса без ` +
-                    'имени нечего проверить: ни домена, ни владельца. Ходи по имени хоста, ' +
-                    'а если адрес действительно нужен — поднимай его сам и зови по localhost.',
-            };
-        }
-        const destructive = destructiveCall(calls);
-        if (destructive) {
-            return { blocked: true, reason: `Команда заблокирована: ${destructive}` };
-        }
-
-        // Сессия петли идёт в оболочке ХОСТА, где рядом крутится прод (#299): она не
-        // ревьюер с ограниченным доступом, а полноценный шелл, и то, что для CI —
-        // «локальная проверка», для хоста — боевая служба. Правило смотрит на ВЫЗОВ,
-        // как соседние: `git log --grep 'systemctl stop caddy'` вызовом не является.
-        const hostService = touchesHostService(calls);
-        if (hostService) {
-            return { blocked: true, reason: hostService };
-        }
-
-        // Цель `kill` без имени в тексте (`kill $p`, `xargs kill`, `pkill`, `fuser -k`)
-        // барьер служб не видит — ей нечем совпасть с перечнем. Инцидент 22.09.2026:
-        // цикл по списку слушателей хоста снял Caddy, docker-proxy и privoxy (#196).
-        const foreignKill = killsForeignProcess(calls, options);
-        if (foreignKill) {
-            return { blocked: true, reason: foreignKill };
-        }
+        return judgeShell(cmd, options) || ALLOWED;
     }
 
     return ALLOWED;
 }
 
+// --- Нормализованное событие (#186, Фаза 16c) ---------------------------------------------
+//
+// Прежний вход (`decide`) судит вызов по имени инструмента Claude Code и его полям, и всё, что
+// он не узнал, разрешал: «незнакомый инструмент» кончался `ALLOWED`. Из одного этого правила
+// выросла половина дыр разбора 27.10 (`docs/harness-contract.md`): `apply_patch` Codex,
+// `grep{include}` OpenCode, `Monitor` самого Claude Code с командой оболочки мимо matcher'а.
+// Вход события другой: нормализатор пакета харнесса переводит вызов в операции
+// (`adapters/harnesses/protocol.ts`), и барьер судит операции, не зная харнесса. Незнакомое
+// приходит операцией `unknown` и блокируется своим кодом; невалидна или запрещена одна
+// операция — запрещён весь вызов, и судятся все операции до первого эффекта.
+
+/** Имена env-файла, на которых проверяется шаблон пути поиска: точка-env, суффикс, префикс. */
+const ENV_NAME_SAMPLES = ['.env', '.env.local', 'ralph.env', 'app.env.production'];
+
+const escapeRe = (c) => c.replace(/[.+^$()|\\\]/{}]/g, '\\$&');
+
+/** Потолок раскрытия `{a,b}`: шаблон шире — барьер считает его совпавшим. */
+const BRACE_LIMIT = 64;
+
+/**
+ * Раскрытие групп `{a,b}` (с вложенностью) в список шаблонов или null — группа не закрыта или
+ * вариантов больше потолка. Раскрытие идёт до разбора, потому что в группе бывает `/`
+ * (`{src/x,.env}`), и последний сегмент пути без раскрытия не найти.
+ */
+function expandBraces(glob) {
+    const open = glob.indexOf('{');
+    if (open === -1) return [glob];
+    let depth = 0;
+    let end = -1;
+    const commas = [];
+    for (let j = open; j < glob.length && end === -1; j++) {
+        if (glob[j] === '{') depth++;
+        else if (glob[j] === '}' && --depth === 0) end = j;
+        else if (glob[j] === ',' && depth === 1) commas.push(j);
+    }
+    if (end === -1) return null;
+    const bounds = [open, ...commas, end];
+    const out = [];
+    for (let k = 0; k + 1 < bounds.length; k++) {
+        const variant =
+            glob.slice(0, open) + glob.slice(bounds[k] + 1, bounds[k + 1]) + glob.slice(end + 1);
+        const expanded = expandBraces(variant);
+        if (expanded === null) return null;
+        out.push(...expanded);
+        if (out.length > BRACE_LIMIT) return null;
+    }
+    return out;
+}
+
+/**
+ * Сегмент шаблона без `/` и без групп (диалект glob: `*`, `?`, `[...]`) → регулярное
+ * выражение по имени, либо null, если сегмент не разобрался.
+ */
+function segmentRegExp(segment) {
+    let re = '';
+    for (let i = 0; i < segment.length; i++) {
+        const c = segment[i];
+        if (c === '*') re += '.*';
+        else if (c === '?') re += '.';
+        else if (c === '[') {
+            const end = segment.indexOf(']', i + 2);
+            if (end === -1) return null;
+            const body = segment
+                .slice(i + 1, end)
+                .replace(/^!/, '^')
+                .replace(/\\/g, '\\\\');
+            re += `[${body}]`;
+            i = end;
+        } else re += escapeRe(c);
+    }
+    try {
+        return new RegExp(`^${re}$`, 'i');
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Может ли шаблон пути поиска выбрать env-файл. Решает последний сегмент пути: каталоги перед
+ * ним env-файл не исключают (`src/**` выбирает и `src/.env`), а `**` в последнем сегменте
+ * выбирает любое имя. Неразобранный шаблон барьер считает совпавшим: догадка о диалекте в
+ * пользу пропуска — дыра, в пользу блока — ложный отказ.
+ */
+function globMayMatchEnv(glob) {
+    return ENV_FILE_RE.test(glob) || ENV_NAME_SAMPLES.some((name) => globMaySelectName(glob, name));
+}
+
+/**
+ * Может ли шаблон выбрать файл с именем `name` — по тому же последнему сегменту. Каталоги
+ * перед ним не сужают выбор: оценка в пользу блока, а не догадка о месте файла.
+ */
+function globMaySelectName(glob, name) {
+    const variants = expandBraces(glob);
+    if (variants === null) return true;
+    return variants.some((variant) => {
+        const segment = variant.slice(variant.lastIndexOf('/') + 1);
+        if (segment === '' || segment.includes('**')) return true;
+        const re = segmentRegExp(segment);
+        return re === null || re.test(name);
+    });
+}
+
+const blockedBy = (code, reason) => ({ blocked: true, code, reason });
+
+const secretPath = (p) =>
+    blockedBy(
+        'secret-env',
+        `Доступ к ${p} заблокирован: файлы .env содержат секреты. ` +
+            'Используй .env.example для структуры переменных.',
+    );
+
+const contourBlock = (what) =>
+    blockedBy(
+        'contour-data',
+        `Правка данных контура хуков (${what}) из сессии петли заблокирована: ` +
+            'они решают, какие MCP-мутации и скиллы требует барьер, и действовали бы со ' +
+            'следующего вызова — раньше ship человека на мердже. Нужна правка — оставь ' +
+            'намерение с обоснованием, файл правит человек.',
+    );
+
+const gitExecBlock = () =>
+    blockedBy(
+        'git-exec-input',
+        'Вызов git с исполняющим входом из сессии петли заблокирован: внешний diff, ' +
+            'пейджер, `GIT_CONFIG_*`, `-c`/`--config-env` с исполняющим ключом, ' +
+            '`--exec-path=` или запись такого ключа через `git config` запускают ' +
+            'программу, которая получает пути дерева и пишет файлы мимо барьера — в том ' +
+            'числе данные контура хуков. Читай git без них (`--no-pager`, `--no-ext-diff`, ' +
+            '`GIT_PAGER=cat`); нужен такой вызов — оставь намерение с обоснованием.',
+    );
+
+const capabilityBlock = (op, what) =>
+    blockedBy(
+        'capability-unjudged',
+        `Операция ${op} (${what}) в сессии петли заблокирована: барьер её не судит — ${
+            op === 'fetch'
+                ? 'политики сети у него нет, и адрес наружу мог бы унести что угодно'
+                : 'наследование барьеров субагентом не доказано'
+        }. Возможность откроется вместе с правилом, которое её судит.`,
+    );
+
+/**
+ * Разрешён ли MCP-инструмент: по эффектам политики, если данные их заявили (`toolsDeclared`),
+ * иначе прежним правилом. Данные прежней формы мигрирует доверенный launcher, а не сессия
+ * (`mcp-effects.cjs`): переключение раньше миграции отняло бы у живой петли все чтения.
+ */
+function mcpEventAllowed(name, mcp) {
+    return mcp.toolsDeclared ? mcpAllowedByEffect(name, mcp) : mcpAllowed(name, mcp);
+}
+
+function mcpBlock(name, mcp) {
+    const how = mcp.toolsDeclared
+        ? 'у него нет эффекта в mcp.tools данных `.claude/ralph/hooks.json` или он под ' +
+          'запретом ядра по слову'
+        : 'данные `.claude/ralph/hooks.json` ещё прежней формы, без mcp.tools (чтение ' +
+          'List*/Get* и mcp.writeAllowed), и по ним он не разрешён';
+    return blockedBy(
+        'mcp-not-allowed',
+        `Инструмент ${name} вне контура MCP: ${how}. Нужен новый — проект заявляет его в ` +
+            'данных контура отдельным PR с обоснованием.',
+    );
+}
+
+function unknownBlock(op) {
+    if (op.kind === 'tool') {
+        return blockedBy(
+            'unknown-tool',
+            `Инструмент вне описания пакета харнесса: ${op.why}. Незнакомое барьер не ` +
+                'пропускает — инструмент добавляет в описание отдельная правка пакета с ' +
+                'живой фикстурой.',
+        );
+    }
+    return blockedBy(
+        'unknown-field',
+        `Вызов не разобрался по описанию пакета харнесса: ${op.why}. Поле, о котором ` +
+            'описание не знает, может нести путь мимо барьера.',
+    );
+}
+
+/**
+ * Каталоги, в которые обход не спускается, — и это предел, а не «там нечего искать» (ревью
+ * 16c). Инструмент поиска их не пропускает: `rg` смотрит `.gitignore`, а не имена, и `.env`
+ * внутри неигнорируемого `node_modules` (или под корнем `Grep{path: node_modules/pkg}`, где
+ * пропускается уже вложенный каталог) он прочтёт, а барьер не увидит. Без пропуска обход
+ * `node_modules` упирался бы в потолок на каждом поиске по корню, и поиск в дереве с
+ * зависимостями стал бы отказом всегда. Корень поиска сам не пропускается никогда.
+ */
+const SEARCH_SKIP_DIRS = new Set(['.git', 'node_modules']);
+/** Потолок обхода: дерево, которое не перечислить, барьер считает содержащим защищённое. */
+const SEARCH_WALK_LIMIT = 50_000;
+/** Потолок переходов по симлинкам при разрешении пути — как `MAXSYMLINKS` ядра Linux. */
+const SYMLINK_HOPS = 40;
+
+const isLink = (entry) =>
+    typeof entry.isSymbolicLink === 'function' ? entry.isSymbolicLink() : false;
+
+/**
+ * Настоящий путь `p` от `baseDir` — тот, куда операция дойдёт в файловой системе (#187).
+ * Строка обходится тремя способами, и каждый закрыт здесь:
+ *
+ * - симлинк в любом сегменте, а не только в последнем или в родителе: разрешение идёт
+ *   посегментно, и `..` после симлинка ведёт к родителю ЦЕЛИ, как у ядра ОС, — лексический
+ *   `path.resolve` (им же начинается `fs.realpathSync`) свернул бы `link/..` в строку;
+ * - ещё не созданное назначение: от ближайшего существующего предка хвост дописывается
+ *   строкой — `alias/ralph/hooks.json`, где `alias` → `.claude`, а `ralph/` ещё нет, — это
+ *   данные контура, хотя ни путь, ни родитель не разрешаются;
+ * - висячий симлинк: запись через него создаёт цель, поэтому судится цель.
+ *
+ * Цикл ссылок обрывается потолком переходов; дальше путь судится строкой.
+ */
+function physicalPath(p, baseDir, fsApi, hops = 0) {
+    const abs = path.isAbsolute(p);
+    let cur = abs ? path.parse(p).root : baseDir || '/';
+    if (!abs && hops === 0) {
+        try {
+            cur = fsApi.realpathSync(path.resolve(cur));
+        } catch {
+            cur = path.resolve(cur);
+        }
+    }
+    for (const part of p.split(/[\\/]+/)) {
+        if (part === '' || part === '.') continue;
+        if (part === '..') {
+            cur = path.dirname(cur);
+            continue;
+        }
+        const next = path.join(cur, part);
+        try {
+            cur = fsApi.realpathSync(next);
+            continue;
+        } catch {
+            // Нет пути или висячая ссылка: ссылка ведёт туда, где запись создаст файл.
+        }
+        let target = null;
+        if (hops < SYMLINK_HOPS && typeof fsApi.readlinkSync === 'function') {
+            try {
+                target = fsApi.readlinkSync(next);
+            } catch {
+                target = null;
+            }
+        }
+        cur =
+            target === null ? next : physicalPath(path.resolve(cur, target), '/', fsApi, hops + 1);
+    }
+    return cur;
+}
+
+/** Путь операции строкой и настоящим путём: правило судит обе формы. */
+function pathForms(p, baseDir, fsApi) {
+    return [p, physicalPath(p, baseDir, fsApi)];
+}
+
+function isDirectory(p, fsApi) {
+    try {
+        return fsApi.statSync(p).isDirectory();
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Обход дерева от `root` в ширину. `visit(путь, запись)` зовётся на каждой не-каталожной
+ * записи и останавливает обход непустой строкой — она и есть ответ. `follow` — спускаться
+ * в каталоги-симлинки (каждый настоящий каталог — один раз, цикл не вешает обход): поиск
+ * читает то, на что ссылка ведёт, а перенос каталога уносит саму ссылку, а не цель.
+ * Корня нет или он не каталог — null; не перечислился — строка с причиной.
+ */
+function walkTree(root, visit, fsApi, follow) {
+    if (!isDirectory(root, fsApi)) return null;
+    const seen = new Set();
+    const queue = [root];
+    let entries = 0;
+    while (queue.length > 0) {
+        const dir = queue.shift();
+        if (follow) {
+            let real = dir;
+            try {
+                real = fsApi.realpathSync(dir);
+            } catch {
+                // Каталог не разрешился — обходим по строке.
+            }
+            if (seen.has(real)) continue;
+            seen.add(real);
+        }
+        let list;
+        try {
+            list = fsApi.readdirSync(dir, { withFileTypes: true });
+        } catch {
+            continue;
+        }
+        for (const e of list) {
+            if (++entries > SEARCH_WALK_LIMIT) {
+                return `${root} (не перечислить: больше ${SEARCH_WALK_LIMIT} записей)`;
+            }
+            const full = path.join(dir, e.name);
+            const dirEntry = e.isDirectory() || (follow && isLink(e) && isDirectory(full, fsApi));
+            if (dirEntry) {
+                if (!SEARCH_SKIP_DIRS.has(e.name)) queue.push(full);
+                continue;
+            }
+            const hit = visit(full, e);
+            if (hit) return hit;
+        }
+    }
+    return null;
+}
+
+/**
+ * Данные контура внутри каталога: перенос или удаление каталога уносит их, не называя
+ * файла. Служебный каталог как корень не обходится — данных проекта в нём нет.
+ */
+function dataInside(dir, fsApi) {
+    if (SEARCH_SKIP_DIRS.has(path.basename(dir))) return null;
+    return walkTree(dir, (full) => (DATA_PATH_RE.test(full) ? full : null), fsApi, false);
+}
+
+/** Путь — данные контура, их каталог-предок или каталог, где данные лежат глубже. */
+function contourAt(p, fsApi) {
+    if (DATA_PATH_RE.test(p) || DATA_ANCESTOR_RE.test(p)) return p;
+    return dataInside(p, fsApi);
+}
+
+/** Потолок раскрытия шаблона оболочки по файловой системе: шире — барьер считает совпавшим. */
+const GLOB_MATCH_LIMIT = 1000;
+
+/**
+ * Раскрытие шаблона оболочки по файловой системе от `baseDir` — как это сделает оболочка, с
+ * правилом ведущей точки. Сегмент без шаблона дописывается строкой. Не разобрался или
+ * совпадений больше потолка — null: вызывающий считает это совпадением с данными.
+ */
+function expandShellGlob(arg, baseDir, fsApi) {
+    const variants = expandBraces(arg);
+    if (variants === null) return null;
+    const out = [];
+    for (const variant of variants) {
+        let paths = [path.isAbsolute(variant) ? path.parse(variant).root : baseDir || '/'];
+        for (const segment of variant.split(/[\\/]+/)) {
+            if (segment === '' || segment === '.') continue;
+            if (!GLOB_CHARS_RE.test(segment)) {
+                paths = paths.map((p) => path.join(p, segment));
+                continue;
+            }
+            const re = segment.includes('**') ? /^/ : segmentRegExp(segment);
+            if (re === null) return null;
+            const next = [];
+            for (const dir of paths) {
+                let names = [];
+                try {
+                    names = fsApi.readdirSync(dir);
+                } catch {
+                    continue;
+                }
+                for (const name of names) {
+                    if (name.startsWith('.') && !segment.startsWith('.')) continue;
+                    if (re.test(name)) next.push(path.join(dir, name));
+                }
+            }
+            if (next.length > GLOB_MATCH_LIMIT) return null;
+            paths = next;
+        }
+        out.push(...paths);
+        if (out.length > GLOB_MATCH_LIMIT) return null;
+    }
+    return out;
+}
+
+/**
+ * Пути, которые вызов заменяет, переносит или удаляет, и база, от которой они судятся.
+ * У git база — значение `-C`, а пути — аргументы вне опций; сам каталог `-C` судится только
+ * как путь данных или их предок: обход всего репозитория по `git -C <репо> push` блокировал
+ * бы любой вызов. У `find` — точки старта до первого выражения, без них — `.`; у `tar` с извлечением — каталог
+ * `-C`/`--directory`, иначе каталог вызова, и пути аргументов.
+ */
+function replacedTargets(name, args, baseDir, fsApi) {
+    const plain = (list) => list.filter((arg) => arg !== '' && !arg.startsWith('-'));
+    if (name === 'git') {
+        let base = baseDir;
+        const anchors = [];
+        const rest = [];
+        for (let i = 0; i < args.length; i += 1) {
+            if (GIT_VALUE_OPTIONS.has(args[i])) {
+                if (args[i] === '-C' && args[i + 1] !== undefined) {
+                    base = physicalPath(args[i + 1], base, fsApi);
+                    anchors.push(base);
+                }
+                i += 1;
+                continue;
+            }
+            rest.push(args[i]);
+        }
+        return { base, anchors, paths: plain(rest) };
+    }
+    if (name === 'find') {
+        // Без точки старта GNU find обходит `.`: пустой список выпустил бы `find -delete`.
+        const end = args.findIndex((arg) => /^[-(!]/.test(arg));
+        const starts = end === -1 ? args : args.slice(0, end);
+        return { base: baseDir, anchors: [], paths: starts.length ? starts : ['.'] };
+    }
+    if (name === 'tar') {
+        const at = args.findIndex((arg) => arg === '-C' || arg === '--directory');
+        const into = at === -1 ? '.' : args[at + 1] || '.';
+        return { base: baseDir, anchors: [], paths: [into, ...plain(args)] };
+    }
+    return { base: baseDir, anchors: [], paths: plain(args) };
+}
+
+/**
+ * Аргумент вызова, заменяющего пути (`replacesPaths`), который по файловой системе — данные
+ * контура или каталог с ними: псевдоним `.claude/ralph` симлинком строкой не виден, а шаблон
+ * оболочки (`mv .c?aude bak`) раскрывается здесь так же, как его раскроет оболочка.
+ * Аргументы судятся от каталога вызова: `cd` внутри той же строки разбор не отслеживает —
+ * предел назван, его держит забор по имени (`shellWritesContourData`). `shopt -s dotglob`
+ * и `GLOBIGNORE` в той же строке раскрытие не учитывает.
+ */
+function moverTouchesData(calls, baseDir, fsApi) {
+    const gitEnvSet = assignmentsOf(calls).some((a) => GIT_ENV_ASSIGNMENT_RE.test(a));
+    for (const call of calls) {
+        const args = argValues(call);
+        if (!replacesPaths(call.name, args, gitEnvSet)) continue;
+        const { base, anchors, paths } = replacedTargets(call.name, args, baseDir, fsApi);
+        const anchor = anchors.find((p) => DATA_PATH_RE.test(p) || DATA_ANCESTOR_RE.test(p));
+        if (anchor) return anchor;
+        for (const arg of paths) {
+            const expanded = GLOB_CHARS_RE.test(arg) ? expandShellGlob(arg, base, fsApi) : [arg];
+            if (expanded === null) return `${arg} (шаблон не раскрыть)`;
+            for (const one of expanded) {
+                const hit = contourAt(physicalPath(one, base, fsApi), fsApi);
+                if (hit) return hit;
+            }
+        }
+    }
+    return null;
+}
+
+/**
+ * Файловая операция: забор данных контура (в петле, кроме чтения) и env-файлы.
+ *
+ * У переноса две стороны (#187). Источник уходит — судится он сам и, если это каталог, его
+ * содержимое. Назначение появляется — новым путём будет назначение, а если оно уже
+ * существующий каталог, то `назначение/имя источника`; встаёт ли на этом месте каталог
+ * данных, решает его имя. Содержимое источника на новом месте отдельно не судится:
+ * шаблон данных без якоря, и данные «где-то внутри» источника уже нашёл обход источника.
+ * Удаление — та же сторона источника.
+ */
+function judgeFileOperation(op, inLoop, fsApi) {
+    const sources = pathForms(op.path, op.baseDir, fsApi);
+    // Новый путь переноса: назначение, а в существующий каталог — `назначение/имя источника`.
+    let landed = [];
+    if (op.op === 'move') {
+        const dest = pathForms(op.destination, op.baseDir, fsApi);
+        landed = isDirectory(dest[1], fsApi)
+            ? [path.join(dest[1], path.basename(sources[1]))]
+            : dest;
+    }
+    const forms = [...sources, ...landed];
+    if (op.op !== 'read' && inLoop()) {
+        const data = forms.find((f) => DATA_PATH_RE.test(f));
+        if (data) return contourBlock(data);
+        if (op.op === 'move' || op.op === 'delete') {
+            const moved =
+                sources.find((f) => DATA_ANCESTOR_RE.test(f)) ||
+                dataInside(sources[1], fsApi) ||
+                landed.find((f) => DATA_ANCESTOR_RE.test(f));
+            if (moved) return contourBlock(moved);
+        }
+    }
+    const env = forms.find((f) => ENV_FILE_RE.test(f));
+    return env ? secretPath(env) : null;
+}
+
+/**
+ * Поиск судится по множеству файлов, которые он может прочесть: корень, шаблон пути, а без
+ * шаблона (или с одним исключающим `!…`) — весь корень. Значение `contentPattern` на решение о
+ * секрете не влияет: совпадение по содержимому решает выдачу строки, а прочитан файл всё равно.
+ * Его НАЛИЧИЕ влияет (ревью 16c): поиск без шаблона содержимого (`Glob`) отдаёт только имена, в
+ * них секрета нет, и `Glob("**\/*")` прежде давал `secret-env` в каждой сессии на событии.
+ *
+ * Цена названа: поиск содержимого без шаблона пути обходит корень синхронно на КАЖДОМ вызове,
+ * до `SEARCH_WALK_LIMIT` записей, и блокируется любым env-файлом под корнем — в том числе
+ * под `.gitignore`, который инструмент поиска сам пропустил бы. В проекте с локальным `.env`
+ * поиск содержимого по корню без шаблона пути — отказ; сузить корень или шаблон — выход.
+ *
+ * Симлинк внутри корня судится по цели (#187): файл `src/config.ts` → `.env` выбирает и
+ * поиск без шаблона, и шаблон `**\/*.ts`. Каталоги-симлинки обходятся — инструмент поиска
+ * пакета может за ними ходить, и барьер не знает, ходит ли.
+ */
+function judgeSearch(op, fsApi) {
+    const root = physicalPath(op.root, op.baseDir, fsApi);
+    const rootEnv = [op.root, root].find((f) => ENV_FILE_RE.test(f));
+    if (rootEnv) return secretPath(rootEnv);
+    if (typeof op.contentPattern !== 'string') return null;
+    const raw = typeof op.pathGlob === 'string' ? op.pathGlob : '';
+    const glob = raw !== '' && !raw.startsWith('!') ? raw : null;
+    if (glob !== null && globMayMatchEnv(glob)) return secretPath(`${op.root} по шаблону ${glob}`);
+    const found = walkTree(
+        root,
+        (full, e) => {
+            let target = full;
+            if (isLink(e)) {
+                try {
+                    target = fsApi.realpathSync(full);
+                } catch {
+                    return null;
+                }
+            }
+            if (glob === null)
+                return ENV_FILE_RE.test(e.name) || ENV_FILE_RE.test(target) ? full : null;
+            return target !== full && ENV_FILE_RE.test(target) && globMaySelectName(glob, e.name)
+                ? `${full} → ${target}`
+                : null;
+        },
+        fsApi,
+        true,
+    );
+    if (!found) return null;
+    const how = glob === null ? 'без шаблона пути' : `по шаблону ${glob}`;
+    return secretPath(`${found} (поиск по корню ${op.root} ${how})`);
+}
+
+/**
+ * Решение по одной операции события или null. `nested` — операция из `derived` MCP-вызова:
+ * сетевой эффект параметров там блокируется и вне петли — до политики сети его не судит никто.
+ */
+function judgeOperation(op, ctx, nested) {
+    switch (op.op) {
+        case 'unknown':
+            return unknownBlock(op);
+        case 'exec': {
+            const calls = shellCalls(op.command);
+            const writes =
+                shellWritesContourData(op.command, calls) ||
+                (ctx.inLoop() ? moverTouchesData(calls, op.baseDir, ctx.fsApi) : null);
+            if (writes === GIT_EXEC_INPUT && ctx.inLoop()) return gitExecBlock();
+            if (writes && ctx.inLoop()) return contourBlock(writes);
+            return judgeShell(op.command, ctx.options);
+        }
+        case 'read':
+        case 'write':
+        case 'delete':
+        case 'move':
+            return judgeFileOperation(op, ctx.inLoop, ctx.fsApi);
+        case 'search':
+            return judgeSearch(op, ctx.fsApi);
+        case 'mcp': {
+            const name = `mcp__${op.server}__${op.tool}`;
+            if (!mcpEventAllowed(name, ctx.mcp)) return mcpBlock(name, ctx.mcp);
+            for (const derived of op.derived) {
+                const verdict = judgeOperation(derived, ctx, true);
+                if (verdict) return verdict;
+            }
+            return null;
+        }
+        case 'fetch':
+            return nested || ctx.inLoop() ? capabilityBlock('fetch', op.url) : null;
+        case 'agent':
+            return ctx.inLoop() ? capabilityBlock('agent', `сессия ${op.parentSession}`) : null;
+        case 'inert':
+            return null;
+        default:
+            // Валидатор границы такую операцию не пропускает; дошла — барьер её не знает.
+            return unknownBlock({ why: `незнакомая операция ${JSON.stringify(op.op)}` });
+    }
+}
+
+/**
+ * Решение по нормализованному событию (#186). Событие уже прошло валидатор границы
+ * (`adapter-event.cjs`); здесь — правила. Первая запрещённая операция запрещает вызов целиком.
+ *
+ * `options` — как у `decide`: `contour`, `loop` и подмена окружения правила про kill; плюс
+ * `fsApi` — чтение файловой системы для разрешения путей и обхода корня поиска (тесты).
+ *
+ * Чего правило на событии пока НЕ судит, сказано вслух. Поверхности конфига харнесса
+ * (`config-surface`): их перечень у каждого пакета свой, общий барьер пакетов не читает, и
+ * правило ждёт политики в контексте сессии. `fetch` и `agent` блокируются только в сессии
+ * петли — в сессии человека сеть и субагенты остаются, как были до карточки.
+ */
+function decideEvent(event, options = {}) {
+    const contour = options.contour || emptyData();
+    const ctx = {
+        options,
+        fsApi: options.fsApi || fs,
+        mcp: { toolsDeclared: false, ...contour.mcp },
+        inLoop: () => (typeof options.loop === 'function' ? options.loop() : !!options.loop),
+    };
+    for (const op of event.operations) {
+        const verdict = judgeOperation(op, ctx, false);
+        if (verdict) return verdict;
+    }
+    return ALLOWED;
+}
+
 module.exports = {
     decide,
+    decideEvent,
+    globMayMatchEnv,
     ENV_FILE_RE,
     CMD_ENV_RE,
     mcpAllowed,
+    mcpAllowedByEffect,
+    mcpReadCall,
 };

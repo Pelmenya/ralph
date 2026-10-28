@@ -273,6 +273,7 @@ import {
 // #121: OpenCode — экспериментальный третий харнесс: argv, конфиг эксперимента, модель, текст.
 import {
     OPENCODE_BIN,
+    OPENCODE_RUNTIME,
     OPENCODE_STATUS,
     buildOpencodeArgs,
     opencodeConfigProblems,
@@ -300,6 +301,7 @@ import {
     type CliVersion,
     type RuntimeProfile,
 } from '../adapters/runtime-profile.ts';
+import { cliVersionDrift, HARNESS_REGISTRY } from '../adapters/harness-registry.ts';
 import {
     describeRoots,
     doctorRootsLines,
@@ -350,6 +352,7 @@ import {
     HOOK_COMMAND_ONLY_ENV,
     type TSessionSettingsDeps,
 } from './session-settings.ts';
+import { loopSessionContext, SESSION_CONTEXT_ENV } from './session-context.ts';
 import {
     acquireRepoOwnership,
     canonicalRepoId,
@@ -1858,12 +1861,33 @@ export function createOrchestrator(env: OrchestratorEnv) {
         logFn(`🧩 Версия CLI \`${bin}\` сменилась между попытками: ${prev} → ${v.version}.`);
     }
 
-    // Версия перед сессией рантайма по его ключу реестра: прочитать и сверить с прошлой.
-    // Это боевое умолчание параметра `cliVersionFn` у run*Once; тесты подменяют его целиком.
+    // Ревью Фазы 16c: версия CLI, с которой снято описание пакета, не сверялась вовсе. Строка
+    // `⚠` — один раз на пару «харнесс, версия» за прогон: перед каждой сессией она тонула бы
+    // в логе, а смену версии посреди ночи всё равно назовёт заново.
+    const warnedCliDrift = new Set<string>();
+    function warnCliVersionDrift(
+        harness: string,
+        version: string,
+        {
+            logFn = log,
+            registry = HARNESS_REGISTRY,
+        }: { logFn?: LogFn; registry?: typeof HARNESS_REGISTRY } = {},
+    ): void {
+        const drift = cliVersionDrift(registry, harness, version, CLI_VERSION_UNKNOWN);
+        const key = `${harness}@${version}`;
+        if (drift === null || warnedCliDrift.has(key)) return;
+        warnedCliDrift.add(key);
+        logFn(`⚠ ${drift}`);
+    }
+
+    // Версия перед сессией рантайма по его ключу реестра: прочитать, сверить с прошлой и с
+    // версией описания пакета. Это боевое умолчание параметра `cliVersionFn` у run*Once;
+    // тесты подменяют его целиком.
     function sessionCliVersion(
         runtime: string,
         readFn: typeof readCliVersion = readCliVersion,
         noteFn: typeof noteCliVersion = noteCliVersion,
+        driftFn: typeof warnCliVersionDrift = warnCliVersionDrift,
     ): CliVersion {
         const id = RUNTIME_IDENTITIES[runtime];
         if (!id) {
@@ -1874,6 +1898,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         }
         const v = readFn(id.bin, id.parseVersion);
         noteFn(id.bin, v);
+        driftFn(id.harness, v.version);
         return v;
     }
 
@@ -2023,23 +2048,80 @@ export function createOrchestrator(env: OrchestratorEnv) {
     let skillGuardByEnv = false;
 
     /**
-     * Env claude-сессии с переключателем барьера скиллов там, где контракта нет, и без
-     * переменных, которые раннер даёт только команде своего хука (`HOOK_COMMAND_ONLY_ENV`):
-     * унаследованный из окружения запуска `RALPH_CORE_SHA` хуки дерева сессии приняли бы за
-     * контракт и сверяли бы себя с чужой ревизией (ревью Фазы 12).
+     * Env сессии с переключателем барьера скиллов там, где контракта нет, с доверенным
+     * контекстом сессии (#184) и без переменных, которые раннер даёт только команде своего
+     * хука (`HOOK_COMMAND_ONLY_ENV`): унаследованный из окружения запуска `RALPH_CORE_SHA` хуки
+     * дерева сессии приняли бы за контракт и сверяли бы себя с чужой ревизией (ревью Фазы 12).
+     * Унаследованный контекст снимается всегда: раннер, запущенный из сессии петли, иначе
+     * отдал бы своим сессиям чужой. Контекст по умолчанию — тот, на котором только что прошла
+     * проба settings этого запуска (`takeSessionContext`), а не собранный заново: у заново
+     * собранного другой `sessionId`, и сессия получила бы не то, что проверено.
+     * Заданный env возвращается всегда (перегрузка): `undefined` — только «env не задан и
+     * менять нечего», и тогда CLI наследует окружение раннера как есть.
      */
+    function withSkillGuard(
+        env: NodeJS.ProcessEnv,
+        base?: NodeJS.ProcessEnv,
+        enabled?: boolean,
+        context?: string | null,
+    ): NodeJS.ProcessEnv;
+    function withSkillGuard(
+        env: NodeJS.ProcessEnv | undefined,
+        base?: NodeJS.ProcessEnv,
+        enabled?: boolean,
+        context?: string | null,
+    ): NodeJS.ProcessEnv | undefined;
     function withSkillGuard(
         env: NodeJS.ProcessEnv | undefined,
         base: NodeJS.ProcessEnv = process.env,
         enabled: boolean = skillGuardByEnv,
+        context: string | null = takeSessionContext(),
     ): NodeJS.ProcessEnv | undefined {
         const src = env ?? base;
-        const leaked = HOOK_COMMAND_ONLY_ENV.some((k) => src[k] !== undefined);
-        if (!enabled && !leaked) return env;
+        const leaked = [...HOOK_COMMAND_ONLY_ENV, SESSION_CONTEXT_ENV].some(
+            (k) => src[k] !== undefined,
+        );
+        if (!enabled && !leaked && context === null) return env;
         const out: NodeJS.ProcessEnv = { ...src };
         for (const k of HOOK_COMMAND_ONLY_ENV) delete out[k];
+        delete out[SESSION_CONTEXT_ENV];
         if (enabled) out[SKILL_GUARD_ENV] = 'on';
+        if (context !== null) out[SESSION_CONTEXT_ENV] = context;
         return out;
+    }
+
+    /**
+     * Доверенный контекст сессии петли (#184) для её окружения. Дерево сессии ставит `main()`
+     * (`codexGuardTree`); до этого — вне управляемого запуска, в юнит-тестах фабрики — `null`.
+     * С раскладкой `roots` потребитель — дерево человека, без неё — само дерево сессии.
+     * Контекст не собрался — стоп, а не сессия без него: guard дерева счёл бы её сессией
+     * человека и пустил бы правку данных контура.
+     */
+    function sessionContextValue({
+        tree = codexGuardTree,
+        roots = sessionSettingsRoots,
+        ...stop
+    }: { tree?: string | null; roots?: typeof sessionSettingsRoots } & TGuardStopDeps = {}):
+        string | null {
+        if (tree === null) return null;
+        const built = loopSessionContext({
+            humanRoot: roots?.humanRoot ?? null,
+            sessionTree: tree,
+            coreSha: roots?.coreSha ?? '',
+        });
+        return built.ok ? built.value : stopOnGuardProbe(built.reason, stop);
+    }
+
+    // Контекст, на котором прошла проба settings перед сессией (`sessionSettingsArgs`). Его
+    // забирает `withSkillGuard` того же запуска — один раз, чтобы следующая сессия не получила
+    // чужой `sessionId`. Пробы не было (Codex, Kimi Code, OpenCode, раскладка без `roots`) —
+    // контекст собирается тут же.
+    let probedSessionContext: string | null = null;
+
+    function takeSessionContext(): string | null {
+        const probed = probedSessionContext;
+        probedSessionContext = null;
+        return probed ?? sessionContextValue();
     }
 
     // Сохранение state петли перед стопом из глубины сессии. Ставит `runLoop` на входе (state
@@ -2100,11 +2182,28 @@ export function createOrchestrator(env: OrchestratorEnv) {
         }: { roots?: typeof sessionSettingsRoots } & TGuardStopDeps = {},
     ): string[] {
         if (!roots) return [];
+        const context = sessionContextValue({ tree: roots.sessionTree, roots, ...stop });
+        // `null` здесь — только дерево сессии не задано: приведение типа увело бы его в разбор
+        // хука как «контекста нет», и причина всплыла бы не там.
+        if (context === null) {
+            return stopOnGuardProbe(
+                'Контекст сессии не собран: дерево сессии раскладки roots не задано — ' +
+                    'проверять пробой нечего, сессия не стартует.',
+                stop,
+            );
+        }
         const prepared = prepareSessionSettings(
-            { ...roots, outPath: path.resolve(RUNTIME.sessionSettings) },
+            {
+                ...roots,
+                outPath: path.resolve(RUNTIME.sessionSettings),
+                sessionContext: context,
+            },
             deps,
         );
-        if (prepared.ok) return ['--settings', prepared.path];
+        if (prepared.ok) {
+            probedSessionContext = context;
+            return ['--settings', prepared.path];
+        }
         return stopOnGuardProbe(prepared.reason, stop);
     }
 
@@ -2186,7 +2285,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             {
                 roots,
                 sessionTree: tree,
-                configDir: path.join(path.resolve(RUNTIME.opencode), 'config'),
+                configDir: path.join(path.resolve(RUNTIME.opencodeSession), 'config'),
                 baseEnv,
             },
             deps,
@@ -2523,6 +2622,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // маркера до последнего. `stdio: ['pipe', …]` явно — по той же причине, что у
     // spawnClaude: молчаливое перекрытие 'ignore' опцией `input` оборвёт stdin при первой
     // же правке опций.
+    // Имя бинаря — из профиля рантайма у адаптеров: `codex` — ещё и имя харнесса пакета, и
+    // литерал в ядре читался бы ветвлением по нему (`tests/harness-identity.test.ts`, #181).
+    const CODEX_BIN = RUNTIME_IDENTITIES.openai.bin;
+
     function spawnCodex(
         cmdArgs: string[],
         prompt: string,
@@ -2532,7 +2635,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         attempt: TAttemptContext = unreadAttemptContext('openai'),
     ): RunResult {
         if (spawnFn === spawnSync) guardSideEffect('spawnCodex(codex)');
-        const res = spawnFn('codex', cmdArgs, {
+        const res = spawnFn(CODEX_BIN, cmdArgs, {
             stdio: ['pipe', 'pipe', 'pipe'],
             input: prompt,
             shell: false,
@@ -2549,7 +2652,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // элементом и был подвержен E2BIG; ENOENT и таймаут у него остаются). Ревью
         // #612: одинаковость держится ОДНИМ вызовом общего модуля, а не копией трёх веток
         // логирования — разъехавшись, копии дали бы разный диагноз одному отказу.
-        const { result, logLines } = resolveSpawnResult('codex', res, output, timeoutMs);
+        const { result, logLines } = resolveSpawnResult(CODEX_BIN, res, output, timeoutMs);
         for (const line of logLines) log(line);
         const end = classifyCodexSessionEnd({
             code: result.code,
@@ -2559,7 +2662,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
             failureKind: result.failureKind,
         });
         recordAttempt({
-            runtime: 'codex',
+            // Ключ рантайма журнала попыток, а не имя бинаря: совпадают они случайно.
+            runtime: 'openai',
             code: result.code,
             parsed: null,
             unknownReason: 'рантайм codex расход токенов в выводе не отдаёт',
@@ -2694,7 +2798,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         expected: 'chatgpt' | 'api',
     ): void {
         if (spawnFn === spawnSync) guardSideEffect('assertCodexLoginChannel(codex login status)');
-        const res = spawnFn('codex', ['login', 'status'], {
+        const res = spawnFn(CODEX_BIN, ['login', 'status'], {
             encoding: 'utf8',
             shell: false,
             env,
@@ -2891,7 +2995,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // token не-null при !DRY только в режиме apiKey (requireToken выше); при подписке он
         // null штатно, и buildOpenAISpawnEnv тогда вычищает OPENAI_API_KEY из окружения.
         // Секрет — только в env процесса, НЕ в argv (иначе виден в /proc/*/cmdline).
-        const env = buildOpenAISpawnEnv(token, process.env, tokenEnv);
+        // Контекст сессии петли (#184) — тем же env, что у остальных харнессов: хук моста Codex
+        // наследует окружение CLI.
+        const openaiEnv = buildOpenAISpawnEnv(token, process.env, tokenEnv);
+        const env = withSkillGuard(openaiEnv);
         // Порядок важен: канал входа проверяется ДО спавна сессии — иначе платный запрос уже
         // ушёл бы, и «стоп» опоздал ровно на одну оплаченную итерацию.
         // Проверяются ОБА режима (ревью Codex, 4-й проход): при `apiKey` кешированный
@@ -3162,7 +3269,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         timeoutMs: number,
         spawnFn: typeof spawnSync = spawnSync,
         env?: NodeJS.ProcessEnv,
-        attempt: TAttemptContext = unreadAttemptContext('opencode'),
+        attempt: TAttemptContext = unreadAttemptContext(OPENCODE_RUNTIME),
     ): RunResult {
         if (spawnFn === spawnSync) guardSideEffect('spawnOpencode(opencode)');
         const res = spawnFn(OPENCODE_BIN, cmdArgs, {
@@ -3180,7 +3287,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         const output = `${text}\n${stderr}`;
         if (text) process.stdout.write(`${text}\n`);
         if (stderr) process.stderr.write(stderr);
-        const { result, logLines } = resolveSpawnResult('opencode', res, output, timeoutMs);
+        const { result, logLines } = resolveSpawnResult(OPENCODE_BIN, res, output, timeoutMs);
         for (const line of logLines) log(line);
         const end = classifyOpencodeSessionEnd({
             code: result.code,
@@ -3190,7 +3297,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             failureKind: result.failureKind,
         });
         recordAttempt({
-            runtime: 'opencode',
+            runtime: OPENCODE_RUNTIME,
             code: result.code,
             parsed: null,
             unknownReason: 'рантайм opencode расход токенов в текст попытки не переводит',
@@ -3221,8 +3328,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
         const timeout = config.claudeTimeoutMs || 2 * 60 * 60 * 1000;
         const env = withSkillGuard(buildOpencodeSpawnEnv(process.env, { configDir }));
         return spawnOpencode(buildOpencodeArgs({ model }), prompt, timeout, spawnFn, env, {
-            profile: runtimeProfile('opencode', model),
-            cliVersion: cliVersionFn('opencode'),
+            profile: runtimeProfile(OPENCODE_RUNTIME, model),
+            cliVersion: cliVersionFn(OPENCODE_RUNTIME),
         });
     }
 
@@ -5769,7 +5876,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             // `claude` (ADAPTER_DEFAULTS) — Claude-путь не меняется.
             openai: createCoderRuntime({
                 run: runOpenAIOnce,
-                checkAvailable: () => probeRuntimeBinaryOnce('codex'),
+                checkAvailable: () => probeRuntimeBinaryOnce(CODEX_BIN),
                 capabilities: CODEX_CAPABILITIES,
             }),
             // #120 (Фаза 16b): Kimi Code родным харнессом — свой бинарь `kimi`, рядом с
@@ -11612,10 +11719,19 @@ export function createOrchestrator(env: OrchestratorEnv) {
             skillGuardByEnv = true;
             log(describeSessionSettingsStart(null));
         }
+        // #184: доверенный контекст сессии — в env каждой сессии петли. Проба ниже требует,
+        // чтобы его получила КАЖДАЯ регистрация guard; без обоих корней — отказ старта.
+        const startContext = loopSessionContext({
+            humanRoot: settingsRoots?.humanRoot ?? null,
+            sessionTree,
+            coreSha,
+        });
+        if (!startContext.ok) fail(startContext.reason);
         ensureGuardHolds(sessionTree, {
             failFn: fail,
             logFn: log,
             settings: builtSettings,
+            sessionContext: startContext.ok ? startContext.value : '',
             runtimes: {
                 coderRuntime: adapterSelection.coderRuntime,
                 modelRouting: config.modelRouting,
@@ -11743,6 +11859,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         kimiNativeHomeFor,
         opencodeConfigDirFor,
         withSkillGuard,
+        sessionContextValue,
         resolveProfile,
         deepMerge,
         parseProfileFlag,
@@ -11851,6 +11968,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         readCliVersion,
         noteCliVersion,
         sessionCliVersion,
+        warnCliVersionDrift,
         runClaude,
         subscriptionKeyRing,
         // #373 (фаза 6): рантайм Kimi (тот же `claude` + endpoint Moonshot). Экспорт —

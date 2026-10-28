@@ -12,7 +12,7 @@ import { coreIsRepoRoot } from '../tests/core-repo.ts';
 import { sideEffectAttempts } from '../shared/side-effect-guard.ts';
 import {
     GUARD_PROBES,
-    GUARD_WIRED_HARNESSES,
+    CONTEXT_UNPROVEN_LIMIT,
     ensureGuardHolds,
     harnessRoutes,
     harnessGuardProblems,
@@ -38,6 +38,8 @@ import {
     type GuardHook,
 } from '../adapters/harness-guard.ts';
 import { readFileSync } from 'node:fs';
+import { HARNESS_REGISTRY } from '../adapters/harness-registry.ts';
+import { heldRun } from '../tests/guard-fake.ts';
 
 const CANON_ROOT = path.resolve(import.meta.dirname, '..');
 
@@ -79,10 +81,7 @@ const settingsWith = (matcher: string, command = 'node guard.cjs') => ({
 });
 
 /** Барьер «как должно быть»: 2 на запрещённом, 0 на безобидном. */
-const goodGuard: TRunHookFn = (_hook, payload) => {
-    const { tool_input } = JSON.parse(payload) as { tool_input: { command?: string } };
-    return { status: tool_input.command === 'git status' ? 0 : 2, stderr: '' };
-};
+const goodGuard: TRunHookFn = (_hook, payload) => heldRun(payload);
 
 describe('matcher и выбор хуков — семантика Claude Code', () => {
     it('пустой и `*` накрывают всё, иначе — регулярное выражение по имени целиком', () => {
@@ -197,9 +196,66 @@ describe('вердикт пробы на исходах хуков', () => {
         const problems = probeProblems(all, '/x', {
             runHookFn: () => ({ status: 2, stderr: 'Правила барьера не загрузились' }),
         });
-        expect(problems).toHaveLength(1);
-        expect(problems[0]).toContain('безобидная команда');
-        expect(problems[0]).toContain('Правила барьера не загрузились');
+        const safe = problems.filter((p) => p.includes('безобидная команда'));
+        expect(safe).toHaveLength(1);
+        expect(safe[0]).toContain('Правила барьера не загрузились');
+    });
+
+    it('от противного: блок всего по сбою загрузки запрещённые пробы не засчитывает (#183)', () => {
+        // Двойка с кодом неисправности — ровно то, что выдаёт guard без правил. Прежде каждая
+        // запрещённая проба на нём была зелёной, и красной оставалась одна безобидная.
+        const problems = probeProblems(all, '/x', {
+            runHookFn: () => ({
+                status: 2,
+                stderr: 'Правила барьера не загрузились\nralph-reason-code: rules-unloaded\n',
+            }),
+        });
+        const blocked = GUARD_PROBES.filter((p) => p.expect === 'blocked');
+        expect(blocked.length).toBeGreaterThan(0);
+        for (const probe of blocked) {
+            expect(problems.join('\n')).toContain(
+                `${probe.what} (${probe.toolName}): вызов заблокирован, но не правилом — ` +
+                    `ждали код причины ${probe.reasonCode}, получили: rules-unloaded`,
+            );
+        }
+    });
+
+    it('двойка без строки кода и с чужим кодом — тоже не правило', () => {
+        const noCode = probeProblems(all, '/x', {
+            runHookFn: (_h, payload) =>
+                /git status/.test(payload) ? heldRun(payload) : { status: 2, stderr: 'нет' },
+        });
+        expect(noCode.join('\n')).toMatch(/получили: в stderr нет строки кода причины/);
+        const wrong = probeProblems(all, '/x', {
+            runHookFn: (_h, payload) =>
+                /git status/.test(payload)
+                    ? heldRun(payload)
+                    : { status: 2, stderr: 'ralph-reason-code: destructive' },
+        });
+        // Удаление названо верно, остальные — чужим кодом.
+        expect(wrong.join('\n')).not.toMatch(/рекурсивное удаление/);
+        expect(wrong.join('\n')).toMatch(/ждали код причины secret-env, получили: destructive/);
+    });
+
+    it('хватает одного хука с кодом правила: хук потребителя со своей двойкой пробу не портит', () => {
+        const two = {
+            hooks: {
+                PreToolUse: [
+                    {
+                        matcher: 'Bash|Read|Edit|Grep|mcp__.*',
+                        hooks: [{ type: 'command', command: 'guard' }],
+                    },
+                    { matcher: 'Bash', hooks: [{ type: 'command', command: 'consumer' }] },
+                ],
+            },
+        };
+        const problems = probeProblems(two, '/x', {
+            runHookFn: (hook, payload) =>
+                hook.command === 'consumer' && !/git status/.test(payload)
+                    ? { status: 2, stderr: 'свой отказ без кода' }
+                    : heldRun(payload),
+        });
+        expect(problems).toEqual([]);
     });
 
     it('достаточно ОДНОГО блокирующего хука, но безобидное обязаны пропустить ВСЕ', () => {
@@ -302,10 +358,10 @@ describe('харнесс рантайма: guard обязан быть дока�
         expect(found[0]).toMatch(/«mystery-cli» не передаётся CLI/);
     });
 
-    // #121: адаптер opencode кладёт плагин барьера в OPENCODE_CONFIG_DIR — харнесс проведён,
-    // и проба старта исполняет его плагин на событиях OpenCode.
+    // #121: адаптер opencode кладёт плагин барьера в OPENCODE_CONFIG_DIR — харнесс проведён
+    // (с #213 — пакетом реестра), и проба старта исполняет его плагин на событиях OpenCode.
     it('opencode: харнесс проведён, проба старта исполняет плагин', () => {
-        expect(GUARD_WIRED_HARNESSES.has('opencode')).toBe(true);
+        expect(HARNESS_REGISTRY.packages.has('opencode')).toBe(true);
         expect(unguardedRoutes(harnessRoutes({ coderRuntime: 'opencode' }))).toEqual([]);
         const logs: string[] = [];
         const fails: string[] = [];
@@ -313,7 +369,7 @@ describe('харнесс рантайма: guard обязан быть дока�
         const runPluginFn: TRunPluginFn = (_src, ev) => {
             const args = JSON.stringify(ev.output.args);
             calls.push(args);
-            return { status: args.includes('git status') ? 0 : 2, stderr: '' };
+            return heldRun(JSON.stringify(ev));
         };
         ensureGuardHolds('/x', {
             failFn: (m) => fails.push(m),
@@ -331,7 +387,7 @@ describe('харнесс рантайма: guard обязан быть дока�
     // #120: адаптер kimi-native отдаёт дом CLI с `[[hooks]]` — харнесс проведён, и конфиг на
     // нём проходит правило «guard доказан», а проба старта гоняет его регистрацию.
     it('kimi-native: харнесс Kimi Code проведён, проба старта гоняет его регистрацию', () => {
-        expect(GUARD_WIRED_HARNESSES.has('kimi-code')).toBe(true);
+        expect(HARNESS_REGISTRY.packages.has('kimi-code')).toBe(true);
         expect(unguardedRoutes(harnessRoutes({ coderRuntime: 'kimi-native' }))).toEqual([]);
         const logs: string[] = [];
         const fails: string[] = [];
@@ -592,11 +648,14 @@ describe('живая проба: настоящие хуки процессом'
             const prefixed = (guardHooksOf(canonSettings(), CANON_ROOT) as GuardHook[]).map(
                 (h) => ({
                     ...h,
-                    command: h.command.replace(/^export (CLAUDE_PROJECT_DIR=\S+); /, '$1 '),
+                    command: h.command.replace(
+                        /^export (CLAUDE_PROJECT_DIR=\S+) (RALPH_GUARD_INPUT=\S+); /,
+                        '$2 $1 ',
+                    ),
                 }),
             );
             expect(prefixed[0].command).toMatch(
-                /^CLAUDE_PROJECT_DIR='[^']+' node "\$\{CLAUDE_PROJECT_DIR\}/,
+                /^RALPH_GUARD_INPUT=compat-16b CLAUDE_PROJECT_DIR='[^']+' node "\$\{CLAUDE_PROJECT_DIR\}/,
             );
             const problems =
                 harness === 'codex'
@@ -671,6 +730,27 @@ describe('живая проба: настоящие хуки процессом'
         },
     );
 
+    it('guardHooksOf: запись без matcher переносится с пустым matcher — на все инструменты', () => {
+        const hooks = guardHooksOf(
+            {
+                hooks: {
+                    PreToolUse: [
+                        {
+                            hooks: [
+                                {
+                                    type: 'command',
+                                    command: "node '/core/.claude/hooks/guard.cjs'",
+                                },
+                            ],
+                        },
+                    ],
+                },
+            },
+            '/work',
+        );
+        expect(hooks.map((h) => h.matcher)).toEqual(['']);
+    });
+
     it('guardHooksOf не переносит барьер скиллов ни каноническим путём, ни путём дерева', () => {
         const hooks = guardHooksOf(
             {
@@ -718,12 +798,38 @@ describe('живая проба: настоящие хуки процессом'
                 coderRuntime: 'claude',
                 modelRouting: { apiLimitFallback: { provider: 'openai' } },
             },
-            runHookFn: (_h, payload) =>
-                /git status/.test(payload)
-                    ? { status: 0, stderr: '' }
-                    : { status: 2, stderr: 'нет' },
+            runHookFn: (_h, payload) => heldRun(payload),
         });
         expect(lines.join('\n')).toMatch(/⚠ codex: барьер скиллов не зарегистрирован/);
+    });
+
+    // Ревью Фазы 16c: Codex, Kimi Code и OpenCode пробу контекста не проходят нигде, и
+    // предел был только абзацем в доках. Теперь — строкой старта у каждого такого маршрута.
+    it('ensureGuardHolds с контекстом называет харнессы, где контекст пробой не доказан', () => {
+        const run = (withRoute: boolean) => {
+            const lines: string[] = [];
+            ensureGuardHolds('/work', {
+                failFn: (m) => {
+                    throw new Error(m);
+                },
+                logFn: (m) => lines.push(m),
+                settings: settingsWith('.*'),
+                sessionContext: '{"loop":true}',
+                runtimes: withRoute
+                    ? {
+                          coderRuntime: 'claude',
+                          modelRouting: { apiLimitFallback: { provider: 'openai' } },
+                      }
+                    : { coderRuntime: 'claude' },
+                runHookFn: (_h, payload) =>
+                    payload.includes('.claude/ralph/hooks.json')
+                        ? { status: 2, stderr: 'ralph-reason-code: contour-data\n' }
+                        : heldRun(payload),
+            });
+            return lines.join('\n');
+        };
+        expect(run(true)).toContain(`⚠ codex: ${CONTEXT_UNPROVEN_LIMIT}`);
+        expect(run(false)).not.toContain(CONTEXT_UNPROVEN_LIMIT);
     });
 
     // Живые события стенда (обрезанные) — на настоящем guard канона: барьер разбирает вход
@@ -877,8 +983,13 @@ describe('живая проба: настоящие хуки процессом'
             { matcher: '', command: `node "${dir}/hook.cjs"`, timeoutSec: 10 },
         ]);
         const problems = opencodePluginProblems(source, dir, { runPluginFn: spawnPlugin });
-        expect(problems).toHaveLength(1);
-        expect(problems[0]).toMatch(/безобидная команда \(bash\)[\s\S]*упал \(код 1/);
+        const safe = problems.filter((p) => p.includes('безобидная команда'));
+        expect(safe).toHaveLength(1);
+        expect(safe[0]).toMatch(/безобидная команда \(bash\)[\s\S]*упал \(код 1/);
+        // Блок упавшим хуком — не правило: запрещённые без кода причины не засчитаны (#183).
+        expect(problems.filter((p) => /ждали код причины/.test(p))).toHaveLength(
+            problems.length - 1,
+        );
     });
 
     it('плагин OpenCode: MCP-имя и патч переводятся в форму, которую судит барьер', () => {

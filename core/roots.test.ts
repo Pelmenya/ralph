@@ -490,7 +490,7 @@ describe('переезд состояния в runtimeDir (канон, зада�
             'log',
             'monitorOut',
             'monitorPid',
-            'opencode',
+            'opencodeSession',
             'requests',
             'sessionSettings',
             'sessions',

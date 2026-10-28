@@ -37,6 +37,8 @@
 // TS-модуль без билд-шага (erasable-only), без побочек: строит тексты регистраций и читает
 // их обратно. Исполняет хуки и плагин проба ядра.
 
+import type { BarrierReasonCode } from './barrier-reason.ts';
+
 /** Харнесс — CLI, который ведёт сессию. Ключи — те же, что `harness` у `RUNTIME_IDENTITIES`. */
 export type Harness = 'claude-code' | 'codex' | 'kimi-code' | 'opencode';
 
@@ -45,37 +47,56 @@ export const HARNESSES: readonly Harness[] = ['claude-code', 'codex', 'kimi-code
 /** Хук барьера в общей форме: регистрации всех харнессов строятся из неё. */
 export type GuardHook = { matcher: string; command: string; timeoutSec: number };
 
-/** Вызов пробы в терминах харнесса: его имя инструмента и его форма аргументов. */
+/**
+ * Вызов пробы в терминах харнесса: его имя инструмента и его форма аргументов. У
+ * запрещённого — код причины, которым его обязан назвать барьер (#183): двойка без кода
+ * или с кодом неисправности значит «барьер сломан и блокирует всё», а не «правило держит».
+ */
 export type HarnessProbe = {
     what: string;
     toolName: string;
     toolInput: Record<string, unknown>;
-    expect: 'blocked' | 'allowed';
-};
+} & ({ expect: 'blocked'; reasonCode: BarrierReasonCode } | { expect: 'allowed' });
 
-const RM = { what: 'рекурсивное удаление', command: 'rm -rf ./.ralph-guard-probe' };
-const CAT = { what: 'чтение env-файла из оболочки', command: 'cat .env' };
-const SED = { what: 'чтение env-файла через sed', command: "sed -n '1,5p' .env" };
-const SAFE = { what: 'безобидная команда', command: 'git status' };
+type ShellProbe = { what: string; command: string; reasonCode?: BarrierReasonCode };
+
+const RM: ShellProbe = {
+    what: 'рекурсивное удаление',
+    command: 'rm -rf ./.ralph-guard-probe',
+    reasonCode: 'destructive',
+};
+const CAT: ShellProbe = {
+    what: 'чтение env-файла из оболочки',
+    command: 'cat .env',
+    reasonCode: 'secret-env',
+};
+const SED: ShellProbe = {
+    what: 'чтение env-файла через sed',
+    command: "sed -n '1,5p' .env",
+    reasonCode: 'secret-env',
+};
+const SAFE: ShellProbe = { what: 'безобидная команда', command: 'git status' };
 
 /**
  * MCP-мутация форжа: matcher канона накрывает MCP только префиксом `mcp__`, и харнесс, чьё имя
  * MCP-инструмента под него не подходит, прошёл бы мимо барьера при зелёной пробе (ревью
  * Фазы 16b). Сервер вымышленный — исполнять вызов некому.
  */
-const MCP_DELETE = {
+const MCP_DELETE: HarnessProbe = {
     what: 'MCP-мутация вне allowlist',
     toolName: 'mcp__ralph-guard-probe__DeleteRepository',
     toolInput: {},
-    expect: 'blocked' as const,
+    expect: 'blocked',
+    reasonCode: 'mcp-not-allowed',
 };
 
-const shell = (toolName: string, p: { what: string; command: string }, allowed = false) => ({
-    what: p.what,
-    toolName,
-    toolInput: { command: p.command },
-    expect: allowed ? ('allowed' as const) : ('blocked' as const),
-});
+/** Проба оболочки: с кодом причины — запрещённая, без него — безобидная. */
+const shell = (toolName: string, p: ShellProbe): HarnessProbe => {
+    const base = { what: p.what, toolName, toolInput: { command: p.command } };
+    return p.reasonCode
+        ? { ...base, expect: 'blocked', reasonCode: p.reasonCode }
+        : { ...base, expect: 'allowed' };
+};
 
 /**
  * Состав пробы у каждого харнесса — критерии задачи 6 (рекурсивное удаление, чтение
@@ -90,6 +111,7 @@ export const HARNESS_PROBES: Record<Harness, readonly HarnessProbe[]> = {
             toolName: 'Read',
             toolInput: { file_path: '.env' },
             expect: 'blocked',
+            reasonCode: 'secret-env',
         },
         shell('Bash', CAT),
         {
@@ -99,16 +121,17 @@ export const HARNESS_PROBES: Record<Harness, readonly HarnessProbe[]> = {
             toolName: 'Grep',
             toolInput: { pattern: '.', path: '.env', output_mode: 'content' },
             expect: 'blocked',
+            reasonCode: 'secret-env',
         },
         // `sed`/`awk` тоже читают файл, а список читающих команд у барьера потребителя их не
         // знал (ревью Kimi): проба из одного `cat` прошла бы при этой дыре.
         shell('Bash', SED),
         MCP_DELETE,
-        shell('Bash', SAFE, true),
+        shell('Bash', SAFE),
     ],
     // MCP-случая у Codex нет: PreToolUse `codex exec` зовёт только на оболочке (стенд).
     // Предел назван строкой старта (`CODEX_GUARD_LIMIT`), а не умолчан.
-    codex: [shell('Bash', RM), shell('Bash', CAT), shell('Bash', SED), shell('Bash', SAFE, true)],
+    codex: [shell('Bash', RM), shell('Bash', CAT), shell('Bash', SED), shell('Bash', SAFE)],
     'kimi-code': [
         shell('Bash', RM),
         {
@@ -116,6 +139,7 @@ export const HARNESS_PROBES: Record<Harness, readonly HarnessProbe[]> = {
             toolName: 'Read',
             toolInput: { path: '.env' },
             expect: 'blocked',
+            reasonCode: 'secret-env',
         },
         shell('Bash', CAT),
         {
@@ -123,12 +147,13 @@ export const HARNESS_PROBES: Record<Harness, readonly HarnessProbe[]> = {
             toolName: 'Grep',
             toolInput: { pattern: '.', path: '.env', output_mode: 'content' },
             expect: 'blocked',
+            reasonCode: 'secret-env',
         },
         shell('Bash', SED),
         // Kimi Code 2.3 называет MCP-инструмент так же, `mcp__<сервер>__<инструмент>`
         // (`MCP_NAME_PREFIX` в исходнике CLI); matcher у него без якорей.
         MCP_DELETE,
-        shell('Bash', SAFE, true),
+        shell('Bash', SAFE),
     ],
     opencode: [
         shell('bash', RM),
@@ -137,6 +162,7 @@ export const HARNESS_PROBES: Record<Harness, readonly HarnessProbe[]> = {
             toolName: 'read',
             toolInput: { filePath: '.env' },
             expect: 'blocked',
+            reasonCode: 'secret-env',
         },
         shell('bash', CAT),
         {
@@ -144,6 +170,7 @@ export const HARNESS_PROBES: Record<Harness, readonly HarnessProbe[]> = {
             toolName: 'grep',
             toolInput: { pattern: '.', path: '.env' },
             expect: 'blocked',
+            reasonCode: 'secret-env',
         },
         shell('bash', SED),
         {
@@ -155,6 +182,7 @@ export const HARNESS_PROBES: Record<Harness, readonly HarnessProbe[]> = {
                 patchText: '*** Begin Patch\n*** Update File: .env\n@@\n-A=1\n+A=2\n*** End Patch',
             },
             expect: 'blocked',
+            reasonCode: 'secret-env',
         },
         {
             // CLI режет путь патча `.trim()`; табуляция вокруг пути не уводит его мимо барьера.
@@ -165,6 +193,7 @@ export const HARNESS_PROBES: Record<Harness, readonly HarnessProbe[]> = {
                     '*** Begin Patch\n*** Update File:\t.env\t\n@@\n-A=1\n+A=2\n*** End Patch',
             },
             expect: 'blocked',
+            reasonCode: 'secret-env',
         },
         {
             // CLI делит патч на строки только по `\n`: `\r` после двоеточия остаётся в
@@ -176,6 +205,7 @@ export const HARNESS_PROBES: Record<Harness, readonly HarnessProbe[]> = {
                     '*** Begin Patch\n*** Update File: a.ts\n@@\n-x\n+y\n*** Update File:\r.env\n@@\n-A=1\n+A=2\n*** End Patch',
             },
             expect: 'blocked',
+            reasonCode: 'secret-env',
         },
         {
             // Путь элемента `edits[]` переводится как и путь верхнего уровня (ревью Фазы 16b).
@@ -186,6 +216,7 @@ export const HARNESS_PROBES: Record<Harness, readonly HarnessProbe[]> = {
                 edits: [{ filePath: '.env', oldString: 'A=1', newString: 'A=2' }],
             },
             expect: 'blocked',
+            reasonCode: 'secret-env',
         },
         {
             // Вложенные вызовы `batch` стендом не сверены — инструмент блокируется целиком.
@@ -193,6 +224,7 @@ export const HARNESS_PROBES: Record<Harness, readonly HarnessProbe[]> = {
             toolName: 'batch',
             toolInput: { tool_calls: [{ tool: 'bash', parameters: { command: RM.command } }] },
             expect: 'blocked',
+            reasonCode: 'mcp-not-allowed',
         },
         {
             // Имя MCP у OpenCode — `<сервер>_<инструмент>`; форма чтения не даёт пропуска.
@@ -200,8 +232,9 @@ export const HARNESS_PROBES: Record<Harness, readonly HarnessProbe[]> = {
             toolName: 'ralph-guard-probe_ListIssues',
             toolInput: {},
             expect: 'blocked',
+            reasonCode: 'mcp-not-allowed',
         },
-        shell('bash', SAFE, true),
+        shell('bash', SAFE),
     ],
 };
 

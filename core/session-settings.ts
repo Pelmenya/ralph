@@ -61,16 +61,31 @@ import path from 'node:path';
 import { guardSideEffect } from '../shared/side-effect-guard.ts';
 import {
     codexArgsProblems,
+    CORE_SHA_ENV,
+    GUARD_ADAPTER_ENV,
+    GUARD_INPUT_ENV,
+    HOOK_COMMAND_ONLY_ENV,
+    HOOKS_DATA_ENV,
     guardHooksOf,
     kimiTomlProblems,
     opencodePluginProblems,
     probeProblems,
     runHook,
+    sessionContextProblems,
     runOpencodePlugin,
     type TRunHookFn,
     type TRunPluginFn,
 } from './guard-probe.ts';
+// Переменные команды хука живут в `guard-probe.ts`: проба снимает их все с окружения хука, а
+// импорт отсюда замкнул бы цикл модулей. Потребителям они по-прежнему отсюда.
+export { CORE_SHA_ENV, GUARD_ADAPTER_ENV, HOOK_COMMAND_ONLY_ENV, HOOKS_DATA_ENV };
 import { codexGuardArgs, opencodeGuardPlugin } from '../adapters/harness-guard.ts';
+import {
+    HARNESS_REGISTRY,
+    normalizerPathIn,
+    SESSION_SETTINGS_HARNESS,
+    type HarnessRegistry,
+} from '../adapters/harness-registry.ts';
 import { KIMI_HOME_LINKS, kimiSessionConfig } from '../adapters/kimi-native.ts';
 import {
     OPENCODE_BIN,
@@ -86,18 +101,24 @@ import { writeFileAtomic } from './roots.ts';
 /**
  * Канонические PreToolUse-хуки сессии петли. Matcher'ы — те же, что в `.claude/settings.json`
  * канона: их совпадение сверяет тест, иначе два списка разъехались бы на первой правке.
+ *
+ * Guard накрывает ВСЕ инструменты (#186): незнакомое — запрет, а инструмент, до которого хук
+ * не дошёл, барьер не видит вовсе — `Monitor` с командой оболочки шёл мимо прежнего перечня
+ * имён. `.*`, а не `*`: перечень переносится и в регистрации Codex и Kimi Code
+ * (`guardHooksOf`), а у Kimi matcher — регулярное выражение без якорей, где `*` не разбирается
+ * и не накрывает ничего. Таймаут — с запасом над сроком нормализатора пакета
+ * (`adapter-event.cjs`): хук, убитый CLI по сроку, у PreToolUse не блокирует.
  */
-export const CANON_SESSION_HOOKS: readonly { file: string; matcher: string; timeout: number }[] = [
-    {
-        file: 'guard.cjs',
-        matcher: 'Bash|Read|Edit|Write|MultiEdit|NotebookEdit|Grep|mcp__.*',
-        timeout: 10,
-    },
+export const CANON_SESSION_HOOKS: readonly {
+    file: string;
+    matcher: string;
+    timeout: number;
+    /** Хук судит событие нормализатора пакета (#186): регистрация несёт путь его команды. */
+    adapter?: boolean;
+}[] = [
+    { file: 'guard.cjs', matcher: '.*', timeout: 30, adapter: true },
     { file: 'skill-barrier.cjs', matcher: 'Bash|Edit|Write|MultiEdit|NotebookEdit', timeout: 10 },
 ];
-
-/** Переменная, которой хук получает путь данных контура (читает `consumer-data.cjs`). */
-export const HOOKS_DATA_ENV = 'RALPH_HOOKS_DATA';
 
 /**
  * Переключатель барьера скиллов (читает `skill-barrier.cjs`). Раннер ставит его сессиям в
@@ -105,15 +126,19 @@ export const HOOKS_DATA_ENV = 'RALPH_HOOKS_DATA';
  */
 export const SKILL_GUARD_ENV = 'RALPH_SKILL_GUARD';
 
-/** Контракт запуска петли: ожидаемая ревизия ядра (читает `core-revision.cjs`). */
-export const CORE_SHA_ENV = 'RALPH_CORE_SHA';
-
 /**
- * Переменные, которые раннер кладёт только в команду своего хука. В env сессии их быть не
- * должно: его наследуют и хуки дерева сессии, и унаследованное из окружения раннера значение
- * дало бы им чужой контракт или чужие данные контура (`withSkillGuard` в оркестраторе).
+ * Значение `RALPH_GUARD_ADAPTER` для ядра `productRoot`: путь нормализатора пакета харнесса
+ * настроек из реестра. Пакет не принят — значение-причина: она не абсолютный путь, guard на
+ * ней блокирует всё кодом `adapter-failed`, и проба перед сессией называет причину стопом, а не
+ * пускает сессию на совместимом входе молча.
  */
-export const HOOK_COMMAND_ONLY_ENV: readonly string[] = [CORE_SHA_ENV, HOOKS_DATA_ENV];
+export function guardAdapterValue(
+    productRoot: string,
+    registry: HarnessRegistry = HARNESS_REGISTRY,
+): string {
+    const found = normalizerPathIn(registry, SESSION_SETTINGS_HARNESS, productRoot);
+    return found.ok ? found.path : `пакет не принят: ${found.reason}`;
+}
 
 // Та же форма, что у `core-revision.cjs`: полный SHA, а не сокращение и не имя ветки.
 const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
@@ -144,6 +169,7 @@ export function canonHookCommand(
     file: string,
     humanRoot: string,
     coreSha: string,
+    adapter?: string,
 ): string {
     const data = path.join(humanRoot, HOOKS_DATA_REL);
     const hook = path.join(productRoot, '.claude', 'hooks', file);
@@ -151,7 +177,8 @@ export function canonHookCommand(
         coreSha === ''
             ? `${CORE_SHA_ENV}='' ${SKILL_GUARD_ENV}=${shellQuote('on')}`
             : `${CORE_SHA_ENV}=${shellQuote(coreSha)}`;
-    return `${loop} ${HOOKS_DATA_ENV}=${shellQuote(data)} node ${shellQuote(hook)}`;
+    const event = adapter === undefined ? '' : ` ${GUARD_ADAPTER_ENV}=${shellQuote(adapter)}`;
+    return `${loop} ${HOOKS_DATA_ENV}=${shellQuote(data)}${event} node ${shellQuote(hook)}`;
 }
 
 /** Исход git-вызова в каталоге: код, stdout, stderr. */
@@ -391,12 +418,18 @@ export function buildSessionSettings({
     }
     hooks.PreToolUse = [
         ...(hooks.PreToolUse ?? []),
-        ...CANON_SESSION_HOOKS.map(({ file, matcher, timeout }) => ({
+        ...CANON_SESSION_HOOKS.map(({ file, matcher, timeout, adapter }) => ({
             matcher,
             hooks: [
                 {
                     type: 'command',
-                    command: canonHookCommand(productRoot, file, humanRoot, coreSha),
+                    command: canonHookCommand(
+                        productRoot,
+                        file,
+                        humanRoot,
+                        coreSha,
+                        adapter ? guardAdapterValue(productRoot) : undefined,
+                    ),
                     timeout,
                 },
             ],
@@ -425,12 +458,15 @@ export function prepareSessionSettings(
         coreSha,
         sessionTree,
         outPath,
+        sessionContext,
     }: {
         productRoot: string;
         humanRoot: string;
         coreSha: string;
         sessionTree: string;
         outPath: string;
+        /** Контекст сессии (#184), который раннер даст ей в окружение: его обязан получить каждый guard. */
+        sessionContext: string;
     },
     {
         readFileFn = (p) => fs.readFileSync(p, 'utf-8'),
@@ -450,7 +486,10 @@ export function prepareSessionSettings(
         };
     }
     const settings = buildSessionSettings({ productRoot, humanRoot, coreSha, humanSettings });
-    const problems = probeProblems(settings, sessionTree, { runHookFn });
+    const problems = [
+        ...probeProblems(settings, sessionTree, { runHookFn }),
+        ...sessionContextProblems(settings, sessionTree, sessionContext, { runHookFn }),
+    ];
     if (problems.length > 0) {
         return {
             ok: false,

@@ -29,9 +29,39 @@
  * `core/guard-probe.ts` подаёт хукам заведомо запрещённые вызовы и не стартует, если
  * хоть один прошёл.
  *
- * Input (stdin): JSON { tool_name, tool_input }
- * Exit 2 + stderr => инструмент блокируется, сообщение уходит агенту.
- * Exit 0 => разрешено.
+ * Input (stdin): сырой вход PreToolUse харнесса. Exit 2 + stderr — блок, сообщение уходит
+ * агенту; exit 0 — разрешено.
+ *
+ * **Вход — нормализованное событие (#186, Фаза 16c).** Сырой вход CLI до правил не доходит:
+ * хук отдаёт его команде нормализатора пакета харнесса (`adapter-event.cjs`, процессом, а не
+ * `require`) и судит полученный `ToolEvent` (`decideEvent` в `guard-rules.cjs`). Незнакомое —
+ * инструмент вне описания пакета, поле вне перечня — приходит операцией `unknown` и
+ * блокируется своим кодом, а не разрешается, как разрешал прежний вход.
+ *
+ * Какой нормализатор, хук не выбирает и не ищет: путь пакета в коде хука был бы зависимостью
+ * барьера от пакетов (`tests/harness-package-deps.test.ts`) и выбором харнесса внутри общего
+ * барьера. Абсолютный путь команды нормализатора приносит регистрация — переменная
+ * `RALPH_GUARD_ADAPTER` в команде хука, которую раннер берёт у реестра пакетов
+ * (`core/session-settings.ts`).
+ *
+ * Цена границы процессом названа: каждый вызов инструмента, включая Read и Grep, порождает
+ * второй процесс node — нормализатор с type stripping и разбором `descriptor.json`, — а под
+ * контрактом `RALPH_CORE_SHA` перед ним идёт `git ls-tree` сверки ревизии. Это десятки
+ * миллисекунд на вызов. Ускорять — компиляцией описания при установке ядра, а не `require`
+ * пакета в процесс хука.
+ *
+ * **Переходный совместимый вход** — прежний `decide` по имени инструмента и полям в форме
+ * Claude Code. Явно его заявляет `RALPH_GUARD_INPUT=compat-16b`: так раннер регистрирует guard у
+ * Codex, Kimi Code и OpenCode (`guardHooksOf` ядра), пока их нормализаторы — заглушки до пакетов
+ * 16d (#189, #191, #192); заглушка блокировала бы всё, а запреты 16b у них держатся прежним
+ * входом. Регистрация без обеих переменных — тоже совместимый вход: так guard зовут настройки
+ * дерева (`.claude/settings.json` канона, копии хуков у потребителя), у которых пакетов рядом
+ * может не быть вовсе. Строгость в сессии петли держит регистрация раннера: хуки дерева Claude
+ * Code складывает с ней, и заблокировать больше они могут, а пропустить за неё — нет. При обеих
+ * переменных действует совместимый вход: регистрацию моста раннер строит из команды guard
+ * настроек сессии, где путь уже стоит. Незнакомое значение `RALPH_GUARD_INPUT` и путь не
+ * абсолютный — блок: регистрацию, которую нельзя прочесть однозначно, барьер не толкует.
+ * Совместимый вход снимается при переводе каждого пакета.
  *
  * **Отказ самого барьера — тоже блокировка (#172).** Раньше здесь стоял fail-open: любая
  * ошибка кончалась нулём, то есть «разрешено». Пока сессии шли под обычным режимом, это
@@ -50,8 +80,6 @@
  * пересматривается отдельным PR, а не послаблением по ходу работы.
  */
 
-const fs = require('node:fs');
-
 /** Единственный код выхода, который у PreToolUse действительно блокирует вызов. */
 const EXIT_BLOCKED = 2;
 
@@ -66,11 +94,22 @@ const EXIT_BLOCKED = 2;
 const nodeExit = process.exit.bind(process);
 
 /**
+ * Префикс машинной строки кода причины (#183). Литералом, а не импортом: хук без
+ * зависимостей, а сосед, загруженный ради строки, исполнился бы до сверки ревизии.
+ * Равенство с `REASON_LINE_PREFIX` контракта держит `adapters/barrier-reason.test.ts`.
+ */
+const REASON_LINE_PREFIX = 'ralph-reason-code: ';
+
+/**
  * Отказ с объяснением. Пишет причину агенту и выходит двойкой — из любой точки, включая
  * загрузку модуля правил, то есть ДО того, как появится хоть какое-то мнение о вызове.
+ *
+ * Последней строкой stderr — код причины из перечня контракта (`docs/harness-contract.md`,
+ * «Коды причины»). Двойка одна на правило и на неисправность, и без кода проба не отличала
+ * барьер, узнавший вызов, от барьера, который блокирует всё, потому что сломан.
  */
-function block(reason) {
-    process.stderr.write(reason);
+function block(code, reason) {
+    process.stderr.write(`${reason}\n${REASON_LINE_PREFIX}${code}\n`);
     // Обработчики выхода снимаются: `process.on("exit", () => process.reallyExit(0))`
     // в модуле правил переписывал КОД БЛОКИРОВКИ на ноль, то есть отменял отказ уже после
     // решения барьера (ревью Codex terra, проход 9).
@@ -108,16 +147,24 @@ function describeError(error) {
     }
 }
 
+/** Переменная регистрации: абсолютный путь команды нормализатора пакета харнесса. */
+const ADAPTER_ENV = 'RALPH_GUARD_ADAPTER';
+/** Переменная регистрации, заявляющая совместимый вход 16b, и её единственное значение. */
+const INPUT_ENV = 'RALPH_GUARD_INPUT';
+const COMPAT_INPUT = 'compat-16b';
+
 let decide;
+let decideEvent;
+let normalizeViaAdapter;
 let contour;
 let revision = { loop: false, error: null };
 let checkCoreRevision;
-let isLoopPrompt;
+let session = { context: null, error: null };
 let rulesError = null;
 try {
     // Сверщик — первым: он не зависит ни от одного соседа, и до его вердикта ни строчки
     // сверяемого кода не исполняется. Не загрузился — та же неисправность, что правила.
-    ({ checkCoreRevision, isLoopPrompt } = withSealedExit(() => require('./core-revision.cjs')));
+    ({ checkCoreRevision } = withSealedExit(() => require('./core-revision.cjs')));
     try {
         revision = withSealedExit(() => checkCoreRevision());
     } catch (error) {
@@ -125,11 +172,18 @@ try {
     }
     // Хук не той ревизии не грузит правил вовсе: их код уже не тот, что ревьюили.
     if (!revision.error) {
-        decide = withSealedExit(() => require('./guard-rules.cjs').decide);
+        ({ decide, decideEvent } = withSealedExit(() => require('./guard-rules.cjs')));
         if (typeof decide !== 'function') throw new Error('decide не функция');
+        if (typeof decideEvent !== 'function') throw new Error('decideEvent не функция');
+        ({ normalizeViaAdapter } = withSealedExit(() => require('./adapter-event.cjs')));
+        if (typeof normalizeViaAdapter !== 'function') {
+            throw new Error('normalizeViaAdapter не функция');
+        }
         // Данные потребителя — в том же try: битые данные — та же неисправность, что не
         // загрузившиеся правила.
         contour = withSealedExit(() => require('./consumer-data.cjs').loadConsumerData());
+        // Контекст сессии — после сверки ревизии, как всё соседнее: разбор тоже код.
+        session = withSealedExit(() => require('./session-context.cjs').readSessionContext());
     }
 } catch (error) {
     rulesError = describeError(error);
@@ -152,6 +206,26 @@ try {
  * Задача заведена отдельно (#175); до неё восстановление барьера — работа человека.
  */
 
+/**
+ * Вход по переменным регистрации: событие через нормализатор (`argv`), совместимый вход
+ * (`compat`) или противоречие (`error`). Команда нормализатора — `node <путь>`: путь приносит
+ * регистрация, исполняемое — тот же node, что исполняет хук.
+ */
+function inputMode(env) {
+    const adapter = env[ADAPTER_ENV] || '';
+    const input = env[INPUT_ENV] || '';
+    if (input !== '' && input !== COMPAT_INPUT) {
+        return { error: `${INPUT_ENV}=${JSON.stringify(input)} — знаком только ${COMPAT_INPUT}` };
+    }
+    // Совместимый вход сильнее пути: регистрацию моста раннер строит из команды guard настроек
+    // сессии, где путь нормализатора Claude Code уже стоит, а вход моста — не Claude Code.
+    if (adapter === '' || input === COMPAT_INPUT) return { compat: true };
+    if (!require('node:path').isAbsolute(adapter)) {
+        return { error: `${ADAPTER_ENV}=${JSON.stringify(adapter)} — путь не абсолютный` };
+    }
+    return { argv: [process.execPath, adapter] };
+}
+
 function readStdin() {
     return new Promise((resolve) => {
         let data = '';
@@ -164,22 +238,15 @@ function readStdin() {
 }
 
 /**
- * Переходный признак петли по транскрипту (`core-revision.cjs`): раннер кладёт контракт
- * только в команду хуков, которые регистрирует из установки (#132), а guard дерева сессии
- * его не получает — и забор данных этого дерева по одному `revision.loop` не действовал бы
- * ни в одной настоящей сессии петли (ревью Фазы 11). Транскрипт читается лениво — только
- * когда вызов трогает данные. Назван, но не читается — считаем петлёй: заблокирована
- * будет одна правка данных, а пропуск открыл бы канал.
+ * Петлю хук узнаёт только по заявлению раннера: контракту `RALPH_CORE_SHA` (хуки из
+ * установки) или доверенному контексту сессии `RALPH_SESSION_CONTEXT` (`session-context.cjs`,
+ * #184) — его раннер кладёт в окружение сессии, и guard дерева сессии получает его
+ * наследованием. Прежний переходный признак — строка `ralph.md` в промпте транскрипта —
+ * снят: догадка по тексту делала петлёй сессию человека с похожим промптом, а у харнессов
+ * без транскрипта Claude не значила ничего.
  */
-function loopByTranscript(transcriptPath) {
-    if (typeof transcriptPath !== 'string' || transcriptPath === '') return false;
-    let lines;
-    try {
-        lines = fs.readFileSync(transcriptPath, 'utf-8').split('\n');
-    } catch {
-        return true;
-    }
-    return isLoopPrompt(lines);
+function isLoopSession() {
+    return revision.loop || (session.context !== null && session.context.loop);
 }
 
 async function main() {
@@ -189,6 +256,7 @@ async function main() {
     // сумеет сломать вход.
     if (!raw.trim()) {
         block(
+            'input-invalid',
             '[guard.cjs] Пустой вход: PreToolUse обязан подать JSON на stdin. ' +
                 'Вызов заблокирован — судить о нём не по чему.',
         );
@@ -199,6 +267,7 @@ async function main() {
         input = JSON.parse(raw);
     } catch (error) {
         block(
+            'input-invalid',
             `[guard.cjs] Вход не разобрался как JSON (${error.message}). ` +
                 'Вызов заблокирован — судить о нём не по чему.',
         );
@@ -206,6 +275,7 @@ async function main() {
 
     if (!input || typeof input !== 'object' || Array.isArray(input)) {
         block(
+            'input-invalid',
             '[guard.cjs] Вход разобрался, но это не объект вызова. ' +
                 'Вызов заблокирован — судить о нём не по чему.',
         );
@@ -216,6 +286,7 @@ async function main() {
 
     if (rulesError) {
         block(
+            'rules-unloaded',
             `[guard.cjs] Правила барьера не загрузились: ${rulesError}. Вызов заблокирован — ` +
                 'проверять его нечем. Барьер чинит человек: сессия этого сделать не может.',
         );
@@ -223,18 +294,41 @@ async function main() {
 
     if (revision.error) {
         block(
+            'core-revision',
             `[guard.cjs] Ревизия хука не сверилась с ядром: ${revision.error} Вызов ` +
                 'заблокирован: хук не той ревизии — не тот барьер, который ревьюили.',
         );
     }
 
+    if (session.error) {
+        block(
+            'session-context',
+            `[guard.cjs] Контекст сессии от раннера не разобрался: ${session.error}. Вызов ` +
+                'заблокирован: заявленный, но битый контекст — не «сессия человека».',
+        );
+    }
+
+    const mode = inputMode(process.env);
+    let event = null;
+    if (!mode.compat) {
+        const normalized = mode.error
+            ? { block: true, reason: `адаптер харнесса: ${mode.error}` }
+            : normalizeViaAdapter(mode.argv, raw);
+        if (normalized.block) {
+            block(
+                'adapter-failed',
+                `[guard.cjs] ${normalized.reason}. Вызов заблокирован: без события от ` +
+                    'нормализатора пакета судить не по чему.',
+            );
+        }
+        event = normalized.event;
+    }
+
     let verdict;
     try {
+        const options = { contour, loop: isLoopSession() };
         verdict = withSealedExit(() =>
-            decide(toolName, toolInput, {
-                contour,
-                loop: revision.loop || (() => loopByTranscript(input.transcript_path)),
-            }),
+            event === null ? decide(toolName, toolInput, options) : decideEvent(event, options),
         );
         // Вердикт не того вида — та же неисправность, что исключение: барьер ничего не
         // сказал о вызове. Без этой проверки `decide: () => ({})` пропускал всё (поле
@@ -243,15 +337,22 @@ async function main() {
         if (!verdict || typeof verdict.blocked !== 'boolean') {
             throw new Error(`вердикт не того вида: ${JSON.stringify(verdict)}`);
         }
+        // Блок без кода причины — тоже вердикт не того вида: проба правила его не
+        // засчитала бы, а неисправность названа своим кодом, а не чужим (#183).
+        const coded = typeof verdict.code === 'string' && /^[a-z][a-z-]*$/.test(verdict.code);
+        if (verdict.blocked && !coded) {
+            throw new Error(`блок без кода причины: ${JSON.stringify(verdict)}`);
+        }
     } catch (error) {
         // Ошибка ИСПОЛНЕНИЯ правила — та же неисправность, что и ошибка загрузки: барьер о
         // вызове ничего не знает, значит вызов не проходит.
         block(
+            'rule-fault',
             `[guard.cjs] Правило барьера неисправно: ${describeError(error)}. Вызов ` +
                 'заблокирован fail-closed. Почини правило — обойти барьер нельзя.',
         );
     }
-    if (verdict.blocked) block(verdict.reason);
+    if (verdict.blocked) block(verdict.code, verdict.reason);
 }
 
 main().then(
@@ -264,6 +365,7 @@ main().then(
         // барьер о вызове ничего не знает. Прежний `.catch(() => undefined)` в этом месте
         // отдавал ноль, то есть разрешал вызов ровно тогда, когда проверка не сработала.
         block(
+            'rule-fault',
             `[guard.cjs] Ошибка барьера при разборе вызова: ${describeError(error)}. ` +
                 'Вызов заблокирован fail-closed. Почини правило — обойти барьер нельзя.',
         ),

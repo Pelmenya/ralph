@@ -59,6 +59,21 @@ describe('фактическая политика ревью площадки', 
         expect(unprotectedPaths(actualRules(), [byPath('core/protected-paths.ts')])).toEqual([]);
     });
 
+    it('пакеты харнессов под защитой: описание и нормализатор — часть барьера (#186)', () => {
+        // `toolMap` описания решает, что guard не судит вовсе; перенос инструмента в `inert`
+        // предстартовая проба видит только у своего состава.
+        const probe = byPath('adapters/harnesses/claude-code/descriptor.json');
+        expect(unprotectedPaths(actualRules(), [probe])).toEqual([]);
+        for (const file of [
+            'adapters/harnesses/claude-code/normalize.ts',
+            'adapters/harnesses/claude-code/event.ts',
+            'adapters/harnesses/protocol.ts',
+            'adapters/harnesses/descriptor.ts',
+        ]) {
+            expect(patternCovers(probe.pattern, file)).toBe(true);
+        }
+    });
+
     it('разбор видит правило с одобрением, а не пустоту', () => {
         const rules = actualRules().filter((r) => r.needShips >= 1);
         expect(rules.length).toBeGreaterThan(0);

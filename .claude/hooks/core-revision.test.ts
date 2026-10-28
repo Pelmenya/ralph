@@ -133,7 +133,13 @@ describe('хук другой ревизии, чем ядро, блокируе�
 
     const run = (hook: string, sha: string, toolName: string, toolInput: object) =>
         spawnSync(process.execPath, [hook], {
-            input: JSON.stringify({ tool_name: toolName, tool_input: toolInput }),
+            input: JSON.stringify({
+                session_id: 'revision-test',
+                cwd: ROOT,
+                hook_event_name: 'PreToolUse',
+                tool_name: toolName,
+                tool_input: toolInput,
+            }),
             encoding: 'utf-8',
             env: {
                 ...gitEnv(),
