@@ -185,10 +185,15 @@ function text(value: unknown, lineNo: number, what: string, max: number): string
 // (путь без строки) у форжа не примется, и намерение потерялось бы уже в транспорте.
 // Сторона диффа — только при якоре: без строки ей не к чему относиться, и молча
 // выброшенное поле означало бы, что сессия думала о строке, которой в намерении нет.
+// `null` у поля якоря — отсутствие поля, а не значение: сводку прохода ревью модель пишет
+// как `"path": null`, и отказ по ней ставил петлю на каждом ревью (28.10, Ф16c3), а
+// переспрос #217 удаление `null` считал сменой смысла. Барьер пары не слабеет:
+// `"path": null` при живой строке — по-прежнему половина якоря.
 function anchor(req: Record<string, unknown>, lineNo: number): { anchor?: TRequestAnchor } {
-    const rawPath = req['path'];
-    const rawLine = req['line'];
-    const rawSide = req['side'];
+    const field = (key: string): unknown => (req[key] === null ? undefined : req[key]);
+    const rawPath = field('path');
+    const rawLine = field('line');
+    const rawSide = field('side');
     if (rawPath === undefined && rawLine === undefined) {
         if (rawSide !== undefined)
             fail(lineNo, 'сторона диффа (side) задаётся только при паре path+line');

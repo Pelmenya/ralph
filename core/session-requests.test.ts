@@ -479,6 +479,33 @@ describe('#41 сторона диффа у pr-comment', () => {
     });
 });
 
+// 28.10, Ф16c3: сводку прохода ревью модель пишет с `"path": null`, и отказ по ней ставил
+// петлю на каждом ревью. `null` у поля якоря — отсутствие поля.
+describe('null у полей якоря — отсутствие поля', () => {
+    it('сводка с path: null — замечание без якоря', () => {
+        const raw = line({ kind: 'pr-comment', comment: 'сводка', path: null });
+        expect(parseSessionRequests(raw, opts)[0]).toEqual({
+            kind: 'pr-comment',
+            comment: 'сводка',
+        });
+    });
+
+    it('path, line и side все null — замечание без якоря', () => {
+        const raw = line({ kind: 'pr-comment', comment: 'x', path: null, line: null, side: null });
+        expect(parseSessionRequests(raw, opts)[0]).toEqual({ kind: 'pr-comment', comment: 'x' });
+    });
+
+    it('НЕГАТИВНЫЙ: path: null при живой строке — половина якоря, отказ', () => {
+        const raw = line({ kind: 'pr-comment', comment: 'x', path: null, line: 42 });
+        expect(() => parseSessionRequests(raw, opts)).toThrow(/ПАРОЙ path\+line/);
+    });
+
+    it('НЕГАТИВНЫЙ: side при path: null — отказ, а не молча выброшенное поле', () => {
+        const raw = line({ kind: 'pr-comment', comment: 'x', path: null, side: 'LEFT' });
+        expect(() => parseSessionRequests(raw, opts)).toThrow(/только при паре path\+line/);
+    });
+});
+
 // #41: что выбывает из хвоста, а что его сохраняет. Умолчание — сохранить: незнакомая
 // формулировка не должна молча отнимать у намерения повтор.
 describe('#41 classifyIntentFailure', () => {
