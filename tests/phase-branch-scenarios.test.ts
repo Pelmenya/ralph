@@ -17,12 +17,18 @@
 // Окружение git — своё, а не унаследованное: `GIT_DIR`/`GIT_WORK_TREE` вызывающего увели бы
 // коммиты в ЕГО репозиторий, а глобальный конфиг подсунул бы чужие хуки процессу с полным
 // окружением сьюта.
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { ensurePhaseBranch, checkOnPhaseBranch } from '../core/phase-branch.ts';
+
+// Срок — как у соседних живых наборов: каждый кейс порождает десятки процессов git (голый
+// origin, клоны, коммиты, пуши). На хосте это доли секунды, а облачный раннер CI под
+// параллельной нагрузкой сьюта порождает их в разы медленнее, и дефолтные 5 с там рвали
+// исправный кейс тайм-аутом.
+vi.setConfig({ testTimeout: 30_000 });
 
 const BRANCH = 'feature/faza-1';
 

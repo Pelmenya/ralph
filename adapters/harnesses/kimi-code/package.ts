@@ -10,8 +10,9 @@
  * Отказ разбора — регистрация непригодна целиком: `hooks` верхнего уровня рядом с
  * `[[hooks]]` CLI отверг бы повторным ключом, и ни один хук не был бы позван.
  *
- * Поля, которых у Kimi Code ещё нет, — объявленные заглушки: нормализатор (`normalize.ts`) и
- * доказательство скилла в описании ждут Фаз 16d и 16e.
+ * Регистрацию guard судит событием нормализатора пакета (#191, `normalize.ts`): `cwd` у `Bash`
+ * и незнакомые CLI имена (`FetchURL`) совместимый вход 16b не судил. Объявленная заглушка
+ * одна — доказательство скилла в описании ждёт Фазы 16e.
  *
  * Версия интерфейса — литерал: под неё пакет написан (`harness-package.ts`).
  */
@@ -40,8 +41,8 @@ export const harnessPackage: HarnessPackage = {
     harness: HARNESS,
     guardRegistration: (_settings: unknown, guardHooks: readonly GuardHook[] = []) =>
         kimiRegistrationFromToml(kimiHooksToml(guardHooks)),
-    // Нормализатор пакета — заглушка до 16d: событием guard блокировал бы любой вызов.
-    guardInput: 'compat-16b',
+    // Нормализатор знает `path` файловых инструментов и `cwd` оболочки (#191).
+    guardInput: 'event',
     probes: HARNESS_PROBES[HARNESS],
     matcherCovers: (matcher, toolName) => harnessMatcherCovers(HARNESS, matcher, toolName),
     hookPayload: (probe: HarnessProbe, projectDir: string) =>
@@ -50,10 +51,20 @@ export const harnessPackage: HarnessPackage = {
     setsProjectDirEnv: false,
     // Транскрипта хуку Kimi Code не отдаёт (`SKILL_BARRIER_LIMIT`).
     skillBarrier: false,
-    // Проба покрывает оболочку, Read, Grep и MCP — всё, что регистрация отдаёт хуку.
+    // Проба покрывает оболочку (и её `cwd`), Read, Write, Grep и MCP — всё, что регистрация
+    // отдаёт хуку.
     guardLimit: null,
     // Барьер — команды хуков, их исполняет проба сама.
     plugin: null,
-    // Сборщика конфига у пакета ещё нет (Фазы 16d2, 16d3): слои дерева не отвергаются.
-    projectLayers: null,
+    // Сборщик конфига — дом сессии (#196, `kimi-home.ts`). Проектные слои Kimi Code —
+    // `.mcp.json` корня git и `.kimi-code/mcp.json` — CLI исполняет только в доверенном
+    // каталоге, а каталог сессии недоверен; поэтому поверхностей отказа в описании нет. Отказ
+    // по наличию был бы и неверен: `.mcp.json` — файл MCP Claude Code, у потребителя он есть
+    // законно. Объект здесь — признак «сборщик есть» (без него старт сказал бы строку
+    // `PROJECT_LAYERS_LIMIT`). Домов нет: исключать их не из чего, скан без поверхностей выходит
+    // раньше, чем они нужны. Появятся поверхности — дома CLI человека (`KIMI_CODE_HOME`,
+    // `~/.kimi-code`) придётся назвать, как у Codex.
+    projectLayers: {
+        homes: () => [],
+    },
 };

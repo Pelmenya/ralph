@@ -1,4 +1,4 @@
-// Адаптер OpenCode (#121): argv, заявка эксперимента, ответ списка моделей, окружение сессии,
+// Адаптер OpenCode (#121): argv, заявка эксперимента, ответ списка моделей,
 // текст из `--format json` и полнота скиллов. Исход сессии — contract suite
 // `session-end.test.ts`, проводка в оркестраторе — `core/opencode-runtime.test.ts`.
 import { describe, expect, it } from 'vitest';
@@ -6,8 +6,6 @@ import fs, { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from '
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
-    OPENCODE_CONFIG_DIR_ENV,
-    OPENCODE_CONFIG_ENV,
     OPENCODE_STATUS,
     buildOpencodeArgs,
     expectedOpencodeSkills,
@@ -17,8 +15,6 @@ import {
     opencodeErrors,
     opencodeEventsText,
     opencodeModelProblems,
-    opencodeSessionConfig,
-    opencodeSessionEnv,
     opencodeSkillProblems,
     parseOpencodeModel,
 } from './opencode.ts';
@@ -116,23 +112,6 @@ describe('ответ `opencode models <провайдер>`', () => {
         expect(opencodeModelProblems({ code: null, stdout: '', stderr: '' }, 'p/m')[0]).toBe(
             'провайдер «p» OpenCode неизвестен: `opencode models p` — код null',
         );
-    });
-});
-
-describe('настройки и окружение сессии', () => {
-    it('вызовы оболочки и правки — без подтверждения; JSON со схемой', () => {
-        const cfg = JSON.parse(opencodeSessionConfig()) as Record<string, unknown>;
-        expect(cfg.permission).toEqual({ bash: 'allow', edit: 'allow' });
-        expect(cfg.$schema).toBe('https://opencode.ai/config.json');
-        expect(cfg).not.toHaveProperty('plugin');
-    });
-
-    it('каталог задан — обе переменные; не задан — окружение как есть', () => {
-        const env = opencodeSessionEnv({ A: '1' }, { configDir: '/c' });
-        expect(env[OPENCODE_CONFIG_DIR_ENV]).toBe('/c');
-        expect(env[OPENCODE_CONFIG_ENV]).toBe(path.join('/c', 'opencode.json'));
-        expect(env.A).toBe('1');
-        expect(opencodeSessionEnv({ A: '1' }, { configDir: null })).toEqual({ A: '1' });
     });
 });
 

@@ -7,6 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createOrchestrator } from './orchestrator.ts';
 import { KIMI_HOME_ENV, KIMI_MAX_STEPS_ENV, kimiStreamText } from '../adapters/kimi-native.ts';
+import { KIMI_NO_AUTO_UPDATE_ENV, KIMI_TRUST_ENV } from '../adapters/kimi-home.ts';
 import { stripComments } from '../tests/strip-comments.ts';
 import { sideEffectAttempts } from '../shared/side-effect-guard.ts';
 import { heldRun } from '../tests/guard-fake.ts';
@@ -51,6 +52,11 @@ function spawnReturning(r: Record<string, unknown>) {
     }));
 }
 
+/** Каталога доверия в доме сессии нет — чтение боевого каталога в тесте не нужно. */
+const NO_TRUST_DIR = (): never => {
+    throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+};
+
 let logs: string[];
 beforeEach(() => {
     logs = [];
@@ -77,6 +83,7 @@ describe('runKimiNativeOnce — сессия Kimi Code', () => {
             writePromptFn: (p: string, t: string) => void writes.push([p, t]),
             removePromptFn: (p: string) => void removed.push(p),
             isDirFn: (p: string) => p === '/work/.claude/skills',
+            listDirFn: NO_TRUST_DIR,
             sessionTree: '/work',
         });
         return { res, writes, removed, call: spawnFn.mock.calls[0] as unknown as SpawnCall };
@@ -98,6 +105,7 @@ describe('runKimiNativeOnce — сессия Kimi Code', () => {
                 writePromptFn: () => {},
                 removePromptFn: (p: string) => void gone.push(p),
                 isDirFn: () => false,
+                listDirFn: NO_TRUST_DIR,
                 sessionTree: '/work',
             }),
         ).toThrow();
@@ -116,6 +124,7 @@ describe('runKimiNativeOnce — сессия Kimi Code', () => {
             writePromptFn: () => {},
             removePromptFn: eacces,
             isDirFn: () => false,
+            listDirFn: NO_TRUST_DIR,
             sessionTree: '/work',
         };
         const res = rt.runKimiNativeOnce(
@@ -170,6 +179,59 @@ describe('runKimiNativeOnce — сессия Kimi Code', () => {
         expect(opts.env?.[KIMI_HOME_ENV]).toBe('/r/kimi-native/home');
         expect(opts.env?.[KIMI_MAX_STEPS_ENV]).toBe('30');
         expect(argv).toEqual(expect.arrayContaining(['--skills-dir', '/work/.claude/skills']));
+    });
+
+    // #196: доверие каталогу и окружение CLI раннера до сессии не доезжают, автообновления нет.
+    it('доверие переменной и окружение CLI раннера вычищены, автообновление выключено', () => {
+        const rt = build();
+        rt.setConfigForTests({} as never);
+        const saved = { ...process.env };
+        Object.assign(process.env, {
+            [KIMI_TRUST_ENV]: '1',
+            KIMI_CODE_BASE_URL: 'https://example.com',
+            [KIMI_NO_AUTO_UPDATE_ENV]: '0',
+        });
+        try {
+            const env = run(rt, { maxTurns: 1 }, spawnReturning({})).call[2].env ?? {};
+            expect(env[KIMI_TRUST_ENV]).toBeUndefined();
+            expect(env.KIMI_CODE_BASE_URL).toBeUndefined();
+            expect(env[KIMI_NO_AUTO_UPDATE_ENV]).toBe('1');
+        } finally {
+            for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+            Object.assign(process.env, saved);
+        }
+    });
+
+    it('НЕГАТИВНЫЙ: запись доверия в доме сессии — стоп guard-probe до промпта и спавна', () => {
+        const rt = build();
+        rt.setConfigForTests({} as never);
+        const spawnFn = spawnReturning({});
+        const pushes: string[] = [];
+        const writes: string[] = [];
+        expect(() =>
+            rt.runKimiNativeOnce('x', { maxTurns: 1 }, spawnFn as unknown as SpawnSyncFn, VERSION, {
+                homeFn: () => '/r/kimi-native/home',
+                writePromptFn: (p: string) => void writes.push(p),
+                removePromptFn: () => {},
+                isDirFn: () => false,
+                listDirFn: (p: string) =>
+                    p === '/r/kimi-native/home/workspace-trust' ? ['wd-loop.json'] : [],
+                sessionTree: '/work',
+                stop: {
+                    persistFn: null,
+                    pushEventFn: (msg: string) => {
+                        pushes.push(msg);
+                        return false;
+                    },
+                    exitFn: (code: number): never => {
+                        throw new Error(`exit ${String(code)}`);
+                    },
+                },
+            }),
+        ).toThrow('exit 1');
+        expect(spawnFn).not.toHaveBeenCalled();
+        expect(writes).toEqual([]);
+        expect(pushes[0]).toMatch(/Kimi Code собрана не изолированной[\s\S]*wd-loop\.json/);
     });
 
     it('чужие секреты из env сессии вычищены', () => {

@@ -86,7 +86,7 @@ describe('runOpencodeOnce — сессия OpenCode', () => {
             { maxTurns: 30 },
             spawnFn as unknown as SpawnSyncFn,
             VERSION,
-            { configDirFn: () => '/r/opencode/config' },
+            { configDirFn: () => '/r/opencode/config', existsFn: () => false },
         );
         return { res, call: spawnFn.mock.calls[0] as unknown as SpawnCall };
     };
@@ -105,12 +105,108 @@ describe('runOpencodeOnce — сессия OpenCode', () => {
         expect(opts.stdio).toEqual(['pipe', 'pipe', 'pipe']);
     });
 
+    // Стенд #197: каталог сессии CLI берёт из `PWD`; `chdir` раннера его не меняет.
+    it('дерево сессии — cwd процесса и PWD его env', () => {
+        const rt = build();
+        rt.setConfigForTests({ opencodeRuntime: EXPERIMENT } as never);
+        const spawnFn = spawnReturning({});
+        rt.runOpencodeOnce('x', { maxTurns: 1 }, spawnFn as unknown as SpawnSyncFn, VERSION, {
+            configDirFn: () => '/r/opencode/config',
+            existsFn: () => false,
+            sessionTree: '/work',
+        });
+        const opts = spawnFn.mock.calls[0][2] as { cwd?: string; env?: Record<string, string> };
+        expect(opts.cwd).toBe('/work');
+        expect(opts.env?.PWD).toBe('/work');
+    });
+
     it('каталог с барьером — в env сессии: OPENCODE_CONFIG_DIR и OPENCODE_CONFIG', () => {
         const rt = build();
         rt.setConfigForTests({ opencodeRuntime: EXPERIMENT } as never);
         const { call } = run(rt, spawnReturning({}));
         expect(call[2].env?.[OPENCODE_CONFIG_DIR_ENV]).toBe('/r/opencode/config');
         expect(call[2].env?.[OPENCODE_CONFIG_ENV]).toBe('/r/opencode/config/opencode.json');
+    });
+
+    // #197: критерий карточки — `OPENCODE_PURE=1` у раннера не снимает плагин барьера.
+    it('OPENCODE_PURE=1 в окружении раннера — сессии не достаётся, проектный конфиг выключен', () => {
+        const rt = build();
+        rt.setConfigForTests({ opencodeRuntime: EXPERIMENT } as never);
+        const saved = { ...process.env };
+        Object.assign(process.env, {
+            OPENCODE_PURE: '1',
+            OPENCODE_CONFIG_CONTENT: '{"plugin":["x"]}',
+            OPENCODE_DISABLE_PROJECT_CONFIG: '0',
+        });
+        try {
+            const { res, call } = run(rt, spawnReturning({}));
+            expect(res.code).toBe(0);
+            const sessionEnv = call[2].env ?? {};
+            expect(sessionEnv.OPENCODE_PURE).toBeUndefined();
+            expect(sessionEnv.OPENCODE_CONFIG_CONTENT).toBeUndefined();
+            expect(sessionEnv.OPENCODE_DISABLE_PROJECT_CONFIG).toBe('1');
+            expect(sessionEnv.XDG_CONFIG_HOME).toBe('/r/opencode/xdg-config');
+        } finally {
+            for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+            Object.assign(process.env, saved);
+        }
+    });
+
+    it('НЕГАТИВНЫЙ: плагин в ~/.opencode — стоп guard-probe до спавна, с адресом', () => {
+        const rt = build();
+        rt.setConfigForTests({ opencodeRuntime: EXPERIMENT } as never);
+        const spawnFn = spawnReturning({});
+        const pushes: string[] = [];
+        expect(() =>
+            rt.runOpencodeOnce('x', { maxTurns: 1 }, spawnFn as unknown as SpawnSyncFn, VERSION, {
+                configDirFn: () => '/r/opencode/config',
+                existsFn: (p: string) => p.endsWith(path.join('.opencode', 'plugin')),
+                stop: {
+                    persistFn: null,
+                    pushEventFn: (m: string) => {
+                        pushes.push(m);
+                        return false;
+                    },
+                    exitFn: (code: number): never => {
+                        throw new Error(`exit ${String(code)}`);
+                    },
+                },
+            }),
+        ).toThrow('exit 1');
+        expect(spawnFn).not.toHaveBeenCalled();
+        expect(pushes[0]).toMatch(
+            /Сессия OpenCode собрана не изолированной[\s\S]*\.opencode \(plugin\)/,
+        );
+    });
+
+    it('НЕГАТИВНЫЙ: перечень запрещённых переменных бросил — стоп guard-probe, а не исключение', () => {
+        const rt = build();
+        rt.setConfigForTests({ opencodeRuntime: EXPERIMENT } as never);
+        const spawnFn = spawnReturning({});
+        const pushes: string[] = [];
+        expect(() =>
+            rt.runOpencodeOnce('x', { maxTurns: 1 }, spawnFn as unknown as SpawnSyncFn, VERSION, {
+                configDirFn: () => '/r/opencode/config',
+                forbiddenEnvFn: () => {
+                    throw new Error('пакет харнесса «opencode» не принят реестром');
+                },
+                existsFn: () => false,
+                stop: {
+                    persistFn: null,
+                    pushEventFn: (m: string) => {
+                        pushes.push(m);
+                        return false;
+                    },
+                    exitFn: (code: number): never => {
+                        throw new Error(`exit ${String(code)}`);
+                    },
+                },
+            }),
+        ).toThrow('exit 1');
+        expect(spawnFn).not.toHaveBeenCalled();
+        expect(pushes[0]).toMatch(
+            /запрещённых переменных сессии OpenCode не собран[\s\S]*не принят/,
+        );
     });
 
     it('чужие секреты из env сессии вычищены', () => {
@@ -274,6 +370,21 @@ describe('checkOpencodeAvailable — отказ до выбора задачи �
             expect(env).not.toHaveProperty('ANTHROPIC_API_KEY');
             expect(env).not.toHaveProperty('OPENAI_API_KEY');
             expect(env.HOME).toBe('/home/user');
+        }
+    });
+
+    // #197: провайдер с ключом в глобальном конфиге человека до сессии не доходит — готовность
+    // спрашивает CLI с тем же глобальным каталогом, что у сессии, и без OPENCODE_* раннера.
+    it('глобальный каталог конфига — каталог сессии, проектный конфиг выключен', () => {
+        const d = deps({
+            sessionXdg: '/r/opencode/xdg-config',
+            baseEnv: { HOME: '/home/user', XDG_CONFIG_HOME: '/home/user/cfg', OPENCODE_PURE: '1' },
+        });
+        build().checkOpencodeAvailable(d);
+        for (const [, cliEnv] of d.cliFn.mock.calls) {
+            expect(cliEnv.XDG_CONFIG_HOME).toBe('/r/opencode/xdg-config');
+            expect(cliEnv.OPENCODE_DISABLE_PROJECT_CONFIG).toBe('1');
+            expect(cliEnv).not.toHaveProperty('OPENCODE_PURE');
         }
     });
 
@@ -553,10 +664,36 @@ describe('opencodeConfigDirFor — каталог с барьером перед
                 mkdirFn: () => {},
                 listDirFn: () => [],
                 listSkillsFn: () => ({ code: 0, stdout: '[]' }),
+                layersFn: () => [],
+                isFileFn: (p: string) => p === '/work/AGENTS.md',
             },
             { tree: '/work', roots: ROOTS, baseEnv: {} },
         );
         expect(dir).toMatch(/opencode[/\\]config$/);
+    });
+
+    // Ревью 16d2: дерево без файлов правил — сессия без правил, и это строка ⚠, а не молчание.
+    it('правил дерева нет — каталог собран, предел назван строкой ⚠', () => {
+        const out = vi.spyOn(console, 'log').mockImplementation(() => {});
+        build().opencodeConfigDirFor(
+            {
+                readFileFn: () => '{}',
+                runPluginFn: (_src: string, ev: { output: Record<string, unknown> }) =>
+                    heldRun(JSON.stringify(ev)),
+                writeFileFn: () => {},
+                mkdirFn: () => {},
+                listDirFn: () => [],
+                listSkillsFn: () => ({ code: 0, stdout: '[]' }),
+                layersFn: () => [],
+                isFileFn: () => false,
+            },
+            { tree: '/work', roots: ROOTS, baseEnv: {} },
+        );
+        expect(out).toHaveBeenCalledWith(
+            expect.stringMatching(
+                /⚠ правил дерева для сессии OpenCode нет: ни одного из AGENTS\.md/,
+            ),
+        );
     });
 });
 

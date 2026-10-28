@@ -55,6 +55,7 @@ import {
     prepareCodexGuardArgs,
     prepareCodexSession,
     prepareKimiNativeHome,
+    opencodeRuleFiles,
     prepareOpencodeSession,
     prepareSessionSettings,
     readHumanSettings,
@@ -926,9 +927,17 @@ describe('prepareKimiNativeHome — дом Kimi Code с барьером пер�
         const { hooks } = kimiHooksFromToml(toml);
         expect(hooks.map((h) => h.matcher)).toEqual(HARNESS_HOOK_MATCHERS);
         expect(hooks[0].command).toContain("CLAUDE_PROJECT_DIR='/work'");
+        // Судит событие нормализатора Kimi Code (#191), а не Claude Code из собранных настроек.
+        const kimi = normalizerPathIn(HARNESS_REGISTRY, 'kimi-code', '/core');
+        if (!kimi.ok) throw new Error(kimi.reason);
         expect(hooks[0].command).toContain(
-            canonHookCommand('/core', 'guard.cjs', '/app', SHA, guardAdapterValue('/core')),
+            canonHookCommand('/core', 'guard.cjs', '/app', SHA, kimi.path),
         );
+        expect(hooks[0].command).toContain(
+            `RALPH_GUARD_ADAPTER='${kimi.path}' RALPH_GUARD_INPUT=''`,
+        );
+        // MCP раннера (#196): серверов нет, файл пересобирается перед каждой сессией.
+        expect(JSON.parse(f.writes.get('/r/home/mcp.json') ?? '')).toEqual({ mcpServers: {} });
         // Отсутствующий у человека файл ссылкой не становится.
         expect(f.links).toEqual([
             ['/h/.kimi-code/credentials', '/r/home/credentials'],
@@ -1057,6 +1066,9 @@ describe('prepareKimiNativeHome — дом Kimi Code с барьером пер�
                     path.join(core, '.claude', 'hooks'),
                     { recursive: true },
                 );
+                // Регистрацию Kimi Code судит событие нормализатора её пакета (#191).
+                const packages = path.relative(CANON_ROOT, HARNESSES_DIR);
+                cpSync(HARNESSES_DIR, path.join(core, packages), { recursive: true });
                 const sha = initRepo(core);
                 const human = tmp('human');
                 const source = tmp('source');
@@ -1106,17 +1118,21 @@ describe('prepareKimiNativeHome — дом Kimi Code с барьером пер�
                 if (!blocked.ok) expect(blocked.reason).toMatch(/настоящий файл или каталог/);
                 expect(lstatSync(path.join(home, 'credentials')).isDirectory()).toBe(true);
             },
+            // Три сборки дома по пробе на каждой, и каждый вызов хука поднимает процесс
+            // нормализатора пакета (#191).
+            60_000,
         );
     });
 });
 
 /** Живой запуск плагина OpenCode — то же, что боевой `runOpencodePlugin`, мимо предохранителя. */
-const spawnPlugin: TRunPluginFn = (source, event, projectDir) => {
+const spawnPlugin: TRunPluginFn = (source, event, projectDir, opts = {}) => {
     const r = spawnSync('node', ['--input-type=module', '-e', OPENCODE_PLUGIN_DRIVER], {
         cwd: projectDir,
         input: JSON.stringify({ source, ...event, directory: projectDir }),
         encoding: 'utf-8',
         timeout: 120 * 1000,
+        env: { ...process.env, ...opts.env },
     });
     return { status: r.status, stderr: r.stderr ?? '' };
 };
@@ -1139,8 +1155,9 @@ describe('prepareOpencodeSession — каталог OpenCode с барьером
                 writeFileFn: (p: string, t: string) => void writes.set(p, t),
                 mkdirFn: (p: string) => void dirs.push(p),
                 runPluginFn: pluginGuard,
+                layersFn: () => [] as string[],
                 listDirFn: () => ['vitest'],
-                isFileFn: (p: string) => p === SKILL,
+                isFileFn: (p: string) => p === SKILL || p === '/work/AGENTS.md',
                 listSkillsFn: (env: NodeJS.ProcessEnv, cwd: string) => {
                     skillCalls.push([env, cwd]);
                     return {
@@ -1163,23 +1180,105 @@ describe('prepareOpencodeSession — каталог OpenCode с барьером
         expect(prepareOpencodeSession(args(), f.deps)).toEqual({
             ok: true,
             configDir: '/r/opencode/config',
+            warnings: [],
         });
-        expect(f.dirs).toEqual(['/r/opencode/config/plugin']);
+        expect(f.dirs).toEqual(['/r/opencode/config/plugin', '/r/opencode/xdg-config']);
         const plugin = f.writes.get('/r/opencode/config/plugin/ralph-guard.js') ?? '';
         const { hooks } = opencodeHooksFromPlugin(plugin);
         expect(hooks.map((h) => h.matcher)).toEqual(HARNESS_HOOK_MATCHERS);
+        // Судит событие нормализатора OpenCode (#192), а не Claude Code из собранных настроек.
+        const opencode = normalizerPathIn(HARNESS_REGISTRY, 'opencode', '/core');
+        if (!opencode.ok) throw new Error(opencode.reason);
         expect(hooks[0].command).toContain(
-            canonHookCommand('/core', 'guard.cjs', '/app', SHA, guardAdapterValue('/core')),
+            canonHookCommand('/core', 'guard.cjs', '/app', SHA, opencode.path),
+        );
+        expect(hooks[0].command).toContain(
+            `RALPH_GUARD_ADAPTER='${opencode.path}' RALPH_GUARD_INPUT=''`,
         );
         const cfg = JSON.parse(f.writes.get('/r/opencode/config/opencode.json') ?? '{}') as {
             permission?: unknown;
+            instructions?: unknown;
+            mcp?: unknown;
         };
         expect(cfg.permission).toEqual({ bash: 'allow', edit: 'allow' });
+        // #197: проектный конфиг выключен — правила дерева абсолютным путём, MCP раннера пустой.
+        expect(cfg.instructions).toEqual(['/work/AGENTS.md']);
+        expect(cfg.mcp).toEqual({});
         const [env, cwd] = f.skillCalls[0];
         expect(cwd).toBe('/work');
         expect(env[OPENCODE_CONFIG_DIR_ENV]).toBe('/r/opencode/config');
         expect(env[OPENCODE_CONFIG_ENV]).toBe('/r/opencode/config/opencode.json');
+        expect(env.OPENCODE_DISABLE_PROJECT_CONFIG).toBe('1');
+        expect(env.XDG_CONFIG_HOME).toBe('/r/opencode/xdg-config');
         expect(env.HOME).toBe('/h');
+    });
+
+    it('исполняемый слой в дереве — отказ до записи, скан с поверхностями пакета', () => {
+        const f = fakeFs();
+        const asked: unknown[] = [];
+        const r = prepareOpencodeSession(args(), {
+            ...f.deps,
+            layersFn: (a) => {
+                asked.push(a);
+                return [
+                    '/work/.opencode/plugin: исполняемый слой конфига харнесса в дереве сессии',
+                ];
+            },
+        });
+        expect(r).toEqual({
+            ok: false,
+            reason:
+                'Исполняемые слои конфига OpenCode в дереве сессии или его предках — сессия не запущена:\n' +
+                '  - /work/.opencode/plugin: исполняемый слой конфига харнесса в дереве сессии',
+        });
+        expect(asked).toEqual([
+            {
+                tree: '/work',
+                surfaces: HARNESS_REGISTRY.packages.get('opencode')?.descriptor.configSurfaces,
+                homes: ['/h/.opencode'],
+                jsonKeys: HARNESS_REGISTRY.packages.get('opencode')?.pkg.projectLayers?.jsonKeys,
+            },
+        ]);
+        expect(f.writes.size).toBe(0);
+        expect(f.skillCalls).toEqual([]);
+    });
+
+    // Ревью 16d2: CLI сам брал CLAUDE.md, когда AGENTS.md нет; раннер повторяет порядок CLI.
+    it('правила — первый найденный из rules описания; нет ни одного — ⚠, а не молчание', () => {
+        expect(HARNESS_REGISTRY.packages.get('opencode')?.descriptor.rules).toEqual([
+            'AGENTS.md',
+            'CLAUDE.md',
+        ]);
+        const both = (p: string) => p === '/work/AGENTS.md' || p === '/work/CLAUDE.md';
+        expect(opencodeRuleFiles(HARNESS_REGISTRY, '/work', both)).toEqual({
+            instructions: ['/work/AGENTS.md'],
+            warnings: [],
+        });
+        expect(
+            opencodeRuleFiles(HARNESS_REGISTRY, '/work', (p) => p === '/work/CLAUDE.md'),
+        ).toEqual({ instructions: ['/work/CLAUDE.md'], warnings: [] });
+        const f = fakeFs();
+        const r = prepareOpencodeSession(args(), { ...f.deps, isFileFn: (p) => p === SKILL });
+        expect(r).toEqual({
+            ok: true,
+            configDir: '/r/opencode/config',
+            warnings: [
+                expect.stringMatching(
+                    /правил дерева для сессии OpenCode нет.*AGENTS\.md, CLAUDE\.md/,
+                ),
+            ],
+        });
+        const cfg = JSON.parse(f.writes.get('/r/opencode/config/opencode.json') ?? '{}') as {
+            instructions?: unknown;
+        };
+        expect(cfg.instructions).toEqual([]);
+    });
+
+    it('пакет OpenCode не принят — отказ, а не пустой список правил', () => {
+        const empty = { ...HARNESS_REGISTRY, packages: new Map() } as typeof HARNESS_REGISTRY;
+        expect(() => opencodeRuleFiles(empty, '/work', () => true)).toThrow(
+            /пакет харнесса «opencode» не принят реестром/,
+        );
     });
 
     it('плагин не держит — отказ, каталог не пишется, скиллы не спрашиваются', () => {
@@ -1245,6 +1344,9 @@ describe('prepareOpencodeSession — каталог OpenCode с барьером
                     path.join(core, '.claude', 'hooks'),
                     { recursive: true },
                 );
+                // Регистрацию OpenCode судит событие нормализатора её пакета (#192).
+                const packages = path.relative(CANON_ROOT, HARNESSES_DIR);
+                cpSync(HARNESSES_DIR, path.join(core, packages), { recursive: true });
                 const sha = initRepo(core);
                 const configDir = path.join(tmp('runtime'), 'opencode', 'config');
                 const r = prepareOpencodeSession(
@@ -1261,7 +1363,11 @@ describe('prepareOpencodeSession — каталог OpenCode с барьером
                         listSkillsFn: () => ({ code: 0, stdout: '[]' }),
                     },
                 );
-                expect(r).toEqual({ ok: true, configDir });
+                expect(r).toEqual({
+                    ok: true,
+                    configDir,
+                    warnings: [expect.stringMatching(/правил дерева/)],
+                });
                 const plugin = readFileSync(
                     path.join(configDir, 'plugin', 'ralph-guard.js'),
                     'utf-8',
@@ -1269,6 +1375,8 @@ describe('prepareOpencodeSession — каталог OpenCode с барьером
                 expect(opencodeHooksFromPlugin(plugin).hooks.length).toBeGreaterThan(0);
                 expect(existsSync(path.join(configDir, 'opencode.json'))).toBe(true);
             },
+            // Проба — процесс плагина, guard и нормализатор пакета на каждую из проб (#192).
+            60_000,
         );
     });
 });
@@ -1313,7 +1421,7 @@ describe('проводка в оркестраторе', () => {
     it('main(): дерево барьера Codex ставится вместе с корнями settings, после пробы', () => {
         const main = source.slice(source.indexOf('function main('));
         const probe = main.indexOf('settings: builtSettings');
-        const set = main.indexOf('codexGuardTree = sessionTree');
+        const set = main.indexOf('guardSessionTree = sessionTree');
         expect(set).toBeGreaterThan(probe);
     });
 
@@ -1644,9 +1752,17 @@ describe('подготовка сессий харнессов: боевые у�
 
     it('OpenCode: скиллы дерева ищутся на диске, каталог сессии — громкая побочка', () => {
         const pluginOk: TRunPluginFn = (_s, ev) => heldRun(JSON.stringify(ev));
-        const r = prepareOpencodeSession(
+        // Скан слоёв по умолчанию — настоящий (#197): непрочитанное дерево — отказ, не «слоёв нет».
+        const scanned = prepareOpencodeSession(
             { roots, sessionTree: missing, configDir: '/r/opencode/config', baseEnv: {} },
             { readFileFn: () => '{}', runPluginFn: pluginOk },
+        );
+        expect(scanned.ok).toBe(false);
+        if (!scanned.ok) expect(scanned.reason).toMatch(/Исполняемые слои конфига OpenCode/);
+        expect(sideEffectAttempts.splice(0)).toEqual([]);
+        const r = prepareOpencodeSession(
+            { roots, sessionTree: missing, configDir: '/r/opencode/config', baseEnv: {} },
+            { readFileFn: () => '{}', runPluginFn: pluginOk, layersFn: () => [] },
         );
         expect(r.ok).toBe(false);
         expect(sideEffectAttempts.splice(0).join(' | ')).toContain(
@@ -1656,6 +1772,7 @@ describe('подготовка сессий харнессов: боевые у�
             { roots, sessionTree: missing, configDir: '/r/opencode/config', baseEnv: {} },
             {
                 runPluginFn: pluginOk,
+                layersFn: () => [],
                 mkdirFn: () => {},
                 writeFileFn: () => {},
                 listSkillsFn: () => ({ code: 0, stdout: '[]' }),

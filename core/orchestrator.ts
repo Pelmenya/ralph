@@ -288,12 +288,12 @@ import {
     buildKimiNativeArgs,
     kimiNativeConfigProblems,
     kimiNativeAuthProblems,
-    kimiNativeSessionEnv,
     kimiNativeSkillsDirs,
     kimiSourceHome,
     kimiStreamText,
 } from '../adapters/kimi-native.ts';
 import { codexHumanHome, codexIsolationProblems, codexSessionEnv } from '../adapters/codex-home.ts';
+import { kimiIsolationProblems, kimiSessionEnv } from '../adapters/kimi-home.ts';
 // #121: OpenCode — экспериментальный третий харнесс: argv, конфиг эксперимента, модель, текст.
 import {
     OPENCODE_BIN,
@@ -305,9 +305,16 @@ import {
     opencodeModelProblems,
     opencodeAuthFile,
     opencodeAuthProblems,
-    opencodeSessionEnv,
     parseOpencodeModel,
 } from '../adapters/opencode.ts';
+// #197: сборщик конфига OpenCode — окружение сессии и его сверка перед спавном.
+import {
+    opencodeHumanXdg,
+    opencodeIsolationProblems,
+    opencodeSessionEnv,
+    opencodeSessionXdg,
+    XDG_CONFIG_HOME_ENV,
+} from '../adapters/opencode-home.ts';
 // #118: объявленные возможности рантаймов реестра и сверка с ними требований конфига.
 import {
     CLAUDE_CODE_CAPABILITIES,
@@ -375,7 +382,7 @@ import {
     runDoctorMode,
 } from './compat.ts';
 import { updateConsumerTree } from './consumer-tree.ts';
-import { ensureGuardHolds } from './guard-probe.ts';
+import { OPENCODE_HARNESS, ensureGuardHolds, harnessForbiddenEnv } from './guard-probe.ts';
 import {
     buildSessionSettings,
     prepareCodexSession,
@@ -2342,13 +2349,13 @@ export function createOrchestrator(env: OrchestratorEnv) {
 
     /**
      * Доверенный контекст сессии петли (#184) для её окружения. Дерево сессии ставит `main()`
-     * (`codexGuardTree`); до этого — вне управляемого запуска, в юнит-тестах фабрики — `null`.
+     * (`guardSessionTree`); до этого — вне управляемого запуска, в юнит-тестах фабрики — `null`.
      * С раскладкой `roots` потребитель — дерево человека, без неё — само дерево сессии.
      * Контекст не собрался — стоп, а не сессия без него: guard дерева счёл бы её сессией
      * человека и пустил бы правку данных контура.
      */
     function sessionContextValue({
-        tree = codexGuardTree,
+        tree = guardSessionTree,
         roots = sessionSettingsRoots,
         ...stop
     }: { tree?: string | null; roots?: typeof sessionSettingsRoots } & TGuardStopDeps = {}):
@@ -2457,14 +2464,19 @@ export function createOrchestrator(env: OrchestratorEnv) {
         return stopOnGuardProbe(prepared.reason, stop);
     }
 
-    // #119: дерево сессий для регистрации барьера не-Claude харнессов. Ставит `main()` рядом
-    // с пробой старта. До этого `null`, и сборка регистрации (`codexSessionFor`,
+    // #119: дерево сессий для регистрации барьера не-Claude харнессов (имя общее для Codex,
+    // Kimi Code и OpenCode, раньше — `codexGuardTree`). Ставит `main()` рядом с пробой старта.
+    // До этого `null`, и сборка регистрации (`codexSessionFor`,
     // `kimiNativeHomeFor`, `opencodeConfigDirFor`) — стоп `guard-probe`, а не сессия без
     // барьера (ревью Фазы 16b): что дерево ставится раньше любого спавна, держал бы только
     // порядок кода, и новый путь спавна до этой точки пустил бы Codex, Kimi Code или OpenCode
     // мимо барьера без строки в логе. Claude без `--settings` хотя бы читает settings дерева,
     // эти CLI — ничего. Юнит-тесты фабрики передают дерево явно.
-    let codexGuardTree: string | null = null;
+    let guardSessionTree: string | null = null;
+
+    /** Каталог `OPENCODE_CONFIG_DIR` сессии OpenCode — один на сборку и проверку готовности. */
+    const opencodeSessionConfigDir = (): string =>
+        path.join(path.resolve(RUNTIME.opencodeSession), 'config');
 
     /** Собранная сессия Codex: argv барьера и недоверия, дом CLI, ключи недоверия. */
     type TCodexSession = { args: string[]; home: string; keys: string[] };
@@ -2485,7 +2497,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
     function kimiNativeHomeFor(
         deps: Parameters<typeof prepareKimiNativeHome>[1] = {},
         {
-            tree = codexGuardTree,
+            tree = guardSessionTree,
             roots = sessionSettingsRoots,
             sourceHome = kimiSourceHome(config?.kimiNativeRuntime?.home, process.env),
             ...stop
@@ -2523,7 +2535,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
     function opencodeConfigDirFor(
         deps: Parameters<typeof prepareOpencodeSession>[1] = {},
         {
-            tree = codexGuardTree,
+            tree = guardSessionTree,
             roots = sessionSettingsRoots,
             baseEnv = process.env,
             ...stop
@@ -2538,13 +2550,14 @@ export function createOrchestrator(env: OrchestratorEnv) {
             {
                 roots,
                 sessionTree: tree,
-                configDir: path.join(path.resolve(RUNTIME.opencodeSession), 'config'),
+                configDir: opencodeSessionConfigDir(),
                 baseEnv,
             },
             deps,
         );
-        if (prepared.ok) return prepared.configDir;
-        return stopOnGuardProbe(prepared.reason, stop);
+        if (!prepared.ok) return stopOnGuardProbe(prepared.reason, stop);
+        for (const warning of prepared.warnings) log(`⚠ ${warning}`);
+        return prepared.configDir;
     }
 
     // #119, #195: сессия Codex. `codex exec` настроек Claude Code не читает, поэтому
@@ -2557,7 +2570,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
     function codexSessionFor(
         deps: TCodexSessionDeps = {},
         {
-            tree = codexGuardTree,
+            tree = guardSessionTree,
             roots = sessionSettingsRoots,
             sourceHome = codexHumanHome(process.env),
             env = process.env,
@@ -3345,13 +3358,13 @@ export function createOrchestrator(env: OrchestratorEnv) {
         return env;
     }
 
-    // Окружение сессии kimi-native: env раннера без чужих секретов. Свой вход сессия берёт из
-    // дома CLI, а не из env.
+    // Окружение сессии kimi-native: env раннера без чужих секретов и без окружения CLI раннера
+    // (#196), автообновление выключено. Свой вход сессия берёт из дома CLI, а не из env.
     function buildKimiNativeSpawnEnv(
         baseEnv: NodeJS.ProcessEnv,
         opts: { home: string | null; maxTurns?: number },
     ): NodeJS.ProcessEnv {
-        return stripRunnerSecrets(kimiNativeSessionEnv(baseEnv, opts));
+        return stripRunnerSecrets(kimiSessionEnv(baseEnv, opts));
     }
 
     // Тонкая обвязка над spawnSync для бинаря `kimi`. Промпта в stdin нет: CLI его оттуда не
@@ -3433,13 +3446,17 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 guardSideEffect(`runKimiNativeOnce:rm-prompt(${p})`);
                 fs.rmSync(p, { force: true });
             },
-            sessionTree = codexGuardTree,
+            sessionTree = guardSessionTree,
+            listDirFn = (p: string) => fs.readdirSync(p),
+            stop = {},
         }: {
             homeFn?: () => string | null;
             writePromptFn?: (p: string, text: string) => void;
             removePromptFn?: (p: string) => void;
             isDirFn?: (p: string) => boolean;
             sessionTree?: string | null;
+            listDirFn?: (p: string) => string[];
+            stop?: TGuardStopDeps;
         } = {},
     ): RunResult {
         if (toolless) return toollessRefusal('kimi-native');
@@ -3458,6 +3475,21 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // Дом с барьером — после проверки DRY, как `--settings` у Claude и argv у Codex:
         // сухой прогон ничего не пишет и пробу прошёл на старте.
         const home = homeFn();
+        const humanHome = kimiSourceHome(config?.kimiNativeRuntime?.home, process.env);
+        const env = withSkillGuard(buildKimiNativeSpawnEnv(process.env, { home, maxTurns }));
+        // #196: сверка — на ТОМ env, что уйдёт в CLI, и на каталоге доверия дома, до записи
+        // промпта и спавна. Дома нет только у подменённого `homeFn` — сверять нечего.
+        if (home !== null) {
+            const isolation = kimiIsolationProblems({ env, home, humanHome, listDirFn });
+            if (isolation.length > 0) {
+                return stopOnGuardProbe(
+                    'Сессия Kimi Code собрана не изолированной от конфига человека и дерева — ' +
+                        'не запущена:\n' +
+                        isolation.map((p) => `  - ${p}`).join('\n'),
+                    stop,
+                );
+            }
+        }
         const promptPath = path.join(path.resolve(RUNTIME.kimiNative), 'prompt', 'prompt.md');
         writePromptFn(promptPath, prompt);
         const cmdArgs = buildKimiNativeArgs({
@@ -3468,14 +3500,13 @@ export function createOrchestrator(env: OrchestratorEnv) {
             skillsDirs: kimiNativeSkillsDirs(
                 {
                     sessionTree,
-                    kimiHome: kimiSourceHome(config?.kimiNativeRuntime?.home, process.env),
+                    kimiHome: humanHome,
                     env: process.env,
                 },
                 isDirFn,
             ),
         });
         const timeout = config.claudeTimeoutMs || 2 * 60 * 60 * 1000;
-        const env = withSkillGuard(buildKimiNativeSpawnEnv(process.env, { home, maxTurns }));
         // Промпт снимается после сессии: он лежит по фиксированному пути и иначе ждал бы
         // следующей сессии с текстом прошлой задачи. Снятие — уборка, best-effort: `rmSync`
         // с `force` гасит только ENOENT, а исключение из `finally` подменило бы и исход
@@ -3548,12 +3579,13 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // argv, свой вывод (`--format json`) и свои признаки исхода.
 
     // Окружение сессии opencode: env раннера без чужих секретов (`stripRunnerSecrets`). Ключ
-    // провайдера OpenCode берёт из своего хранилища входа (`opencode auth login`) или конфига
-    // человека, а не из env раннера: `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` сюда не доходят, и
-    // готовность проверяет вход тем же env (`checkOpencodeAvailable`).
+    // провайдера OpenCode берёт из своего хранилища входа (`opencode auth login`), а не из env
+    // раннера и не из конфига человека (#197, `opencode-home.ts`): `ANTHROPIC_API_KEY`/
+    // `OPENAI_API_KEY` и `OPENCODE_*` раннера сюда не доходят, и готовность проверяет вход тем
+    // же env (`checkOpencodeAvailable`).
     function buildOpencodeSpawnEnv(
         baseEnv: NodeJS.ProcessEnv,
-        opts: { configDir: string | null },
+        opts: { configDir: string | null; cwd?: string | null },
     ): NodeJS.ProcessEnv {
         return stripRunnerSecrets(opencodeSessionEnv(baseEnv, opts));
     }
@@ -3568,6 +3600,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         spawnFn: typeof spawnSync = spawnSync,
         env?: NodeJS.ProcessEnv,
         attempt: TAttemptContext = unreadAttemptContext(OPENCODE_RUNTIME),
+        cwd: string | null = null,
     ): RunResult {
         if (spawnFn === spawnSync) guardSideEffect('spawnOpencode(opencode)');
         const res = spawnFn(OPENCODE_BIN, cmdArgs, {
@@ -3578,6 +3611,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             encoding: 'utf-8',
             maxBuffer: 64 * 1024 * 1024,
             ...(env ? { env } : {}),
+            ...(cwd ? { cwd } : {}),
         });
         const stdoutRaw = String(res.stdout || '');
         const stderr = String(res.stderr || '');
@@ -3613,7 +3647,19 @@ export function createOrchestrator(env: OrchestratorEnv) {
         { maxTurns, toolless }: ClaudeOpts,
         spawnFn: typeof spawnSync = spawnSync,
         cliVersionFn: (runtime: string) => CliVersion = (rt) => sessionCliVersion(rt),
-        { configDirFn = () => opencodeConfigDirFor() }: { configDirFn?: () => string | null } = {},
+        {
+            configDirFn = () => opencodeConfigDirFor(),
+            forbiddenEnvFn = () => harnessForbiddenEnv(OPENCODE_HARNESS),
+            existsFn = (p: string) => fs.existsSync(p),
+            sessionTree = guardSessionTree,
+            stop = {},
+        }: {
+            sessionTree?: string | null;
+            configDirFn?: () => string | null;
+            forbiddenEnvFn?: () => readonly string[];
+            existsFn?: (p: string) => boolean;
+            stop?: TGuardStopDeps;
+        } = {},
     ): RunResult {
         if (toolless) return toollessRefusal(OPENCODE_RUNTIME);
         const model = String(config?.opencodeRuntime?.model ?? '');
@@ -3625,11 +3671,56 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // Каталог с барьером — после проверки DRY, как `--settings` у Claude и дом у Kimi.
         const configDir = configDirFn();
         const timeout = config.claudeTimeoutMs || 2 * 60 * 60 * 1000;
-        const env = withSkillGuard(buildOpencodeSpawnEnv(process.env, { configDir }));
-        return spawnOpencode(buildOpencodeArgs({ model }), prompt, timeout, spawnFn, env, {
-            profile: runtimeProfile(OPENCODE_RUNTIME, model),
-            cliVersion: cliVersionFn(OPENCODE_RUNTIME),
-        });
+        // #197: каталог сессии CLI берёт из `PWD`, а `chdir` раннера его не меняет — `PWD` и
+        // `cwd` процесса ставятся дереву сессии явно.
+        const spawnAt = { configDir, cwd: sessionTree };
+        const env = withSkillGuard(buildOpencodeSpawnEnv(process.env, spawnAt));
+        // #197: сверка — на ТОМ env, что уйдёт в CLI: `OPENCODE_PURE` раннера снял бы плагин
+        // барьера, а конфиг человека и дерева слились бы с настройками сессии. Каталога нет
+        // только у подменённого `configDirFn` — сверять нечего.
+        if (configDir !== null) {
+            // Непринятый пакет перечень бросает; отказ сборки сессии — стоп `guard-probe`, а не
+            // исключение вверх по стеку мимо стопа с пушем. Сюда без пакета не дойти
+            // (`opencodeConfigDirFor` остановит раньше), но порядок не должен держаться этим.
+            let forbiddenEnv: readonly string[];
+            try {
+                forbiddenEnv = forbiddenEnvFn();
+            } catch (error) {
+                return stopOnGuardProbe(
+                    'Перечень запрещённых переменных сессии OpenCode не собран — не запущена: ' +
+                        (error instanceof Error ? error.message : String(error)),
+                    stop,
+                );
+            }
+            const isolation = opencodeIsolationProblems({
+                env,
+                configDir,
+                cwd: sessionTree,
+                humanXdg: opencodeHumanXdg(process.env),
+                forbiddenEnv,
+                existsFn,
+            });
+            if (isolation.length > 0) {
+                return stopOnGuardProbe(
+                    'Сессия OpenCode собрана не изолированной от конфига человека и дерева — ' +
+                        'не запущена:\n' +
+                        isolation.map((p) => `  - ${p}`).join('\n'),
+                    stop,
+                );
+            }
+        }
+        return spawnOpencode(
+            buildOpencodeArgs({ model }),
+            prompt,
+            timeout,
+            spawnFn,
+            env,
+            {
+                profile: runtimeProfile(OPENCODE_RUNTIME, model),
+                cliVersion: cliVersionFn(OPENCODE_RUNTIME),
+            },
+            sessionTree,
+        );
     }
 
     // #121: готовность opencode до выбора задачи. Отказы с причиной: нет CLI (`--version`
@@ -3641,9 +3732,11 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // `ANTHROPIC_API_KEY`, кончился бы первой же сессией исходом `auth`. Поэтому оба вызова CLI
     // идут окружением сессии без ключей раннера (`buildOpencodeSpawnEnv`), но БЕЗ каталога
     // сессии: `OPENCODE_CONFIG`/`OPENCODE_CONFIG_DIR` раннер собирает перед каждой сессией, на
-    // старте их ещё нет. Расхождение названо и безвредно для этой проверки: в каталоге сессии
-    // лежат только плагин барьера и `permission`, провайдер и ключ — из конфига человека, который
-    // CLI читает и здесь. `RALPH_SKILL_GUARD` (`withSkillGuard`) конфиг CLI не меняет.
+    // старте их ещё нет. Глобальный каталог конфига — тот же, что у сессии (`xdg-config` рядом с
+    // каталогом сессии, #197): провайдер с ключом в конфиге человека до сессии не доходит, и
+    // засчитать его здесь значило бы зелёный старт и `auth` первой же сессией. Ключ — входом CLI
+    // (`auth.json`, `XDG_DATA_HOME` человека). `RALPH_SKILL_GUARD` (`withSkillGuard`) конфиг CLI
+    // не меняет.
     function checkOpencodeAvailable({
         probeFn = (bin: string) => probeRuntimeBinaryOnce(bin),
         cliFn = (args: string[], env: NodeJS.ProcessEnv) => {
@@ -3664,7 +3757,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
         readFileFn = (p: string) => fs.readFileSync(p, 'utf-8'),
         cfg = config,
         baseEnv = process.env,
+        sessionXdg = opencodeSessionXdg(opencodeSessionConfigDir()),
     }: {
+        sessionXdg?: string;
         probeFn?: (bin: string) => void;
         cliFn?: (
             args: string[],
@@ -3680,7 +3775,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
         const model = String(cfg.opencodeRuntime?.model);
         const parsed = parseOpencodeModel(model);
         if (!parsed.ok) throw new Error(parsed.reason);
-        const env = buildOpencodeSpawnEnv(baseEnv, { configDir: null });
+        const env = {
+            ...buildOpencodeSpawnEnv(baseEnv, { configDir: null }),
+            [XDG_CONFIG_HOME_ENV]: sessionXdg,
+        };
         const missing = opencodeModelProblems(cliFn(['models', parsed.provider], env), model);
         if (missing.length > 0) throw new Error(missing.join('; '));
         const debug = cliFn(['debug', 'config'], env);
@@ -12800,7 +12898,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             },
         });
         sessionSettingsRoots = settingsRoots;
-        codexGuardTree = sessionTree;
+        guardSessionTree = sessionTree;
 
         // Сироту от прошлого прогона (kill -9, OOM) подбираем ДО preflight: чаще всего
         // preflight и отвергает запуск (грязное дерево, active=false), а брошенный монитор

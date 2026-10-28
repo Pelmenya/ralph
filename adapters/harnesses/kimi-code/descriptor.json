@@ -6,17 +6,46 @@
     "toolMap": {
         "Bash": "exec",
         "Read": "read",
-        "Grep": "search"
+        "Write": "write",
+        "Edit": "write",
+        "Glob": "search",
+        "Grep": "search",
+        "FetchURL": "fetch",
+        "WebSearch": "fetch",
+        "Agent": "agent",
+        "AgentSwarm": "agent",
+        "CronCreate": "defer",
+        "CronDelete": "inert",
+        "CronList": "inert",
+        "AskUserQuestion": "inert",
+        "CreateGoal": "inert",
+        "GetGoal": "inert",
+        "SetGoalBudget": "inert",
+        "UpdateGoal": "inert",
+        "EnterPlanMode": "inert",
+        "ExitPlanMode": "inert",
+        "Skill": "inert",
+        "TaskList": "inert",
+        "TaskOutput": "inert",
+        "TaskStop": "inert",
+        "WaitFor": "inert",
+        "TodoList": "inert"
     },
     "argMap": {
         "Bash": { "command": "command" },
         "Read": { "path": "path" },
-        "Grep": { "root": "path", "contentPattern": "pattern" }
+        "Write": { "path": "path" },
+        "Edit": { "path": "path" },
+        "Glob": { "root": "path", "pathGlob": "pattern" },
+        "Grep": { "root": "path", "contentPattern": "pattern", "pathGlob": "glob" },
+        "FetchURL": { "url": "url" },
+        "WebSearch": { "url": "query" }
     },
     "allowedFields": {
         "envelope": [
             "hook_event_name",
             "session_id",
+            "session_title",
             "cwd",
             "client_type",
             "tool_name",
@@ -24,23 +53,99 @@
             "tool_call_id"
         ],
         "tools": {
-            "Bash": ["command"],
-            "Read": ["path"],
-            "Grep": ["pattern", "path", "output_mode"]
+            "Bash": [
+                "command",
+                "cwd",
+                "timeout",
+                "description",
+                "run_in_background",
+                "disable_timeout"
+            ],
+            "Read": ["path", "line_offset", "column_offset", "n_lines", "max_chars"],
+            "Write": ["path", "content", "mode"],
+            "Edit": ["path", "old_string", "new_string", "replace_all"],
+            "Glob": ["pattern", "path", "head_limit", "offset", "include_ignored", "include_dirs"],
+            "Grep": [
+                "pattern",
+                "path",
+                "glob",
+                "type",
+                "output_mode",
+                "-i",
+                "-n",
+                "-A",
+                "-B",
+                "-C",
+                "head_limit",
+                "offset",
+                "multiline",
+                "include_ignored"
+            ],
+            "FetchURL": ["url"],
+            "WebSearch": ["query"],
+            "Agent": [
+                "prompt",
+                "description",
+                "subagent_type",
+                "resume",
+                "run_in_background",
+                "fork",
+                "model"
+            ],
+            "AgentSwarm": [
+                "description",
+                "items",
+                "prompt_template",
+                "resume_agent_ids",
+                "subagent_type"
+            ],
+            "CronCreate": ["cron", "prompt", "recurring"],
+            "CronDelete": ["id"],
+            "CronList": [],
+            "AskUserQuestion": ["questions", "background"],
+            "CreateGoal": ["objective", "completionCriterion", "replace"],
+            "GetGoal": [],
+            "SetGoalBudget": ["value", "unit"],
+            "UpdateGoal": ["status"],
+            "EnterPlanMode": [],
+            "ExitPlanMode": ["options"],
+            "Skill": ["skill", "args"],
+            "TaskList": ["active_only", "limit"],
+            "TaskOutput": ["task_id"],
+            "TaskStop": ["task_id", "reason"],
+            "WaitFor": ["task_id", "timeout"],
+            "TodoList": ["todos"]
         }
     },
     "eventCoverage": {
         "PreToolUse": {
             "mode": "intercepted",
-            "evidence": "[[hooks]] в config.toml дома CLI, который собирает раннер; проба на том тексте перед каждой сессией (core/session-settings.ts, prepareKimiNativeHome)"
+            "evidence": "[[hooks]] PreToolUse в config.toml дома CLI, который собирает раннер (core/session-settings.ts, prepareKimiNativeHome): хук зовётся до эффекта на Write, Edit, Read, Bash (в том числе с cwd вне дерева), Grep, Glob, FetchURL, Agent и MCP, код 2 останавливает вызов — стенд 2.3.2 (adapters/harnesses/__fixtures__/kimi-code-2.3.2-stand.json). Регистрацию судит событие нормализатора пакета (#191), проба на тексте config.toml — перед каждой сессией"
         }
     },
     "configSurfaces": [],
     "forbiddenEnv": [],
     "mcpNames": {},
+    "probeInputs": {
+        "Write": { "content": "ralph-probe\n" },
+        "Edit": { "old_string": "ralph-probe", "new_string": "ralph-probe" },
+        "Glob": { "pattern": "*" },
+        "Agent": { "prompt": "ralph-probe", "description": "ralph-probe" },
+        "AgentSwarm": { "description": "ralph-probe" },
+        "CronCreate": { "cron": "0 0 1 1 *", "prompt": "ralph-probe" },
+        "CronDelete": { "id": "ralph-probe" },
+        "AskUserQuestion": { "questions": [] },
+        "CreateGoal": { "objective": "ralph-probe" },
+        "SetGoalBudget": { "value": 1, "unit": "turns" },
+        "UpdateGoal": { "status": "complete" },
+        "Skill": { "skill": "ralph-probe" },
+        "TaskOutput": { "task_id": "ralph-probe" },
+        "TaskStop": { "task_id": "ralph-probe" },
+        "WaitFor": { "timeout": 1 }
+    },
     "skillEvidence": {
         "source": "заглушка: доказательства загрузки скилла нет — транскрипта хуку CLI не отдаёт (SKILL_BARRIER_LIMIT); поставщик — Фаза 16e"
     },
     "rules": ["AGENTS.md"],
-    "inventorySource": "заглушка: перечень — вход хука со стенда Фазы 11 и состав пробы 16b (adapters/harness-guard.ts); фикстуры и нормализатор — Фаза 16d"
+    "inventorySource": "стенд 2.3.2 (adapters/harnesses/__fixtures__/kimi-code-2.3.2-stand.json): toolMap и allowedFields — перечень инструментов и полей, который CLI отдал модели в запросе к провайдеру стенда (раздел inventory), плюс поля схем входа бинаря, которых стенд не предлагал (Agent: fork, model; WebSearch — только при провайдере поиска). Конверт — вход хука стенда плюс session_title, которое CLI кладёт в событие, когда у сессии есть заголовок (withSessionFacts в dist/main.mjs). Сверка с инвентарём машиной — Фаза 16f"
 }

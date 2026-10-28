@@ -4,7 +4,12 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { configLayerProblems, LAYER_SCAN_MAX_DIRS, SKIPPED_DIRS } from './config-layers.ts';
+import {
+    configLayerProblems,
+    LAYER_SCAN_MAX_DIRS,
+    parseJsonc,
+    SKIPPED_DIRS,
+} from './config-layers.ts';
 
 const SURFACES = ['.codex/config.toml', '.codex/hooks.json'];
 const dirs: string[] = [];
@@ -124,5 +129,120 @@ describe('configLayerProblems — fail-closed', () => {
         expect(found).toEqual([
             '/t/.codex/config.toml: исполняемый слой конфига харнесса в дереве сессии',
         ]);
+    });
+});
+
+// #197: у OpenCode `opencode.json` — законная настройка человека, слоем её делает исполняющий
+// ключ (`plugin`, `mcp`, `provider.*.npm`, …); каталоги `.opencode/plugin` — слой самим наличием.
+describe('configLayerProblems — JSON-поверхность с ключами слоя', () => {
+    const OC = ['.opencode/plugin', 'opencode.json', 'opencode.jsonc'];
+    const scan = (root: string) =>
+        inTree(configLayerProblems({ tree: root, surfaces: OC, jsonKeys: ['plugin'] }), root);
+
+    it('opencode.json без plugin или с пустым — не слой; с npm-плагином — слой с ключом', () => {
+        const root = tmp();
+        put(path.join(root, 'opencode.json'), '{"theme": "x", "plugin": []}');
+        expect(scan(root)).toEqual([]);
+        put(path.join(root, 'opencode.jsonc'), '{\n  // человек\n  "plugin": ["npm-x",],\n}');
+        expect(scan(root)).toEqual([
+            `${path.join(root, 'opencode.jsonc')}: исполняемый слой конфига харнесса в дереве ` +
+                'сессии (ключи: plugin)',
+        ]);
+    });
+
+    it('mcp, formatter, lsp — тоже исполняющие ключи; пустые и выключенные — не слой', () => {
+        const root = tmp();
+        const scanAll = () =>
+            inTree(
+                configLayerProblems({
+                    tree: root,
+                    surfaces: OC,
+                    jsonKeys: ['plugin', 'mcp', 'formatter', 'lsp'],
+                }),
+                root,
+            );
+        put(path.join(root, 'opencode.json'), '{"mcp": {}, "formatter": false, "lsp": false}');
+        expect(scanAll()).toEqual([]);
+        put(
+            path.join(root, 'opencode.json'),
+            '{"mcp": {"x": {"type": "local", "command": ["x"]}}, "lsp": {"y": {"command": ["y"]}}}',
+        );
+        expect(scanAll()).toEqual([
+            `${path.join(root, 'opencode.json')}: исполняемый слой конфига харнесса в дереве ` +
+                'сессии (ключи: mcp, lsp)',
+        ]);
+    });
+
+    // Схема `Config` OpenCode 1.19.4: `npm` провайдера и модели грузит пакет, `shell` — бинарь
+    // инструмента bash, шаблон `command` исполняет `` !`cmd` ``. Прочее в `provider` — законно.
+    it('НЕГАТИВНЫЙ: npm провайдера и модели, shell, command — слой; ключи провайдера — нет', () => {
+        const root = tmp();
+        const keys = ['shell', 'command', 'provider.*.npm', 'provider.*.models.*.provider.npm'];
+        const scanKeys = () =>
+            inTree(configLayerProblems({ tree: root, surfaces: OC, jsonKeys: keys }), root);
+        const file = path.join(root, 'opencode.json');
+        put(file, '{"provider": {"x": {"options": {"apiKey": "k"}, "models": {"m": {}}}}}');
+        expect(scanKeys()).toEqual([]);
+        put(file, '{"provider": {"x": {"npm": "evil-provider"}}}');
+        expect(scanKeys()).toEqual([
+            `${file}: исполняемый слой конфига харнесса в дереве сессии (ключи: provider.*.npm)`,
+        ]);
+        put(file, '{"provider": {"x": {"models": {"m": {"provider": {"npm": "evil"}}}}}}');
+        expect(scanKeys()[0]).toMatch(/ключи: provider\.\*\.models\.\*\.provider\.npm\)$/);
+        put(file, '{"shell": "./x.sh", "command": {"c": {"template": "!`id`"}}}');
+        expect(scanKeys()[0]).toMatch(/ключи: shell, command\)$/);
+        put(file, '{"provider": "x", "shell": ""}');
+        expect(scanKeys()).toEqual([]);
+    });
+
+    it('.opencode/plugin/x.js — слой самим наличием каталога', () => {
+        const root = tmp();
+        put(path.join(root, '.opencode', 'plugin', 'x.js'), 'export default {}');
+        expect(scan(root)).toEqual([
+            `${path.join(root, '.opencode', 'plugin')}: исполняемый слой конфига харнесса в ` +
+                'дереве сессии',
+        ]);
+    });
+
+    it('НЕГАТИВНЫЙ: не разобрался или не объект — отказ с причиной, а не «ключа нет»', () => {
+        const root = tmp();
+        put(path.join(root, 'opencode.json'), '{"plugin": [');
+        const [broken] = scan(root);
+        expect(broken).toMatch(
+            /opencode\.json: поверхность конфига харнесса не разобрана .* ключи plugin не проверены/,
+        );
+        put(path.join(root, 'opencode.json'), '["plugin"]');
+        expect(scan(root)[0]).toMatch(/не разобрана \(не объект\)/);
+    });
+});
+
+describe('parseJsonc', () => {
+    it('висячая запятая внутри строки остаётся; BOM в начале снят', () => {
+        expect(parseJsonc('{"a": "x,]", "b": ["y,}" ,], }')).toEqual({ a: 'x,]', b: ['y,}'] });
+        expect(parseJsonc('\uFEFF{"plugin": []}')).toEqual({ plugin: [] });
+        expect(parseJsonc('{"a": [1 /* c */ , ] // хвост\n}')).toEqual({ a: [1] });
+    });
+
+    it('комментарии вне строк и висячие запятые сняты; в строках — остаются', () => {
+        expect(
+            parseJsonc('{ /* блок */ "a": "http://x/*y*/", // строка\n "b": [1, 2,], }'),
+        ).toEqual({ a: 'http://x/*y*/', b: [1, 2] });
+        expect(parseJsonc('{"q": "с \\"кавычкой\\" // не комментарий"}')).toEqual({
+            q: 'с "кавычкой" // не комментарий',
+        });
+    });
+
+    it('запятая, после которой шло значение, не снимается; разбор линеен по скобкам', () => {
+        expect(() => parseJsonc('[1, 2 ]')).not.toThrow();
+        expect(parseJsonc('[1, /* c */ 2 ,\n]')).toEqual([1, 2]);
+        // Тысячи скобок с висячими запятыми: регэксп по всему выводу на каждой скобке шёл бы
+        // секундами, линейный проход — миллисекунды.
+        const big = `[${'{"a": [1,],},'.repeat(50_000)}]`;
+        expect(parseJsonc(big)).toHaveLength(50_000);
+    });
+
+    it('незакрытый блочный комментарий и битый JSON — бросок', () => {
+        expect(() => parseJsonc('{ /* без конца')).toThrow(/незакрытый комментарий/);
+        expect(() => parseJsonc('{')).toThrow();
     });
 });

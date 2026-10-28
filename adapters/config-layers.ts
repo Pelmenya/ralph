@@ -22,6 +22,19 @@
 // только при cwd внутри них, а сессия стартует в корне дерева. Без этого пропуска дерево Rust
 // или Python легко перерастало предел и отменяло старт у потребителя без единого слоя.
 //
+// JSON-поверхность бывает законной: `opencode.json` в дереве потребителя — его настройка CLI для
+// человека, и исполняемым слоем её делает не наличие, а ключ, который грузит или исполняет код
+// (#197): у OpenCode это `plugin` (npm-плагины), `mcp` (сервер `type: local` — команда),
+// `formatter` и `lsp` (`command` в массиве), `shell` (бинарь инструмента bash), `command` (шаблон
+// исполняет `` !`cmd` `` оболочкой) и `npm` провайдера и модели (пакет провайдера грузится). Поэтому
+// пакет вправе назвать такие ключи (`jsonKeys`): JSON-поверхность с непустым значением хоть одного
+// из них — слой, без них — нет. Ключ бывает путём через точку, `*` — любой подключ объекта
+// (`provider.*.npm`): прочее в `provider` — ключи и адреса, законная настройка человека.
+// Перечень обязан накрывать КАЖДЫЙ исполняющий ключ: отказ по наличию — защита на случай, если
+// выключатель проектного конфига не сработал, и ключ вне перечня держал бы только выключатель.
+// Файл, который не прочитался или не разобрался как JSONC, — слой с причиной: «не разобрал» не
+// значит «ключа нет».
+//
 // Цена названа. Скан идёт заново перед КАЖДОЙ сессией Codex (`prepareCodexSession`): readdir
 // на каталог дерева и по `existsSync` на поверхность и на `.git` у каждого. Кэша нет нарочно —
 // слой, положенный прошлой сессией, обязан остановить следующую. Симлинк на каталог обход не
@@ -70,6 +83,80 @@ function tomlSections(text: string): string[] {
     return [...out];
 }
 
+/**
+ * JSONC в объект: BOM в начале, строчные и блочные комментарии вне строк и висячие запятые
+ * снимаются, как у CLI, который такие файлы принимает. Запятая снимается в том же проходе, что
+ * пропускает строки, поэтому строковые литералы не меняются (`"x,]"` остаётся собой). Проход
+ * линейный: вывод — куски в массиве, и последняя запятая вне строки помнится индексом куска, а не
+ * ищется регэкспом по всему накопленному выводу на каждой скобке (сгенерированный JSON с
+ * тысячами скобок тормозил бы старт каждой сессии). Не разобралось — бросает.
+ */
+export function parseJsonc(text: string): unknown {
+    const out: string[] = [];
+    // Кусок с запятой, после которой были только пробелы и комментарии; -1 — такой нет.
+    let comma = -1;
+    for (let i = text.startsWith('\uFEFF') ? 1 : 0; i < text.length; i += 1) {
+        const c = text[i];
+        if (c === '}' || c === ']') {
+            if (comma !== -1) out[comma] = '';
+            comma = -1;
+            out.push(c);
+        } else if (c === ',') {
+            comma = out.length;
+            out.push(c);
+        } else if (c === '"') {
+            let j = i + 1;
+            while (j < text.length && text[j] !== '"') j += text[j] === '\\' ? 2 : 1;
+            out.push(text.slice(i, j + 1));
+            comma = -1;
+            i = j;
+        } else if (c === '/' && text[i + 1] === '/') {
+            while (i < text.length && text[i] !== '\n') i += 1;
+            out.push('\n');
+        } else if (c === '/' && text[i + 1] === '*') {
+            const end = text.indexOf('*/', i + 2);
+            if (end === -1) throw new Error('незакрытый комментарий');
+            i = end + 1;
+        } else {
+            if (!/\s/.test(c)) comma = -1;
+            out.push(c);
+        }
+    }
+    return JSON.parse(out.join(''));
+}
+
+const filled = (v: unknown) =>
+    Array.isArray(v)
+        ? v.length > 0
+        : v !== null && typeof v === 'object'
+          ? Object.keys(v).length > 0
+          : v !== undefined && v !== null && v !== false && v !== '';
+
+const isObject = (v: unknown): v is Record<string, unknown> =>
+    v !== null && typeof v === 'object' && !Array.isArray(v);
+
+/** Есть ли по пути (`*` — любой подключ объекта) непустое значение. */
+function filledAt(v: unknown, segments: readonly string[]): boolean {
+    if (segments.length === 0) return filled(v);
+    if (!isObject(v)) return false;
+    const [head, ...rest] = segments;
+    return head === '*'
+        ? Object.values(v).some((child) => filledAt(child, rest))
+        : filledAt(v[head], rest);
+}
+
+/**
+ * Ключи JSON-поверхности, которые делают её исполняемым слоем; `[]` — не слой. Не прочиталась
+ * или не разобралась — бросает: решать «слой или нет» не по чему.
+ */
+function jsonLayerKeys(text: string, keys: readonly string[]): string[] {
+    const v = parseJsonc(text);
+    if (!isObject(v)) throw new Error('не объект');
+    return keys.filter((k) => filledAt(v, k.split('.')));
+}
+
+const isJson = (p: string) => p.endsWith('.json') || p.endsWith('.jsonc');
+
 const inside = (p: string, dir: string) => p === dir || p.startsWith(dir + path.sep);
 
 /**
@@ -81,7 +168,13 @@ export function configLayerProblems(
         tree,
         surfaces,
         homes = [],
-    }: { tree: string; surfaces: readonly string[]; homes?: readonly string[] },
+        jsonKeys = [],
+    }: {
+        tree: string;
+        surfaces: readonly string[];
+        homes?: readonly string[];
+        jsonKeys?: readonly string[];
+    },
     {
         listDirsFn = defaultListDirs,
         existsFn = (p) => fs.existsSync(p),
@@ -128,7 +221,21 @@ export function configLayerProblems(
             const p = path.join(dir, surface);
             if (excluded.some((h) => inside(p, h)) || !existsFn(p)) continue;
             let sections: string[] = [];
-            if (p.endsWith('.toml')) {
+            if (jsonKeys.length > 0 && isJson(p)) {
+                let keys: string[];
+                try {
+                    keys = jsonLayerKeys(readFileFn(p), jsonKeys);
+                } catch (error) {
+                    out.push(
+                        `${p}: поверхность конфига харнесса не разобрана ` +
+                            `(${error instanceof Error ? error.message : String(error)}) — ` +
+                            `ключи ${jsonKeys.join(', ')} не проверены`,
+                    );
+                    continue;
+                }
+                if (keys.length === 0) continue;
+                sections = keys;
+            } else if (p.endsWith('.toml')) {
                 try {
                     sections = tomlSections(readFileFn(p));
                 } catch {
@@ -138,7 +245,9 @@ export function configLayerProblems(
             const where = inside(dir, root) ? 'в дереве сессии' : 'в предке дерева сессии';
             out.push(
                 `${p}: исполняемый слой конфига харнесса ${where}` +
-                    (sections.length > 0 ? ` (секции: ${sections.join(', ')})` : ''),
+                    (sections.length > 0
+                        ? ` (${isJson(p) ? 'ключи' : 'секции'}: ${sections.join(', ')})`
+                        : ''),
             );
         }
     }

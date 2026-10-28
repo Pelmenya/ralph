@@ -101,6 +101,12 @@ export type HarnessPackage = {
      * дереве сессии и его предках (`config-layers.ts`), а `homes` — дома CLI человека, которые
      * лежат в предке (`~/.codex`) и слоем проекта не являются. `null` — сборщика конфига у пакета
      * ещё нет: слои дерева не отвергаются, и старт говорит это строкой `⚠`, а не молчит.
+     * `jsonKeys` (#197) — ключи, которые делают JSON-поверхность слоем (у OpenCode — `plugin`,
+     * `mcp`, `provider.*.npm`, …; путь через точку, `*` — любой подключ): без поля
+     * JSON-поверхность — слой самим наличием, как TOML.
      */
-    projectLayers: { homes(env: NodeJS.ProcessEnv): string[] } | null;
+    projectLayers: {
+        homes(env: NodeJS.ProcessEnv): string[];
+        jsonKeys?: readonly string[];
+    } | null;
 };

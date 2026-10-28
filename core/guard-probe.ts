@@ -475,10 +475,11 @@ export function sessionContextProblems(
 
 /**
  * Вход guard в регистрациях Codex, Kimi Code и OpenCode (#186): переменная, которую читает
- * `guard.cjs`, и значение совместимого входа 16b. Нормализаторы Codex, Kimi Code и OpenCode —
- * заглушки до пакетов 16d, и через событие их сессии блокировались бы целиком; совместимый вход
- * держит их запреты 16b прежним правилом, а снимается при переводе каждого пакета. Литералы сверяет
- * тест с хуком.
+ * `guard.cjs`, и значение совместимого входа 16b. Пока нормализаторы пакетов были заглушками,
+ * через событие их сессии блокировались бы целиком, и совместимый вход держал запреты 16b
+ * прежним правилом. С переводом пакетов (Codex #232, Kimi Code #191, OpenCode #192) его выбирает
+ * только пакет с `guardInput: 'compat-16b'` — у реестра такого сейчас нет. Литералы сверяет тест
+ * с хуком.
  */
 export const GUARD_INPUT_ENV = 'RALPH_GUARD_INPUT';
 export const GUARD_COMPAT_INPUT = 'compat-16b' as const;
@@ -611,19 +612,23 @@ export type TRunPluginFn = (
     source: string,
     event: { input: Record<string, unknown>; output: Record<string, unknown> },
     projectDir: string,
+    opts?: { env?: Record<string, string> },
 ) => THookRun;
 
 /**
  * Боевой запуск плагина: отдельный `node` грузит исходник и зовёт его событие так, как
  * его зовёт OpenCode. Исполняются плагин и хуки, а не сам вызов инструмента.
  */
-export const runOpencodePlugin: TRunPluginFn = (source, event, projectDir) => {
+export const runOpencodePlugin: TRunPluginFn = (source, event, projectDir, opts = {}) => {
     guardSideEffect('guard-probe: плагин OpenCode', 'Подмени runPluginFn в тесте.');
+    // Окружение — как у хука под пробой (`probeHookEnv`): хуки плагин зовёт со своим env, и
+    // унаследованный из окружения раннера контекст сессии засчитал бы пробу петли без него.
     const r = spawnSync('node', ['--input-type=module', '-e', OPENCODE_PLUGIN_DRIVER], {
         cwd: projectDir,
         input: JSON.stringify({ source, ...event, directory: projectDir }),
         encoding: 'utf-8',
         timeout: 120 * 1000,
+        env: probeHookEnv(process.env, projectDir, { env: opts.env }),
     });
     return { status: r.status, stderr: r.stderr ?? String(r.error ?? '') };
 };
@@ -725,7 +730,12 @@ function pluginProblems(
             out.push(`${probe.what} (${name}): ни один хук плагина не накрывает инструмент`);
             continue;
         }
-        const run = runPluginFn(source, plugin.event(probe), projectDir);
+        // Правило сессии петли (`HarnessProbe.loop`) — с контекстом петли, как у хуков командой.
+        const run = probe.loop
+            ? runPluginFn(source, plugin.event(probe), projectDir, {
+                  env: { [SESSION_CONTEXT_ENV]: probeLoopContext(projectDir) },
+              })
+            : runPluginFn(source, plugin.event(probe), projectDir);
         out.push(...verdictProblems(probe, [{ hook: pluginHook, run }]));
     }
     return out;
@@ -869,15 +879,25 @@ export function unguardedRoutes(
         });
 }
 
-/** Скан исполняемых слоёв конфига: дерево, поверхности пакета, исключённые дома CLI. */
+/**
+ * Скан исполняемых слоёв конфига: дерево, поверхности пакета, исключённые дома CLI и ключи,
+ * которые делают JSON-поверхность слоем (#197).
+ */
 export type TLayersFn = (args: {
     tree: string;
     surfaces: readonly string[];
     homes: readonly string[];
+    jsonKeys: readonly string[];
 }) => string[];
 
 /** Харнесс рантайма Codex — для сборщика его сессии (`session-settings.ts`). */
 export const CODEX_HARNESS = CODEX_RUNTIME_HARNESS;
+
+/** Харнесс рантайма `kimi-native` — для сборщика его дома (`session-settings.ts`, #191). */
+export const KIMI_NATIVE_HARNESS = KIMI_NATIVE_RUNTIME_HARNESS;
+
+/** Харнесс рантайма `opencode` — для сборщика его каталога (`session-settings.ts`, #192). */
+export const OPENCODE_HARNESS = OPENCODE_RUNTIME_HARNESS;
 
 /**
  * Исполняемые слои конфига харнесса в дереве сессии и его предках (#195): поверхности
@@ -900,7 +920,22 @@ export function harnessLayerProblems(
         tree,
         surfaces: loaded.descriptor.configSurfaces,
         homes: loaded.pkg.projectLayers.homes(env),
+        jsonKeys: loaded.pkg.projectLayers.jsonKeys ?? [],
     });
+}
+
+/**
+ * Переменные окружения, снимающие барьер харнесса (`forbiddenEnv` описания пакета, #197), —
+ * для сверки окружения сессии перед спавном. Пакет не принят — бросок, а не пустой перечень:
+ * «запрещённого нет» по непринятому пакету было бы молчаливым снятием сверки.
+ */
+export function harnessForbiddenEnv(
+    harness: string,
+    registry: HarnessRegistry = HARNESS_REGISTRY,
+): readonly string[] {
+    const loaded = registry.packages.get(harness);
+    if (!loaded) throw new Error(`пакет харнесса «${harness}» не принят реестром`);
+    return loaded.descriptor.forbiddenEnv;
 }
 
 /** Предел пакета без сборщика конфига — строка `⚠` старта. */

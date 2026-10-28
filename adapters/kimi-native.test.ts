@@ -4,12 +4,10 @@
 import { describe, expect, it } from 'vitest';
 import {
     KIMI_HOME_ENV,
-    KIMI_MAX_STEPS_ENV,
     buildKimiNativeArgs,
     kimiNativeAuthProblems,
     kimiNativeConfigProblems,
     kimiNativePromptPointer,
-    kimiNativeSessionEnv,
     kimiNativeSkillsDirs,
     kimiSessionConfig,
     kimiSourceHome,
@@ -113,14 +111,6 @@ describe('дом CLI', () => {
     it('пустой конфиг человека — только регистрация барьера', () => {
         const toml = kimiSessionConfig('', [{ matcher: '', command: 'g', timeoutSec: 5 }]);
         expect(kimiHooksFromToml(toml).hooks).toHaveLength(1);
-    });
-
-    it('env сессии: свой дом и потолок шагов; без потолка переменной нет', () => {
-        const env = kimiNativeSessionEnv({ PATH: '/bin' }, { home: '/r/home', maxTurns: 40.7 });
-        expect(env).toMatchObject({ PATH: '/bin', [KIMI_HOME_ENV]: '/r/home' });
-        expect(env[KIMI_MAX_STEPS_ENV]).toBe('40');
-        const bare = kimiNativeSessionEnv({}, { home: null });
-        expect(bare).toEqual({});
     });
 });
 

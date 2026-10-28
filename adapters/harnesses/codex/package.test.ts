@@ -6,10 +6,10 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { CODEX_GUARD_LIMIT, CODEX_HOOK_TRUST_FLAG, codexGuardArgs } from '../../harness-guard.ts';
-import { parseHarnessDescriptor } from '../descriptor.ts';
+import { ownDescriptor, parseHarnessDescriptor } from '../descriptor.ts';
 import { probeMatrix } from '../probe-matrix.ts';
 import { ADAPTER_PROTOCOL_VERSION } from '../protocol.ts';
-import { main, ownDescriptor } from './normalize.ts';
+import { main } from './normalize.ts';
 import { codexRegistrationFromArgs, harnessPackage } from './package.ts';
 
 const DIR = import.meta.dirname;
@@ -144,7 +144,7 @@ describe('команда нормализатора', () => {
 
     it('описание чужого харнесса рядом с командой — отказ', () => {
         const d = JSON.parse(readFileSync(path.join(DIR, 'descriptor.json'), 'utf-8'));
-        expect(() => ownDescriptor({ ...d, harness: 'claude-code' }, 'd')).toThrow(
+        expect(() => ownDescriptor({ ...d, harness: 'claude-code' }, 'd', 'codex')).toThrow(
             /описание харнесса «claude-code», а команда — нормализатор codex/,
         );
     });

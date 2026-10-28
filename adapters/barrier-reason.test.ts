@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import { describe, expect, it } from 'vitest';
+import { opencodeGuardPlugin } from './harness-guard.ts';
 import { HARNESS_REGISTRY, normalizerPathIn } from './harness-registry.ts';
 
 import {
@@ -96,6 +97,19 @@ describe('хуки говорят кодами контракта', () => {
             expect(emittedBy(files)).toEqual(declared);
         },
     );
+
+    // Плагин OpenCode (#192) зовёт хук сам и называет его неисправность своим кодом: исходник
+    // строится в `harness-guard.ts`, и коды в нём — ровно коды контракта этого выпускающего.
+    it('opencode-plugin: коды в исходнике плагина — ровно коды контракта', () => {
+        const source = opencodeGuardPlugin([{ matcher: '', command: 'true', timeoutSec: 1 }]);
+        const emitted = [...source.matchAll(/ralph-reason-code: ([a-z][a-z-]*)/g)].map((m) => m[1]);
+        const declared = Object.entries(BARRIER_REASON_CODES)
+            .filter(([, v]) => v.emitter === 'opencode-plugin')
+            .map(([code]) => code)
+            .sort();
+        expect(declared.length).toBeGreaterThan(0);
+        expect([...new Set(emitted)].sort()).toEqual(declared);
+    });
 
     it.each(['guard.cjs', 'skill-barrier.cjs'])('%s: префикс строки — тот же литерал', (file) => {
         const m = hookSource(file).match(/const REASON_LINE_PREFIX = '([^']*)';/);

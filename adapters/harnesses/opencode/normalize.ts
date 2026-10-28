@@ -1,18 +1,21 @@
-// Команда нормализатора пакета OpenCode — объявленная заглушка (#213). Нормализатор OpenCode и
-// фикстуры — Фаза 16d; до неё любое событие — отказ команды с причиной (код 1), то есть блок у хука
-// кодом неисправности `adapter-failed`: команда, которой нет, блокировала бы так же, но без
-// объяснения, а «пропустить» здесь значило бы судить по таблицам, которых никто не сверял со
-// стендом. Не `unknown`: его хук читает кодом ПРАВИЛА (`unknown-field`), и заглушка, подключённая
-// без совместимого входа, засчиталась бы пробой как держащий барьер (ревью 16c). Плагин 16b зовёт
-// guard совместимым входом (`RALPH_GUARD_INPUT=compat-16b`), и его сессии заглушка не трогает.
+// Команда нормализатора пакета OpenCode (#192): её зовёт общий хук процессом
+// (`.claude/hooks/adapter-event.cjs`), отдаёт вход, который положил плагин барьера, на stdin и ждёт
+// ответ протокола. Описание читается рядом с модулем и проверяется схемой, имя харнесса в нём
+// сверяется при старте общей сверкой (`ownDescriptor`): guard зовёт команду по пути из своей
+// регистрации, мимо реестра, и чужое описание рядом с модулем судило бы события OpenCode
+// таблицами другого CLI. До #192 здесь стояла объявленная заглушка — отказ на любом событии.
+import fs from 'node:fs';
+import path from 'node:path';
+import { ownDescriptor } from '../descriptor.ts';
 import { runNormalizer, type RunNormalizerDeps } from '../protocol.ts';
+import { normalizeOpencodeEvent } from './event.ts';
 
-export const STUB_REASON = 'нормализатор OpenCode — заглушка до Фазы 16d: событие не разобрано';
+const HARNESS = 'opencode';
 
 export async function main(deps: RunNormalizerDeps = {}): Promise<void> {
-    await runNormalizer(() => {
-        throw new Error(STUB_REASON);
-    }, deps);
+    const file = path.join(import.meta.dirname, 'descriptor.json');
+    const descriptor = ownDescriptor(JSON.parse(fs.readFileSync(file, 'utf-8')), file, HARNESS);
+    await runNormalizer((raw) => normalizeOpencodeEvent(descriptor, raw), deps);
 }
 
 if (import.meta.main) await main();

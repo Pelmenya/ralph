@@ -14,6 +14,7 @@ import {
     GUARD_PROBES,
     CONTEXT_UNPROVEN_LIMIT,
     ensureGuardHolds,
+    harnessForbiddenEnv,
     harnessLayerProblems,
     harnessRoutes,
     PROJECT_LAYERS_LIMIT,
@@ -34,6 +35,7 @@ import {
     type TRunPluginFn,
 } from './guard-probe.ts';
 import {
+    HARNESS_PROBES,
     OPENCODE_PLUGIN_DRIVER,
     codexGuardArgs,
     kimiHooksToml,
@@ -70,12 +72,13 @@ const spawnHook: TRunHookFn = (hook, payload, projectDir, opts = {}) => {
 };
 
 /** Живой запуск плагина OpenCode — то же, что боевой `runOpencodePlugin`, мимо предохранителя. */
-const spawnPlugin: TRunPluginFn = (source, event, projectDir) => {
+const spawnPlugin: TRunPluginFn = (source, event, projectDir, opts = {}) => {
     const r = spawnSync('node', ['--input-type=module', '-e', OPENCODE_PLUGIN_DRIVER], {
         cwd: projectDir,
         input: JSON.stringify({ source, ...event, directory: projectDir }),
         encoding: 'utf-8',
         timeout: 120 * 1000,
+        env: { ...process.env, ...opts.env },
     });
     return { status: r.status, stderr: r.stderr ?? '' };
 };
@@ -378,10 +381,14 @@ describe('харнесс рантайма: guard обязан быть дока�
         ensureGuardHolds('/x', {
             failFn: (m) => fails.push(m),
             logFn: (m) => logs.push(m),
-            settings: settingsWith('Bash|Read|Edit|MultiEdit|Grep|mcp__.*'),
+            // `Write` и `Task` — в matcher: проба OpenCode подаёт запись данных контура и
+            // субагента в петле (#192).
+            settings: settingsWith('Bash|Read|Write|Edit|MultiEdit|Grep|Task|mcp__.*'),
             runtimes: { coderRuntime: 'opencode' },
             runHookFn: goodGuard,
             runPluginFn,
+            // Слои дерева со сборщиком конфига (#197) — свой кейс ниже.
+            layersFn: () => [],
         });
         expect(fails).toEqual([]);
         expect(calls.length).toBeGreaterThan(0);
@@ -398,7 +405,8 @@ describe('харнесс рантайма: guard обязан быть дока�
         ensureGuardHolds('/x', {
             failFn: (m) => fails.push(m),
             logFn: (m) => logs.push(m),
-            settings: settingsWith('Bash|Read|Edit|Grep|mcp__.*'),
+            // `Write` — в matcher: проба Kimi Code подаёт запись данных контура (#191).
+            settings: settingsWith('Bash|Read|Write|Edit|Grep|mcp__.*'),
             runtimes: { coderRuntime: 'kimi-native' },
             runHookFn: goodGuard,
         });
@@ -443,7 +451,9 @@ describe('регистрация харнесса: отказы, которые 
         expect(opencodePluginProblems('export {};', '/x', { runPluginFn })[0]).toMatch(
             /нет списка/,
         );
-        const onlyEdit = opencodeGuardPlugin([{ matcher: 'Write', command: 'g', timeoutSec: 5 }]);
+        const onlyEdit = opencodeGuardPlugin([
+            { matcher: 'NotebookEdit', command: 'g', timeoutSec: 5 },
+        ]);
         const problems = opencodePluginProblems(onlyEdit, '/x', { runPluginFn });
         expect(problems[0]).toMatch(/\(bash\): ни один хук плагина не накрывает/);
         expect(runs).toBe(0);
@@ -513,6 +523,7 @@ describe('ensureGuardHolds — старт отменяется до первой
                 tree: '/path/to/app',
                 surfaces: ['.codex/config.toml', '.codex/hooks.json'],
                 homes: ['/path/to/home/.codex'],
+                jsonKeys: [],
             },
         ]);
         expect(c.failed).toHaveLength(1);
@@ -520,6 +531,42 @@ describe('ensureGuardHolds — старт отменяется до первой
             /^Исполняемые слои конфига харнесса[\s\S]*codex: \/path\/to\/app\/\.codex\/config\.toml[\s\S]*mcp_servers[\s\S]*Убери слой/,
         );
         expect(c.logged).toEqual([]);
+    });
+
+    // #197: сборщик конфига OpenCode — `.opencode/plugin/x.js` в дереве останавливает старт
+    // настоящим сканом, а `opencode.json` без npm-плагинов — законная настройка человека.
+    it('OpenCode: .opencode/plugin/x.js в дереве — отказ старта; opencode.json без plugin — нет', () => {
+        const tree = mkdtempSync(path.join(tmpdir(), 'opencode-layers-'));
+        try {
+            writeFileSync(path.join(tree, 'opencode.json'), '{ "theme": "x", // человек\n}');
+            const clean = harnessLayerProblems('opencode', tree, { HOME: '/nonexistent-home' });
+            expect(clean).toEqual([]);
+            mkdirSync(path.join(tree, '.opencode', 'plugin'), { recursive: true });
+            writeFileSync(path.join(tree, '.opencode', 'plugin', 'x.js'), 'export default {}');
+            writeFileSync(path.join(tree, 'opencode.json'), '{ "plugin": ["some-npm-plugin"] }');
+            expect(harnessLayerProblems('opencode', tree, { HOME: '/nonexistent-home' })).toEqual([
+                `${path.join(tree, '.opencode', 'plugin')}: исполняемый слой конфига харнесса в дереве сессии`,
+                `${path.join(tree, 'opencode.json')}: исполняемый слой конфига харнесса в дереве сессии (ключи: plugin)`,
+            ]);
+            const c = calls();
+            ensureGuardHolds(tree, {
+                ...c,
+                settings: settingsWith('.*'),
+                runHookFn: goodGuard,
+                runPluginFn: (_src, ev) => heldRun(JSON.stringify(ev)),
+                runtimes: { coderRuntime: 'opencode' },
+                env: { HOME: '/nonexistent-home' },
+            });
+            expect(c.failed).toHaveLength(1);
+            expect(c.failed[0]).toMatch(/opencode: .*\.opencode\/plugin: исполняемый слой/);
+        } finally {
+            rmSync(tree, { recursive: true, force: true });
+        }
+    });
+
+    it('forbiddenEnv харнесса — из описания пакета; непринятый пакет — бросок', () => {
+        expect(harnessForbiddenEnv('opencode')).toContain('OPENCODE_PURE');
+        expect(() => harnessForbiddenEnv('нет-такого')).toThrow(/не принят реестром/);
     });
 
     it('пакет без сборщика конфига слоёв не проверяет — и старт говорит это строкой', () => {
@@ -534,10 +581,24 @@ describe('ensureGuardHolds — старт отменяется до первой
         });
         expect(c.failed).toEqual([]);
         expect(layersFn).not.toHaveBeenCalled();
-        expect(harnessLayerProblems('kimi-code', '/w', {}, { layersFn })).toEqual([]);
         expect(harnessLayerProblems('нет-такого', '/w', {}, { layersFn })).toEqual([]);
         expect(c.logged.join('\n')).not.toContain(PROJECT_LAYERS_LIMIT);
 
+        // Сборщик конфига есть у Kimi Code с #196; пакет без него — та же регистрация с `null`.
+        const noBuilder = {
+            ...HARNESS_REGISTRY,
+            packages: new Map(
+                [...HARNESS_REGISTRY.packages].map(([name, loaded]) => [
+                    name,
+                    name === 'kimi-code'
+                        ? { ...loaded, pkg: { ...loaded.pkg, projectLayers: null } }
+                        : loaded,
+                ]),
+            ),
+        };
+        expect(
+            harnessLayerProblems('kimi-code', '/w', {}, { layersFn, registry: noBuilder }),
+        ).toEqual([]);
         const k = calls();
         ensureGuardHolds('/path/to/app', {
             ...k,
@@ -547,11 +608,38 @@ describe('ensureGuardHolds — старт отменяется до первой
                 coderRuntime: 'claude',
                 modelRouting: { apiLimitFallback: { provider: 'kimi-native' } },
             },
+            registry: noBuilder,
             layersFn,
         });
         expect(k.failed).toEqual([]);
         expect(layersFn).not.toHaveBeenCalled();
         expect(k.logged).toContain(`⚠ kimi-code: ${PROJECT_LAYERS_LIMIT}`);
+    });
+
+    // #196: проектные слои Kimi Code держит недоверие каталогу, а не отказ старта — поверхностей
+    // у пакета нет, и строки «сборщика нет» тоже.
+    it('Kimi Code со сборщиком конфига: слои сверяются без поверхностей, строки ⚠ нет', () => {
+        const layersFn = vi.fn(() => []);
+        const k = calls();
+        ensureGuardHolds('/path/to/app', {
+            ...k,
+            settings: settingsWith('.*'),
+            runHookFn: (_h, payload) => heldRun(payload),
+            runtimes: {
+                coderRuntime: 'claude',
+                modelRouting: { apiLimitFallback: { provider: 'kimi-native' } },
+            },
+            env: { HOME: '/h' },
+            layersFn,
+        });
+        expect(k.failed).toEqual([]);
+        expect(layersFn).toHaveBeenCalledWith({
+            tree: '/path/to/app',
+            surfaces: [],
+            homes: [],
+            jsonKeys: [],
+        });
+        expect(k.logged.join('\n')).not.toContain(PROJECT_LAYERS_LIMIT);
     });
 
     it('незнакомый рантайм при исправном барьере — fail с местом в конфиге', () => {
@@ -626,7 +714,9 @@ describe('ensureGuardHolds — старт отменяется до первой
     });
 });
 
-describe('живая проба: настоящие хуки процессом', () => {
+// Каждая проба — настоящий процесс плагина и хука: под полным сьютом с покрытием набор проб
+// пакета не укладывается в стандартные 5 с (гейт 28.10: 5057 мс), отдельно — доли секунды.
+describe('живая проба: настоящие хуки процессом', { timeout: 30_000 }, () => {
     let dir = '';
     afterEach(() => {
         if (dir) rmSync(dir, { recursive: true, force: true });
@@ -705,6 +795,8 @@ describe('живая проба: настоящие хуки процессом'
                 }),
             ).toEqual([]);
         },
+        // Проба OpenCode — процесс плагина, guard и нормализатор на каждую из двух десятков проб.
+        60_000,
     );
 
     // #120, от противного: живая сессия Kimi Code исполнила `rm -rf`, потому что команда
@@ -851,7 +943,14 @@ describe('живая проба: настоящие хуки процессом'
         if (!moved.ok) throw new Error(moved.reason);
         expect(moved.path.startsWith('/core/')).toBe(true);
         expect(guardInputOf(HARNESS_REGISTRY, 'codex', '/core')).toEqual({ adapter: moved.path });
-        expect(guardInputOf(HARNESS_REGISTRY, 'kimi-code', '/core')).toBe('compat-16b');
+        // Kimi Code судит событием с #191, OpenCode — с #192.
+        for (const harness of ['kimi-code', 'opencode']) {
+            const found = normalizerPathIn(HARNESS_REGISTRY, harness, '/core');
+            if (!found.ok) throw new Error(found.reason);
+            expect(guardInputOf(HARNESS_REGISTRY, harness, '/core')).toEqual({
+                adapter: found.path,
+            });
+        }
         // Значение-причина не абсолютный путь: guard на ней блокирует всё `adapter-failed`.
         const missing = guardInputOf(HARNESS_REGISTRY, 'nope');
         expect(missing).toEqual({ adapter: expect.stringMatching(/^пакет не принят: /) });
@@ -1091,13 +1190,15 @@ describe('живая проба: настоящие хуки процессом'
             { matcher: '', command: `node "${dir}/hook.cjs"`, timeoutSec: 10 },
         ]);
         const problems = opencodePluginProblems(source, dir, { runPluginFn: spawnPlugin });
-        const safe = problems.filter((p) => p.includes('безобидная команда'));
-        expect(safe).toHaveLength(1);
-        expect(safe[0]).toMatch(/безобидная команда \(bash\)[\s\S]*упал \(код 1/);
-        // Блок упавшим хуком — не правило: запрещённые без кода причины не засчитаны (#183).
-        expect(problems.filter((p) => /ждали код причины/.test(p))).toHaveLength(
-            problems.length - 1,
-        );
+        const allowedCount = HARNESS_PROBES.opencode.filter((p) => p.expect === 'allowed').length;
+        const safe = problems.filter((p) => p.includes('не пропустил её'));
+        expect(safe).toHaveLength(allowedCount);
+        expect(safe.join('\n')).toMatch(/безобидная команда \(bash\)[\s\S]*упал \(код 1/);
+        // Блок упавшим хуком — не правило, а неисправность со своим кодом (#183, #192):
+        // запрещённые им не засчитаны.
+        const rules = problems.filter((p) => /ждали код причины/.test(p));
+        expect(rules).toHaveLength(problems.length - allowedCount);
+        for (const p of rules) expect(p).toMatch(/получили: hook-failed$/);
     });
 
     it('плагин OpenCode: MCP-имя и патч переводятся в форму, которую судит барьер', () => {

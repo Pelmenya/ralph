@@ -1,0 +1,563 @@
+{
+    "source": "Kimi Code 2.3.2 (@moonshot-ai/kimi-code, dist/main.mjs), изолированный стенд живых проб (provision/stand/stand.mts exec --cli kimi), 28.10.2026, карточка #191. Модель — фиктивный провайдер Chat Completions на loopback стенда (провайдер type = \"openai\" в config.toml дома CLI стенда): на запрос с инструментами без результата инструмента он отдаёт заданный вызов (поле call), иначе — текст done. Диспетчер инструментов, хуки [[hooks]], исполнение — настоящего бинаря. Хук стенда пишет свой stdin целиком и выходит кодом 2 на маркере ralph-stand-forbidden. Заменены только корень стенда (/path/to/stand), каталог скриптов стенда (/path/to/stand-scripts), каталог пакета CLI и канона.",
+    "cliVersion": "2.3.2",
+    "assembled": false,
+    "conditions": "Воспроизведение: kit['stand.sh'] <случай> на хосте поднимает новый стенд и исполняет kit['drive.sh'] в изоляции ОС; drive.sh создаёт репозиторий work/loop, исполняет pre() случая (kit['cases'][<случай>]), пишет config.toml дома CLI стенда (провайдер mock и [[hooks]] PreToolUse с пустым matcher) и при MCPJSON — mcp.json дома, поднимает kit['mock.mjs'] и зовёт kimi --output-format stream-json -p go из work/loop. Окружение — standEnv стенда: HOME и KIMI_CODE_HOME внутри стенда, KIMI_CODE_NO_AUTO_UPDATE=1, ключей нет. ripgrep в стенде нет и бутстрап без сети отказывает: у Grep и Glob снят вход хука, а не исполнение поиска.",
+    "kit": {
+        "stand.sh": "#!/usr/bin/env bash\n# Хост: новый стенд под случай, исполнение drive.sh в изоляции.\nset -u\nCASE=\"$1\"; ST=\"/path/to/stand-runs/$CASE.$(date +%s)\"; mkdir -p /path/to/stand-runs\nPKG=/path/to/kimi-code\ncd /path/to/canon\nKIMI_BIN=\"$PKG/dist/main.mjs\" node provision/stand/stand.mts exec --stand \"$ST\" --cli kimi --ro \"$PKG\" --ro /path/to/stand-scripts --ro /path/to/canon/provision/stand --pass-env KIMI_BIN \\\n  -- bash /path/to/stand-scripts/drive.sh \"$CASE\"\necho \"stand=$ST rc=$?\"\n",
+        "drive.sh": "#!/usr/bin/env bash\n# Внутри стенда: фиктивный провайдер, репозиторий потребителя, kimi -p с [[hooks]] стенда.\nset -uo pipefail\nCASE=\"$1\"; S=\"$(dirname \"$HOME\")\"; OUT=\"$S/journal/$CASE\"; mkdir -p \"$OUT\"\nD=\"$(dirname \"${BASH_SOURCE[0]}\")\"; KIMI=\"${KIMI_BIN:?}\"; PORT=18998\nLOOP=\"$S/work/loop\"; mkdir -p \"$LOOP\" \"$KIMI_CODE_HOME\"\ngit init -q \"$LOOP\"; git -C \"$LOOP\" -c user.name=s -c user.email=s@example.com commit -q --allow-empty -m init\npre() { :; }\n. \"$D/cases/$CASE.sh\"\npre\nprintf '%s' \"$CALL\" >\"$OUT/call.json\"\ncat >\"$KIMI_CODE_HOME/config.toml\" <<TOML\ndefault_model = \"mock/mock\"\n\n[providers.mock]\ntype = \"openai\"\nbase_url = \"http://127.0.0.1:$PORT/v1\"\napi_key = \"stand-fake\"\n\n[models.\"mock/mock\"]\nprovider = \"mock\"\nmodel = \"mock\"\nmax_context_size = 131072\ncapabilities = [ \"tool_use\" ]\n\n[[hooks]]\nevent = \"PreToolUse\"\nmatcher = \"\"\ncommand = \"node $D/hook.cjs $OUT/hook.jsonl\"\ntimeout = 10\nTOML\ncat \"$D/cases/mcp.toml\" >/dev/null 2>&1\n[ -n \"${MCPJSON:-}\" ] && printf '%s' \"$MCPJSON\" >\"$KIMI_CODE_HOME/mcp.json\"\nnode \"$D/mock.mjs\" $PORT \"$OUT/call.json\" \"$OUT/provider.jsonl\" & MP=$!\nfor i in $(seq 50); do grep -q ready \"$OUT/provider.jsonl\" 2>/dev/null && break; sleep 0.1; done\n(cd \"$LOOP\" && timeout 120 \"$KIMI\" --output-format stream-json -p 'go' </dev/null >\"$OUT/stdout.txt\" 2>\"$OUT/stderr.txt\"); echo \"exit=$?\" >\"$OUT/exit.txt\"\nls -la \"$LOOP\" \"$S/outside\" >\"$OUT/tree.txt\" 2>&1\nfor f in \"$LOOP\"/* \"$S\"/outside/*; do [ -f \"$f\" ] && { echo \"== $f\"; cat \"$f\"; } ; done >>\"$OUT/tree.txt\" 2>&1\nkill $MP 2>/dev/null\n",
+        "mock.mjs": "// Фиктивный провайдер Chat Completions: на запрос с инструментами без результата инструмента\n// отдаёт заданный вызов (call.json), иначе — текст \"done\". Каждый запрос пишет в журнал.\nimport http from 'node:http';\nimport fs from 'node:fs';\nconst [port, callFile, journal] = process.argv.slice(2);\nconst call = JSON.parse(fs.readFileSync(callFile, 'utf8'));\nconst chunk = (res, delta, finish) =>\n  res.write(`data: ${JSON.stringify({ id: 'c1', object: 'chat.completion.chunk', created: 1, model: 'mock', choices: [{ index: 0, delta, finish_reason: finish ?? null }] })}\\n\\n`);\nhttp.createServer((req, res) => {\n  let body = '';\n  req.on('data', (d) => (body += d));\n  req.on('end', () => {\n    fs.appendFileSync(journal, JSON.stringify({ method: req.method, url: req.url, body: body.slice(0, 200000) }) + '\\n');\n    if (req.method === 'GET') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end('{\"object\":\"list\",\"data\":[{\"id\":\"mock\",\"object\":\"model\"}]}'); }\n    let j = {}; try { j = JSON.parse(body); } catch {}\n    const msgs = j.messages ?? [];\n    const answered = msgs.some((m) => m.role === 'tool');\n    const wantsTool = Array.isArray(j.tools) && j.tools.length > 0 && !answered;\n    res.writeHead(200, { 'content-type': 'text/event-stream' });\n    if (wantsTool) {\n      chunk(res, { role: 'assistant', tool_calls: [{ index: 0, id: 'call_stand_1', type: 'function', function: { name: call.name, arguments: JSON.stringify(call.arguments) } }] });\n      chunk(res, {}, 'tool_calls');\n    } else {\n      chunk(res, { role: 'assistant', content: 'done' });\n      chunk(res, {}, 'stop');\n    }\n    res.write(`data: ${JSON.stringify({ id: 'c1', object: 'chat.completion.chunk', created: 1, model: 'mock', choices: [], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } })}\\n\\n`);\n    res.end('data: [DONE]\\n\\n');\n  });\n}).listen(Number(port), '127.0.0.1', () => fs.appendFileSync(journal, '{\"ready\":true}\\n'));\n",
+        "hook.cjs": "// Хук стенда: пишет сырой вход целиком в файл из argv, блокирует на маркере.\nconst fs = require('fs');\nlet s = '';\nprocess.stdin.on('data', (d) => (s += d));\nprocess.stdin.on('end', () => {\n  fs.appendFileSync(process.argv[2], JSON.stringify({ env: { PWD: process.cwd() }, input: s }) + '\\n');\n  if (s.includes('ralph-stand-forbidden')) { process.stderr.write('blocked by stand hook'); process.exit(2); }\n  process.exit(0);\n});\n",
+        "qualify.mjs": "const s = (p) => p.replaceAll(/[^a-zA-Z0-9_-]/g, '_').replaceAll(/_+/g, '_');\nconst h = (input) => { let x = 2166136261; for (let i = 0; i < input.length; i++) { x ^= input.codePointAt(i); x = Math.trunc(Math.imul(x, 16777619)); } return x.toString(16).padStart(8, '0'); };\nconst q = (a, b) => { const f = `mcp__${s(a)}__${s(b)}`; if (f.length <= 64) return f; const k = h(f); return `${f.slice(0, 64 - k.length - 1)}_${k}`; };\nconsole.log(q(process.argv[2], process.argv[3]));\n",
+        "cases": {
+            "write-forbidden": "CALL='{\"name\":\"Write\",\"arguments\":{\"path\":\"ralph-stand-forbidden.txt\",\"content\":\"x\"}}'\n",
+            "write-allowed": "CALL='{\"name\":\"Write\",\"arguments\":{\"path\":\"allowed.txt\",\"content\":\"x\"}}'\n",
+            "write-append": "pre() { printf \"a\\n\" >\"$LOOP/allowed.txt\"; }; CALL='{\"name\":\"Write\",\"arguments\":{\"path\":\"allowed.txt\",\"content\":\"b\\n\",\"mode\":\"append\"}}'\n",
+            "write-append-forbidden": "pre() { printf \"a\\n\" >\"$LOOP/ralph-stand-forbidden.txt\"; }; CALL='{\"name\":\"Write\",\"arguments\":{\"path\":\"ralph-stand-forbidden.txt\",\"content\":\"b\\n\",\"mode\":\"append\"}}'\n",
+            "edit-forbidden": "pre() { printf \"old\\n\" >\"$LOOP/ralph-stand-forbidden.txt\"; }; CALL='{\"name\":\"Edit\",\"arguments\":{\"path\":\"ralph-stand-forbidden.txt\",\"old_string\":\"old\",\"new_string\":\"new\"}}'\n",
+            "edit-allowed": "pre() { printf \"old\\n\" >\"$LOOP/allowed.txt\"; }; CALL='{\"name\":\"Edit\",\"arguments\":{\"path\":\"allowed.txt\",\"old_string\":\"old\",\"new_string\":\"new\",\"replace_all\":true}}'\n",
+            "bash-cwd": "pre() { mkdir -p \"$S/outside\"; }; CALL=\"{\\\"name\\\":\\\"Bash\\\",\\\"arguments\\\":{\\\"command\\\":\\\"touch made-here; echo ralph-stand-forbidden\\\",\\\"cwd\\\":\\\"$S/outside\\\"}}\"\n",
+            "bash-cwd-allowed": "pre() { mkdir -p \"$S/outside\"; }; CALL=\"{\\\"name\\\":\\\"Bash\\\",\\\"arguments\\\":{\\\"command\\\":\\\"touch made-here\\\",\\\"cwd\\\":\\\"$S/outside\\\"}}\"\n",
+            "bash-cwd-relative": "pre() { mkdir -p \"$LOOP/sub\"; }; CALL=\"{\\\"name\\\":\\\"Bash\\\",\\\"arguments\\\":{\\\"command\\\":\\\"touch made-here\\\",\\\"cwd\\\":\\\"sub\\\"}}\"\n",
+            "grep-glob": "pre() { printf \"needle\\n\" >\"$LOOP/allowed.txt\"; }; CALL='{\"name\":\"Grep\",\"arguments\":{\"pattern\":\"needle\",\"glob\":\"*.txt\",\"output_mode\":\"content\"}}'\n",
+            "glob": "CALL='{\"name\":\"Glob\",\"arguments\":{\"pattern\":\"**/*.txt\"}}'\n",
+            "read": "pre() { printf \"x\\n\" >\"$LOOP/allowed.txt\"; }; CALL='{\"name\":\"Read\",\"arguments\":{\"path\":\"allowed.txt\",\"n_lines\":5}}'\n",
+            "fetch": "CALL='{\"name\":\"FetchURL\",\"arguments\":{\"url\":\"http://127.0.0.1:9/ralph-stand-forbidden\"}}'\n",
+            "agent": "CALL='{\"name\":\"Agent\",\"arguments\":{\"prompt\":\"ralph-stand-forbidden\",\"description\":\"stand probe\"}}'\n",
+            "mcp": "MCPJSON='{\"mcpServers\":{\"stand\":{\"command\":\"node\",\"args\":[\"/path/to/canon/provision/stand/fake-mcp.mts\",\"'\"$RALPH_STAND_MCP_JOURNAL\"'\"]}}}'; CALL='{\"name\":\"mcp__stand__stand_write\",\"arguments\":{\"key\":\"k\",\"value\":\"ralph-stand-forbidden\"}}'\n",
+            "mcp-long": "MCPJSON='{\"mcpServers\":{\"stand-server-with-a-rather-long-name-for-the-hash\":{\"command\":\"node\",\"args\":[\"/path/to/canon/provision/stand/fake-mcp.mts\",\"'\"$RALPH_STAND_MCP_JOURNAL\"'\"]}}}'; CALL='{\"name\":\"mcp__stand-server-with-a-rather-long-name-for-the-hash_-6af8ac39\",\"arguments\":{\"key\":\"k\",\"value\":\"ralph-stand-forbidden\"}}'\n"
+        }
+    },
+    "events": [
+        {
+            "id": "write-forbidden",
+            "title": "Write: путь в поле path, запрещённый — блок, файла нет",
+            "call": {
+                "name": "Write",
+                "arguments": {
+                    "path": "ralph-stand-forbidden.txt",
+                    "content": "x"
+                }
+            },
+            "hookStdin": [
+                "{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"session_d33790fc-9bd1-4df4-a352-7126308ac2e9\",\"cwd\":\"/path/to/stand/work/loop\",\"client_type\":\"kimi_code_cli\",\"tool_name\":\"Write\",\"tool_input\":{\"path\":\"ralph-stand-forbidden.txt\",\"content\":\"x\"},\"tool_call_id\":\"call_stand_1\"}"
+            ],
+            "toolResult": "blocked by stand hook",
+            "exit": "exit=0",
+            "tree": "ls: cannot access '/path/to/stand/outside': No such file or directory\n/path/to/stand/work/loop:\ntotal 12\ndrwxr-xr-x 3 root root 4096 Oct 28 15:13 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:13 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:13 .git\n"
+        },
+        {
+            "id": "write-allowed",
+            "title": "Write: разрешённая пара — файл записан",
+            "call": {
+                "name": "Write",
+                "arguments": {
+                    "path": "allowed.txt",
+                    "content": "x"
+                }
+            },
+            "hookStdin": [
+                "{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"session_0171d67d-f579-493a-9622-53b00fb76da9\",\"cwd\":\"/path/to/stand/work/loop\",\"client_type\":\"kimi_code_cli\",\"tool_name\":\"Write\",\"tool_input\":{\"path\":\"allowed.txt\",\"content\":\"x\"},\"tool_call_id\":\"call_stand_1\"}"
+            ],
+            "toolResult": "Wrote 1 bytes to allowed.txt",
+            "exit": "exit=0",
+            "tree": "ls: cannot access '/path/to/stand/outside': No such file or directory\n/path/to/stand/work/loop:\ntotal 16\ndrwxr-xr-x 3 root root 4096 Oct 28 15:14 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:14 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:14 .git\n-rw-r--r-- 1 root root    1 Oct 28 15:14 allowed.txt\n== /path/to/stand/work/loop/allowed.txt\nx"
+        },
+        {
+            "id": "write-append",
+            "title": "Write с mode: append — дописано",
+            "call": {
+                "name": "Write",
+                "arguments": {
+                    "path": "allowed.txt",
+                    "content": "b\n",
+                    "mode": "append"
+                }
+            },
+            "hookStdin": [
+                "{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"session_2a237e7b-7800-4b2d-bbf6-6545cb255966\",\"cwd\":\"/path/to/stand/work/loop\",\"client_type\":\"kimi_code_cli\",\"tool_name\":\"Write\",\"tool_input\":{\"path\":\"allowed.txt\",\"content\":\"b\\n\",\"mode\":\"append\"},\"tool_call_id\":\"call_stand_1\"}"
+            ],
+            "toolResult": "Appended 2 bytes to allowed.txt",
+            "exit": "exit=0",
+            "tree": "ls: cannot access '/path/to/stand/outside': No such file or directory\n/path/to/stand/work/loop:\ntotal 16\ndrwxr-xr-x 3 root root 4096 Oct 28 15:15 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:15 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:15 .git\n-rw-r--r-- 1 root root    4 Oct 28 15:15 allowed.txt\n== /path/to/stand/work/loop/allowed.txt\na\nb\n"
+        },
+        {
+            "id": "write-append-forbidden",
+            "title": "Write с mode: append, запрещённый — блок, файл прежний",
+            "call": {
+                "name": "Write",
+                "arguments": {
+                    "path": "ralph-stand-forbidden.txt",
+                    "content": "b\n",
+                    "mode": "append"
+                }
+            },
+            "hookStdin": [
+                "{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"session_4da8f958-49c5-42ed-ba2e-8df4dd4b97f7\",\"cwd\":\"/path/to/stand/work/loop\",\"client_type\":\"kimi_code_cli\",\"tool_name\":\"Write\",\"tool_input\":{\"path\":\"ralph-stand-forbidden.txt\",\"content\":\"b\\n\",\"mode\":\"append\"},\"tool_call_id\":\"call_stand_1\"}"
+            ],
+            "toolResult": "blocked by stand hook",
+            "exit": "exit=0",
+            "tree": "ls: cannot access '/path/to/stand/outside': No such file or directory\n/path/to/stand/work/loop:\ntotal 16\ndrwxr-xr-x 3 root root 4096 Oct 28 15:15 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:15 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:15 .git\n-rw-r--r-- 1 root root    2 Oct 28 15:15 ralph-stand-forbidden.txt\n== /path/to/stand/work/loop/ralph-stand-forbidden.txt\na\n"
+        },
+        {
+            "id": "edit-forbidden",
+            "title": "Edit: путь в поле path, запрещённый — блок",
+            "call": {
+                "name": "Edit",
+                "arguments": {
+                    "path": "ralph-stand-forbidden.txt",
+                    "old_string": "old",
+                    "new_string": "new"
+                }
+            },
+            "hookStdin": [
+                "{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"session_a90cb2c5-60bb-423d-8815-0760cbc93d7f\",\"cwd\":\"/path/to/stand/work/loop\",\"client_type\":\"kimi_code_cli\",\"tool_name\":\"Edit\",\"tool_input\":{\"path\":\"ralph-stand-forbidden.txt\",\"old_string\":\"old\",\"new_string\":\"new\"},\"tool_call_id\":\"call_stand_1\"}"
+            ],
+            "toolResult": "blocked by stand hook",
+            "exit": "exit=0",
+            "tree": "ls: cannot access '/path/to/stand/outside': No such file or directory\n/path/to/stand/work/loop:\ntotal 16\ndrwxr-xr-x 3 root root 4096 Oct 28 15:14 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:14 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:14 .git\n-rw-r--r-- 1 root root    4 Oct 28 15:14 ralph-stand-forbidden.txt\n== /path/to/stand/work/loop/ralph-stand-forbidden.txt\nold\n"
+        },
+        {
+            "id": "edit-allowed",
+            "title": "Edit с replace_all — заменено",
+            "call": {
+                "name": "Edit",
+                "arguments": {
+                    "path": "allowed.txt",
+                    "old_string": "old",
+                    "new_string": "new",
+                    "replace_all": true
+                }
+            },
+            "hookStdin": [
+                "{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"session_67628836-9755-4e31-9140-46cdb7bd7ca4\",\"cwd\":\"/path/to/stand/work/loop\",\"client_type\":\"kimi_code_cli\",\"tool_name\":\"Edit\",\"tool_input\":{\"path\":\"allowed.txt\",\"old_string\":\"old\",\"new_string\":\"new\",\"replace_all\":true},\"tool_call_id\":\"call_stand_1\"}"
+            ],
+            "toolResult": "Replaced 1 occurrence in allowed.txt",
+            "exit": "exit=0",
+            "tree": "ls: cannot access '/path/to/stand/outside': No such file or directory\n/path/to/stand/work/loop:\ntotal 16\ndrwxr-xr-x 3 root root 4096 Oct 28 15:14 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:14 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:14 .git\n-rw-r--r-- 1 root root    4 Oct 28 15:14 allowed.txt\n== /path/to/stand/work/loop/allowed.txt\nnew\n"
+        },
+        {
+            "id": "bash-cwd",
+            "title": "Bash с cwd вне дерева, запрещённый — блок, эффекта в cwd нет",
+            "call": {
+                "name": "Bash",
+                "arguments": {
+                    "command": "touch made-here; echo ralph-stand-forbidden",
+                    "cwd": "/path/to/stand/outside"
+                }
+            },
+            "hookStdin": [
+                "{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"session_f1deb02a-9d05-46d3-92d9-ed1d721bf850\",\"cwd\":\"/path/to/stand/work/loop\",\"client_type\":\"kimi_code_cli\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"touch made-here; echo ralph-stand-forbidden\",\"cwd\":\"/path/to/stand/outside\"},\"tool_call_id\":\"call_stand_1\"}"
+            ],
+            "toolResult": "blocked by stand hook",
+            "exit": "exit=0",
+            "tree": "/path/to/stand/outside:\ntotal 8\ndrwxr-xr-x 2 root root 4096 Oct 28 15:14 .\ndrwxr-xr-x 9 root root 4096 Oct 28 15:14 ..\n\n/path/to/stand/work/loop:\ntotal 12\ndrwxr-xr-x 3 root root 4096 Oct 28 15:14 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:14 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:14 .git\n"
+        },
+        {
+            "id": "bash-cwd-allowed",
+            "title": "Bash с cwd вне дерева, разрешённый — эффект лёг в cwd вызова, а не сессии",
+            "call": {
+                "name": "Bash",
+                "arguments": {
+                    "command": "touch made-here",
+                    "cwd": "/path/to/stand/outside"
+                }
+            },
+            "hookStdin": [
+                "{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"session_f71d3a78-0962-486f-8682-c319aff10f62\",\"cwd\":\"/path/to/stand/work/loop\",\"client_type\":\"kimi_code_cli\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"touch made-here\",\"cwd\":\"/path/to/stand/outside\"},\"tool_call_id\":\"call_stand_1\"}"
+            ],
+            "toolResult": "Command executed successfully.",
+            "exit": "exit=0",
+            "tree": "/path/to/stand/outside:\ntotal 8\ndrwxr-xr-x 2 root root 4096 Oct 28 15:13 .\ndrwxr-xr-x 9 root root 4096 Oct 28 15:13 ..\n-rw-r--r-- 1 root root    0 Oct 28 15:13 made-here\n\n/path/to/stand/work/loop:\ntotal 12\ndrwxr-xr-x 3 root root 4096 Oct 28 15:13 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:13 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:13 .git\n== /path/to/stand/outside/made-here\n"
+        },
+        {
+            "id": "bash-cwd-relative",
+            "title": "Bash с относительным cwd — эффект в подкаталоге от cwd сессии",
+            "call": {
+                "name": "Bash",
+                "arguments": {
+                    "command": "touch made-here",
+                    "cwd": "sub"
+                }
+            },
+            "hookStdin": [
+                "{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"session_fa708b5a-deb0-444b-a389-0d9f712524da\",\"cwd\":\"/path/to/stand/work/loop\",\"client_type\":\"kimi_code_cli\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"touch made-here\",\"cwd\":\"sub\"},\"tool_call_id\":\"call_stand_1\"}"
+            ],
+            "toolResult": "Command executed successfully.",
+            "exit": "exit=0",
+            "tree": "ls: cannot access '/path/to/stand/outside': No such file or directory\n/path/to/stand/work/loop:\ntotal 16\ndrwxr-xr-x 4 root root 4096 Oct 28 15:14 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:14 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:14 .git\ndrwxr-xr-x 2 root root 4096 Oct 28 15:14 sub\n"
+        },
+        {
+            "id": "grep-glob",
+            "title": "Grep с glob: хук зовётся до исполнения (rg в стенде нет — сам поиск не исполнен)",
+            "call": {
+                "name": "Grep",
+                "arguments": {
+                    "pattern": "needle",
+                    "glob": "*.txt",
+                    "output_mode": "content"
+                }
+            },
+            "hookStdin": [
+                "{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"session_666577cd-2922-48b8-85c6-02d06b79712d\",\"cwd\":\"/path/to/stand/work/loop\",\"client_type\":\"kimi_code_cli\",\"tool_name\":\"Grep\",\"tool_input\":{\"pattern\":\"needle\",\"glob\":\"*.txt\",\"output_mode\":\"content\"},\"tool_call_id\":\"call_stand_1\"}"
+            ],
+            "toolResult": "ripgrep (rg) is not available and the automatic bootstrap failed.\n\nError: fetch failed\n\nFix options:\n  macOS:   brew install ripgrep\n  Ubuntu:  sudo apt-get install ripgrep\n  Other:   https://github.com/BurntSushi/ripgrep#installation\n\nAlternatively, drop a static rg binary at /path/to/stand/home/.k",
+            "exit": "exit=0",
+            "tree": "ls: cannot access '/path/to/stand/outside': No such file or directory\n/path/to/stand/work/loop:\ntotal 16\ndrwxr-xr-x 3 root root 4096 Oct 28 15:14 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:14 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:14 .git\n-rw-r--r-- 1 root root    7 Oct 28 15:14 allowed.txt\n== /path/to/stand/work/loop/allowed.txt\nneedle\n"
+        },
+        {
+            "id": "glob",
+            "title": "Glob: хук зовётся до исполнения (rg в стенде нет)",
+            "call": {
+                "name": "Glob",
+                "arguments": {
+                    "pattern": "**/*.txt"
+                }
+            },
+            "hookStdin": [
+                "{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"session_83006ebe-a7da-43ad-a311-aad4d0ef058e\",\"cwd\":\"/path/to/stand/work/loop\",\"client_type\":\"kimi_code_cli\",\"tool_name\":\"Glob\",\"tool_input\":{\"pattern\":\"**/*.txt\"},\"tool_call_id\":\"call_stand_1\"}"
+            ],
+            "toolResult": "ripgrep (rg) is not available and the automatic bootstrap failed.\n\nError: fetch failed\n\nFix options:\n  macOS:   brew install ripgrep\n  Ubuntu:  sudo apt-get install ripgrep\n  Other:   https://github.com/BurntSushi/ripgrep#installation\n\nAlternatively, drop a static rg binary at /path/to/stand/home/.k",
+            "exit": "exit=0",
+            "tree": "ls: cannot access '/path/to/stand/outside': No such file or directory\n/path/to/stand/work/loop:\ntotal 12\ndrwxr-xr-x 3 root root 4096 Oct 28 15:14 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:14 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:14 .git\n"
+        },
+        {
+            "id": "read",
+            "title": "Read: путь в поле path",
+            "call": {
+                "name": "Read",
+                "arguments": {
+                    "path": "allowed.txt",
+                    "n_lines": 5
+                }
+            },
+            "hookStdin": [
+                "{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"session_1be243dc-565d-4b61-8f2e-8420539e5b28\",\"cwd\":\"/path/to/stand/work/loop\",\"client_type\":\"kimi_code_cli\",\"tool_name\":\"Read\",\"tool_input\":{\"path\":\"allowed.txt\",\"n_lines\":5},\"tool_call_id\":\"call_stand_1\"}"
+            ],
+            "toolResult": "1\tx",
+            "exit": "exit=0",
+            "tree": "ls: cannot access '/path/to/stand/outside': No such file or directory\n/path/to/stand/work/loop:\ntotal 16\ndrwxr-xr-x 3 root root 4096 Oct 28 15:14 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:14 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:14 .git\n-rw-r--r-- 1 root root    2 Oct 28 15:14 allowed.txt\n== /path/to/stand/work/loop/allowed.txt\nx\n"
+        },
+        {
+            "id": "fetch",
+            "title": "FetchURL: url — хук зовётся до выхода в сеть",
+            "call": {
+                "name": "FetchURL",
+                "arguments": {
+                    "url": "http://127.0.0.1:9/ralph-stand-forbidden"
+                }
+            },
+            "hookStdin": [
+                "{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"session_27823647-66f9-4f1d-a26d-93e7d3045d83\",\"cwd\":\"/path/to/stand/work/loop\",\"client_type\":\"kimi_code_cli\",\"tool_name\":\"FetchURL\",\"tool_input\":{\"url\":\"http://127.0.0.1:9/ralph-stand-forbidden\"},\"tool_call_id\":\"call_stand_1\"}"
+            ],
+            "toolResult": "blocked by stand hook",
+            "exit": "exit=0",
+            "tree": "ls: cannot access '/path/to/stand/outside': No such file or directory\n/path/to/stand/work/loop:\ntotal 12\ndrwxr-xr-x 3 root root 4096 Oct 28 15:14 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:14 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:14 .git\n"
+        },
+        {
+            "id": "agent",
+            "title": "Agent: prompt и description — хук зовётся до порождения субагента",
+            "call": {
+                "name": "Agent",
+                "arguments": {
+                    "prompt": "ralph-stand-forbidden",
+                    "description": "stand probe"
+                }
+            },
+            "hookStdin": [
+                "{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"session_2322da61-7445-46e5-bd12-e77f83bb1f80\",\"cwd\":\"/path/to/stand/work/loop\",\"client_type\":\"kimi_code_cli\",\"tool_name\":\"Agent\",\"tool_input\":{\"prompt\":\"ralph-stand-forbidden\",\"description\":\"stand probe\"},\"tool_call_id\":\"call_stand_1\"}"
+            ],
+            "toolResult": "blocked by stand hook",
+            "exit": "exit=0",
+            "tree": "ls: cannot access '/path/to/stand/outside': No such file or directory\n/path/to/stand/work/loop:\ntotal 12\ndrwxr-xr-x 3 root root 4096 Oct 28 15:13 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:13 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:13 .git\n"
+        },
+        {
+            "id": "mcp",
+            "title": "MCP: mcp__<сервер>__<инструмент>, аргументы как есть",
+            "call": {
+                "name": "mcp__stand__stand_write",
+                "arguments": {
+                    "key": "k",
+                    "value": "ralph-stand-forbidden"
+                }
+            },
+            "hookStdin": [
+                "{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"session_7bf87086-9bce-4a47-96b5-41dbeb14d7dc\",\"cwd\":\"/path/to/stand/work/loop\",\"client_type\":\"kimi_code_cli\",\"tool_name\":\"mcp__stand__stand_write\",\"tool_input\":{\"key\":\"k\",\"value\":\"ralph-stand-forbidden\"},\"tool_call_id\":\"call_stand_1\"}"
+            ],
+            "toolResult": "blocked by stand hook",
+            "exit": "exit=0",
+            "tree": "ls: cannot access '/path/to/stand/outside': No such file or directory\n/path/to/stand/work/loop:\ntotal 12\ndrwxr-xr-x 3 root root 4096 Oct 28 15:14 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:14 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:14 .git\n"
+        },
+        {
+            "id": "mcp-long",
+            "title": "MCP: имя длиннее 64 знаков обрезано с хешем, граница сервера и инструмента потеряна",
+            "call": {
+                "name": "mcp__stand-server-with-a-rather-long-name-for-the-hash_-6af8ac39",
+                "arguments": {
+                    "key": "k",
+                    "value": "ralph-stand-forbidden"
+                }
+            },
+            "hookStdin": [
+                "{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"session_bb99f616-a8a1-4f4c-8ccd-780c1c3c0d38\",\"cwd\":\"/path/to/stand/work/loop\",\"client_type\":\"kimi_code_cli\",\"tool_name\":\"mcp__stand-server-with-a-rather-long-name-for-the-hash_-6af8ac39\",\"tool_input\":{\"key\":\"k\",\"value\":\"ralph-stand-forbidden\"},\"tool_call_id\":\"call_stand_1\"}"
+            ],
+            "toolResult": "blocked by stand hook",
+            "exit": "exit=0",
+            "tree": "ls: cannot access '/path/to/stand/outside': No such file or directory\n/path/to/stand/work/loop:\ntotal 12\ndrwxr-xr-x 3 root root 4096 Oct 28 15:14 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:14 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:14 .git\n",
+            "advertised": [
+                "mcp__stand-server-with-a-rather-long-name-for-the-hash_-6af8ac39",
+                "mcp__stand-server-with-a-rather-long-name-for-the-hash__2144cc8c"
+            ]
+        }
+    ],
+    "inventory": {
+        "source": "случай mcp: перечень инструментов, который CLI отдал модели в первом запросе к провайдеру стенда (поле tools запроса Chat Completions), — имя, поля входа и обязательные поля",
+        "tools": {
+            "Agent": {
+                "properties": [
+                    "description",
+                    "prompt",
+                    "resume",
+                    "run_in_background",
+                    "subagent_type"
+                ],
+                "required": ["prompt", "description"]
+            },
+            "AgentSwarm": {
+                "properties": [
+                    "description",
+                    "items",
+                    "prompt_template",
+                    "resume_agent_ids",
+                    "subagent_type"
+                ],
+                "required": ["description"]
+            },
+            "AskUserQuestion": {
+                "properties": ["background", "questions"],
+                "required": ["questions"]
+            },
+            "Bash": {
+                "properties": [
+                    "command",
+                    "cwd",
+                    "description",
+                    "disable_timeout",
+                    "run_in_background",
+                    "timeout"
+                ],
+                "required": ["command"]
+            },
+            "CreateGoal": {
+                "properties": ["completionCriterion", "objective", "replace"],
+                "required": ["objective"]
+            },
+            "CronCreate": {
+                "properties": ["cron", "prompt", "recurring"],
+                "required": ["cron", "prompt"]
+            },
+            "CronDelete": {
+                "properties": ["id"],
+                "required": ["id"]
+            },
+            "CronList": {
+                "properties": [],
+                "required": []
+            },
+            "Edit": {
+                "properties": ["new_string", "old_string", "path", "replace_all"],
+                "required": ["path", "old_string", "new_string"]
+            },
+            "EnterPlanMode": {
+                "properties": [],
+                "required": []
+            },
+            "ExitPlanMode": {
+                "properties": ["options"],
+                "required": []
+            },
+            "FetchURL": {
+                "properties": ["url"],
+                "required": ["url"]
+            },
+            "GetGoal": {
+                "properties": [],
+                "required": []
+            },
+            "Glob": {
+                "properties": [
+                    "head_limit",
+                    "include_dirs",
+                    "include_ignored",
+                    "offset",
+                    "path",
+                    "pattern"
+                ],
+                "required": ["pattern"]
+            },
+            "Grep": {
+                "properties": [
+                    "-A",
+                    "-B",
+                    "-C",
+                    "-i",
+                    "-n",
+                    "glob",
+                    "head_limit",
+                    "include_ignored",
+                    "multiline",
+                    "offset",
+                    "output_mode",
+                    "path",
+                    "pattern",
+                    "type"
+                ],
+                "required": ["pattern"]
+            },
+            "mcp__stand__stand_read": {
+                "properties": ["key"],
+                "required": ["key"]
+            },
+            "mcp__stand__stand_write": {
+                "properties": ["key", "value"],
+                "required": ["key", "value"]
+            },
+            "Read": {
+                "properties": ["column_offset", "line_offset", "max_chars", "n_lines", "path"],
+                "required": ["path"]
+            },
+            "SetGoalBudget": {
+                "properties": ["unit", "value"],
+                "required": ["value", "unit"]
+            },
+            "Skill": {
+                "properties": ["args", "skill"],
+                "required": ["skill"]
+            },
+            "TaskList": {
+                "properties": ["active_only", "limit"],
+                "required": []
+            },
+            "TaskOutput": {
+                "properties": ["task_id"],
+                "required": ["task_id"]
+            },
+            "TaskStop": {
+                "properties": ["reason", "task_id"],
+                "required": ["task_id"]
+            },
+            "TodoList": {
+                "properties": ["todos"],
+                "required": []
+            },
+            "UpdateGoal": {
+                "properties": ["status"],
+                "required": ["status"]
+            },
+            "WaitFor": {
+                "properties": ["task_id", "timeout"],
+                "required": ["timeout"]
+            },
+            "Write": {
+                "properties": ["content", "mode", "path"],
+                "required": ["path", "content"]
+            }
+        }
+    },
+    "sessionHome": [
+        {
+            "id": "K-built",
+            "title": "окружение и дом сессии сборщиком канона: проектные MCP не подняты, доверия и автообновления нет",
+            "source": "Kimi Code 2.3.2 (@moonshot-ai/kimi-code, dist/main.mjs), изолированный стенд живых проб (provision/stand/stand.mts exec --cli kimi), 28.10.2026, карточка #196; режим built",
+            "cliVersion": "2.3.2",
+            "mode": "built",
+            "projectMcp": {
+                ".mcp.json": "proj",
+                ".kimi-code/mcp.json": "projlocal"
+            },
+            "isolationProblems": [],
+            "serversStarted": [],
+            "trustGateWarning": "Warning: this folder is not trusted; skipped 2 project-level MCP servers: proj (stdio: sh -c echo proj-root >>/path/to/stand/journal/built/started.txt; exec node /path/to/canon/provision/stand/fake-mcp.mts /path/to/stand/journal/mcp.jsonl), projlocal (stdio: sh -c echo proj-local >>/path/to/stand/journal/built/started.txt; exec node /path/to/canon/provision/stand/fake-mcp.mts /path/to/stand/journal/mcp.jsonl).",
+            "exit": "exit=0",
+            "versionBefore": "2.3.2",
+            "versionAfter": "2.3.2",
+            "workspaceTrust": null,
+            "updatesDir": null,
+            "rolloutLog": null,
+            "homeMcpAfter": "{ \"mcpServers\": {} }\n",
+            "stdout": [
+                "{\"role\":\"meta\",\"type\":\"system.version\",\"version\":\"2.3.2\"}",
+                "{\"role\":\"assistant\",\"tool_calls\":[{\"type\":\"function\",\"id\":\"call_stand_1\",\"function\":{\"name\":\"Bash\",\"arguments\":\"{\\\"command\\\":\\\"true\\\"}\"}}]}",
+                "{\"role\":\"tool\",\"tool_call_id\":\"call_stand_1\",\"content\":\"Command executed successfully.\"}",
+                "{\"role\":\"assistant\",\"content\":\"done\"}",
+                "{\"role\":\"meta\",\"type\":\"session.resume_hint\",\"session_id\":\"session_aae291d8-ae16-4ad9-8463-6e538cf85dce\",\"command\":\"kimi -r session_aae291d8-ae16-4ad9-8463-6e538cf85dce\",\"content\":\"To resume this session: kimi -r session_aae291d8-ae16-4ad9-8463-6e538cf85dce\"}"
+            ]
+        },
+        {
+            "id": "K-trusted",
+            "title": "контроль: доверие переменной ПОСЛЕ сборщика — оба проектных сервера подняты, сверка называет переменную",
+            "source": "Kimi Code 2.3.2 (@moonshot-ai/kimi-code, dist/main.mjs), изолированный стенд живых проб (provision/stand/stand.mts exec --cli kimi), 28.10.2026, карточка #196; режим trusted",
+            "cliVersion": "2.3.2",
+            "mode": "trusted",
+            "projectMcp": {
+                ".mcp.json": "proj",
+                ".kimi-code/mcp.json": "projlocal"
+            },
+            "isolationProblems": [
+                "KIMI_CODE_TRUST_WORKSPACE в окружении сессии: каталог доверен, проектные MCP поднялись бы"
+            ],
+            "serversStarted": ["proj-root", "proj-local"],
+            "trustGateWarning": null,
+            "exit": "exit=0",
+            "versionBefore": "2.3.2",
+            "versionAfter": "2.3.2",
+            "workspaceTrust": null,
+            "updatesDir": null,
+            "rolloutLog": null,
+            "homeMcpAfter": "{ \"mcpServers\": {} }\n",
+            "stdout": [
+                "{\"role\":\"meta\",\"type\":\"system.version\",\"version\":\"2.3.2\"}",
+                "{\"role\":\"assistant\",\"tool_calls\":[{\"type\":\"function\",\"id\":\"call_stand_1\",\"function\":{\"name\":\"Bash\",\"arguments\":\"{\\\"command\\\":\\\"true\\\"}\"}}]}",
+                "{\"role\":\"tool\",\"tool_call_id\":\"call_stand_1\",\"content\":\"Command executed successfully.\"}",
+                "{\"role\":\"assistant\",\"content\":\"done\"}",
+                "{\"role\":\"meta\",\"type\":\"session.resume_hint\",\"session_id\":\"session_5f059bd1-68e3-43e5-b8b1-6154773d839e\",\"command\":\"kimi -r session_5f059bd1-68e3-43e5-b8b1-6154773d839e\",\"content\":\"To resume this session: kimi -r session_5f059bd1-68e3-43e5-b8b1-6154773d839e\"}"
+            ]
+        },
+        {
+            "id": "K-update-on",
+            "title": "контроль: выключатель автообновления снят ПОСЛЕ сборщика — CLI проверяет релиз и пишет updates/, сверка называет",
+            "source": "Kimi Code 2.3.2 (@moonshot-ai/kimi-code, dist/main.mjs), изолированный стенд живых проб (provision/stand/stand.mts exec --cli kimi), 28.10.2026, карточка #196; режим update-on",
+            "cliVersion": "2.3.2",
+            "mode": "update-on",
+            "projectMcp": {
+                ".mcp.json": "proj",
+                ".kimi-code/mcp.json": "projlocal"
+            },
+            "isolationProblems": [
+                "KIMI_CODE_NO_AUTO_UPDATE не «1»: CLI обновился бы под петлёй сам"
+            ],
+            "serversStarted": [],
+            "trustGateWarning": "Warning: this folder is not trusted; skipped 2 project-level MCP servers: proj (stdio: sh -c echo proj-root >>/path/to/stand/journal/update-on/started.txt; exec node /path/to/canon/provision/stand/fake-mcp.mts /path/to/stand/journal/mcp.jsonl), projlocal (stdio: sh -c echo proj-local >>/path/to/stand/journal/update-on/started.txt; exec node /path/to/canon/provision/stand/fake-mcp.mts /path/to/stand/journal/mcp.jsonl).",
+            "exit": "exit=0",
+            "versionBefore": "2.3.2",
+            "versionAfter": "2.3.2",
+            "workspaceTrust": null,
+            "updatesDir": ["rollout.log"],
+            "rolloutLog": "{\"ts\":\"2026-10-28T16:20:35.787Z\",\"phase\":\"startup-cache\",\"reason\":\"no-latest\",\"current\":\"2.3.2\",\"latest\":null,\"target\":null,\"manifestPresent\":false,\"publishedAt\":null,\"bucket\":null,\"delaySeconds\":null,\"eligibleAt\":null}",
+            "homeMcpAfter": "{ \"mcpServers\": {} }\n",
+            "stdout": [
+                "{\"role\":\"meta\",\"type\":\"system.version\",\"version\":\"2.3.2\"}",
+                "{\"role\":\"assistant\",\"tool_calls\":[{\"type\":\"function\",\"id\":\"call_stand_1\",\"function\":{\"name\":\"Bash\",\"arguments\":\"{\\\"command\\\":\\\"true\\\"}\"}}]}",
+                "{\"role\":\"tool\",\"tool_call_id\":\"call_stand_1\",\"content\":\"Command executed successfully.\"}",
+                "{\"role\":\"assistant\",\"content\":\"done\"}",
+                "{\"role\":\"meta\",\"type\":\"session.resume_hint\",\"session_id\":\"session_95d9138f-076e-4f97-af49-52b898a3b875\",\"command\":\"kimi -r session_95d9138f-076e-4f97-af49-52b898a3b875\",\"content\":\"To resume this session: kimi -r session_95d9138f-076e-4f97-af49-52b898a3b875\"}"
+            ]
+        }
+    ],
+    "sessionHomeKit": {
+        "conditions": "Воспроизведение: sessionHomeKit['stand.sh'] <режим> на хосте поднимает новый стенд и исполняет drive.sh в изоляции ОС; mock.mjs и hook.cjs — из kit. drive.sh кладёт в репозиторий work/loop проектные .mcp.json (сервер proj) и .kimi-code/mcp.json (сервер projlocal); команда каждого сервера сначала пишет своё имя в started.txt, затем исполняет fake-mcp.mts — так виден сам старт, а не вызов. session.mts собирает окружение сессии kimiSessionEnv канона из окружения «раннера» с KIMI_CODE_TRUST_WORKSPACE=1 и KIMI_CODE_NO_AUTO_UPDATE=0, пишет KIMI_SESSION_MCP в mcp.json дома и печатает kimiIsolationProblems до запуска; режимы trusted и update-on портят окружение ПОСЛЕ сборщика. kimi --version — до и после сессии тем же окружением. Сети, кроме loopback, у стенда нет.",
+        "stand.sh": "#!/usr/bin/env bash\n# Хост: новый стенд под режим, исполнение drive.sh в изоляции.\nset -u\nMODE=\"$1\"; RUNS=/path/to/stand-runs; ST=\"$RUNS/$MODE.$(date +%s)\"; mkdir -p \"$RUNS\"\nPKG=/path/to/kimi-code\nCANON=/path/to/canon\ncd \"$CANON\"\nKIMI_BIN=\"$PKG/dist/main.mjs\" node provision/stand/stand.mts exec --stand \"$ST\" --cli kimi --ro \"$PKG\" --ro /path/to/stand-scripts --ro \"$CANON\" --pass-env KIMI_BIN \\\n  -- bash /path/to/stand-scripts/drive.sh \"$MODE\" \"$CANON\"\necho \"stand=$ST rc=$?\"\n",
+        "drive.sh": "#!/usr/bin/env bash\n# Внутри стенда: репозиторий потребителя с проектными .mcp.json и .kimi-code/mcp.json, дом\n# сессии сборщиком канона, kimi -p на фиктивном провайдере. Режим — built | trusted | update-on.\nset -uo pipefail\nMODE=\"$1\"; CANON=\"$2\"; S=\"$(dirname \"$HOME\")\"; OUT=\"$S/journal/$MODE\"; mkdir -p \"$OUT\"\nD=\"$(dirname \"${BASH_SOURCE[0]}\")\"; KIMI=\"${KIMI_BIN:?}\"; PORT=18997\nLOOP=\"$S/work/loop\"; mkdir -p \"$LOOP/.kimi-code\" \"$KIMI_CODE_HOME\"\ngit init -q \"$LOOP\"; git -C \"$LOOP\" -c user.name=s -c user.email=s@example.com commit -q --allow-empty -m init\nsrv() { printf '{\"command\":\"sh\",\"args\":[\"-c\",\"echo %s >>%s; exec node %s/provision/stand/fake-mcp.mts %s\"]}' \"$1\" \"$OUT/started.txt\" \"$CANON\" \"$RALPH_STAND_MCP_JOURNAL\"; }\nprintf '{\"mcpServers\":{\"proj\":%s}}' \"$(srv proj-root)\" >\"$LOOP/.mcp.json\"\nprintf '{\"mcpServers\":{\"projlocal\":%s}}' \"$(srv proj-local)\" >\"$LOOP/.kimi-code/mcp.json\"\nprintf '%s' '{\"name\":\"Bash\",\"arguments\":{\"command\":\"true\"}}' >\"$OUT/call.json\"\ncat >\"$KIMI_CODE_HOME/config.toml\" <<TOML\ndefault_model = \"mock/mock\"\n\n[providers.mock]\ntype = \"openai\"\nbase_url = \"http://127.0.0.1:$PORT/v1\"\napi_key = \"stand-fake\"\n\n[models.\"mock/mock\"]\nprovider = \"mock\"\nmodel = \"mock\"\nmax_context_size = 131072\ncapabilities = [ \"tool_use\" ]\n\n[[hooks]]\nevent = \"PreToolUse\"\nmatcher = \"\"\ncommand = \"node $D/hook.cjs $OUT/hook.jsonl\"\ntimeout = 10\nTOML\nnode \"$D/mock.mjs\" $PORT \"$OUT/call.json\" \"$OUT/provider.jsonl\" & MP=$!\nfor i in $(seq 50); do grep -q ready \"$OUT/provider.jsonl\" 2>/dev/null && break; sleep 0.1; done\nnode \"$D/session.mts\" \"$CANON\" \"$MODE\" \"$KIMI\" --version >\"$OUT/version-before.txt\" 2>\"$OUT/version-before.err\"\n(cd \"$LOOP\" && timeout 120 node \"$D/session.mts\" \"$CANON\" \"$MODE\" \"$KIMI\" --output-format stream-json -p 'go' </dev/null >\"$OUT/stdout.txt\" 2>\"$OUT/stderr.txt\"); echo \"exit=$?\" >\"$OUT/exit.txt\"\nsleep 1\nnode \"$D/session.mts\" \"$CANON\" \"$MODE\" \"$KIMI\" --version >\"$OUT/version-after.txt\" 2>\"$OUT/version-after.err\"\nkill $MP 2>/dev/null\n{ echo \"== started\"; cat \"$OUT/started.txt\" 2>/dev/null; echo \"== mcp journal\"; cat \"$RALPH_STAND_MCP_JOURNAL\" 2>/dev/null\n  echo \"== home\"; (cd \"$KIMI_CODE_HOME\" && find . -maxdepth 2 | sort)\n  echo \"== workspace-trust\"; ls -A \"$KIMI_CODE_HOME/workspace-trust\" 2>&1\n  echo \"== home mcp.json\"; cat \"$KIMI_CODE_HOME/mcp.json\"; } >\"$OUT/report.txt\" 2>&1\n",
+        "session.mts": "// Внутри стенда: окружение и mcp.json дома сессии — сборщиком канона (adapters/kimi-home.ts),\n// затем команда с этим окружением. Режим: built — как у раннера; trusted — контроль, доверие\n// переменной ПОСЛЕ сборщика; update-on — контроль, автообновление включено после сборщика.\nimport { spawnSync } from 'node:child_process';\nimport { readdirSync, writeFileSync } from 'node:fs';\nimport { join } from 'node:path';\nconst [canon, mode, ...cmd] = process.argv.slice(2);\nconst kh = await import(join(canon, 'adapters', 'kimi-home.ts'));\nconst home = process.env.KIMI_CODE_HOME as string;\n// Окружение раннера с каналами, которые сборщик обязан снять.\nconst runner = { ...process.env, KIMI_CODE_TRUST_WORKSPACE: '1', KIMI_CODE_NO_AUTO_UPDATE: '0' };\nconst env = kh.kimiSessionEnv(runner, { home, maxTurns: 5 });\nwriteFileSync(join(home, 'mcp.json'), kh.KIMI_SESSION_MCP);\nif (mode === 'trusted') env.KIMI_CODE_TRUST_WORKSPACE = '1';\nif (mode === 'update-on') delete env.KIMI_CODE_NO_AUTO_UPDATE;\nconst problems = kh.kimiIsolationProblems({\n    env,\n    home,\n    humanHome: null,\n    listDirFn: (p: string) => readdirSync(p),\n});\nconsole.error(`isolation(${mode}): ${JSON.stringify(problems)}`);\nconst r = spawnSync(cmd[0], cmd.slice(1), { env, stdio: 'inherit' });\nprocess.exit(r.status ?? 1);\n"
+    }
+}

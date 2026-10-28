@@ -22,16 +22,10 @@
  * Поля `mcp_server` у Codex нет, граница сервера — единственный разделитель `__`.
  */
 import type { HarnessDescriptor } from '../descriptor.ts';
+import { isRecord, mcpEvent, roleReader, unknownOp } from '../event-roles.ts';
 import { MCP_PREFIX, mcpParts } from '../mcp-name.ts';
 import { patchOperations, patchesInCommand } from '../patch.ts';
-import type { ToolEvent, ToolOperation, UnknownKind } from '../protocol.ts';
-
-const isRecord = (v: unknown): v is Record<string, unknown> =>
-    typeof v === 'object' && v !== null && !Array.isArray(v);
-
-const unknownOp = (why: string, kind: UnknownKind = 'field'): ToolEvent => ({
-    operations: [{ op: 'unknown', why, kind }],
-});
+import type { ToolEvent, ToolOperation } from '../protocol.ts';
 
 function operations(
     d: HarnessDescriptor,
@@ -39,16 +33,7 @@ function operations(
     input: Record<string, unknown>,
     baseDir: string,
 ): [ToolOperation, ...ToolOperation[]] {
-    const roles = d.argMap[tool] ?? {};
-    const required = (role: keyof typeof roles): string => {
-        const field = roles[role] ?? role;
-        const value = input[field];
-        if (value !== undefined && typeof value !== 'string') {
-            throw new Error(`${tool}: поле ${field} не строка`);
-        }
-        if (!value) throw new Error(`${tool}: нет строкового ${field}`);
-        return value;
-    };
+    const { required } = roleReader(d, tool, input);
     const op = d.toolMap[tool];
     switch (op) {
         case 'exec': {
@@ -77,11 +62,7 @@ export function normalizeCodexEvent(d: HarnessDescriptor, raw: unknown): ToolEve
     if (tool.startsWith(MCP_PREFIX)) {
         const mcp = mcpParts(tool, undefined);
         if ('why' in mcp) return unknownOp(mcp.why);
-        return {
-            operations: [
-                { op: 'mcp', server: mcp.server, tool: mcp.tool, effect: 'unknown', derived: [] },
-            ],
-        };
+        return mcpEvent(mcp.server, mcp.tool);
     }
     if (!Object.hasOwn(d.toolMap, tool)) {
         return unknownOp(`инструмент ${tool} вне описания`, 'tool');

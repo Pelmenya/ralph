@@ -284,23 +284,29 @@ update, не называет ни один lock, и после удаления
 (`guardAdapterValue`). Пакет не принят — значение-причина вместо пути: guard на ней блокирует
 всё кодом `adapter-failed`, и проба перед сессией останавливает старт с этой причиной, а не
 пускает сессию на совместимом входе молча. Вход регистрации остальных харнессов
-(`guardHooksOf`) объявляет пакет полем `guardInput` (#232). Пакет с нормализатором (Codex)
-получает путь своей команды (`guardInputOf`, тем же переносом в `productRoot`) — в `export`
-регистрации и вместо пути Claude Code в команде канонического хука: присваивание перед `node`
-сильнее `export`. Пакеты-заглушки (Kimi Code, OpenCode) получают `RALPH_GUARD_INPUT=compat-16b`:
-он сильнее пути, который уже стоит в команде, взятой из настроек сессии. Пробу правила, которое
-действует только в петле (патч данных контура у Codex), проба старта подаёт с контекстом петли
-(`HarnessProbe.loop`). Обе переменные — в `HOOK_COMMAND_ONLY_ENV`: унаследованные сессией, они
+(`guardHooksOf`) объявляет пакет полем `guardInput` (#232). Пакет с нормализатором (Codex,
+Kimi Code с #191, OpenCode с #192) получает путь своей команды (`guardInputOf`, тем же
+переносом в `productRoot`) — в `export` регистрации и вместо пути Claude Code в команде
+канонического хука: присваивание перед `node` сильнее `export`. Пакет с совместимым входом
+получил бы `RALPH_GUARD_INPUT=compat-16b`: он сильнее пути, который уже стоит в команде, взятой
+из настроек сессии; у реестра такого пакета сейчас нет. Пробу правила, которое действует только
+в петле (патч данных контура у Codex, запись данных контура и перенос из `cwd` оболочки у Kimi
+Code, патч, запись, перенос из `workdir` и субагент у OpenCode), проба старта подаёт с
+контекстом петли (`HarnessProbe.loop`); плагин OpenCode получает его окружением процесса пробы. Обе переменные — в `HOOK_COMMAND_ONLY_ENV`: унаследованные сессией, они
 перевели бы guard дерева сессии на чужой вход.
 
 Не-Claude харнессы настроек Claude Code не читают, и регистрацию барьера раннер строит из тех
 же хуков перед каждой их сессией: Codex — аргументами `codex exec` (`prepareCodexGuardArgs`,
 #119) с недоверием проекту и своим домом CLI в `runtimeDir/codex-session/home`
 (`prepareCodexSession`, #195; слои `.codex/` в дереве — стоп), Kimi Code (`kimi-native`, #120) — домом CLI в `runtimeDir/kimi-native/home`
-(`prepareKimiNativeHome`): `config.toml` человека плюс `[[hooks]]`, вход ссылками на дом
-человека; OpenCode (`opencode`, #121) — каталогом `runtimeDir/opencode/config` для
-`OPENCODE_CONFIG_DIR` (`prepareOpencodeSession`): плагин барьера, настройки сессии, затем
-сверка полноты скиллов по `opencode debug skill`. Проба идёт на том, что уйдёт в CLI, стоп тот
+(`prepareKimiNativeHome`): `config.toml` человека плюс `[[hooks]]`, пустой `mcp.json` раннера,
+вход ссылками на дом человека, а перед спавном — сверка окружения и каталога доверия дома
+(`kimiIsolationProblems`, #196); OpenCode (`opencode`, #121) — каталогом `runtimeDir/opencode/config` для
+`OPENCODE_CONFIG_DIR` (`prepareOpencodeSession`): слои `.opencode/` и `opencode.json` с
+исполняющими ключами (`jsonKeys` пакета) в дереве — стоп, плагин барьера, настройки сессии с правилами дерева и пустым
+MCP, свой `XDG_CONFIG_HOME` рядом, затем сверка полноты скиллов по `opencode debug skill`; перед
+спавном — сверка окружения без `OPENCODE_*` раннера и `~/.opencode` (`opencodeIsolationProblems`,
+#197). Проба идёт на том, что уйдёт в CLI, стоп тот
 же — `guard-probe`. Каталоги `kimi-native`, `opencode` и `codex-session` есть в описи состояния, но не
 переезжают: они пересобираются перед каждой сессией, а ссылки на ключи переезд файлов не
 переносит.

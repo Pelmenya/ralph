@@ -1,0 +1,798 @@
+{
+    "source": "OpenCode 1.19.4 (opencode-ai, бинарь opencode-linux-x64), изолированный стенд живых проб (provision/stand/stand.mts exec --cli opencode), 28.10.2026, карточка #192. Модель — фиктивный провайдер Chat Completions на loopback стенда (провайдер @ai-sdk/openai-compatible в opencode.json каталога OPENCODE_CONFIG_DIR стенда): на запрос с инструментами без результата инструмента он отдаёт заданный вызов (поле call), иначе — текст done. Диспетчер инструментов, плагины и исполнение — настоящего бинаря. Плагин стенда пишет аргументы tool.execute.before целиком и бросает на маркере ralph-stand-forbidden. Заменены только корень стенда (/path/to/stand), каталог скриптов стенда (/path/to/stand-scripts), бинарь CLI и канон.",
+    "cliVersion": "1.19.4",
+    "assembled": false,
+    "conditions": "Воспроизведение: kit['stand.sh'] <случай> на хосте поднимает новый стенд и исполняет kit['drive.sh'] в изоляции ОС; drive.sh создаёт репозиторий work/loop, исполняет pre() случая (kit['cases'][<случай>]), пишет opencode.json (провайдер mock, модель gpt-5-mock либо mock — по MODEL случая, разрешения allow, при MCPJSON — секция mcp с фиктивным сервером стенда) и plugin/stand.js в OPENCODE_CONFIG_DIR, поднимает kit['mock.mjs'] и зовёт opencode run --format json go из work/loop. Модель с gpt- в имени (кроме oss и gpt-4) получает apply_patch вместо edit и write — ToolRegistry.tools бинаря. Окружение — standEnv стенда: HOME и OPENCODE_CONFIG_DIR внутри стенда, автообновление и загрузка моделей выключены, ключей нет. ripgrep в стенде нет: у grep и glob снят вход плагина, а не исполнение поиска.",
+    "kit": {
+        "stand.sh": "/path/to/stand#/path/to/stand!/path/to/stand//path/to/standu/path/to/stands/path/to/standr/path/to/stand//path/to/standb/path/to/standi/path/to/standn/path/to/stand//path/to/stande/path/to/standn/path/to/standv/path/to/stand /path/to/standb/path/to/standa/path/to/stands/path/to/standh/path/to/stand\n/path/to/stand#/path/to/stand /path/to/standХ/path/to/standо/path/to/standс/path/to/standт/path/to/stand:/path/to/stand /path/to/standн/path/to/standо/path/to/standв/path/to/standы/path/to/standй/path/to/stand /path/to/standс/path/to/standт/path/to/standе/path/to/standн/path/to/standд/path/to/stand /path/to/standп/path/to/standо/path/to/standд/path/to/stand /path/to/standс/path/to/standл/path/to/standу/path/to/standч/path/to/standа/path/to/standй/path/to/stand,/path/to/stand /path/to/standи/path/to/standс/path/to/standп/path/to/standо/path/to/standл/path/to/standн/path/to/standе/path/to/standн/path/to/standи/path/to/standе/path/to/stand /path/to/standd/path/to/standr/path/to/standi/path/to/standv/path/to/stande/path/to/stand./path/to/stands/path/to/standh/path/to/stand /path/to/standв/path/to/stand /path/to/standи/path/to/standз/path/to/standо/path/to/standл/path/to/standя/path/to/standц/path/to/standи/path/to/standи/path/to/stand./path/to/stand\n/path/to/stands/path/to/stande/path/to/standt/path/to/stand /path/to/stand-/path/to/standu/path/to/stand\n/path/to/standC/path/to/standA/path/to/standS/path/to/standE/path/to/stand=/path/to/stand\"/path/to/stand$/path/to/stand1/path/to/stand\"/path/to/stand;/path/to/stand /path/to/standS/path/to/standT/path/to/stand=/path/to/stand\"/path/to/stand//path/to/standt/path/to/standm/path/to/standp/path/to/stand//path/to/stando/path/to/standc/path/to/stand-/path/to/stands/path/to/standt/path/to/standa/path/to/standn/path/to/standd/path/to/stand-/path/to/standr/path/to/standu/path/to/standn/path/to/stands/path/to/stand//path/to/stand$/path/to/standC/path/to/standA/path/to/standS/path/to/standE/path/to/stand./path/to/stand$/path/to/stand(/path/to/standd/path/to/standa/path/to/standt/path/to/stande/path/to/stand /path/to/stand+/path/to/stand%/path/to/stands/path/to/stand%/path/to/standN/path/to/stand)/path/to/stand\"/path/to/stand\n/path/to/standc/path/to/standd/path/to/stand /path/to/stand//path/to/standr/path/to/stando/path/to/stando/path/to/standt/path/to/stand//path/to/standr/path/to/standa/path/to/standl/path/to/standp/path/to/standh/path/to/stand-/path/to/standc/path/to/standa/path/to/standn/path/to/stando/path/to/standn/path/to/stand-/path/to/standr/path/to/standa/path/to/standl/path/to/standp/path/to/standh/path/to/stand\n/path/to/standn/path/to/stando/path/to/standd/path/to/stande/path/to/stand /path/to/standp/path/to/standr/path/to/stando/path/to/standv/path/to/standi/path/to/stands/path/to/standi/path/to/stando/path/to/standn/path/to/stand//path/to/stands/path/to/standt/path/to/standa/path/to/standn/path/to/standd/path/to/stand//path/to/stands/path/to/standt/path/to/standa/path/to/standn/path/to/standd/path/to/stand./path/to/standm/path/to/standt/path/to/stands/path/to/stand /path/to/stande/path/to/standx/path/to/stande/path/to/standc/path/to/stand /path/to/stand-/path/to/stand-/path/to/stands/path/to/standt/path/to/standa/path/to/standn/path/to/standd/path/to/stand /path/to/stand\"/path/to/stand$/path/to/standS/path/to/standT/path/to/stand\"/path/to/stand /path/to/stand-/path/to/stand-/path/to/standc/path/to/standl/path/to/standi/path/to/stand /path/to/stando/path/to/standp/path/to/stande/path/to/standn/path/to/standc/path/to/stando/path/to/standd/path/to/stande/path/to/stand /path/to/stand-/path/to/stand-/path/to/standc/path/to/standl/path/to/standi/path/to/stand-/path/to/standb/path/to/standi/path/to/standn/path/to/stand /path/to/stand//path/to/standu/path/to/stands/path/to/standr/path/to/stand//path/to/standl/path/to/standi/path/to/standb/path/to/stand//path/to/standn/path/to/stando/path/to/standd/path/to/stande/path/to/stand_/path/to/standm/path/to/stando/path/to/standd/path/to/standu/path/to/standl/path/to/stande/path/to/stands/path/to/stand//path/to/stando/path/to/standp/path/to/stande/path/to/standn/path/to/standc/path/to/stando/path/to/standd/path/to/stande/path/to/stand-/path/to/standa/path/to/standi/path/to/stand//path/to/standn/path/to/stando/path/to/standd/path/to/stande/path/to/stand_/path/to/standm/path/to/stando/path/to/standd/path/to/standu/path/to/standl/path/to/stande/path/to/stands/path/to/stand//path/to/stando/path/to/standp/path/to/stande/path/to/standn/path/to/standc/path/to/stando/path/to/standd/path/to/stande/path/to/stand-/path/to/standl/path/to/standi/path/to/standn/path/to/standu/path/to/standx/path/to/stand-/path/to/standx/path/to/stand6/path/to/stand4/path/to/stand//path/to/standb/path/to/standi/path/to/standn/path/to/stand//path/to/stando/path/to/standp/path/to/stande/path/to/standn/path/to/standc/path/to/stando/path/to/standd/path/to/stande/path/to/stand /path/to/stand-/path/to/stand-/path/to/standr/path/to/stando/path/to/stand /path/to/stand//path/to/standt/path/to/standm/path/to/standp/path/to/stand//path/to/stando/path/to/standc/path/to/stand-/path/to/stands/path/to/standt/path/to/standa/path/to/standn/path/to/standd/path/to/stand-/path/to/stands/path/to/standc/path/to/standr/path/to/standi/path/to/standp/path/to/standt/path/to/stands/path/to/stand /path/to/stand-/path/to/stand-/path/to/standr/path/to/stando/path/to/stand /path/to/stand//path/to/standr/path/to/stando/path/to/stando/path/to/standt/path/to/stand//path/to/standr/path/to/standa/path/to/standl/path/to/standp/path/to/standh/path/to/stand-/path/to/standc/path/to/standa/path/to/standn/path/to/stando/path/to/standn/path/to/stand-/path/to/standr/path/to/standa/path/to/standl/path/to/standp/path/to/standh/path/to/stand//path/to/standp/path/to/standr/path/to/stando/path/to/standv/path/to/standi/path/to/stands/path/to/standi/path/to/stando/path/to/standn/path/to/stand//path/to/stands/path/to/standt/path/to/standa/path/to/standn/path/to/standd/path/to/stand /path/to/stand\\/path/to/stand\n/path/to/stand /path/to/stand /path/to/stand-/path/to/stand-/path/to/stand /path/to/standb/path/to/standa/path/to/stands/path/to/standh/path/to/stand /path/to/stand//path/to/standt/path/to/standm/path/to/standp/path/to/stand//path/to/stando/path/to/standc/path/to/stand-/path/to/stands/path/to/standt/path/to/standa/path/to/standn/path/to/standd/path/to/stand-/path/to/stands/path/to/standc/path/to/standr/path/to/standi/path/to/standp/path/to/standt/path/to/stands/path/to/stand//path/to/standd/path/to/standr/path/to/standi/path/to/standv/path/to/stande/path/to/stand./path/to/stands/path/to/standh/path/to/stand /path/to/stand\"/path/to/stand$/path/to/standC/path/to/standA/path/to/standS/path/to/standE/path/to/stand\"/path/to/stand\n/path/to/stande/path/to/standc/path/to/standh/path/to/stando/path/to/stand /path/to/stand\"/path/to/stands/path/to/standt/path/to/standa/path/to/standn/path/to/standd/path/to/stand=/path/to/stand$/path/to/standS/path/to/standT/path/to/stand /path/to/standr/path/to/standc/path/to/stand=/path/to/stand$/path/to/stand?/path/to/stand\"/path/to/stand\n/path/to/stand",
+        "drive.sh": "/path/to/stand#/path/to/stand!/path/to/stand//path/to/standu/path/to/stands/path/to/standr/path/to/stand//path/to/standb/path/to/standi/path/to/standn/path/to/stand//path/to/stande/path/to/standn/path/to/standv/path/to/stand /path/to/standb/path/to/standa/path/to/stands/path/to/standh/path/to/stand\n/path/to/stand#/path/to/stand /path/to/standВ/path/to/standн/path/to/standу/path/to/standт/path/to/standр/path/to/standи/path/to/stand /path/to/standс/path/to/standт/path/to/standе/path/to/standн/path/to/standд/path/to/standа/path/to/stand:/path/to/stand /path/to/standф/path/to/standи/path/to/standк/path/to/standт/path/to/standи/path/to/standв/path/to/standн/path/to/standы/path/to/standй/path/to/stand /path/to/standп/path/to/standр/path/to/standо/path/to/standв/path/to/standа/path/to/standй/path/to/standд/path/to/standе/path/to/standр/path/to/stand,/path/to/stand /path/to/standр/path/to/standе/path/to/standп/path/to/standо/path/to/standз/path/to/standи/path/to/standт/path/to/standо/path/to/standр/path/to/standи/path/to/standй/path/to/stand /path/to/standп/path/to/standо/path/to/standт/path/to/standр/path/to/standе/path/to/standб/path/to/standи/path/to/standт/path/to/standе/path/to/standл/path/to/standя/path/to/stand,/path/to/stand /path/to/stando/path/to/standp/path/to/stande/path/to/standn/path/to/standc/path/to/stando/path/to/standd/path/to/stande/path/to/stand /path/to/standr/path/to/standu/path/to/standn/path/to/stand /path/to/standс/path/to/stand /path/to/standп/path/to/standл/path/to/standа/path/to/standг/path/to/standи/path/to/standн/path/to/standо/path/to/standм/path/to/stand /path/to/standс/path/to/standт/path/to/standе/path/to/standн/path/to/standд/path/to/standа/path/to/stand./path/to/stand\n/path/to/stands/path/to/stande/path/to/standt/path/to/stand /path/to/stand-/path/to/standu/path/to/stando/path/to/stand /path/to/standp/path/to/standi/path/to/standp/path/to/stande/path/to/standf/path/to/standa/path/to/standi/path/to/standl/path/to/stand\n/path/to/standC/path/to/standA/path/to/standS/path/to/standE/path/to/stand=/path/to/stand\"/path/to/stand$/path/to/stand1/path/to/stand\"/path/to/stand;/path/to/stand /path/to/standS/path/to/stand=/path/to/stand\"/path/to/stand$/path/to/stand(/path/to/standd/path/to/standi/path/to/standr/path/to/standn/path/to/standa/path/to/standm/path/to/stande/path/to/stand /path/to/stand\"/path/to/stand$/path/to/standH/path/to/standO/path/to/standM/path/to/standE/path/to/stand\"/path/to/stand)/path/to/stand\"/path/to/stand;/path/to/stand /path/to/standO/path/to/standU/path/to/standT/path/to/stand=/path/to/stand\"/path/to/stand$/path/to/standS/path/to/stand//path/to/standj/path/to/stando/path/to/standu/path/to/standr/path/to/standn/path/to/standa/path/to/standl/path/to/stand//path/to/stand$/path/to/standC/path/to/standA/path/to/standS/path/to/standE/path/to/stand\"/path/to/stand;/path/to/stand /path/to/standm/path/to/standk/path/to/standd/path/to/standi/path/to/standr/path/to/stand /path/to/stand-/path/to/standp/path/to/stand /path/to/stand\"/path/to/stand$/path/to/standO/path/to/standU/path/to/standT/path/to/stand\"/path/to/stand\n/path/to/standD/path/to/stand=/path/to/stand\"/path/to/stand$/path/to/stand(/path/to/standd/path/to/standi/path/to/standr/path/to/standn/path/to/standa/path/to/standm/path/to/stande/path/to/stand /path/to/stand\"/path/to/stand$/path/to/stand{/path/to/standB/path/to/standA/path/to/standS/path/to/standH/path/to/stand_/path/to/standS/path/to/standO/path/to/standU/path/to/standR/path/to/standC/path/to/standE/path/to/stand[/path/to/stand0/path/to/stand]/path/to/stand}/path/to/stand\"/path/to/stand)/path/to/stand\"/path/to/stand;/path/to/stand /path/to/standP/path/to/standO/path/to/standR/path/to/standT/path/to/stand=/path/to/stand1/path/to/stand8/path/to/stand9/path/to/stand9/path/to/stand7/path/to/stand\n/path/to/standL/path/to/standO/path/to/standO/path/to/standP/path/to/stand=/path/to/stand\"/path/to/stand$/path/to/standS/path/to/stand//path/to/standw/path/to/stando/path/to/standr/path/to/standk/path/to/stand//path/to/standl/path/to/stando/path/to/stando/path/to/standp/path/to/stand\"/path/to/stand;/path/to/stand /path/to/standm/path/to/standk/path/to/standd/path/to/standi/path/to/standr/path/to/stand /path/to/stand-/path/to/standp/path/to/stand /path/to/stand\"/path/to/stand$/path/to/standL/path/to/standO/path/to/standO/path/to/standP/path/to/stand\"/path/to/stand /path/to/stand\"/path/to/stand$/path/to/standO/path/to/standP/path/to/standE/path/to/standN/path/to/standC/path/to/standO/path/to/standD/path/to/standE/path/to/stand_/path/to/standC/path/to/standO/path/to/standN/path/to/standF/path/to/standI/path/to/standG/path/to/stand_/path/to/standD/path/to/standI/path/to/standR/path/to/stand//path/to/standp/path/to/standl/path/to/standu/path/to/standg/path/to/standi/path/to/standn/path/to/stand\"/path/to/stand\n/path/to/standg/path/to/standi/path/to/standt/path/to/stand /path/to/standi/path/to/standn/path/to/standi/path/to/standt/path/to/stand /path/to/stand-/path/to/standq/path/to/stand /path/to/stand\"/path/to/stand$/path/to/standL/path/to/standO/path/to/standO/path/to/standP/path/to/stand\"/path/to/stand;/path/to/stand /path/to/standg/path/to/standi/path/to/standt/path/to/stand /path/to/stand-/path/to/standC/path/to/stand /path/to/stand\"/path/to/stand$/path/to/standL/path/to/standO/path/to/standO/path/to/standP/path/to/stand\"/path/to/stand /path/to/stand-/path/to/standc/path/to/stand /path/to/standu/path/to/stands/path/to/stande/path/to/standr/path/to/stand./path/to/standn/path/to/standa/path/to/standm/path/to/stande/path/to/stand=/path/to/stands/path/to/stand /path/to/stand-/path/to/standc/path/to/stand /path/to/standu/path/to/stands/path/to/stande/path/to/standr/path/to/stand./path/to/stande/path/to/standm/path/to/standa/path/to/standi/path/to/standl/path/to/stand=/path/to/stands/path/to/stand@/path/to/stande/path/to/standx/path/to/standa/path/to/standm/path/to/standp/path/to/standl/path/to/stande/path/to/stand./path/to/standc/path/to/stando/path/to/standm/path/to/stand /path/to/standc/path/to/stando/path/to/standm/path/to/standm/path/to/standi/path/to/standt/path/to/stand /path/to/stand-/path/to/standq/path/to/stand /path/to/stand-/path/to/stand-/path/to/standa/path/to/standl/path/to/standl/path/to/stando/path/to/standw/path/to/stand-/path/to/stande/path/to/standm/path/to/standp/path/to/standt/path/to/standy/path/to/stand /path/to/stand-/path/to/standm/path/to/stand /path/to/standi/path/to/standn/path/to/standi/path/to/standt/path/to/stand\n/path/to/standM/path/to/standO/path/to/standD/path/to/standE/path/to/standL/path/to/stand=/path/to/standg/path/to/standp/path/to/standt/path/to/stand-/path/to/stand5/path/to/stand-/path/to/standm/path/to/stando/path/to/standc/path/to/standk/path/to/stand;/path/to/stand /path/to/standM/path/to/standC/path/to/standP/path/to/standJ/path/to/standS/path/to/standO/path/to/standN/path/to/stand=/path/to/stand'/path/to/stand'/path/to/stand\n/path/to/standp/path/to/standr/path/to/stande/path/to/stand(/path/to/stand)/path/to/stand /path/to/stand{/path/to/stand /path/to/stand:/path/to/stand;/path/to/stand /path/to/stand}/path/to/stand\n/path/to/stand./path/to/stand /path/to/stand\"/path/to/stand$/path/to/standD/path/to/stand//path/to/standc/path/to/standa/path/to/stands/path/to/stande/path/to/stands/path/to/stand//path/to/stand$/path/to/standC/path/to/standA/path/to/standS/path/to/standE/path/to/stand./path/to/stands/path/to/standh/path/to/stand\"/path/to/stand\n/path/to/standp/path/to/standr/path/to/stande/path/to/stand\n/path/to/standp/path/to/standr/path/to/standi/path/to/standn/path/to/standt/path/to/standf/path/to/stand /path/to/stand'/path/to/stand%/path/to/stands/path/to/stand'/path/to/stand /path/to/stand\"/path/to/stand$/path/to/standC/path/to/standA/path/to/standL/path/to/standL/path/to/stand\"/path/to/stand /path/to/stand>/path/to/stand\"/path/to/stand$/path/to/standO/path/to/standU/path/to/standT/path/to/stand//path/to/standc/path/to/standa/path/to/standl/path/to/standl/path/to/stand./path/to/standj/path/to/stands/path/to/stando/path/to/standn/path/to/stand\"/path/to/stand\n/path/to/standc/path/to/standp/path/to/stand /path/to/stand\"/path/to/stand$/path/to/standD/path/to/stand//path/to/standp/path/to/standl/path/to/standu/path/to/standg/path/to/standi/path/to/standn/path/to/stand./path/to/standj/path/to/stands/path/to/stand\"/path/to/stand /path/to/stand\"/path/to/stand$/path/to/standO/path/to/standP/path/to/standE/path/to/standN/path/to/standC/path/to/standO/path/to/standD/path/to/standE/path/to/stand_/path/to/standC/path/to/standO/path/to/standN/path/to/standF/path/to/standI/path/to/standG/path/to/stand_/path/to/standD/path/to/standI/path/to/standR/path/to/stand//path/to/standp/path/to/standl/path/to/standu/path/to/standg/path/to/standi/path/to/standn/path/to/stand//path/to/stands/path/to/standt/path/to/standa/path/to/standn/path/to/standd/path/to/stand./path/to/standj/path/to/stands/path/to/stand\"/path/to/stand\n/path/to/standM/path/to/standC/path/to/standP/path/to/stand=/path/to/stand'/path/to/stand'/path/to/stand;/path/to/stand /path/to/stand[/path/to/stand /path/to/stand-/path/to/standn/path/to/stand /path/to/stand\"/path/to/stand$/path/to/standM/path/to/standC/path/to/standP/path/to/standJ/path/to/standS/path/to/standO/path/to/standN/path/to/stand\"/path/to/stand /path/to/stand]/path/to/stand /path/to/stand&/path/to/stand&/path/to/stand /path/to/standM/path/to/standC/path/to/standP/path/to/stand=/path/to/stand\"/path/to/stand,/path/to/stand\\/path/to/stand\"/path/to/standm/path/to/standc/path/to/standp/path/to/stand\\/path/to/stand\"/path/to/stand:/path/to/stand$/path/to/standM/path/to/standC/path/to/standP/path/to/standJ/path/to/standS/path/to/standO/path/to/standN/path/to/stand\"/path/to/stand\n/path/to/standc/path/to/standa/path/to/standt/path/to/stand /path/to/stand>/path/to/stand\"/path/to/stand$/path/to/standO/path/to/standP/path/to/standE/path/to/standN/path/to/standC/path/to/standO/path/to/standD/path/to/standE/path/to/stand_/path/to/standC/path/to/standO/path/to/standN/path/to/standF/path/to/standI/path/to/standG/path/to/stand_/path/to/standD/path/to/standI/path/to/standR/path/to/stand//path/to/stando/path/to/standp/path/to/stande/path/to/standn/path/to/standc/path/to/stando/path/to/standd/path/to/stande/path/to/stand./path/to/standj/path/to/stands/path/to/stando/path/to/standn/path/to/stand\"/path/to/stand /path/to/stand</path/to/stand</path/to/standJ/path/to/standS/path/to/standO/path/to/standN/path/to/stand\n/path/to/stand{/path/to/stand\"/path/to/stand\\/path/to/stand$/path/to/stands/path/to/standc/path/to/standh/path/to/stande/path/to/standm/path/to/standa/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standh/path/to/standt/path/to/standt/path/to/standp/path/to/stands/path/to/stand:/path/to/stand//path/to/stand//path/to/stando/path/to/standp/path/to/stande/path/to/standn/path/to/standc/path/to/stando/path/to/standd/path/to/stande/path/to/stand./path/to/standa/path/to/standi/path/to/stand//path/to/standc/path/to/stando/path/to/standn/path/to/standf/path/to/standi/path/to/standg/path/to/stand./path/to/standj/path/to/stands/path/to/stando/path/to/standn/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standm/path/to/stando/path/to/standd/path/to/stande/path/to/standl/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standm/path/to/stando/path/to/standc/path/to/standk/path/to/stand//path/to/stand$/path/to/standM/path/to/standO/path/to/standD/path/to/standE/path/to/standL/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standa/path/to/standu/path/to/standt/path/to/stando/path/to/standu/path/to/standp/path/to/standd/path/to/standa/path/to/standt/path/to/stande/path/to/stand\"/path/to/stand:/path/to/standf/path/to/standa/path/to/standl/path/to/stands/path/to/stande/path/to/stand,/path/to/stand\"/path/to/stands/path/to/standh/path/to/standa/path/to/standr/path/to/stande/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standd/path/to/standi/path/to/stands/path/to/standa/path/to/standb/path/to/standl/path/to/stande/path/to/standd/path/to/stand\"/path/to/stand,/path/to/stand\n/path/to/stand\"/path/to/standp/path/to/stande/path/to/standr/path/to/standm/path/to/standi/path/to/stands/path/to/stands/path/to/standi/path/to/stando/path/to/standn/path/to/stand\"/path/to/stand:/path/to/stand{/path/to/stand\"/path/to/stand*/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standa/path/to/standl/path/to/standl/path/to/stando/path/to/standw/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/stande/path/to/standx/path/to/standt/path/to/stande/path/to/standr/path/to/standn/path/to/standa/path/to/standl/path/to/stand_/path/to/standd/path/to/standi/path/to/standr/path/to/stande/path/to/standc/path/to/standt/path/to/stando/path/to/standr/path/to/standy/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standa/path/to/standl/path/to/standl/path/to/stando/path/to/standw/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standd/path/to/stando/path/to/stando/path/to/standm/path/to/stand_/path/to/standl/path/to/stando/path/to/stando/path/to/standp/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standa/path/to/standl/path/to/standl/path/to/stando/path/to/standw/path/to/stand\"/path/to/stand}/path/to/stand,/path/to/stand\n/path/to/stand\"/path/to/standp/path/to/standr/path/to/stando/path/to/standv/path/to/standi/path/to/standd/path/to/stande/path/to/standr/path/to/stand\"/path/to/stand:/path/to/stand{/path/to/stand\"/path/to/standm/path/to/stando/path/to/standc/path/to/standk/path/to/stand\"/path/to/stand:/path/to/stand{/path/to/stand\"/path/to/standn/path/to/standp/path/to/standm/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/stand@/path/to/standa/path/to/standi/path/to/stand-/path/to/stands/path/to/standd/path/to/standk/path/to/stand//path/to/stando/path/to/standp/path/to/stande/path/to/standn/path/to/standa/path/to/standi/path/to/stand-/path/to/standc/path/to/stando/path/to/standm/path/to/standp/path/to/standa/path/to/standt/path/to/standi/path/to/standb/path/to/standl/path/to/stande/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standn/path/to/standa/path/to/standm/path/to/stande/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standm/path/to/stando/path/to/standc/path/to/standk/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/stando/path/to/standp/path/to/standt/path/to/standi/path/to/stando/path/to/standn/path/to/stands/path/to/stand\"/path/to/stand:/path/to/stand{/path/to/stand\"/path/to/standb/path/to/standa/path/to/stands/path/to/stande/path/to/standU/path/to/standR/path/to/standL/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standh/path/to/standt/path/to/standt/path/to/standp/path/to/stand:/path/to/stand//path/to/stand//path/to/stand1/path/to/stand2/path/to/stand7/path/to/stand./path/to/stand0/path/to/stand./path/to/stand0/path/to/stand./path/to/stand1/path/to/stand:/path/to/stand$/path/to/standP/path/to/standO/path/to/standR/path/to/standT/path/to/stand//path/to/standv/path/to/stand1/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standa/path/to/standp/path/to/standi/path/to/standK/path/to/stande/path/to/standy/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/stands/path/to/standt/path/to/standa/path/to/standn/path/to/standd/path/to/stand-/path/to/standf/path/to/standa/path/to/standk/path/to/stande/path/to/stand\"/path/to/stand}/path/to/stand,/path/to/stand\n/path/to/stand\"/path/to/standm/path/to/stando/path/to/standd/path/to/stande/path/to/standl/path/to/stands/path/to/stand\"/path/to/stand:/path/to/stand{/path/to/stand\"/path/to/stand$/path/to/standM/path/to/standO/path/to/standD/path/to/standE/path/to/standL/path/to/stand\"/path/to/stand:/path/to/stand{/path/to/stand\"/path/to/standn/path/to/standa/path/to/standm/path/to/stande/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/stand$/path/to/standM/path/to/standO/path/to/standD/path/to/standE/path/to/standL/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standt/path/to/stando/path/to/stando/path/to/standl/path/to/stand_/path/to/standc/path/to/standa/path/to/standl/path/to/standl/path/to/stand\"/path/to/stand:/path/to/standt/path/to/standr/path/to/standu/path/to/stande/path/to/stand,/path/to/stand\"/path/to/standl/path/to/standi/path/to/standm/path/to/standi/path/to/standt/path/to/stand\"/path/to/stand:/path/to/stand{/path/to/stand\"/path/to/standc/path/to/stando/path/to/standn/path/to/standt/path/to/stande/path/to/standx/path/to/standt/path/to/stand\"/path/to/stand:/path/to/stand1/path/to/stand3/path/to/stand1/path/to/stand0/path/to/stand7/path/to/stand2/path/to/stand,/path/to/stand\"/path/to/stando/path/to/standu/path/to/standt/path/to/standp/path/to/standu/path/to/standt/path/to/stand\"/path/to/stand:/path/to/stand8/path/to/stand1/path/to/stand9/path/to/stand2/path/to/stand}/path/to/stand}/path/to/stand}/path/to/stand}/path/to/stand}/path/to/stand$/path/to/standM/path/to/standC/path/to/standP/path/to/stand}/path/to/stand\n/path/to/standJ/path/to/standS/path/to/standO/path/to/standN/path/to/stand\n/path/to/standn/path/to/stando/path/to/standd/path/to/stande/path/to/stand /path/to/stand\"/path/to/stand$/path/to/standD/path/to/stand//path/to/standm/path/to/stando/path/to/standc/path/to/standk/path/to/stand./path/to/standm/path/to/standj/path/to/stands/path/to/stand\"/path/to/stand /path/to/stand$/path/to/standP/path/to/standO/path/to/standR/path/to/standT/path/to/stand /path/to/stand\"/path/to/stand$/path/to/standO/path/to/standU/path/to/standT/path/to/stand//path/to/standc/path/to/standa/path/to/standl/path/to/standl/path/to/stand./path/to/standj/path/to/stands/path/to/stando/path/to/standn/path/to/stand\"/path/to/stand /path/to/stand\"/path/to/stand$/path/to/standO/path/to/standU/path/to/standT/path/to/stand//path/to/standp/path/to/standr/path/to/stando/path/to/standv/path/to/standi/path/to/standd/path/to/stande/path/to/standr/path/to/stand./path/to/standj/path/to/stands/path/to/stando/path/to/standn/path/to/standl/path/to/stand\"/path/to/stand /path/to/stand&/path/to/stand /path/to/standM/path/to/standP/path/to/stand=/path/to/stand$/path/to/stand!/path/to/stand\n/path/to/standf/path/to/stando/path/to/standr/path/to/stand /path/to/standi/path/to/stand /path/to/standi/path/to/standn/path/to/stand /path/to/stand$/path/to/stand(/path/to/stands/path/to/stande/path/to/standq/path/to/stand /path/to/stand5/path/to/stand0/path/to/stand)/path/to/stand;/path/to/stand /path/to/standd/path/to/stando/path/to/stand /path/to/standg/path/to/standr/path/to/stande/path/to/standp/path/to/stand /path/to/stand-/path/to/standq/path/to/stand /path/to/standr/path/to/stande/path/to/standa/path/to/standd/path/to/standy/path/to/stand /path/to/stand\"/path/to/stand$/path/to/standO/path/to/standU/path/to/standT/path/to/stand//path/to/standp/path/to/standr/path/to/stando/path/to/standv/path/to/standi/path/to/standd/path/to/stande/path/to/standr/path/to/stand./path/to/standj/path/to/stands/path/to/stando/path/to/standn/path/to/standl/path/to/stand\"/path/to/stand /path/to/stand2/path/to/stand>/path/to/stand//path/to/standd/path/to/stande/path/to/standv/path/to/stand//path/to/standn/path/to/standu/path/to/standl/path/to/standl/path/to/stand /path/to/stand&/path/to/stand&/path/to/stand /path/to/standb/path/to/standr/path/to/stande/path/to/standa/path/to/standk/path/to/stand;/path/to/stand /path/to/stands/path/to/standl/path/to/stande/path/to/stande/path/to/standp/path/to/stand /path/to/stand0/path/to/stand./path/to/stand1/path/to/stand;/path/to/stand /path/to/standd/path/to/stando/path/to/standn/path/to/stande/path/to/stand\n/path/to/stand(/path/to/standc/path/to/standd/path/to/stand /path/to/stand\"/path/to/stand$/path/to/standL/path/to/standO/path/to/standO/path/to/standP/path/to/stand\"/path/to/stand /path/to/stand&/path/to/stand&/path/to/stand /path/to/standS/path/to/standT/path/to/standA/path/to/standN/path/to/standD/path/to/stand_/path/to/standH/path/to/standO/path/to/standO/path/to/standK/path/to/stand_/path/to/standL/path/to/standO/path/to/standG/path/to/stand=/path/to/stand\"/path/to/stand$/path/to/standO/path/to/standU/path/to/standT/path/to/stand//path/to/standh/path/to/stando/path/to/stando/path/to/standk/path/to/stand./path/to/standj/path/to/stands/path/to/stando/path/to/standn/path/to/standl/path/to/stand\"/path/to/stand /path/to/standO/path/to/standP/path/to/standE/path/to/standN/path/to/standC/path/to/standO/path/to/standD/path/to/standE/path/to/stand_/path/to/standD/path/to/standI/path/to/standS/path/to/standA/path/to/standB/path/to/standL/path/to/standE/path/to/stand_/path/to/standA/path/to/standU/path/to/standT/path/to/standO/path/to/standU/path/to/standP/path/to/standD/path/to/standA/path/to/standT/path/to/standE/path/to/stand=/path/to/stand1/path/to/stand /path/to/standO/path/to/standP/path/to/standE/path/to/standN/path/to/standC/path/to/standO/path/to/standD/path/to/standE/path/to/stand_/path/to/standD/path/to/standI/path/to/standS/path/to/standA/path/to/standB/path/to/standL/path/to/standE/path/to/stand_/path/to/standM/path/to/standO/path/to/standD/path/to/standE/path/to/standL/path/to/standS/path/to/stand_/path/to/standF/path/to/standE/path/to/standT/path/to/standC/path/to/standH/path/to/stand=/path/to/stand1/path/to/stand /path/to/standt/path/to/standi/path/to/standm/path/to/stande/path/to/stando/path/to/standu/path/to/standt/path/to/stand /path/to/stand1/path/to/stand2/path/to/stand0/path/to/stand /path/to/stando/path/to/standp/path/to/stande/path/to/standn/path/to/standc/path/to/stando/path/to/standd/path/to/stande/path/to/stand /path/to/standr/path/to/standu/path/to/standn/path/to/stand /path/to/stand-/path/to/stand-/path/to/standf/path/to/stando/path/to/standr/path/to/standm/path/to/standa/path/to/standt/path/to/stand /path/to/standj/path/to/stands/path/to/stando/path/to/standn/path/to/stand /path/to/stand'/path/to/standg/path/to/stando/path/to/stand'/path/to/stand /path/to/stand</path/to/stand//path/to/standd/path/to/stande/path/to/standv/path/to/stand//path/to/standn/path/to/standu/path/to/standl/path/to/standl/path/to/stand /path/to/stand>/path/to/stand\"/path/to/stand$/path/to/standO/path/to/standU/path/to/standT/path/to/stand//path/to/stands/path/to/standt/path/to/standd/path/to/stando/path/to/standu/path/to/standt/path/to/stand./path/to/standt/path/to/standx/path/to/standt/path/to/stand\"/path/to/stand /path/to/stand2/path/to/stand>/path/to/stand\"/path/to/stand$/path/to/standO/path/to/standU/path/to/standT/path/to/stand//path/to/stands/path/to/standt/path/to/standd/path/to/stande/path/to/standr/path/to/standr/path/to/stand./path/to/standt/path/to/standx/path/to/standt/path/to/stand\"/path/to/stand)/path/to/stand;/path/to/stand /path/to/stande/path/to/standc/path/to/standh/path/to/stando/path/to/stand /path/to/stand\"/path/to/stande/path/to/standx/path/to/standi/path/to/standt/path/to/stand=/path/to/stand$/path/to/stand?/path/to/stand\"/path/to/stand /path/to/stand>/path/to/stand\"/path/to/stand$/path/to/standO/path/to/standU/path/to/standT/path/to/stand//path/to/stande/path/to/standx/path/to/standi/path/to/standt/path/to/stand./path/to/standt/path/to/standx/path/to/standt/path/to/stand\"/path/to/stand\n/path/to/standl/path/to/stands/path/to/stand /path/to/stand-/path/to/standl/path/to/standa/path/to/stand /path/to/stand\"/path/to/stand$/path/to/standL/path/to/standO/path/to/standO/path/to/standP/path/to/stand\"/path/to/stand /path/to/stand\"/path/to/stand$/path/to/standS/path/to/stand//path/to/stando/path/to/standu/path/to/standt/path/to/stands/path/to/standi/path/to/standd/path/to/stande/path/to/stand\"/path/to/stand /path/to/stand>/path/to/stand\"/path/to/stand$/path/to/standO/path/to/standU/path/to/standT/path/to/stand//path/to/standt/path/to/standr/path/to/stande/path/to/stande/path/to/stand./path/to/standt/path/to/standx/path/to/standt/path/to/stand\"/path/to/stand /path/to/stand2/path/to/stand>/path/to/stand&/path/to/stand1/path/to/stand\n/path/to/standf/path/to/stando/path/to/standr/path/to/stand /path/to/standf/path/to/stand /path/to/standi/path/to/standn/path/to/stand /path/to/stand\"/path/to/stand$/path/to/standL/path/to/standO/path/to/standO/path/to/standP/path/to/stand\"/path/to/stand//path/to/stand*/path/to/stand /path/to/stand\"/path/to/stand$/path/to/standL/path/to/standO/path/to/standO/path/to/standP/path/to/stand\"/path/to/stand//path/to/stands/path/to/standu/path/to/standb/path/to/stand//path/to/stand*/path/to/stand /path/to/stand\"/path/to/stand$/path/to/standS/path/to/stand\"/path/to/stand//path/to/stando/path/to/standu/path/to/standt/path/to/stands/path/to/standi/path/to/standd/path/to/stande/path/to/stand//path/to/stand*/path/to/stand;/path/to/stand /path/to/standd/path/to/stando/path/to/stand /path/to/stand[/path/to/stand /path/to/stand-/path/to/standf/path/to/stand /path/to/stand\"/path/to/stand$/path/to/standf/path/to/stand\"/path/to/stand /path/to/stand]/path/to/stand /path/to/stand&/path/to/stand&/path/to/stand /path/to/stand{/path/to/stand /path/to/stande/path/to/standc/path/to/standh/path/to/stando/path/to/stand /path/to/stand\"/path/to/stand=/path/to/stand=/path/to/stand /path/to/stand$/path/to/standf/path/to/stand\"/path/to/stand;/path/to/stand /path/to/standc/path/to/standa/path/to/standt/path/to/stand /path/to/stand\"/path/to/stand$/path/to/standf/path/to/stand\"/path/to/stand;/path/to/stand /path/to/stand}/path/to/stand /path/to/stand;/path/to/stand /path/to/standd/path/to/stando/path/to/standn/path/to/stande/path/to/stand /path/to/stand>/path/to/stand>/path/to/stand\"/path/to/stand$/path/to/standO/path/to/standU/path/to/standT/path/to/stand//path/to/standt/path/to/standr/path/to/stande/path/to/stande/path/to/stand./path/to/standt/path/to/standx/path/to/standt/path/to/stand\"/path/to/stand /path/to/stand2/path/to/stand>/path/to/stand&/path/to/stand1/path/to/stand\n/path/to/standk/path/to/standi/path/to/standl/path/to/standl/path/to/stand /path/to/stand$/path/to/standM/path/to/standP/path/to/stand /path/to/stand2/path/to/stand>/path/to/stand//path/to/standd/path/to/stande/path/to/standv/path/to/stand//path/to/standn/path/to/standu/path/to/standl/path/to/standl/path/to/stand\n/path/to/stand",
+        "mock.mjs": "// Фиктивный провайдер Chat Completions: на запрос с инструментами без результата инструмента\n// отдаёт заданный вызов (call.json), иначе — текст \"done\". Каждый запрос пишет в журнал.\nimport http from 'node:http';\nimport fs from 'node:fs';\nconst [port, callFile, journal] = process.argv.slice(2);\nconst call = JSON.parse(fs.readFileSync(callFile, 'utf8'));\nconst chunk = (res, delta, finish) =>\n  res.write(`data: ${JSON.stringify({ id: 'c1', object: 'chat.completion.chunk', created: 1, model: 'mock', choices: [{ index: 0, delta, finish_reason: finish ?? null }] })}\\n\\n`);\nhttp.createServer((req, res) => {\n  let body = '';\n  req.on('data', (d) => (body += d));\n  req.on('end', () => {\n    fs.appendFileSync(journal, JSON.stringify({ method: req.method, url: req.url, body: body.slice(0, 400000) }) + '\\n');\n    if (req.method === 'GET') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end('{\"object\":\"list\",\"data\":[{\"id\":\"mock\",\"object\":\"model\"}]}'); }\n    let j = {}; try { j = JSON.parse(body); } catch {}\n    const msgs = j.messages ?? [];\n    const answered = msgs.some((m) => m.role === 'tool');\n    const wantsTool = Array.isArray(j.tools) && j.tools.length > 0 && !answered;\n    res.writeHead(200, { 'content-type': 'text/event-stream' });\n    if (wantsTool) {\n      chunk(res, { role: 'assistant', tool_calls: [{ index: 0, id: 'call_stand_1', type: 'function', function: { name: call.name, arguments: JSON.stringify(call.arguments) } }] });\n      chunk(res, {}, 'tool_calls');\n    } else {\n      chunk(res, { role: 'assistant', content: 'done' });\n      chunk(res, {}, 'stop');\n    }\n    res.write(`data: ${JSON.stringify({ id: 'c1', object: 'chat.completion.chunk', created: 1, model: 'mock', choices: [], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } })}\\n\\n`);\n    res.end('data: [DONE]\\n\\n');\n  });\n}).listen(Number(port), '127.0.0.1', () => fs.appendFileSync(journal, '{\"ready\":true}\\n'));\n",
+        "plugin.js": "// Плагин стенда: пишет сырые аргументы tool.execute.before целиком, отменяет вызов на маркере.\nimport fs from 'node:fs';\nexport const StandProbe = async (ctx) => ({\n    'tool.execute.before': async (input, output) => {\n        fs.appendFileSync(process.env.STAND_HOOK_LOG, JSON.stringify({ ctx: { directory: ctx.directory, worktree: ctx.worktree }, input, output }) + '\\n');\n        if (JSON.stringify(output).includes('ralph-stand-forbidden')) throw new Error('blocked by stand plugin');\n    },\n});\n",
+        "cases": {
+            "apply-patch-allowed": "/path/to/standC/path/to/standA/path/to/standL/path/to/standL/path/to/stand=/path/to/stand'/path/to/stand{/path/to/stand\"/path/to/standn/path/to/standa/path/to/standm/path/to/stande/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standa/path/to/standp/path/to/standp/path/to/standl/path/to/standy/path/to/stand_/path/to/standp/path/to/standa/path/to/standt/path/to/standc/path/to/standh/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standa/path/to/standr/path/to/standg/path/to/standu/path/to/standm/path/to/stande/path/to/standn/path/to/standt/path/to/stands/path/to/stand\"/path/to/stand:/path/to/stand{/path/to/stand\"/path/to/standp/path/to/standa/path/to/standt/path/to/standc/path/to/standh/path/to/standT/path/to/stande/path/to/standx/path/to/standt/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/stand*/path/to/stand*/path/to/stand*/path/to/stand /path/to/standB/path/to/stande/path/to/standg/path/to/standi/path/to/standn/path/to/stand /path/to/standP/path/to/standa/path/to/standt/path/to/standc/path/to/standh/path/to/stand\\/path/to/standn/path/to/stand*/path/to/stand*/path/to/stand*/path/to/stand /path/to/standA/path/to/standd/path/to/standd/path/to/stand /path/to/standF/path/to/standi/path/to/standl/path/to/stande/path/to/stand:/path/to/stand /path/to/standa/path/to/standl/path/to/standl/path/to/stando/path/to/standw/path/to/stande/path/to/standd/path/to/stand./path/to/standt/path/to/standx/path/to/standt/path/to/stand\\/path/to/standn/path/to/stand+/path/to/standx/path/to/stand\\/path/to/standn/path/to/stand*/path/to/stand*/path/to/stand*/path/to/stand /path/to/standE/path/to/standn/path/to/standd/path/to/stand /path/to/standP/path/to/standa/path/to/standt/path/to/standc/path/to/standh/path/to/stand\"/path/to/stand}/path/to/stand}/path/to/stand'/path/to/stand\n/path/to/stand",
+            "apply-patch-forbidden": "/path/to/standC/path/to/standA/path/to/standL/path/to/standL/path/to/stand=/path/to/stand'/path/to/stand{/path/to/stand\"/path/to/standn/path/to/standa/path/to/standm/path/to/stande/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standa/path/to/standp/path/to/standp/path/to/standl/path/to/standy/path/to/stand_/path/to/standp/path/to/standa/path/to/standt/path/to/standc/path/to/standh/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standa/path/to/standr/path/to/standg/path/to/standu/path/to/standm/path/to/stande/path/to/standn/path/to/standt/path/to/stands/path/to/stand\"/path/to/stand:/path/to/stand{/path/to/stand\"/path/to/standp/path/to/standa/path/to/standt/path/to/standc/path/to/standh/path/to/standT/path/to/stande/path/to/standx/path/to/standt/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/stand*/path/to/stand*/path/to/stand*/path/to/stand /path/to/standB/path/to/stande/path/to/standg/path/to/standi/path/to/standn/path/to/stand /path/to/standP/path/to/standa/path/to/standt/path/to/standc/path/to/standh/path/to/stand\\/path/to/standn/path/to/stand*/path/to/stand*/path/to/stand*/path/to/stand /path/to/standA/path/to/standd/path/to/standd/path/to/stand /path/to/standF/path/to/standi/path/to/standl/path/to/stande/path/to/stand:/path/to/stand /path/to/standr/path/to/standa/path/to/standl/path/to/standp/path/to/standh/path/to/stand-/path/to/stands/path/to/standt/path/to/standa/path/to/standn/path/to/standd/path/to/stand-/path/to/standf/path/to/stando/path/to/standr/path/to/standb/path/to/standi/path/to/standd/path/to/standd/path/to/stande/path/to/standn/path/to/stand./path/to/standt/path/to/standx/path/to/standt/path/to/stand\\/path/to/standn/path/to/stand+/path/to/standx/path/to/stand\\/path/to/standn/path/to/stand*/path/to/stand*/path/to/stand*/path/to/stand /path/to/standE/path/to/standn/path/to/standd/path/to/stand /path/to/standP/path/to/standa/path/to/standt/path/to/standc/path/to/standh/path/to/stand\"/path/to/stand}/path/to/stand}/path/to/stand'/path/to/stand\n/path/to/stand",
+            "apply-patch-move": "/path/to/standp/path/to/standr/path/to/stande/path/to/stand(/path/to/stand)/path/to/stand /path/to/stand{/path/to/stand /path/to/standp/path/to/standr/path/to/standi/path/to/standn/path/to/standt/path/to/standf/path/to/stand /path/to/stand\"/path/to/stando/path/to/standl/path/to/standd/path/to/stand\\/path/to/standn/path/to/stand\"/path/to/stand /path/to/stand>/path/to/stand\"/path/to/stand$/path/to/standL/path/to/standO/path/to/standO/path/to/standP/path/to/stand//path/to/standa/path/to/standl/path/to/standl/path/to/stando/path/to/standw/path/to/stande/path/to/standd/path/to/stand./path/to/standt/path/to/standx/path/to/standt/path/to/stand\"/path/to/stand;/path/to/stand /path/to/stand}/path/to/stand;/path/to/stand /path/to/standC/path/to/standA/path/to/standL/path/to/standL/path/to/stand=/path/to/stand'/path/to/stand{/path/to/stand\"/path/to/standn/path/to/standa/path/to/standm/path/to/stande/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standa/path/to/standp/path/to/standp/path/to/standl/path/to/standy/path/to/stand_/path/to/standp/path/to/standa/path/to/standt/path/to/standc/path/to/standh/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standa/path/to/standr/path/to/standg/path/to/standu/path/to/standm/path/to/stande/path/to/standn/path/to/standt/path/to/stands/path/to/stand\"/path/to/stand:/path/to/stand{/path/to/stand\"/path/to/standp/path/to/standa/path/to/standt/path/to/standc/path/to/standh/path/to/standT/path/to/stande/path/to/standx/path/to/standt/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/stand*/path/to/stand*/path/to/stand*/path/to/stand /path/to/standB/path/to/stande/path/to/standg/path/to/standi/path/to/standn/path/to/stand /path/to/standP/path/to/standa/path/to/standt/path/to/standc/path/to/standh/path/to/stand\\/path/to/standn/path/to/stand*/path/to/stand*/path/to/stand*/path/to/stand /path/to/standU/path/to/standp/path/to/standd/path/to/standa/path/to/standt/path/to/stande/path/to/stand /path/to/standF/path/to/standi/path/to/standl/path/to/stande/path/to/stand:/path/to/stand /path/to/standa/path/to/standl/path/to/standl/path/to/stando/path/to/standw/path/to/stande/path/to/standd/path/to/stand./path/to/standt/path/to/standx/path/to/standt/path/to/stand\\/path/to/standn/path/to/stand*/path/to/stand*/path/to/stand*/path/to/stand /path/to/standM/path/to/stando/path/to/standv/path/to/stande/path/to/stand /path/to/standt/path/to/stando/path/to/stand:/path/to/stand /path/to/standm/path/to/stando/path/to/standv/path/to/stande/path/to/standd/path/to/stand./path/to/standt/path/to/standx/path/to/standt/path/to/stand\\/path/to/standn/path/to/stand@/path/to/stand@/path/to/stand\\/path/to/standn/path/to/stand-/path/to/stando/path/to/standl/path/to/standd/path/to/stand\\/path/to/standn/path/to/stand+/path/to/standn/path/to/stande/path/to/standw/path/to/stand\\/path/to/standn/path/to/stand*/path/to/stand*/path/to/stand*/path/to/stand /path/to/standE/path/to/standn/path/to/standd/path/to/stand /path/to/standP/path/to/standa/path/to/standt/path/to/standc/path/to/standh/path/to/stand\"/path/to/stand}/path/to/stand}/path/to/stand'/path/to/stand\n/path/to/stand",
+            "bash-workdir-allowed": "/path/to/standp/path/to/standr/path/to/stande/path/to/stand(/path/to/stand)/path/to/stand /path/to/stand{/path/to/stand /path/to/standm/path/to/standk/path/to/standd/path/to/standi/path/to/standr/path/to/stand /path/to/stand-/path/to/standp/path/to/stand /path/to/stand\"/path/to/stand$/path/to/standS/path/to/stand//path/to/stando/path/to/standu/path/to/standt/path/to/stands/path/to/standi/path/to/standd/path/to/stande/path/to/stand\"/path/to/stand;/path/to/stand /path/to/stand}/path/to/stand;/path/to/stand /path/to/standC/path/to/standA/path/to/standL/path/to/standL/path/to/stand=/path/to/stand\"/path/to/stand{/path/to/stand\\/path/to/stand\"/path/to/standn/path/to/standa/path/to/standm/path/to/stande/path/to/stand\\/path/to/stand\"/path/to/stand:/path/to/stand\\/path/to/stand\"/path/to/standb/path/to/standa/path/to/stands/path/to/standh/path/to/stand\\/path/to/stand\"/path/to/stand,/path/to/stand\\/path/to/stand\"/path/to/standa/path/to/standr/path/to/standg/path/to/standu/path/to/standm/path/to/stande/path/to/standn/path/to/standt/path/to/stands/path/to/stand\\/path/to/stand\"/path/to/stand:/path/to/stand{/path/to/stand\\/path/to/stand\"/path/to/standc/path/to/stando/path/to/standm/path/to/standm/path/to/standa/path/to/standn/path/to/standd/path/to/stand\\/path/to/stand\"/path/to/stand:/path/to/stand\\/path/to/stand\"/path/to/standt/path/to/stando/path/to/standu/path/to/standc/path/to/standh/path/to/stand /path/to/standm/path/to/standa/path/to/standd/path/to/stande/path/to/stand-/path/to/standh/path/to/stande/path/to/standr/path/to/stande/path/to/stand\\/path/to/stand\"/path/to/stand,/path/to/stand\\/path/to/stand\"/path/to/standw/path/to/stando/path/to/standr/path/to/standk/path/to/standd/path/to/standi/path/to/standr/path/to/stand\\/path/to/stand\"/path/to/stand:/path/to/stand\\/path/to/stand\"/path/to/stand$/path/to/standS/path/to/stand//path/to/stando/path/to/standu/path/to/standt/path/to/stands/path/to/standi/path/to/standd/path/to/stande/path/to/stand\\/path/to/stand\"/path/to/stand,/path/to/stand\\/path/to/stand\"/path/to/standd/path/to/stande/path/to/stands/path/to/standc/path/to/standr/path/to/standi/path/to/standp/path/to/standt/path/to/standi/path/to/stando/path/to/standn/path/to/stand\\/path/to/stand\"/path/to/stand:/path/to/stand\\/path/to/stand\"/path/to/stands/path/to/standt/path/to/standa/path/to/standn/path/to/standd/path/to/stand /path/to/standp/path/to/standr/path/to/stando/path/to/standb/path/to/stande/path/to/stand\\/path/to/stand\"/path/to/stand}/path/to/stand}/path/to/stand\"/path/to/stand\n/path/to/stand",
+            "bash-workdir-relative": "/path/to/standp/path/to/standr/path/to/stande/path/to/stand(/path/to/stand)/path/to/stand /path/to/stand{/path/to/stand /path/to/standm/path/to/standk/path/to/standd/path/to/standi/path/to/standr/path/to/stand /path/to/stand-/path/to/standp/path/to/stand /path/to/stand\"/path/to/stand$/path/to/standL/path/to/standO/path/to/standO/path/to/standP/path/to/stand//path/to/stands/path/to/standu/path/to/standb/path/to/stand\"/path/to/stand;/path/to/stand /path/to/stand}/path/to/stand;/path/to/stand /path/to/standC/path/to/standA/path/to/standL/path/to/standL/path/to/stand=/path/to/stand'/path/to/stand{/path/to/stand\"/path/to/standn/path/to/standa/path/to/standm/path/to/stande/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standb/path/to/standa/path/to/stands/path/to/standh/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standa/path/to/standr/path/to/standg/path/to/standu/path/to/standm/path/to/stande/path/to/standn/path/to/standt/path/to/stands/path/to/stand\"/path/to/stand:/path/to/stand{/path/to/stand\"/path/to/standc/path/to/stando/path/to/standm/path/to/standm/path/to/standa/path/to/standn/path/to/standd/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standt/path/to/stando/path/to/standu/path/to/standc/path/to/standh/path/to/stand /path/to/standm/path/to/standa/path/to/standd/path/to/stande/path/to/stand-/path/to/standh/path/to/stande/path/to/standr/path/to/stande/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standw/path/to/stando/path/to/standr/path/to/standk/path/to/standd/path/to/standi/path/to/standr/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/stands/path/to/standu/path/to/standb/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standd/path/to/stande/path/to/stands/path/to/standc/path/to/standr/path/to/standi/path/to/standp/path/to/standt/path/to/standi/path/to/stando/path/to/standn/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/stands/path/to/standt/path/to/standa/path/to/standn/path/to/standd/path/to/stand /path/to/standp/path/to/standr/path/to/stando/path/to/standb/path/to/stande/path/to/stand\"/path/to/stand}/path/to/stand}/path/to/stand'/path/to/stand\n/path/to/stand",
+            "bash-workdir": "/path/to/standp/path/to/standr/path/to/stande/path/to/stand(/path/to/stand)/path/to/stand /path/to/stand{/path/to/stand /path/to/standm/path/to/standk/path/to/standd/path/to/standi/path/to/standr/path/to/stand /path/to/stand-/path/to/standp/path/to/stand /path/to/stand\"/path/to/stand$/path/to/standS/path/to/stand//path/to/stando/path/to/standu/path/to/standt/path/to/stands/path/to/standi/path/to/standd/path/to/stande/path/to/stand\"/path/to/stand;/path/to/stand /path/to/stand}/path/to/stand;/path/to/stand /path/to/standC/path/to/standA/path/to/standL/path/to/standL/path/to/stand=/path/to/stand\"/path/to/stand{/path/to/stand\\/path/to/stand\"/path/to/standn/path/to/standa/path/to/standm/path/to/stande/path/to/stand\\/path/to/stand\"/path/to/stand:/path/to/stand\\/path/to/stand\"/path/to/standb/path/to/standa/path/to/stands/path/to/standh/path/to/stand\\/path/to/stand\"/path/to/stand,/path/to/stand\\/path/to/stand\"/path/to/standa/path/to/standr/path/to/standg/path/to/standu/path/to/standm/path/to/stande/path/to/standn/path/to/standt/path/to/stands/path/to/stand\\/path/to/stand\"/path/to/stand:/path/to/stand{/path/to/stand\\/path/to/stand\"/path/to/standc/path/to/stando/path/to/standm/path/to/standm/path/to/standa/path/to/standn/path/to/standd/path/to/stand\\/path/to/stand\"/path/to/stand:/path/to/stand\\/path/to/stand\"/path/to/standt/path/to/stando/path/to/standu/path/to/standc/path/to/standh/path/to/stand /path/to/standm/path/to/standa/path/to/standd/path/to/stande/path/to/stand-/path/to/standh/path/to/stande/path/to/standr/path/to/stande/path/to/stand;/path/to/stand /path/to/stande/path/to/standc/path/to/standh/path/to/stando/path/to/stand /path/to/standr/path/to/standa/path/to/standl/path/to/standp/path/to/standh/path/to/stand-/path/to/stands/path/to/standt/path/to/standa/path/to/standn/path/to/standd/path/to/stand-/path/to/standf/path/to/stando/path/to/standr/path/to/standb/path/to/standi/path/to/standd/path/to/standd/path/to/stande/path/to/standn/path/to/stand\\/path/to/stand\"/path/to/stand,/path/to/stand\\/path/to/stand\"/path/to/standw/path/to/stando/path/to/standr/path/to/standk/path/to/standd/path/to/standi/path/to/standr/path/to/stand\\/path/to/stand\"/path/to/stand:/path/to/stand\\/path/to/stand\"/path/to/stand$/path/to/standS/path/to/stand//path/to/stando/path/to/standu/path/to/standt/path/to/stands/path/to/standi/path/to/standd/path/to/stande/path/to/stand\\/path/to/stand\"/path/to/stand,/path/to/stand\\/path/to/stand\"/path/to/standd/path/to/stande/path/to/stands/path/to/standc/path/to/standr/path/to/standi/path/to/standp/path/to/standt/path/to/standi/path/to/stando/path/to/standn/path/to/stand\\/path/to/stand\"/path/to/stand:/path/to/stand\\/path/to/stand\"/path/to/stands/path/to/standt/path/to/standa/path/to/standn/path/to/standd/path/to/stand /path/to/standp/path/to/standr/path/to/stando/path/to/standb/path/to/stande/path/to/stand\\/path/to/stand\"/path/to/stand}/path/to/stand}/path/to/stand\"/path/to/stand\n/path/to/stand",
+            "edit-allowed": "/path/to/standM/path/to/standO/path/to/standD/path/to/standE/path/to/standL/path/to/stand=/path/to/standm/path/to/stando/path/to/standc/path/to/standk/path/to/stand;/path/to/stand /path/to/standp/path/to/standr/path/to/stande/path/to/stand(/path/to/stand)/path/to/stand /path/to/stand{/path/to/stand /path/to/standp/path/to/standr/path/to/standi/path/to/standn/path/to/standt/path/to/standf/path/to/stand /path/to/stand\"/path/to/stando/path/to/standl/path/to/standd/path/to/stand\\/path/to/standn/path/to/stand\"/path/to/stand /path/to/stand>/path/to/stand\"/path/to/stand$/path/to/standL/path/to/standO/path/to/standO/path/to/standP/path/to/stand//path/to/standa/path/to/standl/path/to/standl/path/to/stando/path/to/standw/path/to/stande/path/to/standd/path/to/stand./path/to/standt/path/to/standx/path/to/standt/path/to/stand\"/path/to/stand;/path/to/stand /path/to/stand}/path/to/stand;/path/to/stand /path/to/standC/path/to/standA/path/to/standL/path/to/standL/path/to/stand=/path/to/stand'/path/to/stand{/path/to/stand\"/path/to/standn/path/to/standa/path/to/standm/path/to/stande/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/stande/path/to/standd/path/to/standi/path/to/standt/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standa/path/to/standr/path/to/standg/path/to/standu/path/to/standm/path/to/stande/path/to/standn/path/to/standt/path/to/stands/path/to/stand\"/path/to/stand:/path/to/stand{/path/to/stand\"/path/to/standf/path/to/standi/path/to/standl/path/to/stande/path/to/standP/path/to/standa/path/to/standt/path/to/standh/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standa/path/to/standl/path/to/standl/path/to/stando/path/to/standw/path/to/stande/path/to/standd/path/to/stand./path/to/standt/path/to/standx/path/to/standt/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/stando/path/to/standl/path/to/standd/path/to/standS/path/to/standt/path/to/standr/path/to/standi/path/to/standn/path/to/standg/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/stando/path/to/standl/path/to/standd/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standn/path/to/stande/path/to/standw/path/to/standS/path/to/standt/path/to/standr/path/to/standi/path/to/standn/path/to/standg/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standn/path/to/stande/path/to/standw/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standr/path/to/stande/path/to/standp/path/to/standl/path/to/standa/path/to/standc/path/to/stande/path/to/standA/path/to/standl/path/to/standl/path/to/stand\"/path/to/stand:/path/to/standt/path/to/standr/path/to/standu/path/to/stande/path/to/stand}/path/to/stand}/path/to/stand'/path/to/stand\n/path/to/stand",
+            "edit-forbidden": "/path/to/standM/path/to/standO/path/to/standD/path/to/standE/path/to/standL/path/to/stand=/path/to/standm/path/to/stando/path/to/standc/path/to/standk/path/to/stand;/path/to/stand /path/to/standp/path/to/standr/path/to/stande/path/to/stand(/path/to/stand)/path/to/stand /path/to/stand{/path/to/stand /path/to/standp/path/to/standr/path/to/standi/path/to/standn/path/to/standt/path/to/standf/path/to/stand /path/to/stand\"/path/to/stando/path/to/standl/path/to/standd/path/to/stand\\/path/to/standn/path/to/stand\"/path/to/stand /path/to/stand>/path/to/stand\"/path/to/stand$/path/to/standL/path/to/standO/path/to/standO/path/to/standP/path/to/stand//path/to/standr/path/to/standa/path/to/standl/path/to/standp/path/to/standh/path/to/stand-/path/to/stands/path/to/standt/path/to/standa/path/to/standn/path/to/standd/path/to/stand-/path/to/standf/path/to/stando/path/to/standr/path/to/standb/path/to/standi/path/to/standd/path/to/standd/path/to/stande/path/to/standn/path/to/stand./path/to/standt/path/to/standx/path/to/standt/path/to/stand\"/path/to/stand;/path/to/stand /path/to/stand}/path/to/stand;/path/to/stand /path/to/standC/path/to/standA/path/to/standL/path/to/standL/path/to/stand=/path/to/stand'/path/to/stand{/path/to/stand\"/path/to/standn/path/to/standa/path/to/standm/path/to/stande/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/stande/path/to/standd/path/to/standi/path/to/standt/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standa/path/to/standr/path/to/standg/path/to/standu/path/to/standm/path/to/stande/path/to/standn/path/to/standt/path/to/stands/path/to/stand\"/path/to/stand:/path/to/stand{/path/to/stand\"/path/to/standf/path/to/standi/path/to/standl/path/to/stande/path/to/standP/path/to/standa/path/to/standt/path/to/standh/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standr/path/to/standa/path/to/standl/path/to/standp/path/to/standh/path/to/stand-/path/to/stands/path/to/standt/path/to/standa/path/to/standn/path/to/standd/path/to/stand-/path/to/standf/path/to/stando/path/to/standr/path/to/standb/path/to/standi/path/to/standd/path/to/standd/path/to/stande/path/to/standn/path/to/stand./path/to/standt/path/to/standx/path/to/standt/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/stando/path/to/standl/path/to/standd/path/to/standS/path/to/standt/path/to/standr/path/to/standi/path/to/standn/path/to/standg/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/stando/path/to/standl/path/to/standd/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standn/path/to/stande/path/to/standw/path/to/standS/path/to/standt/path/to/standr/path/to/standi/path/to/standn/path/to/standg/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standn/path/to/stande/path/to/standw/path/to/stand\"/path/to/stand}/path/to/stand}/path/to/stand'/path/to/stand\n/path/to/stand",
+            "glob": "/path/to/standC/path/to/standA/path/to/standL/path/to/standL/path/to/stand=/path/to/stand'/path/to/stand{/path/to/stand\"/path/to/standn/path/to/standa/path/to/standm/path/to/stande/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standg/path/to/standl/path/to/stando/path/to/standb/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standa/path/to/standr/path/to/standg/path/to/standu/path/to/standm/path/to/stande/path/to/standn/path/to/standt/path/to/stands/path/to/stand\"/path/to/stand:/path/to/stand{/path/to/stand\"/path/to/standp/path/to/standa/path/to/standt/path/to/standt/path/to/stande/path/to/standr/path/to/standn/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/stand*/path/to/stand*/path/to/stand//path/to/stand*/path/to/stand./path/to/standt/path/to/standx/path/to/standt/path/to/stand\"/path/to/stand}/path/to/stand}/path/to/stand'/path/to/stand\n/path/to/stand",
+            "grep-include": "/path/to/standp/path/to/standr/path/to/stande/path/to/stand(/path/to/stand)/path/to/stand /path/to/stand{/path/to/stand /path/to/standp/path/to/standr/path/to/standi/path/to/standn/path/to/standt/path/to/standf/path/to/stand /path/to/stand\"/path/to/standn/path/to/stande/path/to/stande/path/to/standd/path/to/standl/path/to/stande/path/to/stand\\/path/to/standn/path/to/stand\"/path/to/stand /path/to/stand>/path/to/stand\"/path/to/stand$/path/to/standL/path/to/standO/path/to/standO/path/to/standP/path/to/stand//path/to/standa/path/to/standl/path/to/standl/path/to/stando/path/to/standw/path/to/stande/path/to/standd/path/to/stand./path/to/standt/path/to/standx/path/to/standt/path/to/stand\"/path/to/stand;/path/to/stand /path/to/stand}/path/to/stand;/path/to/stand /path/to/standC/path/to/standA/path/to/standL/path/to/standL/path/to/stand=/path/to/stand'/path/to/stand{/path/to/stand\"/path/to/standn/path/to/standa/path/to/standm/path/to/stande/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standg/path/to/standr/path/to/stande/path/to/standp/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standa/path/to/standr/path/to/standg/path/to/standu/path/to/standm/path/to/stande/path/to/standn/path/to/standt/path/to/stands/path/to/stand\"/path/to/stand:/path/to/stand{/path/to/stand\"/path/to/standp/path/to/standa/path/to/standt/path/to/standt/path/to/stande/path/to/standr/path/to/standn/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standn/path/to/stande/path/to/stande/path/to/standd/path/to/standl/path/to/stande/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standi/path/to/standn/path/to/standc/path/to/standl/path/to/standu/path/to/standd/path/to/stande/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/stand*/path/to/stand./path/to/standt/path/to/standx/path/to/standt/path/to/stand\"/path/to/stand}/path/to/stand}/path/to/stand'/path/to/stand\n/path/to/stand",
+            "mcp": "/path/to/standM/path/to/standC/path/to/standP/path/to/standJ/path/to/standS/path/to/standO/path/to/standN/path/to/stand=/path/to/stand\"/path/to/stand{/path/to/stand\\/path/to/stand\"/path/to/stands/path/to/standt/path/to/standa/path/to/standn/path/to/standd/path/to/stand\\/path/to/stand\"/path/to/stand:/path/to/stand{/path/to/stand\\/path/to/stand\"/path/to/standt/path/to/standy/path/to/standp/path/to/stande/path/to/stand\\/path/to/stand\"/path/to/stand:/path/to/stand\\/path/to/stand\"/path/to/standl/path/to/stando/path/to/standc/path/to/standa/path/to/standl/path/to/stand\\/path/to/stand\"/path/to/stand,/path/to/stand\\/path/to/stand\"/path/to/standc/path/to/stando/path/to/standm/path/to/standm/path/to/standa/path/to/standn/path/to/standd/path/to/stand\\/path/to/stand\"/path/to/stand:/path/to/stand[/path/to/stand\\/path/to/stand\"/path/to/standn/path/to/stando/path/to/standd/path/to/stande/path/to/stand\\/path/to/stand\"/path/to/stand,/path/to/stand\\/path/to/stand\"/path/to/stand//path/to/standr/path/to/stando/path/to/stando/path/to/standt/path/to/stand//path/to/standr/path/to/standa/path/to/standl/path/to/standp/path/to/standh/path/to/stand-/path/to/standc/path/to/standa/path/to/standn/path/to/stando/path/to/standn/path/to/stand-/path/to/standr/path/to/standa/path/to/standl/path/to/standp/path/to/standh/path/to/stand//path/to/standp/path/to/standr/path/to/stando/path/to/standv/path/to/standi/path/to/stands/path/to/standi/path/to/stando/path/to/standn/path/to/stand//path/to/stands/path/to/standt/path/to/standa/path/to/standn/path/to/standd/path/to/stand//path/to/standf/path/to/standa/path/to/standk/path/to/stande/path/to/stand-/path/to/standm/path/to/standc/path/to/standp/path/to/stand./path/to/standm/path/to/standt/path/to/stands/path/to/stand\\/path/to/stand\"/path/to/stand,/path/to/stand\\/path/to/stand\"/path/to/stand$/path/to/standR/path/to/standA/path/to/standL/path/to/standP/path/to/standH/path/to/stand_/path/to/standS/path/to/standT/path/to/standA/path/to/standN/path/to/standD/path/to/stand_/path/to/standM/path/to/standC/path/to/standP/path/to/stand_/path/to/standJ/path/to/standO/path/to/standU/path/to/standR/path/to/standN/path/to/standA/path/to/standL/path/to/stand\\/path/to/stand\"/path/to/stand]/path/to/stand}/path/to/stand}/path/to/stand\"/path/to/stand;/path/to/stand /path/to/standC/path/to/standA/path/to/standL/path/to/standL/path/to/stand=/path/to/stand'/path/to/stand{/path/to/stand\"/path/to/standn/path/to/standa/path/to/standm/path/to/stande/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/stands/path/to/standt/path/to/standa/path/to/standn/path/to/standd/path/to/stand_/path/to/stands/path/to/standt/path/to/standa/path/to/standn/path/to/standd/path/to/stand_/path/to/standw/path/to/standr/path/to/standi/path/to/standt/path/to/stande/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standa/path/to/standr/path/to/standg/path/to/standu/path/to/standm/path/to/stande/path/to/standn/path/to/standt/path/to/stands/path/to/stand\"/path/to/stand:/path/to/stand{/path/to/stand\"/path/to/standk/path/to/stande/path/to/standy/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standk/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standv/path/to/standa/path/to/standl/path/to/standu/path/to/stande/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standr/path/to/standa/path/to/standl/path/to/standp/path/to/standh/path/to/stand-/path/to/stands/path/to/standt/path/to/standa/path/to/standn/path/to/standd/path/to/stand-/path/to/standf/path/to/stando/path/to/standr/path/to/standb/path/to/standi/path/to/standd/path/to/standd/path/to/stande/path/to/standn/path/to/stand\"/path/to/stand}/path/to/stand}/path/to/stand'/path/to/stand\n/path/to/stand",
+            "read": "/path/to/standp/path/to/standr/path/to/stande/path/to/stand(/path/to/stand)/path/to/stand /path/to/stand{/path/to/stand /path/to/standp/path/to/standr/path/to/standi/path/to/standn/path/to/standt/path/to/standf/path/to/stand /path/to/stand\"/path/to/standx/path/to/stand\\/path/to/standn/path/to/stand\"/path/to/stand /path/to/stand>/path/to/stand\"/path/to/stand$/path/to/standL/path/to/standO/path/to/standO/path/to/standP/path/to/stand//path/to/standa/path/to/standl/path/to/standl/path/to/stando/path/to/standw/path/to/stande/path/to/standd/path/to/stand./path/to/standt/path/to/standx/path/to/standt/path/to/stand\"/path/to/stand;/path/to/stand /path/to/stand}/path/to/stand;/path/to/stand /path/to/standC/path/to/standA/path/to/standL/path/to/standL/path/to/stand=/path/to/stand'/path/to/stand{/path/to/stand\"/path/to/standn/path/to/standa/path/to/standm/path/to/stande/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standr/path/to/stande/path/to/standa/path/to/standd/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standa/path/to/standr/path/to/standg/path/to/standu/path/to/standm/path/to/stande/path/to/standn/path/to/standt/path/to/stands/path/to/stand\"/path/to/stand:/path/to/stand{/path/to/stand\"/path/to/standf/path/to/standi/path/to/standl/path/to/stande/path/to/standP/path/to/standa/path/to/standt/path/to/standh/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standa/path/to/standl/path/to/standl/path/to/stando/path/to/standw/path/to/stande/path/to/standd/path/to/stand./path/to/standt/path/to/standx/path/to/standt/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standl/path/to/standi/path/to/standm/path/to/standi/path/to/standt/path/to/stand\"/path/to/stand:/path/to/stand5/path/to/stand}/path/to/stand}/path/to/stand'/path/to/stand\n/path/to/stand",
+            "skill": "/path/to/standp/path/to/standr/path/to/stande/path/to/stand(/path/to/stand)/path/to/stand /path/to/stand{/path/to/stand /path/to/standm/path/to/standk/path/to/standd/path/to/standi/path/to/standr/path/to/stand /path/to/stand-/path/to/standp/path/to/stand /path/to/stand\"/path/to/stand$/path/to/standL/path/to/standO/path/to/standO/path/to/standP/path/to/stand//path/to/stand./path/to/standc/path/to/standl/path/to/standa/path/to/standu/path/to/standd/path/to/stande/path/to/stand//path/to/stands/path/to/standk/path/to/standi/path/to/standl/path/to/standl/path/to/stands/path/to/stand//path/to/standp/path/to/standr/path/to/stando/path/to/standb/path/to/stande/path/to/stand\"/path/to/stand;/path/to/stand /path/to/standp/path/to/standr/path/to/standi/path/to/standn/path/to/standt/path/to/standf/path/to/stand /path/to/stand-/path/to/stand-/path/to/stand /path/to/stand\"/path/to/stand-/path/to/stand-/path/to/stand-/path/to/stand\\/path/to/standn/path/to/standn/path/to/standa/path/to/standm/path/to/stande/path/to/stand:/path/to/stand /path/to/standp/path/to/standr/path/to/stando/path/to/standb/path/to/stande/path/to/stand\\/path/to/standn/path/to/standd/path/to/stande/path/to/stands/path/to/standc/path/to/standr/path/to/standi/path/to/standp/path/to/standt/path/to/standi/path/to/stando/path/to/standn/path/to/stand:/path/to/stand /path/to/stands/path/to/standt/path/to/standa/path/to/standn/path/to/standd/path/to/stand /path/to/standp/path/to/standr/path/to/stando/path/to/standb/path/to/stande/path/to/stand /path/to/stands/path/to/standk/path/to/standi/path/to/standl/path/to/standl/path/to/stand\\/path/to/standn/path/to/stand-/path/to/stand-/path/to/stand-/path/to/stand\\/path/to/standn/path/to/stand\\/path/to/standn/path/to/standb/path/to/stando/path/to/standd/path/to/standy/path/to/stand\\/path/to/standn/path/to/stand\"/path/to/stand /path/to/stand>/path/to/stand\"/path/to/stand$/path/to/standL/path/to/standO/path/to/standO/path/to/standP/path/to/stand//path/to/stand./path/to/standc/path/to/standl/path/to/standa/path/to/standu/path/to/standd/path/to/stande/path/to/stand//path/to/stands/path/to/standk/path/to/standi/path/to/standl/path/to/standl/path/to/stands/path/to/stand//path/to/standp/path/to/standr/path/to/stando/path/to/standb/path/to/stande/path/to/stand//path/to/standS/path/to/standK/path/to/standI/path/to/standL/path/to/standL/path/to/stand./path/to/standm/path/to/standd/path/to/stand\"/path/to/stand;/path/to/stand /path/to/stand}/path/to/stand;/path/to/stand /path/to/standC/path/to/standA/path/to/standL/path/to/standL/path/to/stand=/path/to/stand'/path/to/stand{/path/to/stand\"/path/to/standn/path/to/standa/path/to/standm/path/to/stande/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/stands/path/to/standk/path/to/standi/path/to/standl/path/to/standl/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standa/path/to/standr/path/to/standg/path/to/standu/path/to/standm/path/to/stande/path/to/standn/path/to/standt/path/to/stands/path/to/stand\"/path/to/stand:/path/to/stand{/path/to/stand\"/path/to/standn/path/to/standa/path/to/standm/path/to/stande/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standp/path/to/standr/path/to/stando/path/to/standb/path/to/stande/path/to/stand\"/path/to/stand}/path/to/stand}/path/to/stand'/path/to/stand\n/path/to/stand",
+            "task": "/path/to/standC/path/to/standA/path/to/standL/path/to/standL/path/to/stand=/path/to/stand'/path/to/stand{/path/to/stand\"/path/to/standn/path/to/standa/path/to/standm/path/to/stande/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standt/path/to/standa/path/to/stands/path/to/standk/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standa/path/to/standr/path/to/standg/path/to/standu/path/to/standm/path/to/stande/path/to/standn/path/to/standt/path/to/stands/path/to/stand\"/path/to/stand:/path/to/stand{/path/to/stand\"/path/to/standd/path/to/stande/path/to/stands/path/to/standc/path/to/standr/path/to/standi/path/to/standp/path/to/standt/path/to/standi/path/to/stando/path/to/standn/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/stands/path/to/standt/path/to/standa/path/to/standn/path/to/standd/path/to/stand /path/to/standp/path/to/standr/path/to/stando/path/to/standb/path/to/stande/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standp/path/to/standr/path/to/stando/path/to/standm/path/to/standp/path/to/standt/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standr/path/to/standa/path/to/standl/path/to/standp/path/to/standh/path/to/stand-/path/to/stands/path/to/standt/path/to/standa/path/to/standn/path/to/standd/path/to/stand-/path/to/standf/path/to/stando/path/to/standr/path/to/standb/path/to/standi/path/to/standd/path/to/standd/path/to/stande/path/to/standn/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/stands/path/to/standu/path/to/standb/path/to/standa/path/to/standg/path/to/stande/path/to/standn/path/to/standt/path/to/stand_/path/to/standt/path/to/standy/path/to/standp/path/to/stande/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standg/path/to/stande/path/to/standn/path/to/stande/path/to/standr/path/to/standa/path/to/standl/path/to/stand\"/path/to/stand}/path/to/stand}/path/to/stand'/path/to/stand\n/path/to/stand",
+            "webfetch": "/path/to/standC/path/to/standA/path/to/standL/path/to/standL/path/to/stand=/path/to/stand'/path/to/stand{/path/to/stand\"/path/to/standn/path/to/standa/path/to/standm/path/to/stande/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standw/path/to/stande/path/to/standb/path/to/standf/path/to/stande/path/to/standt/path/to/standc/path/to/standh/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standa/path/to/standr/path/to/standg/path/to/standu/path/to/standm/path/to/stande/path/to/standn/path/to/standt/path/to/stands/path/to/stand\"/path/to/stand:/path/to/stand{/path/to/stand\"/path/to/standu/path/to/standr/path/to/standl/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standh/path/to/standt/path/to/standt/path/to/standp/path/to/stand:/path/to/stand//path/to/stand//path/to/stand1/path/to/stand2/path/to/stand7/path/to/stand./path/to/stand0/path/to/stand./path/to/stand0/path/to/stand./path/to/stand1/path/to/stand:/path/to/stand9/path/to/stand//path/to/standr/path/to/standa/path/to/standl/path/to/standp/path/to/standh/path/to/stand-/path/to/stands/path/to/standt/path/to/standa/path/to/standn/path/to/standd/path/to/stand-/path/to/standf/path/to/stando/path/to/standr/path/to/standb/path/to/standi/path/to/standd/path/to/standd/path/to/stande/path/to/standn/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standf/path/to/stando/path/to/standr/path/to/standm/path/to/standa/path/to/standt/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standt/path/to/stande/path/to/standx/path/to/standt/path/to/stand\"/path/to/stand}/path/to/stand}/path/to/stand'/path/to/stand\n/path/to/stand",
+            "write-allowed": "/path/to/standM/path/to/standO/path/to/standD/path/to/standE/path/to/standL/path/to/stand=/path/to/standm/path/to/stando/path/to/standc/path/to/standk/path/to/stand;/path/to/stand /path/to/standC/path/to/standA/path/to/standL/path/to/standL/path/to/stand=/path/to/stand'/path/to/stand{/path/to/stand\"/path/to/standn/path/to/standa/path/to/standm/path/to/stande/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standw/path/to/standr/path/to/standi/path/to/standt/path/to/stande/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standa/path/to/standr/path/to/standg/path/to/standu/path/to/standm/path/to/stande/path/to/standn/path/to/standt/path/to/stands/path/to/stand\"/path/to/stand:/path/to/stand{/path/to/stand\"/path/to/standf/path/to/standi/path/to/standl/path/to/stande/path/to/standP/path/to/standa/path/to/standt/path/to/standh/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standa/path/to/standl/path/to/standl/path/to/stando/path/to/standw/path/to/stande/path/to/standd/path/to/stand./path/to/standt/path/to/standx/path/to/standt/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standc/path/to/stando/path/to/standn/path/to/standt/path/to/stande/path/to/standn/path/to/standt/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standx/path/to/stand\"/path/to/stand}/path/to/stand}/path/to/stand'/path/to/stand\n/path/to/stand",
+            "write-forbidden": "/path/to/standM/path/to/standO/path/to/standD/path/to/standE/path/to/standL/path/to/stand=/path/to/standm/path/to/stando/path/to/standc/path/to/standk/path/to/stand;/path/to/stand /path/to/standC/path/to/standA/path/to/standL/path/to/standL/path/to/stand=/path/to/stand'/path/to/stand{/path/to/stand\"/path/to/standn/path/to/standa/path/to/standm/path/to/stande/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standw/path/to/standr/path/to/standi/path/to/standt/path/to/stande/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standa/path/to/standr/path/to/standg/path/to/standu/path/to/standm/path/to/stande/path/to/standn/path/to/standt/path/to/stands/path/to/stand\"/path/to/stand:/path/to/stand{/path/to/stand\"/path/to/standf/path/to/standi/path/to/standl/path/to/stande/path/to/standP/path/to/standa/path/to/standt/path/to/standh/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standr/path/to/standa/path/to/standl/path/to/standp/path/to/standh/path/to/stand-/path/to/stands/path/to/standt/path/to/standa/path/to/standn/path/to/standd/path/to/stand-/path/to/standf/path/to/stando/path/to/standr/path/to/standb/path/to/standi/path/to/standd/path/to/standd/path/to/stande/path/to/standn/path/to/stand./path/to/standt/path/to/standx/path/to/standt/path/to/stand\"/path/to/stand,/path/to/stand\"/path/to/standc/path/to/stando/path/to/standn/path/to/standt/path/to/stande/path/to/standn/path/to/standt/path/to/stand\"/path/to/stand:/path/to/stand\"/path/to/standx/path/to/stand\"/path/to/stand}/path/to/stand}/path/to/stand'/path/to/stand\n/path/to/stand"
+        }
+    },
+    "events": [
+        {
+            "id": "apply-patch-allowed",
+            "title": "apply_patch (модель gpt-): путь в тексте patchText, разрешённая пара — файл создан",
+            "model": "gpt-5-mock",
+            "call": {
+                "name": "apply_patch",
+                "arguments": {
+                    "patchText": "*** Begin Patch\n*** Add File: allowed.txt\n+x\n*** End Patch"
+                }
+            },
+            "pluginEvents": [
+                {
+                    "ctx": {
+                        "directory": "/path/to/stand/work/loop",
+                        "worktree": "/path/to/stand/work/loop"
+                    },
+                    "input": {
+                        "tool": "apply_patch",
+                        "sessionID": "ses_e7cd5dedeffe4UbtNYfAUgsWr8",
+                        "callID": "call_stand_1"
+                    },
+                    "output": {
+                        "args": {
+                            "patchText": "*** Begin Patch\n*** Add File: allowed.txt\n+x\n*** End Patch"
+                        }
+                    }
+                }
+            ],
+            "toolStatus": "completed",
+            "toolError": null,
+            "exit": "exit=0",
+            "tree": "ls: cannot access '/path/to/stand/outside': No such file or directory\n/path/to/stand/work/loop:\ntotal 16\ndrwxr-xr-x 3 root root 4096 Oct 28 15:39 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:37 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:37 .git\n-rw-r--r-- 1 root root    2 Oct 28 15:39 allowed.txt\n== /path/to/stand/work/loop/allowed.txt\nx\n"
+        },
+        {
+            "id": "apply-patch-forbidden",
+            "title": "apply_patch: запрещённый путь в тексте патча — вызов отменён, файла нет",
+            "model": "gpt-5-mock",
+            "call": {
+                "name": "apply_patch",
+                "arguments": {
+                    "patchText": "*** Begin Patch\n*** Add File: ralph-stand-forbidden.txt\n+x\n*** End Patch"
+                }
+            },
+            "pluginEvents": [
+                {
+                    "ctx": {
+                        "directory": "/path/to/stand/work/loop",
+                        "worktree": "/path/to/stand/work/loop"
+                    },
+                    "input": {
+                        "tool": "apply_patch",
+                        "sessionID": "ses_e7cd4b870ffeSjMJ6dCYr4CvXl",
+                        "callID": "call_stand_1"
+                    },
+                    "output": {
+                        "args": {
+                            "patchText": "*** Begin Patch\n*** Add File: ralph-stand-forbidden.txt\n+x\n*** End Patch"
+                        }
+                    }
+                }
+            ],
+            "toolStatus": "error",
+            "toolError": "blocked by stand plugin",
+            "exit": "exit=0",
+            "tree": "ls: cannot access '/path/to/stand/outside': No such file or directory\n/path/to/stand/work/loop:\ntotal 12\ndrwxr-xr-x 3 root root 4096 Oct 28 15:39 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:39 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:39 .git\n"
+        },
+        {
+            "id": "apply-patch-move",
+            "title": "apply_patch с Move to: CLI переносит файл по второму пути",
+            "model": "gpt-5-mock",
+            "call": {
+                "name": "apply_patch",
+                "arguments": {
+                    "patchText": "*** Begin Patch\n*** Update File: allowed.txt\n*** Move to: moved.txt\n@@\n-old\n+new\n*** End Patch"
+                }
+            },
+            "pluginEvents": [
+                {
+                    "ctx": {
+                        "directory": "/path/to/stand/work/loop",
+                        "worktree": "/path/to/stand/work/loop"
+                    },
+                    "input": {
+                        "tool": "apply_patch",
+                        "sessionID": "ses_e7cd391c6ffeIFq11gHlESWjwu",
+                        "callID": "call_stand_1"
+                    },
+                    "output": {
+                        "args": {
+                            "patchText": "*** Begin Patch\n*** Update File: allowed.txt\n*** Move to: moved.txt\n@@\n-old\n+new\n*** End Patch"
+                        }
+                    }
+                }
+            ],
+            "toolStatus": "completed",
+            "toolError": null,
+            "exit": "exit=0",
+            "tree": "ls: cannot access '/path/to/stand/outside': No such file or directory\n/path/to/stand/work/loop:\ntotal 16\ndrwxr-xr-x 3 root root 4096 Oct 28 15:41 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:40 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:40 .git\n-rw-r--r-- 1 root root    4 Oct 28 15:41 moved.txt\n== /path/to/stand/work/loop/moved.txt\nnew\n"
+        },
+        {
+            "id": "bash-workdir-allowed",
+            "title": "bash с workdir вне дерева: команда исполнена в workdir, а не в каталоге сессии",
+            "model": "gpt-5-mock",
+            "call": {
+                "name": "bash",
+                "arguments": {
+                    "command": "touch made-here",
+                    "workdir": "/path/to/stand/outside",
+                    "description": "stand probe"
+                }
+            },
+            "pluginEvents": [
+                {
+                    "ctx": {
+                        "directory": "/path/to/stand/work/loop",
+                        "worktree": "/path/to/stand/work/loop"
+                    },
+                    "input": {
+                        "tool": "bash",
+                        "sessionID": "ses_e7cd26d7bffeaQmLdvVYszRuhH",
+                        "callID": "call_stand_1"
+                    },
+                    "output": {
+                        "args": {
+                            "command": "touch made-here",
+                            "workdir": "/path/to/stand/outside",
+                            "description": "stand probe"
+                        }
+                    }
+                }
+            ],
+            "toolStatus": "completed",
+            "toolError": null,
+            "exit": "exit=0",
+            "tree": "/path/to/stand/outside:\ntotal 8\ndrwxr-xr-x 2 root root 4096 Oct 28 15:42 .\ndrwxr-xr-x 9 root root 4096 Oct 28 15:41 ..\n-rw-r--r-- 1 root root    0 Oct 28 15:42 made-here\n\n/path/to/stand/work/loop:\ntotal 12\ndrwxr-xr-x 3 root root 4096 Oct 28 15:41 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:41 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:41 .git\n== /path/to/stand/outside/made-here\n"
+        },
+        {
+            "id": "bash-workdir-relative",
+            "title": "bash с относительным workdir: исполнена в каталоге от каталога сессии",
+            "model": "gpt-5-mock",
+            "call": {
+                "name": "bash",
+                "arguments": {
+                    "command": "touch made-here",
+                    "workdir": "sub",
+                    "description": "stand probe"
+                }
+            },
+            "pluginEvents": [
+                {
+                    "ctx": {
+                        "directory": "/path/to/stand/work/loop",
+                        "worktree": "/path/to/stand/work/loop"
+                    },
+                    "input": {
+                        "tool": "bash",
+                        "sessionID": "ses_e7cd149cfffeupNik6aZLMpPkd",
+                        "callID": "call_stand_1"
+                    },
+                    "output": {
+                        "args": {
+                            "command": "touch made-here",
+                            "workdir": "sub",
+                            "description": "stand probe"
+                        }
+                    }
+                }
+            ],
+            "toolStatus": "completed",
+            "toolError": null,
+            "exit": "exit=0",
+            "tree": "ls: cannot access '/path/to/stand/outside': No such file or directory\n/path/to/stand/work/loop:\ntotal 16\ndrwxr-xr-x 4 root root 4096 Oct 28 15:42 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:42 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:42 .git\ndrwxr-xr-x 2 root root 4096 Oct 28 15:44 sub\n== /path/to/stand/work/loop/sub/made-here\n"
+        },
+        {
+            "id": "bash-workdir",
+            "title": "bash с workdir вне дерева: запрещённое — вызов отменён, файла нет",
+            "model": "gpt-5-mock",
+            "call": {
+                "name": "bash",
+                "arguments": {
+                    "command": "touch made-here; echo ralph-stand-forbidden",
+                    "workdir": "/path/to/stand/outside",
+                    "description": "stand probe"
+                }
+            },
+            "pluginEvents": [
+                {
+                    "ctx": {
+                        "directory": "/path/to/stand/work/loop",
+                        "worktree": "/path/to/stand/work/loop"
+                    },
+                    "input": {
+                        "tool": "bash",
+                        "sessionID": "ses_e7cd024b9ffe33qH4cQLhjEc7a",
+                        "callID": "call_stand_1"
+                    },
+                    "output": {
+                        "args": {
+                            "command": "touch made-here; echo ralph-stand-forbidden",
+                            "workdir": "/path/to/stand/outside",
+                            "description": "stand probe"
+                        }
+                    }
+                }
+            ],
+            "toolStatus": "error",
+            "toolError": "blocked by stand plugin",
+            "exit": "exit=0",
+            "tree": "/path/to/stand/outside:\ntotal 8\ndrwxr-xr-x 2 root root 4096 Oct 28 15:44 .\ndrwxr-xr-x 9 root root 4096 Oct 28 15:44 ..\n\n/path/to/stand/work/loop:\ntotal 12\ndrwxr-xr-x 3 root root 4096 Oct 28 15:44 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:44 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:44 .git\n"
+        },
+        {
+            "id": "edit-allowed",
+            "title": "edit: filePath и replaceAll, разрешённая пара — правка легла",
+            "model": "mock",
+            "call": {
+                "name": "edit",
+                "arguments": {
+                    "filePath": "allowed.txt",
+                    "oldString": "old",
+                    "newString": "new",
+                    "replaceAll": true
+                }
+            },
+            "pluginEvents": [
+                {
+                    "ctx": {
+                        "directory": "/path/to/stand/work/loop",
+                        "worktree": "/path/to/stand/work/loop"
+                    },
+                    "input": {
+                        "tool": "edit",
+                        "sessionID": "ses_e7ccefe62ffeTSCojjCpdNqK25",
+                        "callID": "call_stand_1"
+                    },
+                    "output": {
+                        "args": {
+                            "filePath": "allowed.txt",
+                            "oldString": "old",
+                            "newString": "new",
+                            "replaceAll": true
+                        }
+                    }
+                }
+            ],
+            "toolStatus": "completed",
+            "toolError": null,
+            "exit": "exit=0",
+            "tree": "ls: cannot access '/path/to/stand/outside': No such file or directory\n/path/to/stand/work/loop:\ntotal 16\ndrwxr-xr-x 3 root root 4096 Oct 28 15:45 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:45 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:45 .git\n-rw-r--r-- 1 root root    4 Oct 28 15:46 allowed.txt\n== /path/to/stand/work/loop/allowed.txt\nnew\n"
+        },
+        {
+            "id": "edit-forbidden",
+            "title": "edit: запрещённый путь — вызов отменён, файл прежний",
+            "model": "mock",
+            "call": {
+                "name": "edit",
+                "arguments": {
+                    "filePath": "ralph-stand-forbidden.txt",
+                    "oldString": "old",
+                    "newString": "new"
+                }
+            },
+            "pluginEvents": [
+                {
+                    "ctx": {
+                        "directory": "/path/to/stand/work/loop",
+                        "worktree": "/path/to/stand/work/loop"
+                    },
+                    "input": {
+                        "tool": "edit",
+                        "sessionID": "ses_e7ccddaadffe0JUZIU8tBP5gxP",
+                        "callID": "call_stand_1"
+                    },
+                    "output": {
+                        "args": {
+                            "filePath": "ralph-stand-forbidden.txt",
+                            "oldString": "old",
+                            "newString": "new"
+                        }
+                    }
+                }
+            ],
+            "toolStatus": "error",
+            "toolError": "blocked by stand plugin",
+            "exit": "exit=0",
+            "tree": "ls: cannot access '/path/to/stand/outside': No such file or directory\n/path/to/stand/work/loop:\ntotal 16\ndrwxr-xr-x 3 root root 4096 Oct 28 15:46 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:46 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:46 .git\n-rw-r--r-- 1 root root    4 Oct 28 15:46 ralph-stand-forbidden.txt\n== /path/to/stand/work/loop/ralph-stand-forbidden.txt\nold\n"
+        },
+        {
+            "id": "glob",
+            "title": "glob: шаблон путей — поле pattern (ripgrep в стенде нет — снят вход плагина)",
+            "model": "gpt-5-mock",
+            "call": {
+                "name": "glob",
+                "arguments": {
+                    "pattern": "**/*.txt"
+                }
+            },
+            "pluginEvents": [
+                {
+                    "ctx": {
+                        "directory": "/path/to/stand/work/loop",
+                        "worktree": "/path/to/stand/work/loop"
+                    },
+                    "input": {
+                        "tool": "glob",
+                        "sessionID": "ses_e7cccb772ffeks3xcs12ZQ24bd",
+                        "callID": "call_stand_1"
+                    },
+                    "output": {
+                        "args": {
+                            "pattern": "**/*.txt"
+                        }
+                    }
+                }
+            ],
+            "toolStatus": "error",
+            "toolError": "ripgrep execution failed",
+            "exit": "exit=0",
+            "tree": "ls: cannot access '/path/to/stand/outside': No such file or directory\n/path/to/stand/work/loop:\ntotal 12\ndrwxr-xr-x 3 root root 4096 Oct 28 15:47 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:47 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:47 .git\n"
+        },
+        {
+            "id": "grep-include",
+            "title": "grep: шаблон путей — поле include (ripgrep в стенде нет — снят вход плагина)",
+            "model": "gpt-5-mock",
+            "call": {
+                "name": "grep",
+                "arguments": {
+                    "pattern": "needle",
+                    "include": "*.txt"
+                }
+            },
+            "pluginEvents": [
+                {
+                    "ctx": {
+                        "directory": "/path/to/stand/work/loop",
+                        "worktree": "/path/to/stand/work/loop"
+                    },
+                    "input": {
+                        "tool": "grep",
+                        "sessionID": "ses_e7ccb923cffeWc7VQxOoAp741r",
+                        "callID": "call_stand_1"
+                    },
+                    "output": {
+                        "args": {
+                            "pattern": "needle",
+                            "include": "*.txt"
+                        }
+                    }
+                }
+            ],
+            "toolStatus": "error",
+            "toolError": "ripgrep execution failed",
+            "exit": "exit=0",
+            "tree": "ls: cannot access '/path/to/stand/outside': No such file or directory\n/path/to/stand/work/loop:\ntotal 16\ndrwxr-xr-x 3 root root 4096 Oct 28 15:49 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:49 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:49 .git\n-rw-r--r-- 1 root root    7 Oct 28 15:49 allowed.txt\n== /path/to/stand/work/loop/allowed.txt\nneedle\n"
+        },
+        {
+            "id": "mcp",
+            "title": "MCP: имя <сервер>_<инструмент> без mcp__ (stand_stand_write), запрещённый — вызов отменён",
+            "model": "gpt-5-mock",
+            "call": {
+                "name": "stand_stand_write",
+                "arguments": {
+                    "key": "k",
+                    "value": "ralph-stand-forbidden"
+                }
+            },
+            "pluginEvents": [
+                {
+                    "ctx": {
+                        "directory": "/path/to/stand/work/loop",
+                        "worktree": "/path/to/stand/work/loop"
+                    },
+                    "input": {
+                        "tool": "stand_stand_write",
+                        "sessionID": "ses_e7cca6df6ffetCD9SOa66OhTvt",
+                        "callID": "call_stand_1"
+                    },
+                    "output": {
+                        "args": {
+                            "key": "k",
+                            "value": "ralph-stand-forbidden"
+                        }
+                    }
+                }
+            ],
+            "toolStatus": "error",
+            "toolError": "blocked by stand plugin",
+            "exit": "exit=0",
+            "tree": "ls: cannot access '/path/to/stand/outside': No such file or directory\n/path/to/stand/work/loop:\ntotal 12\ndrwxr-xr-x 3 root root 4096 Oct 28 15:50 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:50 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:50 .git\n"
+        },
+        {
+            "id": "read",
+            "title": "read: путь в поле filePath",
+            "model": "gpt-5-mock",
+            "call": {
+                "name": "read",
+                "arguments": {
+                    "filePath": "allowed.txt",
+                    "limit": 5
+                }
+            },
+            "pluginEvents": [
+                {
+                    "ctx": {
+                        "directory": "/path/to/stand/work/loop",
+                        "worktree": "/path/to/stand/work/loop"
+                    },
+                    "input": {
+                        "tool": "read",
+                        "sessionID": "ses_e7cc94a3dffeI3Ut48pw5dZPjU",
+                        "callID": "call_stand_1"
+                    },
+                    "output": {
+                        "args": {
+                            "filePath": "allowed.txt",
+                            "limit": 5
+                        }
+                    }
+                }
+            ],
+            "toolStatus": "completed",
+            "toolError": null,
+            "exit": "exit=0",
+            "tree": "ls: cannot access '/path/to/stand/outside': No such file or directory\n/path/to/stand/work/loop:\ntotal 16\ndrwxr-xr-x 3 root root 4096 Oct 28 15:51 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:51 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:51 .git\n-rw-r--r-- 1 root root    2 Oct 28 15:51 allowed.txt\n== /path/to/stand/work/loop/allowed.txt\nx\n"
+        },
+        {
+            "id": "skill",
+            "title": "skill: name скилла дерева, событие доставки инструкций",
+            "model": "gpt-5-mock",
+            "call": {
+                "name": "skill",
+                "arguments": {
+                    "name": "probe"
+                }
+            },
+            "pluginEvents": [
+                {
+                    "ctx": {
+                        "directory": "/path/to/stand/work/loop",
+                        "worktree": "/path/to/stand/work/loop"
+                    },
+                    "input": {
+                        "tool": "skill",
+                        "sessionID": "ses_e7cc826d8ffexeA68nBr1sueh2",
+                        "callID": "call_stand_1"
+                    },
+                    "output": {
+                        "args": {
+                            "name": "probe"
+                        }
+                    }
+                }
+            ],
+            "toolStatus": "error",
+            "toolError": "ripgrep execution failed",
+            "exit": "exit=0",
+            "tree": "ls: cannot access '/path/to/stand/outside': No such file or directory\n/path/to/stand/work/loop:\ntotal 16\ndrwxr-xr-x 4 root root 4096 Oct 28 15:52 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:52 ..\ndrwxr-xr-x 3 root root 4096 Oct 28 15:52 .claude\ndrwxr-xr-x 8 root root 4096 Oct 28 15:52 .git\n"
+        },
+        {
+            "id": "task",
+            "title": "task: субагент с prompt и subagent_type, запрещённый — вызов отменён",
+            "model": "gpt-5-mock",
+            "call": {
+                "name": "task",
+                "arguments": {
+                    "description": "stand probe",
+                    "prompt": "ralph-stand-forbidden",
+                    "subagent_type": "general"
+                }
+            },
+            "pluginEvents": [
+                {
+                    "ctx": {
+                        "directory": "/path/to/stand/work/loop",
+                        "worktree": "/path/to/stand/work/loop"
+                    },
+                    "input": {
+                        "tool": "task",
+                        "sessionID": "ses_e7cc702dcffe58r4bJCRgAqqvx",
+                        "callID": "call_stand_1"
+                    },
+                    "output": {
+                        "args": {
+                            "description": "stand probe",
+                            "prompt": "ralph-stand-forbidden",
+                            "subagent_type": "general"
+                        }
+                    }
+                }
+            ],
+            "toolStatus": "error",
+            "toolError": "blocked by stand plugin",
+            "exit": "exit=0",
+            "tree": "ls: cannot access '/path/to/stand/outside': No such file or directory\n/path/to/stand/work/loop:\ntotal 12\ndrwxr-xr-x 3 root root 4096 Oct 28 15:54 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:54 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:54 .git\n"
+        },
+        {
+            "id": "webfetch",
+            "title": "webfetch: url, запрещённый — вызов отменён",
+            "model": "gpt-5-mock",
+            "call": {
+                "name": "webfetch",
+                "arguments": {
+                    "url": "http://127.0.0.1:9/ralph-stand-forbidden",
+                    "format": "text"
+                }
+            },
+            "pluginEvents": [
+                {
+                    "ctx": {
+                        "directory": "/path/to/stand/work/loop",
+                        "worktree": "/path/to/stand/work/loop"
+                    },
+                    "input": {
+                        "tool": "webfetch",
+                        "sessionID": "ses_e7cc5de93ffeyzfJANAU6q1IFD",
+                        "callID": "call_stand_1"
+                    },
+                    "output": {
+                        "args": {
+                            "url": "http://127.0.0.1:9/ralph-stand-forbidden",
+                            "format": "text"
+                        }
+                    }
+                }
+            ],
+            "toolStatus": "error",
+            "toolError": "blocked by stand plugin",
+            "exit": "exit=0",
+            "tree": "ls: cannot access '/path/to/stand/outside': No such file or directory\n/path/to/stand/work/loop:\ntotal 12\ndrwxr-xr-x 3 root root 4096 Oct 28 15:55 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:55 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:55 .git\n"
+        },
+        {
+            "id": "write-allowed",
+            "title": "write: путь в поле filePath, разрешённая пара — файл записан",
+            "model": "mock",
+            "call": {
+                "name": "write",
+                "arguments": {
+                    "filePath": "allowed.txt",
+                    "content": "x"
+                }
+            },
+            "pluginEvents": [
+                {
+                    "ctx": {
+                        "directory": "/path/to/stand/work/loop",
+                        "worktree": "/path/to/stand/work/loop"
+                    },
+                    "input": {
+                        "tool": "write",
+                        "sessionID": "ses_e7cd75aeeffezzi7vzQv4ReiJT",
+                        "callID": "call_stand_1"
+                    },
+                    "output": {
+                        "args": {
+                            "filePath": "allowed.txt",
+                            "content": "x"
+                        }
+                    }
+                }
+            ],
+            "toolStatus": "completed",
+            "toolError": null,
+            "exit": "exit=0",
+            "tree": "ls: cannot access '/path/to/stand/outside': No such file or directory\n/path/to/stand/work/loop:\ntotal 16\ndrwxr-xr-x 3 root root 4096 Oct 28 15:37 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:36 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:36 .git\n-rw-r--r-- 1 root root    1 Oct 28 15:37 allowed.txt\n== /path/to/stand/work/loop/allowed.txt\nx"
+        },
+        {
+            "id": "write-forbidden",
+            "title": "write: запрещённый путь — вызов отменён, файла нет",
+            "model": "mock",
+            "call": {
+                "name": "write",
+                "arguments": {
+                    "filePath": "ralph-stand-forbidden.txt",
+                    "content": "x"
+                }
+            },
+            "pluginEvents": [
+                {
+                    "ctx": {
+                        "directory": "/path/to/stand/work/loop",
+                        "worktree": "/path/to/stand/work/loop"
+                    },
+                    "input": {
+                        "tool": "write",
+                        "sessionID": "ses_e7cc4ba37ffeE85fuEu6W50CXe",
+                        "callID": "call_stand_1"
+                    },
+                    "output": {
+                        "args": {
+                            "filePath": "ralph-stand-forbidden.txt",
+                            "content": "x"
+                        }
+                    }
+                }
+            ],
+            "toolStatus": "error",
+            "toolError": "blocked by stand plugin",
+            "exit": "exit=0",
+            "tree": "ls: cannot access '/path/to/stand/outside': No such file or directory\n/path/to/stand/work/loop:\ntotal 12\ndrwxr-xr-x 3 root root 4096 Oct 28 15:56 .\ndrwxr-xr-x 6 root root 4096 Oct 28 15:56 ..\ndrwxr-xr-x 8 root root 4096 Oct 28 15:56 .git\n"
+        }
+    ],
+    "inventory": {
+        "source": "инструменты и поля, которые CLI в режиме run отдал модели в первом запросе с инструментами (журнал provider.jsonl фиктивного провайдера), по модели; инструменты MCP-сервера стенда исключены",
+        "models": {
+            "gpt-5-mock": {
+                "apply_patch": {
+                    "properties": ["patchText"],
+                    "required": ["patchText"]
+                },
+                "bash": {
+                    "properties": ["command", "timeout", "workdir"],
+                    "required": ["command"]
+                },
+                "glob": {
+                    "properties": ["path", "pattern"],
+                    "required": ["pattern"]
+                },
+                "grep": {
+                    "properties": ["include", "path", "pattern"],
+                    "required": ["pattern"]
+                },
+                "read": {
+                    "properties": ["filePath", "limit", "offset"],
+                    "required": ["filePath"]
+                },
+                "skill": {
+                    "properties": ["name"],
+                    "required": ["name"]
+                },
+                "task": {
+                    "properties": ["command", "description", "prompt", "subagent_type", "task_id"],
+                    "required": ["description", "prompt", "subagent_type"]
+                },
+                "todowrite": {
+                    "properties": ["todos"],
+                    "required": ["todos"]
+                },
+                "webfetch": {
+                    "properties": ["format", "timeout", "url"],
+                    "required": ["url"]
+                }
+            },
+            "mock": {
+                "bash": {
+                    "properties": ["command", "timeout", "workdir"],
+                    "required": ["command"]
+                },
+                "edit": {
+                    "properties": ["filePath", "newString", "oldString", "replaceAll"],
+                    "required": ["filePath", "oldString", "newString"]
+                },
+                "glob": {
+                    "properties": ["path", "pattern"],
+                    "required": ["pattern"]
+                },
+                "grep": {
+                    "properties": ["include", "path", "pattern"],
+                    "required": ["pattern"]
+                },
+                "read": {
+                    "properties": ["filePath", "limit", "offset"],
+                    "required": ["filePath"]
+                },
+                "skill": {
+                    "properties": ["name"],
+                    "required": ["name"]
+                },
+                "task": {
+                    "properties": ["command", "description", "prompt", "subagent_type", "task_id"],
+                    "required": ["description", "prompt", "subagent_type"]
+                },
+                "todowrite": {
+                    "properties": ["todos"],
+                    "required": ["todos"]
+                },
+                "webfetch": {
+                    "properties": ["format", "timeout", "url"],
+                    "required": ["url"]
+                },
+                "write": {
+                    "properties": ["content", "filePath"],
+                    "required": ["content", "filePath"]
+                }
+            }
+        }
+    },
+    "sessionHome": [
+        {
+            "id": "O-built",
+            "source": "OpenCode 1.19.4 (opencode-ai, бинарь opencode-linux-x64), изолированный стенд живых проб (provision/stand/stand.mts exec --cli opencode), 28.10.2026, карточка #197; случай O-built",
+            "cliVersion": "1.19.4",
+            "isolationProblems": [],
+            "pluginsLoaded": ["barrier-plugin"],
+            "spawnPwd": "/path/to/stand/work/loop",
+            "sessionDirectory": "/path/to/stand/work/loop",
+            "toolStatus": "error",
+            "toolError": "blocked by stand barrier",
+            "forbiddenWritten": false,
+            "rulesInPrompt": true,
+            "providerRequests": 3,
+            "exit": "exit=0",
+            "stderrTail": []
+        },
+        {
+            "id": "O-pure",
+            "source": "OpenCode 1.19.4 (opencode-ai, бинарь opencode-linux-x64), изолированный стенд живых проб (provision/stand/stand.mts exec --cli opencode), 28.10.2026, карточка #197; случай O-pure",
+            "cliVersion": "1.19.4",
+            "isolationProblems": ["OPENCODE_PURE в окружении сессии снимает барьер"],
+            "pluginsLoaded": [],
+            "spawnPwd": "/path/to/stand/work/loop",
+            "sessionDirectory": "/path/to/stand/work/loop",
+            "toolStatus": "completed",
+            "toolError": null,
+            "forbiddenWritten": true,
+            "rulesInPrompt": true,
+            "providerRequests": 3,
+            "exit": "exit=0",
+            "stderrTail": []
+        },
+        {
+            "id": "O-project",
+            "source": "OpenCode 1.19.4 (opencode-ai, бинарь opencode-linux-x64), изолированный стенд живых проб (provision/stand/stand.mts exec --cli opencode), 28.10.2026, карточка #197; случай O-project",
+            "cliVersion": "1.19.4",
+            "isolationProblems": [
+                "XDG_CONFIG_HOME сессии — не каталог раннера: глобальный конфиг человека слился бы с настройками сессии",
+                "OPENCODE_DISABLE_PROJECT_CONFIG не «1»: opencode.json и .opencode/ дерева исполнились бы"
+            ],
+            "pluginsLoaded": [
+                "barrier-plugin",
+                "human-plugin",
+                "tree-dir-plugin",
+                "tree-json-plugin"
+            ],
+            "spawnPwd": "/path/to/stand/work/loop",
+            "sessionDirectory": "/path/to/stand/work/loop",
+            "toolStatus": "error",
+            "toolError": "blocked by stand barrier",
+            "forbiddenWritten": false,
+            "rulesInPrompt": true,
+            "providerRequests": 3,
+            "exit": "exit=0",
+            "stderrTail": []
+        },
+        {
+            "id": "O-pwd-stale",
+            "source": "OpenCode 1.19.4 (opencode-ai, бинарь opencode-linux-x64), изолированный стенд живых проб (provision/stand/stand.mts exec --cli opencode), 28.10.2026, карточка #197; случай O-pwd-stale",
+            "cliVersion": "1.19.4",
+            "isolationProblems": [
+                "PWD сессии (/path/to/stand) — не дерево сессии (/path/to/stand/work/loop): каталог сессии CLI берёт из него"
+            ],
+            "pluginsLoaded": ["barrier-plugin"],
+            "spawnPwd": "/path/to/stand",
+            "sessionDirectory": "/path/to/stand",
+            "toolStatus": "error",
+            "toolError": "blocked by stand barrier",
+            "forbiddenWritten": false,
+            "rulesInPrompt": true,
+            "providerRequests": 3,
+            "exit": "exit=0",
+            "stderrTail": []
+        }
+    ],
+    "sessionHomeKit": {
+        "conditions": "Воспроизведение: kit stand.sh <канон> <каталог скриптов> <случай> на хосте поднимает новый стенд и исполняет drive.mts в изоляции ОС. drive.mts создаёт репозиторий work/loop со слоями-маркерами — .opencode/plugin/tree.js и opencode.json с плагином file:// (npm-плагин дерева), AGENTS.md с маркером правил, — плагин в глобальном каталоге человека (XDG_CONFIG_HOME стенда) и каталог сессии как prepareOpencodeSession: плагин барьера (маркер загрузки, отмена вызова с ralph-stand-forbidden) и opencodeSessionConfig с правилами абсолютным путём. Окружение раннера несёт OPENCODE_PURE=1 и OPENCODE_CONFIG_CONTENT с плагином; сессия идёт окружением opencodeSessionEnv канона с деревом. Провайдер — фиктивный Chat Completions (mock.mjs из kit карточки #192) в настройках сессии: ключа у стенда нет. Добавлено стендом после сверки: OPENCODE_DISABLE_MODELS_FETCH=1 — сети нет, у сессии петли она есть. Модель отдаёт вызов bash, пишущий forbidden.txt с маркером запрета. Контроли: O-pure — OPENCODE_PURE после сборщика; O-project — выключатель проекта снят и XDG_CONFIG_HOME человека; O-pwd-stale — PWD каталога запуска. Без сети CLI ~70 с пытается поставить @opencode-ai/plugin в каталоги конфига и продолжает.",
+        "stand.sh": "#!/usr/bin/env bash\n# Стенд #197: один случай (O-built | O-pure | O-project | O-pwd-stale) на новом стенде.\n# stand.sh <канон> <каталог скриптов> <случай>; бинарь — OpenCode 1.19.4.\nset -euo pipefail\ncanon=$1 kit=$2 case=$3\nstand=$(mktemp -d)/stand\nnode \"$canon/provision/stand/stand.mts\" exec --stand \"$stand\" --cli opencode \\\n    --cli-bin \"$(command -v opencode)\" --ro \"$kit\" --ro \"$canon\" \\\n    -- node \"$kit/drive.mts\" \"$canon\" \"$case\" | grep '^STAND-RESULT '\n",
+        "drive.mts": "// Стенд #197: сессия OpenCode с окружением и настройками от сборщика канона (`opencode-home.ts`).\n// Исполняется ВНУТРИ стенда (`stand.mts exec`): node drive.mts <канон> <случай>.\n// Слои-маркеры: плагин `.opencode/plugin` дерева, npm-плагин `opencode.json` дерева (file://),\n// плагин глобального каталога человека, плагин из `OPENCODE_CONFIG_CONTENT` раннера. Барьер —\n// плагин стенда в каталоге сессии: отмечает загрузку и отменяет вызов с маркером запрета.\nimport { spawn, spawnSync } from 'node:child_process';\nimport fs from 'node:fs';\nimport path from 'node:path';\n\nconst [canon, caseId] = process.argv.slice(2);\nconst oh = await import(path.join(canon, 'adapters', 'opencode-home.ts'));\nconst root = path.dirname(process.env.HOME as string);\nconst markers = path.join(root, 'markers');\nconst tree = path.join(root, 'work', 'loop');\nconst configDir = path.join(root, 'ralph', 'opencode', 'config');\nconst humanXdg = process.env.XDG_CONFIG_HOME as string;\nconst journal = path.join(root, 'journal', 'provider.jsonl');\nconst port = 18500 + (process.pid % 400);\nfs.mkdirSync(markers, { recursive: true });\nfs.mkdirSync(path.dirname(journal), { recursive: true });\n\nconst markerPlugin = (name: string, barrier = false) =>\n    `import fs from 'node:fs';\\n` +\n    `export const P_${name.replace(/\\W/g, '_')} = async () => {\\n` +\n    `    fs.writeFileSync(${JSON.stringify(path.join(markers, name))}, 'loaded');\\n` +\n    `    return {\\n` +\n    `        'tool.execute.before': async (input, output) => {\\n` +\n    `            fs.appendFileSync(${JSON.stringify(path.join(markers, `${name}.calls`))}, input.tool + '\\\\n');\\n` +\n    (barrier\n        ? `            if (JSON.stringify(output).includes('ralph-stand-forbidden')) throw new Error('blocked by stand barrier');\\n`\n        : '') +\n    `        },\\n` +\n    `    };\\n` +\n    `};\\n`;\nconst put = (p: string, text: string) => {\n    fs.mkdirSync(path.dirname(p), { recursive: true });\n    fs.writeFileSync(p, text);\n};\n\n// Дерево: репозиторий, правила, слои проекта.\nfs.mkdirSync(tree, { recursive: true });\nspawnSync('git', ['init', '-q'], { cwd: tree });\nput(path.join(tree, 'AGENTS.md'), '# Правила дерева\\n\\nRALPH-STAND-RULES-MARKER\\n');\nput(path.join(tree, '.opencode', 'plugin', 'tree.js'), markerPlugin('tree-dir-plugin'));\nconst npmLike = path.join(root, 'pkgs', 'tree-json-plugin.js');\nput(npmLike, markerPlugin('tree-json-plugin'));\nput(path.join(tree, 'opencode.json'), JSON.stringify({ plugin: [`file://${npmLike}`] }));\n// Глобальный каталог конфига человека.\nput(path.join(humanXdg, 'opencode', 'plugin', 'human.js'), markerPlugin('human-plugin'));\nconst contentPlugin = path.join(root, 'pkgs', 'content-plugin.js');\nput(contentPlugin, markerPlugin('content-plugin'));\n\n// Каталог сессии — как `prepareOpencodeSession`: плагин (здесь — барьер стенда), настройки\n// `opencodeSessionConfig` с правилами абсолютным путём. Провайдер — фиктивный, добавлен стендом:\n// ключа у стенда нет, и вход CLI здесь заменяет провайдер в настройках сессии.\nput(path.join(configDir, 'plugin', 'ralph-guard.js'), markerPlugin('barrier-plugin', true));\nfs.mkdirSync(oh.opencodeSessionXdg(configDir), { recursive: true });\nconst sessionCfg = JSON.parse(\n    oh.opencodeSessionConfig({ instructions: [path.join(tree, 'AGENTS.md')] }),\n);\nsessionCfg.provider = {\n    mock: {\n        npm: '@ai-sdk/openai-compatible',\n        options: { baseURL: `http://127.0.0.1:${port}/v1`, apiKey: 'stand' },\n        models: { mock: { name: 'mock', tool_call: true } },\n    },\n};\nput(path.join(configDir, 'opencode.json'), JSON.stringify(sessionCfg, null, 4));\n\n// Окружение раннера: OPENCODE_PURE и вливание конфига с плагином — то, что сборщик обязан снять.\nconst runnerEnv: NodeJS.ProcessEnv = {\n    ...process.env,\n    OPENCODE_PURE: '1',\n    OPENCODE_CONFIG_CONTENT: JSON.stringify({ plugin: [`file://${contentPlugin}`] }),\n};\nconst env = oh.opencodeSessionEnv(runnerEnv, { configDir, cwd: tree });\nif (caseId === 'O-pure') env.OPENCODE_PURE = '1';\n// Контроль: `PWD` каталога запуска, как до сборщика с деревом, — каталог сессии CLI берёт из него.\nif (caseId === 'O-pwd-stale') env.PWD = root;\nif (caseId === 'O-project') {\n    delete env[oh.OPENCODE_DISABLE_PROJECT_CONFIG_ENV];\n    env[oh.XDG_CONFIG_HOME_ENV] = humanXdg;\n}\nconst isolationProblems = oh.opencodeIsolationProblems({\n    env,\n    configDir,\n    cwd: tree,\n    humanXdg,\n    forbiddenEnv: ['OPENCODE_PURE', 'OPENCODE_CONFIG_CONTENT', 'OPENCODE_PERMISSION'],\n    existsFn: (p: string) => fs.existsSync(p),\n});\n\n// Сети у стенда нет: загрузку списка моделей выключает стенд ПОСЛЕ сверки — у сессии петли сеть\n// есть, и сборщик эту переменную раннера снимает вместе с прочими `OPENCODE_*`.\nenv.OPENCODE_DISABLE_MODELS_FETCH = '1';\n\n// Провайдер и вызов: оболочка пишет файл с маркером запрета — барьер обязан отменить её.\nconst callFile = path.join(root, 'call.json');\nput(\n    callFile,\n    JSON.stringify({\n        name: 'bash',\n        arguments: {\n            command: 'echo ralph-stand-forbidden > forbidden.txt',\n            description: 'stand',\n        },\n    }),\n);\nconst mock = spawn(process.execPath, [path.join(import.meta.dirname, 'mock.mjs'), String(port), callFile, journal], {\n    stdio: 'ignore',\n});\nfor (let i = 0; i < 100 && !(fs.existsSync(journal) && fs.readFileSync(journal, 'utf8').includes('ready')); i++)\n    await new Promise((r) => setTimeout(r, 50));\nconst versionBefore = spawnSync('opencode', ['--version'], { env, encoding: 'utf8' }).stdout.trim();\nconst r = spawnSync('opencode', ['run', '--format', 'json', '-m', 'mock/mock', 'go'], {\n    cwd: tree,\n    env,\n    encoding: 'utf8',\n    timeout: 420_000,\n});\nmock.kill();\nconst events = r.stdout\n    .split('\\n')\n    .filter(Boolean)\n    .map((l) => {\n        try {\n            return JSON.parse(l);\n        } catch {\n            return { raw: l };\n        }\n    });\nconst tool = events.find((e) => e.type === 'tool_use')?.part?.state;\nconst requests = fs\n    .readFileSync(journal, 'utf8')\n    .split('\\n')\n    .filter((l) => l.startsWith('{\"method\":\"POST\"'));\nconst loaded = fs\n    .readdirSync(markers)\n    .filter((n) => !n.endsWith('.calls'))\n    .sort();\nconst logDir = path.join(process.env.XDG_DATA_HOME as string, 'opencode', 'log');\nconst created = fs\n    .readdirSync(logDir)\n    .flatMap((f) => fs.readFileSync(path.join(logDir, f), 'utf8').split('\\n'))\n    .find((l) => l.includes('message=created '));\nconst sessionDirectory = / directory=(\\S+)/.exec(created ?? '')?.[1] ?? null;\nconst strip = (s: string) => s.split(root).join('/path/to/stand');\nconsole.log(\n    'STAND-RESULT ' +\n        strip(\n            JSON.stringify({\n                id: caseId,\n                cliVersion: versionBefore,\n                isolationProblems,\n                pluginsLoaded: loaded,\n                spawnPwd: env.PWD ?? null,\n                sessionDirectory,\n                toolStatus: tool?.status ?? null,\n                toolError: tool?.error ?? null,\n                forbiddenWritten: fs.existsSync(path.join(sessionDirectory ?? tree, 'forbidden.txt')),\n                rulesInPrompt: requests.some((l) => l.includes('RALPH-STAND-RULES-MARKER')),\n                providerRequests: requests.length,\n                exit: r.status === null ? `signal=${r.signal}` : `exit=${r.status}`,\n                stderrTail: r.stderr.split('\\n').filter(Boolean).slice(-3),\n            }),\n        ),\n);\n"
+    }
+}

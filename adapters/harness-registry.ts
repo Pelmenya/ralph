@@ -145,6 +145,14 @@ export function harnessPackageProblems(raw: unknown, name: string): string[] {
     const layers = raw.projectLayers;
     if (layers !== null && (!isRecord(layers) || typeof layers.homes !== 'function')) {
         problems.push(`${PACKAGE_MODULE}: projectLayers не null и не объект с функцией homes`);
+    } else if (
+        layers !== null &&
+        layers.jsonKeys !== undefined &&
+        (!Array.isArray(layers.jsonKeys) ||
+            layers.jsonKeys.length === 0 ||
+            layers.jsonKeys.some((k) => typeof k !== 'string' || k.trim() === ''))
+    ) {
+        problems.push(`${PACKAGE_MODULE}: projectLayers.jsonKeys не непустой список строк`);
     }
     const plugin = raw.plugin;
     if (plugin !== null) {

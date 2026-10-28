@@ -38,7 +38,7 @@
 // TS-модуль без билд-шага (erasable-only), без побочек: строит тексты регистраций и читает
 // их обратно. Исполняет хуки и плагин проба ядра.
 
-import type { BarrierReasonCode } from './barrier-reason.ts';
+import { REASON_LINE_PREFIX, type BarrierReasonCode } from './barrier-reason.ts';
 
 /** Харнесс — CLI, который ведёт сессию. Ключи — те же, что `harness` у `RUNTIME_IDENTITIES`. */
 export type Harness = 'claude-code' | 'codex' | 'kimi-code' | 'opencode';
@@ -122,6 +122,110 @@ const CODEX_SAFE_PATCH: HarnessProbe = {
     expect: 'allowed',
 };
 
+/**
+ * Пробы Kimi Code в сессии петли (#191): guard судит событие нормализатора пакета, и проба
+ * держит то, что нормализатор обязан разобрать. `Write` несёт путь полем `path`, а не
+ * `file_path`. `Bash` исполняется в своём `cwd`, и перенос `ralph` из `.claude` — перенос каталога
+ * данных, хотя от корня дерева `ralph` ничем не защищён: совместимый вход 16b `cwd` не видел.
+ * Разрешённая запись — пара: нормализатор, блокирующий любой `Write`, прошёл бы пробу без неё.
+ */
+const KIMI_CONTOUR_WRITE: HarnessProbe = {
+    what: 'запись данных контура инструментом Write в сессии петли',
+    toolName: 'Write',
+    toolInput: { path: '.claude/ralph/hooks.json', content: '{}' },
+    loop: true,
+    expect: 'blocked',
+    reasonCode: 'contour-data',
+};
+const KIMI_CONTOUR_BASH_CWD: HarnessProbe = {
+    what: 'перенос каталога данных контура оболочкой из её cwd в сессии петли',
+    toolName: 'Bash',
+    toolInput: { command: 'mv ralph ralph.bak', cwd: '.claude' },
+    loop: true,
+    expect: 'blocked',
+    reasonCode: 'contour-data',
+};
+const KIMI_SAFE_WRITE: HarnessProbe = {
+    what: 'безобидная запись инструментом Write в сессии петли',
+    toolName: 'Write',
+    toolInput: { path: '.ralph-guard-probe/allowed.txt', content: 'x' },
+    loop: true,
+    expect: 'allowed',
+};
+
+/**
+ * Пробы OpenCode на событии нормализатора пакета (#192). GPT-модели правят файлы только
+ * `apply_patch{patchText}`, остальные — `write`/`edit` с `filePath`; оболочка исполняется в своём
+ * `workdir`, и перенос `ralph` из `.claude` — перенос каталога данных, хотя от корня дерева `ralph`
+ * ничем не защищён. Шаблон `include` поиска выбирает env-файлы корня. Субагент `task` в сессии
+ * петли — `loop-delegation`. У каждой файловой отрицательной — разрешённая пара той же формы:
+ * нормализатор, блокирующий любой патч или запись, прошёл бы пробу без неё.
+ */
+const OPENCODE_LOOP_PROBES: readonly HarnessProbe[] = [
+    {
+        what: 'патч данных контура в сессии петли',
+        toolName: 'apply_patch',
+        toolInput: { patchText: patchText('.claude/ralph/hooks.json', '+{}') },
+        loop: true,
+        expect: 'blocked',
+        reasonCode: 'contour-data',
+    },
+    {
+        what: 'запись данных контура инструментом write в сессии петли',
+        toolName: 'write',
+        toolInput: { filePath: '.claude/ralph/hooks.json', content: '{}' },
+        loop: true,
+        expect: 'blocked',
+        reasonCode: 'contour-data',
+    },
+    {
+        what: 'перенос каталога данных контура оболочкой из её workdir в сессии петли',
+        toolName: 'bash',
+        toolInput: { command: 'mv ralph ralph.bak', workdir: '.claude' },
+        loop: true,
+        expect: 'blocked',
+        reasonCode: 'contour-data',
+    },
+    {
+        what: 'поиск по env-файлам шаблоном include',
+        toolName: 'grep',
+        toolInput: { pattern: '.', include: '.env*' },
+        expect: 'blocked',
+        reasonCode: 'secret-env',
+    },
+    {
+        what: 'субагент task в сессии петли',
+        toolName: 'task',
+        toolInput: { description: 'ralph-probe', prompt: 'ralph-probe', subagent_type: 'general' },
+        loop: true,
+        expect: 'blocked',
+        reasonCode: 'loop-delegation',
+    },
+];
+const OPENCODE_SAFE_PROBES: readonly HarnessProbe[] = [
+    {
+        what: 'безобидный патч в сессии петли',
+        toolName: 'apply_patch',
+        toolInput: { patchText: patchText('.ralph-guard-probe/allowed.txt', '+x') },
+        loop: true,
+        expect: 'allowed',
+    },
+    {
+        what: 'безобидная запись инструментом write в сессии петли',
+        toolName: 'write',
+        toolInput: { filePath: '.ralph-guard-probe/allowed.txt', content: 'x' },
+        loop: true,
+        expect: 'allowed',
+    },
+    {
+        what: 'безобидная команда оболочки из её workdir в сессии петли',
+        toolName: 'bash',
+        toolInput: { command: 'git status', workdir: '.claude' },
+        loop: true,
+        expect: 'allowed',
+    },
+];
+
 /** Проба оболочки: с кодом причины — запрещённая, без него — безобидная. */
 const shell = (toolName: string, p: ShellProbe): HarnessProbe => {
     const base = { what: p.what, toolName, toolInput: { command: p.command } };
@@ -196,7 +300,10 @@ export const HARNESS_PROBES: Record<Harness, readonly HarnessProbe[]> = {
         // Kimi Code 2.3 называет MCP-инструмент так же, `mcp__<сервер>__<инструмент>`
         // (`MCP_NAME_PREFIX` в исходнике CLI); matcher у него без якорей.
         MCP_DELETE,
+        KIMI_CONTOUR_WRITE,
+        KIMI_CONTOUR_BASH_CWD,
         shell('Bash', SAFE),
+        KIMI_SAFE_WRITE,
     ],
     opencode: [
         shell('bash', RM),
@@ -217,8 +324,8 @@ export const HARNESS_PROBES: Record<Harness, readonly HarnessProbe[]> = {
         },
         shell('bash', SED),
         {
-            // Патч несёт пути в тексте (`patchText`), а не полем: без разбора Edit ушёл бы
-            // барьеру без пути, и защищённые пути проверялись бы вхолостую (ревью Фазы 16b).
+            // Патч несёт пути в тексте (`patchText`), а не полем: без разбора барьер судил бы
+            // вызов без пути, и защищённые пути проверялись бы вхолостую (ревью Фазы 16b).
             what: 'правка env-файла патчем',
             toolName: 'apply_patch',
             toolInput: {
@@ -228,7 +335,9 @@ export const HARNESS_PROBES: Record<Harness, readonly HarnessProbe[]> = {
             reasonCode: 'secret-env',
         },
         {
-            // CLI режет путь патча `.trim()`; табуляция вокруг пути не уводит его мимо барьера.
+            // OpenCode режет путь патча `.trim()`, Codex заголовок без пробела не примет: путь,
+            // который CLI читают по-разному, общий разбор отвергает (`patch.ts`) — блок
+            // неразобранным полем, а не путь мимо барьера.
             what: 'правка env-файла патчем с табуляцией вокруг пути',
             toolName: 'apply_patch',
             toolInput: {
@@ -236,11 +345,11 @@ export const HARNESS_PROBES: Record<Harness, readonly HarnessProbe[]> = {
                     '*** Begin Patch\n*** Update File:\t.env\t\n@@\n-A=1\n+A=2\n*** End Patch',
             },
             expect: 'blocked',
-            reasonCode: 'secret-env',
+            reasonCode: 'unknown-field',
         },
         {
-            // CLI делит патч на строки только по `\n`: `\r` после двоеточия остаётся в
-            // заголовке и срезается `.trim()`, а не уводит строку из разбора барьера.
+            // CLI делит патч на строки только по `\n`: `\r` после двоеточия — та же развилка
+            // разборов, что и табуляция выше.
             what: 'правка env-файла патчем с возвратом каретки после двоеточия',
             toolName: 'apply_patch',
             toolInput: {
@@ -248,10 +357,11 @@ export const HARNESS_PROBES: Record<Harness, readonly HarnessProbe[]> = {
                     '*** Begin Patch\n*** Update File: a.ts\n@@\n-x\n+y\n*** Update File:\r.env\n@@\n-A=1\n+A=2\n*** End Patch',
             },
             expect: 'blocked',
-            reasonCode: 'secret-env',
+            reasonCode: 'unknown-field',
         },
         {
-            // Путь элемента `edits[]` переводится как и путь верхнего уровня (ревью Фазы 16b).
+            // `multiedit` CLI 1.19.4 в режиме run модели не отдаёт (стенд, `inventory`): вне
+            // описания он — незнакомый инструмент, а не правка по путям элементов.
             what: 'правка env-файла элементом multiedit',
             toolName: 'multiedit',
             toolInput: {
@@ -259,7 +369,7 @@ export const HARNESS_PROBES: Record<Harness, readonly HarnessProbe[]> = {
                 edits: [{ filePath: '.env', oldString: 'A=1', newString: 'A=2' }],
             },
             expect: 'blocked',
-            reasonCode: 'secret-env',
+            reasonCode: 'unknown-tool',
         },
         {
             // Вложенные вызовы `batch` стендом не сверены — инструмент блокируется целиком.
@@ -267,17 +377,20 @@ export const HARNESS_PROBES: Record<Harness, readonly HarnessProbe[]> = {
             toolName: 'batch',
             toolInput: { tool_calls: [{ tool: 'bash', parameters: { command: RM.command } }] },
             expect: 'blocked',
-            reasonCode: 'mcp-not-allowed',
+            reasonCode: 'unknown-tool',
         },
         {
-            // Имя MCP у OpenCode — `<сервер>_<инструмент>`; форма чтения не даёт пропуска.
+            // Имя MCP у OpenCode — `<сервер>_<инструмент>`, граница сервера по нему не
+            // восстанавливается: без перевода в `mcpNames` описания — незнакомый инструмент.
             what: 'MCP-вызов OpenCode',
             toolName: 'ralph-guard-probe_ListIssues',
             toolInput: {},
             expect: 'blocked',
-            reasonCode: 'mcp-not-allowed',
+            reasonCode: 'unknown-tool',
         },
+        ...OPENCODE_LOOP_PROBES,
         shell('bash', SAFE),
+        ...OPENCODE_SAFE_PROBES,
     ],
 };
 
@@ -733,7 +846,9 @@ export const OPENCODE_TOOL_NAMES: Readonly<Record<string, string>> = {
  * (`multiedit`): `guard-rules` и барьер скиллов читают `edits[].file_path`, и путь элемента,
  * оставшийся `filePath`, уводил бы правку мимо забора контура. Правило env-файлов у guard
  * смотрит только путь верхнего уровня, поэтому плагин судит путь каждого элемента ещё и
- * отдельным вызовом с `file_path` — как пути патча.
+ * отдельным вызовом с `file_path` — как пути патча. Перевод — для хуков потребителя в форме
+ * Claude Code: guard регистрации раннера с #192 судит сырое событие, и `multiedit` для него —
+ * `unknown-tool`.
  */
 export const OPENCODE_ARG_KEYS: Readonly<Record<string, string>> = {
     filePath: 'file_path',
@@ -770,7 +885,15 @@ const PLUGIN_HOOKS_PREFIX = 'const HOOKS = ';
  * брошенное исключение, то есть отменённый вызов. Хук пропускает вызов только кодом 0:
  * код 2 — блок с его причиной, а любой другой код, сигнал, срок и отказ запуска — тоже блок.
  * У Kimi и Codex упавший хук вызов пропускает (#120), но плагин — наш код, и держать в нём
- * «упал → пропустить» незачем.
+ * «упал → пропустить» незачем. Неисправность плагин называет своим кодом причины последней
+ * строкой (#192): хук упал, завис или не запустился — `hook-failed`, сам плагин не смог судить —
+ * `plugin-fault`. Двойка хука несёт причину правила, и проба отличает одно от другого: блок
+ * неисправностью правило не доказывает.
+ *
+ * Вход хука — форма Claude Code (её читают хуки потребителя) и рядом сырое событие CLI полем
+ * `opencode`: `input` целиком и `output.args` (#192). Guard регистрации раннера судит сырое
+ * событием нормализатора пакета: перевод ниже терял `workdir` оболочки и `include` поиска, а у
+ * GPT-моделей `apply_patch` — единственная правка файла.
  *
  * Хук идёт асинхронным `spawn`: `spawnSync` в обработчике стоял бы на event loop всего
  * процесса OpenCode — стрим ответа и соседние вызовы — до срока каждого хука.
@@ -880,12 +1003,16 @@ const jsonDenial = (stdout) => {
     if (o.continue === false) return String(o.stopReason || 'хук остановил сессию (continue: false)');
     return undefined;
 };
+// Код 2 — причина правила (строку кода хук пишет сам); любой другой исход — неисправность хука
+// со своим кодом причины: блок ею проба правила не засчитывает.
+const HOOK_FAILED = '\\n${REASON_LINE_PREFIX}hook-failed';
 const verdict = (h, r) => {
-    if (r.error) return 'хук «' + h.command + '» не исполнился (' + (r.error.message || r.error) + ')';
+    if (r.error)
+        return 'хук «' + h.command + '» не исполнился (' + (r.error.message || r.error) + ')' + HOOK_FAILED;
     if (r.status === 0) return jsonDenial((r.stdout || '').trim());
     if (r.status === 2) return (r.stderr || '').trim() || 'вызов заблокирован барьером';
     return 'хук «' + h.command + '» упал (' + (r.status === null ? 'сигнал ' + r.signal : 'код ' + r.status) +
-        ((r.stderr || '').trim() ? ': ' + r.stderr.trim().slice(0, 300) : '') + ')';
+        ((r.stderr || '').trim() ? ': ' + r.stderr.trim().slice(0, 300) : '') + ')' + HOOK_FAILED;
 };
 export const RalphGuard = async (ctx) => ({
     'tool.execute.before': async (input, output) => {
@@ -895,6 +1022,9 @@ export const RalphGuard = async (ctx) => ({
             const dir = ctx && (ctx.directory || ctx.worktree);
             if (!dir) throw new Error('OpenCode не назвал каталог сессии');
             const name = toolName(input.tool);
+            // Сырое событие CLI — для нормализатора пакета: перевод ниже теряет \`workdir\`,
+            // \`include\` и разбор патча самим CLI. Поля \`input\` — все, какие дал CLI.
+            const opencode = { ...input, args: output ? output.args : undefined };
             const args = renameKeys(output && output.args);
             if (Array.isArray(args.edits))
                 args.edits = args.edits.map((e) => (e && typeof e === 'object' ? renameKeys(e) : e));
@@ -924,6 +1054,7 @@ export const RalphGuard = async (ctx) => ({
                     cwd: dir,
                     tool_name: name,
                     tool_input,
+                    opencode,
                 });
                 for (const h of HOOKS) {
                     if (!covers(h.matcher, name)) continue;
@@ -934,7 +1065,7 @@ export const RalphGuard = async (ctx) => ({
             }
         } catch (error) {
             reason = 'ralph-guard: плагин барьера неисправен (' + ((error && error.message) || error) +
-                ') — вызов заблокирован fail-closed';
+                ') — вызов заблокирован fail-closed\\n${REASON_LINE_PREFIX}plugin-fault';
         }
         if (reason !== undefined) throw new Error(reason);
     },

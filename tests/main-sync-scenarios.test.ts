@@ -9,7 +9,7 @@
 // git НАСТОЯЩИЙ, как у соседних сценариев ветки фазы: `runArgvFn` инжектируется тестом и
 // исполняет команды сам, боевой `shArgv` не зовётся. Окружение git — своё, по той же
 // причине: `GIT_DIR` вызывающего увёл бы коммиты в его репозиторий.
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -17,6 +17,12 @@ import { execFileSync, execSync } from 'node:child_process';
 import { syncPhaseBranchWithMain } from '../core/main-sync.ts';
 import { createGateRunner } from '../core/gate.ts';
 import type { GateEnv } from '../core/gate.ts';
+
+// Срок — как у соседних живых наборов: каждый кейс порождает десятки процессов git (голый
+// origin, клоны, коммиты, пуши). На хосте это доли секунды, а облачный раннер CI под
+// параллельной нагрузкой сьюта порождает их в разы медленнее, и дефолтные 5 с там рвали
+// исправный кейс тайм-аутом.
+vi.setConfig({ testTimeout: 30_000 });
 
 const BRANCH = 'feature/faza-1';
 const JOURNAL = 'docs/core-journal.md';

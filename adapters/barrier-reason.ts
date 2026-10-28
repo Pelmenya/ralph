@@ -25,8 +25,10 @@ export const REASON_LINE_PREFIX = 'ralph-reason-code: ';
 /**
  * Кто код выпускает. `reserved` — код контракта, который судья матрицы уже ждёт, а хук
  * начнёт выпускать в карточке, названной в `meaning` (барьер на нормализованном событии).
+ * `opencode-plugin` — плагин барьера OpenCode (`opencodeGuardPlugin`, #192): хук он зовёт сам и
+ * исход, кроме 0 и 2, называет своей неисправностью.
  */
-export type ReasonEmitter = 'guard' | 'skill-barrier' | 'reserved';
+export type ReasonEmitter = 'guard' | 'skill-barrier' | 'opencode-plugin' | 'reserved';
 
 /** Отказ по существу правила или неисправность самого барьера. */
 export type ReasonClass = 'rule' | 'fault';
@@ -133,6 +135,17 @@ export const BARRIER_REASON_CODES = {
         class: 'fault',
         emitter: 'guard',
         meaning: 'нормализатор пакета не дал событие по протоколу (#186)',
+    },
+    'hook-failed': {
+        class: 'fault',
+        emitter: 'opencode-plugin',
+        meaning:
+            'хук упал, не ответил в срок или не запустился — плагин OpenCode отменил вызов (#192)',
+    },
+    'plugin-fault': {
+        class: 'fault',
+        emitter: 'opencode-plugin',
+        meaning: 'плагин барьера OpenCode не смог судить событие — вызов отменён (#192)',
     },
 } as const satisfies Record<
     string,

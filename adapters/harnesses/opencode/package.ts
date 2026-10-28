@@ -15,11 +15,14 @@
  * Claude Code, и накрытие считается по переводу (`opencodeClaudeToolName`) — тем же, что
  * делает плагин в сессии.
  *
- * Поля, которых у OpenCode ещё нет, — объявленные заглушки: нормализатор (`normalize.ts`) и
- * доказательство скилла в описании ждут Фаз 16d и 16e.
+ * Регистрацию guard судит событием нормализатора пакета (#192, `normalize.ts`): плагин кладёт
+ * хуку рядом с формой Claude Code сырое событие CLI, а перевод в форму Claude Code терял
+ * `workdir` оболочки и `include` поиска. Объявленная заглушка одна — доказательство скилла в
+ * описании ждёт Фазы 16e.
  *
  * Версия интерфейса — литерал: под неё пакет написан (`harness-package.ts`).
  */
+import path from 'node:path';
 import {
     HARNESS_PROBES,
     harnessMatcherCovers,
@@ -31,6 +34,7 @@ import {
     type HarnessProbe,
 } from '../../harness-guard.ts';
 import type { GuardPlugin, GuardRegistration, HarnessPackage } from '../../harness-package.ts';
+import { OPENCODE_HOME_DIR } from '../../opencode-home.ts';
 
 const HARNESS = 'opencode';
 
@@ -52,8 +56,8 @@ export const harnessPackage: HarnessPackage = {
     harness: HARNESS,
     guardRegistration: (_settings: unknown, guardHooks: readonly GuardHook[] = []) =>
         opencodeRegistrationFromPlugin(opencodeGuardPlugin(guardHooks)),
-    // Нормализатор пакета — заглушка до 16d: событием guard блокировал бы любой вызов.
-    guardInput: 'compat-16b',
+    // Нормализатор знает `apply_patch`, `workdir` оболочки и `include` поиска (#192).
+    guardInput: 'event',
     probes: HARNESS_PROBES[HARNESS],
     matcherCovers: (matcher, toolName) =>
         harnessMatcherCovers(HARNESS, matcher, opencodeClaudeToolName(toolName)),
@@ -68,6 +72,30 @@ export const harnessPackage: HarnessPackage = {
     // исполненным позже, — предел из докблока `opencodeGuardPlugin`, стендом не сверен.
     guardLimit: null,
     plugin,
-    // Сборщика конфига у пакета ещё нет (Фазы 16d2, 16d3): слои дерева не отвергаются.
-    projectLayers: null,
+    // Сборщик конфига — каталог сессии со своим глобальным конфигом и выключенным проектным
+    // (#197, `opencode-home.ts`). Слои дерева CLI под `OPENCODE_DISABLE_PROJECT_CONFIG` не
+    // исполняет, и всё же их наличие — отказ: слой в дереве петли кто-то положил. Каталоги
+    // плагинов и инструментов `.opencode/` — слой самим наличием, `opencode.json(c)` — только с
+    // ключами, которые грузят или исполняют код. Перечень снят со схемы `Config` бинаря 1.19.4:
+    // `plugin` (npm-плагины), `mcp` (локальный сервер — команда), `formatter` и `lsp`
+    // (`command`), `shell` (бинарь инструмента bash), `command` (шаблон исполняет `` !`cmd` ``),
+    // `npm` провайдера и модели (пакет провайдера грузится). `experimental` в 1.19.4 исполняемого
+    // не несёт: подключа `hook` у него нет. Без этих ключей файл — законная настройка CLI
+    // человека в дереве потребителя. `~/.opencode` из скана исключён: его CLI читает и без
+    // проекта, и сверяет его перед спавном `opencodeIsolationProblems` с адресом дома, а не
+    // «слоем в предке».
+    projectLayers: {
+        homes: (env: NodeJS.ProcessEnv) =>
+            env.HOME ? [path.join(env.HOME, OPENCODE_HOME_DIR)] : [],
+        jsonKeys: [
+            'plugin',
+            'mcp',
+            'formatter',
+            'lsp',
+            'shell',
+            'command',
+            'provider.*.npm',
+            'provider.*.models.*.provider.npm',
+        ],
+    },
 };

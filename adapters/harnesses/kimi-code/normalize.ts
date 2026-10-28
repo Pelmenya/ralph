@@ -1,17 +1,21 @@
-// Команда нормализатора пакета Kimi Code — объявленная заглушка (#181). Нормализатор Kimi Code и
-// фикстуры — Фаза 16d; до неё любое событие — отказ команды с причиной (код 1), то есть блок у хука
-// кодом неисправности `adapter-failed`: команда, которой нет, блокировала бы так же, но без
-// объяснения, а «пропустить» здесь значило бы судить по таблицам, которых никто не сверял со
-// стендом. Не `unknown`: его хук читает кодом ПРАВИЛА (`unknown-field`), и заглушка,
-// подключённая без совместимого входа, засчиталась бы пробой как держащий барьер (ревью 16c).
+// Команда нормализатора пакета Kimi Code (#191): её зовёт общий хук процессом
+// (`.claude/hooks/adapter-event.cjs`), отдаёт сырой вход на stdin и ждёт ответ протокола.
+// Описание читается рядом с модулем и проверяется схемой, имя харнесса в нём сверяется при
+// старте общей сверкой (`ownDescriptor`): guard зовёт команду по пути из своей регистрации, мимо
+// реестра, и чужое описание рядом с модулем судило бы события Kimi Code таблицами другого CLI.
+// До #191 здесь стояла объявленная заглушка — отказ на любом событии.
+import fs from 'node:fs';
+import path from 'node:path';
+import { ownDescriptor } from '../descriptor.ts';
 import { runNormalizer, type RunNormalizerDeps } from '../protocol.ts';
+import { normalizeKimiEvent } from './event.ts';
 
-export const STUB_REASON = 'нормализатор Kimi Code — заглушка до Фазы 16d: событие не разобрано';
+const HARNESS = 'kimi-code';
 
 export async function main(deps: RunNormalizerDeps = {}): Promise<void> {
-    await runNormalizer(() => {
-        throw new Error(STUB_REASON);
-    }, deps);
+    const file = path.join(import.meta.dirname, 'descriptor.json');
+    const descriptor = ownDescriptor(JSON.parse(fs.readFileSync(file, 'utf-8')), file, HARNESS);
+    await runNormalizer((raw) => normalizeKimiEvent(descriptor, raw), deps);
 }
 
 if (import.meta.main) await main();

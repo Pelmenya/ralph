@@ -246,6 +246,26 @@ describe('форма кода пакета', () => {
         ]);
     });
 
+    // #197: ключи JSON-поверхности — непустой список непустых строк; пустой список молча
+    // означал бы «ни одна JSON-поверхность не слой».
+    it('projectLayers.jsonKeys — только непустой список строк', () => {
+        const homes = () => [];
+        for (const jsonKeys of [[], [''], [1], 'plugin']) {
+            expect(
+                harnessPackageProblems(
+                    goodPackage('a', { projectLayers: { homes, jsonKeys } }).harnessPackage,
+                    'a',
+                ),
+            ).toEqual(['package.ts: projectLayers.jsonKeys не непустой список строк']);
+        }
+        expect(
+            harnessPackageProblems(
+                goodPackage('a', { projectLayers: { homes, jsonKeys: ['plugin'] } }).harnessPackage,
+                'a',
+            ),
+        ).toEqual([]);
+    });
+
     // Ревью Фазы 16c: у состава пробы проверялась только непустота. Проба с кодом
     // неисправности засчитала бы сломанный барьер, блокирующий всё.
     it('проба пакета: запрещённое ждёт код правила, разрешённое — без кода', () => {

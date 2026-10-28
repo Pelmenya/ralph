@@ -67,6 +67,8 @@ import {
     GUARD_INPUT_ENV,
     HOOK_COMMAND_ONLY_ENV,
     HOOKS_DATA_ENV,
+    KIMI_NATIVE_HARNESS,
+    OPENCODE_HARNESS,
     guardHooksOf,
     guardInputOf,
     harnessLayerProblems,
@@ -91,6 +93,7 @@ import {
     type HarnessRegistry,
 } from '../adapters/harness-registry.ts';
 import { KIMI_HOME_LINKS, kimiSessionConfig } from '../adapters/kimi-native.ts';
+import { KIMI_SESSION_MCP } from '../adapters/kimi-home.ts';
 import {
     CODEX_HOME_LINKS,
     CODEX_SESSION_CONFIG,
@@ -101,10 +104,13 @@ import {
     OPENCODE_BIN,
     OPENCODE_GUARD_PLUGIN_FILE,
     expectedOpencodeSkills,
-    opencodeSessionConfig,
-    opencodeSessionEnv,
     opencodeSkillProblems,
 } from '../adapters/opencode.ts';
+import {
+    opencodeSessionConfig,
+    opencodeSessionEnv,
+    opencodeSessionXdg,
+} from '../adapters/opencode-home.ts';
 import { stripGitContext } from './consumer-tree.ts';
 import { writeFileAtomic } from './roots.ts';
 
@@ -761,6 +767,7 @@ export type TKimiHomeDeps = Pick<
     TSessionSettingsDeps,
     'readFileFn' | 'writeFileFn' | 'runHookFn'
 > & {
+    registry?: HarnessRegistry;
     existsFn?: (p: string) => boolean;
     /** Что лежит на месте ссылки в доме сессии: ничего, ссылка или настоящий файл/каталог. */
     entryKindFn?: (p: string) => 'missing' | 'link' | 'other';
@@ -779,6 +786,10 @@ export type TKimiHomeDeps = Pick<
  * его возьмёт сессия. Конфиг человека без хуков установки сессии не достаётся никогда —
  * профиль «дом человека как есть» стенд не допускает.
  *
+ * `mcp.json` дома — MCP раннера (#196): пустой, перезаписывается перед каждой сессией. Доверие
+ * каталогу, автообновление и окружение CLI сверяет перед спавном `kimiIsolationProblems`
+ * (`adapters/kimi-home.ts`): дом собирает этот сборщик, а окружение — уже спавн.
+ *
  * Ссылка входа снимается ВСЕГДА и ставится заново, только если цель есть: ссылка на
  * пропавший у человека файл иначе висела бы с прошлой сессии. Настоящий файл или каталог на
  * месте ссылки (CLI создал `credentials` сам, пока ссылки не было) раннер не удаляет — там
@@ -796,6 +807,7 @@ export function prepareKimiNativeHome(
         readFileFn = (p) => fs.readFileSync(p, 'utf-8'),
         writeFileFn = (p, text) => writeFileAtomic(p, text),
         runHookFn = runHook,
+        registry = HARNESS_REGISTRY,
         existsFn = (p) => fs.existsSync(p),
         entryKindFn = defaultEntryKind,
         unlinkFn = (p) => {
@@ -835,8 +847,11 @@ export function prepareKimiNativeHome(
                 'сессии не на чем войти — войди `kimi login` или задай kimiNativeRuntime.home.',
         };
     }
-    const toml = kimiSessionConfig(humanToml, guardHooksOf(settings, sessionTree));
-    const problems = kimiTomlProblems(toml, sessionTree, { runHookFn });
+    // Судит регистрацию событие нормализатора Kimi Code (#191): путь — в каталоге исполняемого
+    // ядра, как у Codex (`guardInputOf`).
+    const input = guardInputOf(registry, KIMI_NATIVE_HARNESS, roots?.productRoot);
+    const toml = kimiSessionConfig(humanToml, guardHooksOf(settings, sessionTree, input));
+    const problems = kimiTomlProblems(toml, sessionTree, { runHookFn, registry });
     if (problems.length > 0) {
         return {
             ok: false,
@@ -848,6 +863,9 @@ export function prepareKimiNativeHome(
     try {
         mkdirFn(home);
         writeFileFn(path.join(home, 'config.toml'), toml);
+        // MCP раннера (#196): серверов нет, и сервер, дописанный в дом прошлой сессией, до
+        // этой не доживает.
+        writeFileFn(path.join(home, 'mcp.json'), KIMI_SESSION_MCP);
         const refused = linkHomeEntries(
             { cli: 'Kimi Code', home, sourceHome, names: KIMI_HOME_LINKS },
             { existsFn, entryKindFn, unlinkFn, linkFn },
@@ -860,7 +878,38 @@ export function prepareKimiNativeHome(
 }
 
 /** Исход подготовки каталога сессии OpenCode: каталог для `OPENCODE_CONFIG_DIR` либо причина. */
-export type TPreparedOpencode = { ok: true; configDir: string } | { ok: false; reason: string };
+/** `warnings` — пределы собранной сессии для строки `⚠` (правил дерева не нашлось). */
+export type TPreparedOpencode =
+    { ok: true; configDir: string; warnings: string[] } | { ok: false; reason: string };
+
+/**
+ * Правила дерева для `instructions` сессии OpenCode (ревью 16d2). `rules` описания — файлы в
+ * порядке, в котором их ищет сам CLI, и берётся первый найденный: при выключенном проектном
+ * конфиге CLI их не ищет, а раннер, отдавший один `AGENTS.md`, оставил бы без правил
+ * потребителя, у которого есть только `CLAUDE.md` (CLI взял бы его запасным). Не нашлось ни
+ * одного — пустой список и предел строкой `⚠`, а не молчание. Непринятый пакет — бросок, как у
+ * `harnessForbiddenEnv`: пустой список правил выглядел бы деревом без правил.
+ */
+export function opencodeRuleFiles(
+    registry: HarnessRegistry,
+    sessionTree: string,
+    isFileFn: (p: string) => boolean,
+): { instructions: string[]; warnings: string[] } {
+    const loaded = registry.packages.get(OPENCODE_HARNESS);
+    if (!loaded) throw new Error(`пакет харнесса «${OPENCODE_HARNESS}» не принят реестром`);
+    const { rules } = loaded.descriptor;
+    const found = rules
+        .map((r) => path.join(path.resolve(sessionTree), r))
+        .find((p) => isFileFn(p));
+    if (found) return { instructions: [found], warnings: [] };
+    return {
+        instructions: [],
+        warnings: [
+            `правил дерева для сессии OpenCode нет: ни одного из ${rules.join(', ')} в ` +
+                `${sessionTree} — сессия идёт без правил дерева`,
+        ],
+    };
+}
 
 /** Ответ `opencode debug skill` в дереве сессии: код и stdout (JSON-список скиллов). */
 export type TListSkillsFn = (
@@ -869,7 +918,9 @@ export type TListSkillsFn = (
 ) => { code: number | null; stdout: string };
 
 export type TOpencodeDeps = Pick<TSessionSettingsDeps, 'readFileFn' | 'writeFileFn'> & {
+    layersFn?: TLayersFn;
     runPluginFn?: TRunPluginFn;
+    registry?: HarnessRegistry;
     mkdirFn?: (p: string) => void;
     listSkillsFn?: TListSkillsFn;
     listDirFn?: (p: string) => string[];
@@ -901,6 +952,13 @@ export const listOpencodeSkills: TListSkillsFn = (env, cwd) => {
  * После записи — полнота скиллов: `opencode debug skill` с окружением сессии в её дереве
  * обязан назвать каждый `.claude/skills/<имя>/SKILL.md` дерева. Поиск `.claude/skills` CLI
  * делает сам, но «нашёл» не значит «нашёл все» — недостающий скилл сессия просто не увидела бы.
+ *
+ * Сборщик конфига (#197, `adapters/opencode-home.ts`): рядом с каталогом — свой глобальный
+ * каталог конфига (`xdg-config`, пересоздаётся пустым только ради `mkdir`: CLI создаёт его и сам),
+ * в настройках — правила дерева абсолютным путём (первый найденный из `rules` описания пакета,
+ * `opencodeRuleFiles`: проектный конфиг выключен, и корневой `AGENTS.md` CLI сам не грузит) и
+ * пустой MCP раннера. Исполняемые слои `.opencode/` и `opencode.json(c)` с исполняющими ключами
+ * (`jsonKeys` пакета) в дереве и предках — отказ до записи, тем же сканом, что у Codex.
  */
 export function prepareOpencodeSession(
     {
@@ -913,11 +971,13 @@ export function prepareOpencodeSession(
         readFileFn = (p) => fs.readFileSync(p, 'utf-8'),
         writeFileFn = (p, text) => writeFileAtomic(p, text),
         runPluginFn = runOpencodePlugin,
+        registry = HARNESS_REGISTRY,
         mkdirFn = (p) => {
             guardSideEffect(`prepareOpencodeSession:mkdir(${p})`, 'Подмени mkdirFn в тесте.');
             fs.mkdirSync(p, { recursive: true, mode: 0o700 });
         },
         listSkillsFn = listOpencodeSkills,
+        layersFn,
         listDirFn = (p) => fs.readdirSync(p),
         isFileFn = (p) => {
             try {
@@ -940,8 +1000,11 @@ export function prepareOpencodeSession(
                 'Без них сессия opencode шла бы без барьера — старт отменён.',
         };
     }
-    const plugin = opencodeGuardPlugin(guardHooksOf(settings, sessionTree));
-    const problems = opencodePluginProblems(plugin, sessionTree, { runPluginFn });
+    // Судит регистрацию событие нормализатора OpenCode (#192): путь — в каталоге исполняемого
+    // ядра, как у Codex и Kimi Code (`guardInputOf`).
+    const input = guardInputOf(registry, OPENCODE_HARNESS, roots?.productRoot);
+    const plugin = opencodeGuardPlugin(guardHooksOf(settings, sessionTree, input));
+    const problems = opencodePluginProblems(plugin, sessionTree, { runPluginFn, registry });
     if (problems.length > 0) {
         return {
             ok: false,
@@ -950,10 +1013,30 @@ export function prepareOpencodeSession(
                 problems.map((p) => `  - ${p}`).join('\n'),
         };
     }
+    const layers = harnessLayerProblems(OPENCODE_HARNESS, sessionTree, baseEnv, {
+        registry,
+        ...(layersFn ? { layersFn } : {}),
+    });
+    if (layers.length > 0) {
+        return {
+            ok: false,
+            reason:
+                'Исполняемые слои конфига OpenCode в дереве сессии или его предках — сессия не запущена:\n' +
+                layers.map((p) => `  - ${p}`).join('\n'),
+        };
+    }
+    let rules: ReturnType<typeof opencodeRuleFiles>;
+    try {
+        rules = opencodeRuleFiles(registry, sessionTree, isFileFn);
+    } catch (error) {
+        return { ok: false, reason: `Правила сессии OpenCode не собраны: ${why(error)}.` };
+    }
+    const { instructions } = rules;
     try {
         mkdirFn(path.join(configDir, 'plugin'));
+        mkdirFn(opencodeSessionXdg(configDir));
         writeFileFn(path.join(configDir, 'plugin', OPENCODE_GUARD_PLUGIN_FILE), plugin);
-        writeFileFn(path.join(configDir, 'opencode.json'), opencodeSessionConfig());
+        writeFileFn(path.join(configDir, 'opencode.json'), opencodeSessionConfig({ instructions }));
     } catch (error) {
         return {
             ok: false,
@@ -962,7 +1045,7 @@ export function prepareOpencodeSession(
     }
     const expected = expectedOpencodeSkills(sessionTree, listDirFn, isFileFn);
     const skills = opencodeSkillProblems(
-        listSkillsFn(opencodeSessionEnv(baseEnv, { configDir }), sessionTree),
+        listSkillsFn(opencodeSessionEnv(baseEnv, { configDir, cwd: sessionTree }), sessionTree),
         expected,
     );
     if (skills.length > 0) {
@@ -973,5 +1056,5 @@ export function prepareOpencodeSession(
                 skills.map((p) => `  - ${p}`).join('\n'),
         };
     }
-    return { ok: true, configDir };
+    return { ok: true, configDir, warnings: rules.warnings };
 }

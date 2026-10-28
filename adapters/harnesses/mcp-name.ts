@@ -8,8 +8,7 @@
  * `get__CreateReport`, а несколько возможных границ без имени сервера — отказ с причиной.
  */
 
-const isRecord = (v: unknown): v is Record<string, unknown> =>
-    typeof v === 'object' && v !== null && !Array.isArray(v);
+import { isRecord } from './event-roles.ts';
 
 export const MCP_PREFIX = 'mcp__';
 

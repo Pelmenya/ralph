@@ -9,13 +9,23 @@ import { reasonLine, type BarrierReasonCode } from '../adapters/barrier-reason.t
 
 /** Код причины, которым исправный барьер назвал бы запрещённую пробу из этого текста. */
 export function probeReasonCode(text: string): BarrierReasonCode {
-    // Пакетный вызов несёт `rm -rf` внутри — MCP-правило судит его раньше оболочки.
-    if (/mcp__|_ListIssues|batch/.test(text)) return 'mcp-not-allowed';
+    // OpenCode на событии нормализатора (#192): инструмент вне описания пакета — `multiedit`,
+    // `batch` (несёт `rm -rf` внутри) и MCP-имя без перевода — незнакомый, а патч с путём,
+    // который CLI читают по-разному, — неразобранное поле.
+    if (/"tool":"(?:multiedit|batch|ralph-guard-probe_ListIssues)"/.test(text)) {
+        return 'unknown-tool';
+    }
+    if (/File:\\[tr]/.test(text)) return 'unknown-field';
+    if (/mcp__/.test(text)) return 'mcp-not-allowed';
     // Правка данных контура (#184) — запрещена только в сессии петли; фейк изображает хук,
     // которому контекст сессии дошёл.
-    if (/\.claude\/ralph\/hooks\.json/.test(text)) return 'contour-data';
+    // Перенос каталога данных из `cwd` оболочки Kimi Code (#191) и `workdir` OpenCode (#192) —
+    // тот же забор.
+    if (/\.claude\/ralph\/hooks\.json|"(?:cwd|workdir)":"\.claude"/.test(text)) {
+        return 'contour-data';
+    }
     // Субагент и отложенный ход (#225) — тоже только в сессии петли, как контур выше.
-    if (/"tool_name":"(?:Agent|ScheduleWakeup)"/.test(text)) return 'loop-delegation';
+    if (/"tool_name":"(?:Agent|ScheduleWakeup)"|"tool":"task"/.test(text)) return 'loop-delegation';
     if (/rm -rf/.test(text)) return 'destructive';
     return 'secret-env';
 }

@@ -4,11 +4,11 @@ import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { parseHarnessDescriptor } from '../descriptor.ts';
+import { ownDescriptor, parseHarnessDescriptor } from '../descriptor.ts';
 import { probeMatrix } from '../probe-matrix.ts';
 import { ADAPTER_PROTOCOL_VERSION } from '../protocol.ts';
 import { normalizeClaudeEvent } from './event.ts';
-import { main, ownDescriptor } from './normalize.ts';
+import { main } from './normalize.ts';
 import { harnessPackage, settingsHooks } from './package.ts';
 
 const DIR = import.meta.dirname;
@@ -214,6 +214,15 @@ describe('нормализатор: тождественная форма Claude
         expect(first.op === 'unknown' && first.kind).toBe(kind);
     });
 
+    it('tool_input не задан — пустой вход; инструмент без перечня полей — любое поле незнакомо', () => {
+        expect(op('TodoWrite', undefined)).toEqual([{ op: 'inert', what: 'TodoWrite' }]);
+        const bare = { ...descriptor, allowedFields: { ...descriptor.allowedFields, tools: {} } };
+        const ops = (input: unknown) =>
+            normalizeClaudeEvent(bare, envelope('TodoWrite', input)).operations;
+        expect(ops({})).toEqual([{ op: 'inert', what: 'TodoWrite' }]);
+        expect(ops({ todos: [] })[0]).toMatchObject({ op: 'unknown', kind: 'field' });
+    });
+
     it('пустые необязательные поля поиска — не заданы, пустой шаблон содержимого — задан', () => {
         expect(op('Grep', { pattern: '', path: '', glob: '' })).toEqual([
             { op: 'search', root: '/work', contentPattern: '', baseDir: '/work' },
@@ -315,8 +324,8 @@ describe('команда нормализатора', () => {
 
     it('описание чужого харнесса рядом с командой — отказ, а не суд его таблицами', () => {
         const raw = JSON.parse(readFileSync(path.join(DIR, 'descriptor.json'), 'utf-8'));
-        expect(ownDescriptor(raw, 'd').harness).toBe('claude-code');
-        expect(() => ownDescriptor({ ...raw, harness: 'codex' }, 'd')).toThrow(
+        expect(ownDescriptor(raw, 'd', 'claude-code').harness).toBe('claude-code');
+        expect(() => ownDescriptor({ ...raw, harness: 'codex' }, 'd', 'claude-code')).toThrow(
             /описание харнесса «codex», а команда — нормализатор claude-code/,
         );
     });

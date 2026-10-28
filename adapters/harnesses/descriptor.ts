@@ -62,6 +62,8 @@ export const ARG_ROLES = [
     'patch',
 ] as const;
 
+export type ArgRole = (typeof ARG_ROLES)[number];
+
 /** Канал исполнения: перехвачен хуком или доказанно выключен — третьего нет. */
 export const COVERAGE_MODES = ['intercepted', 'disabled'] as const;
 
@@ -72,13 +74,17 @@ export type HarnessDescriptor = {
     /** Исполняемая команда нормализатора: путь скрипта от каталога пакета. */
     normalizer: string;
     toolMap: Record<string, (typeof MAPPED_OPERATIONS)[number]>;
-    argMap: Record<string, Partial<Record<(typeof ARG_ROLES)[number], string>>>;
+    argMap: Record<string, Partial<Record<ArgRole, string>>>;
     allowedFields: { envelope: string[]; tools: Record<string, string[]> };
     eventCoverage: Record<string, { mode: (typeof COVERAGE_MODES)[number]; evidence: string }>;
     configSurfaces: string[];
     forbiddenEnv: string[];
     mcpNames: Record<string, { server: string; tool: string }>;
     skillEvidence: { source: string };
+    /**
+     * Файлы правил дерева в порядке, в котором их ищет CLI; где правила отдаёт раннер (OpenCode
+     * с выключенным проектным конфигом), берётся первый найденный, как у самого CLI.
+     */
     rules: string[];
     inventorySource: string;
     /**
@@ -309,4 +315,20 @@ export function parseHarnessDescriptor(raw: unknown, source: string): HarnessDes
         );
     }
     return raw as HarnessDescriptor;
+}
+
+/**
+ * Описание, принятое схемой и названное харнессом команды нормализатора; иначе — отказ. Guard
+ * зовёт команду по пути из своей регистрации, мимо реестра, и чужое описание рядом с модулем
+ * судило бы события таблицами другого CLI. Сверка общая для всех пакетов: копия в каждом
+ * нормализаторе оставила бы пропущенный CLI со старой сверкой.
+ */
+export function ownDescriptor(raw: unknown, source: string, harness: string): HarnessDescriptor {
+    const descriptor = parseHarnessDescriptor(raw, source);
+    if (descriptor.harness !== harness) {
+        throw new Error(
+            `${source}: описание харнесса «${descriptor.harness}», а команда — нормализатор ${harness}`,
+        );
+    }
+    return descriptor;
 }

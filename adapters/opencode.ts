@@ -19,10 +19,11 @@
 //     узнаёт лишь «Unexpected server error» без причины, поэтому их проверяет готовность до
 //     выбора задачи по списку `opencode models <провайдер>` («Provider not found» — код 1);
 //   • guard — плагин на `tool.execute.before` (`harness-guard.ts`, #119) в каталоге
-//     `OPENCODE_CONFIG_DIR`, настройки сессии — файл по `OPENCODE_CONFIG`. Оба СЛИВАЮТСЯ с
-//     глобальным конфигом человека (провайдер и ключ — оттуда) и с конфигом дерева; `"plugin":
-//     []` потребителя внешний плагин не снимает (стенд, `override`). `--pure` отключил бы
-//     плагин — в argv его нет никогда;
+//     `OPENCODE_CONFIG_DIR`, настройки сессии — файл по `OPENCODE_CONFIG`. `"plugin": []`
+//     потребителя внешний плагин не снимает (стенд, `override`). `--pure` отключил бы
+//     плагин — в argv его нет никогда, а `OPENCODE_PURE` и прочее окружение CLI снимает
+//     сборщик конфига (`opencode-home.ts`, #197): он же выключает проектный конфиг и отрезает
+//     глобальный конфиг человека;
 //   • скиллы — поиском `.claude/skills` самого CLI; полноту набора видно `opencode debug
 //     skill` (JSON со `location` каждого), и её сверяет раннер перед сессией;
 //   • бюджета ходов, который CLI исполнял бы обрывом, нет — `turnLimit: 'best-effort'`, и
@@ -43,10 +44,9 @@ export const OPENCODE_BIN = 'opencode';
  */
 export const OPENCODE_RUNTIME = 'opencode';
 
-/** Файл настроек сессии — сливается с конфигом человека и дерева. */
-export const OPENCODE_CONFIG_ENV = 'OPENCODE_CONFIG';
-/** Каталог внешних плагинов (`<каталог>/plugin/*.js`). */
-export const OPENCODE_CONFIG_DIR_ENV = 'OPENCODE_CONFIG_DIR';
+// Окружение и настройки сессии — сборщик конфига (`opencode-home.ts`, #197); переменные
+// каталога сессии нужны и здесь, и у ядра, поэтому едут отсюда же.
+export { OPENCODE_CONFIG_DIR_ENV, OPENCODE_CONFIG_ENV } from './opencode-home.ts';
 
 /** Имя файла плагина барьера в `plugin/` каталога сессии. */
 export const OPENCODE_GUARD_PLUGIN_FILE = 'ralph-guard.js';
@@ -186,35 +186,6 @@ export function opencodeAuthProblems({
             `provider.${provider}.options.apiKey в его конфиге. Ключи из окружения раннера сессии ` +
             'OpenCode не достаются — заведи ключ в самом CLI',
     ];
-}
-
-/**
- * Настройки сессии (`OPENCODE_CONFIG`): вызовы оболочки и правки без подтверждения — иначе
- * `opencode run` без человека встаёт на первом же. Плагин барьера зовётся и при `allow`
- * (стенд). Остальное — из конфига человека и дерева, которые CLI сливает с этим файлом.
- */
-export function opencodeSessionConfig(): string {
-    return `${JSON.stringify(
-        {
-            $schema: 'https://opencode.ai/config.json',
-            permission: { bash: 'allow', edit: 'allow' },
-        },
-        null,
-        4,
-    )}\n`;
-}
-
-/** Окружение сессии: свои файл настроек и каталог плагина. */
-export function opencodeSessionEnv(
-    base: NodeJS.ProcessEnv,
-    { configDir }: { configDir: string | null },
-): NodeJS.ProcessEnv {
-    const env: NodeJS.ProcessEnv = { ...base };
-    if (configDir) {
-        env[OPENCODE_CONFIG_DIR_ENV] = configDir;
-        env[OPENCODE_CONFIG_ENV] = path.join(configDir, 'opencode.json');
-    }
-    return env;
 }
 
 /** События `--format json`; строка, не разобравшаяся как JSON, — `{ raw }`. */

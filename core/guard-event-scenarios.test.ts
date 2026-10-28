@@ -7,8 +7,8 @@
 // намеренные ужесточения у Claude Code списком (`docs/harness-contract.md`, «Изменения
 // поведения у Claude Code»): каждое — с доказательством, что прежний вход пропускал вызов, иначе
 // «ужесточение» могло бы оказаться тем, что и так блокировалось. И промежуточное состояние
-// четырёх регистраций: Claude Code и Codex (#232) — через событие своего нормализатора, Kimi Code
-// и OpenCode — совместимым входом 16b, где их запреты держатся, а незнакомое по-прежнему проходит.
+// четырёх регистраций: Claude Code, Codex (#232), Kimi Code (#191) и OpenCode (#192) — через
+// событие своего нормализатора; совместимый вход 16b остался у копий хуков в деревьях.
 //
 // Пробы живые, но безопасные: хук решает, вызов не исполняется — исполнять его некому.
 import { spawnSync } from 'node:child_process';
@@ -265,18 +265,12 @@ describe.skipIf(!coreIsRepoRoot())('промежуточное состояни�
     });
 
     /** Хук моста процессом: окружение без `CLAUDE_PROJECT_DIR` — его ставит только Claude Code. */
-    const bridgeVerdict = (command: string, toolName: string, toolInput: object): Verdict => {
+    const hookVerdict = (command: string, payload: object): Verdict => {
         const env: NodeJS.ProcessEnv = { ...process.env, [SESSION_CONTEXT_ENV]: LOOP_CONTEXT };
         delete env.CLAUDE_PROJECT_DIR;
         const r = spawnSync('sh', ['-c', command], {
             cwd: CANON_ROOT,
-            input: JSON.stringify({
-                session_id: 'bridge',
-                hook_event_name: 'PreToolUse',
-                cwd: CANON_ROOT,
-                tool_name: toolName,
-                tool_input: toolInput,
-            }),
+            input: JSON.stringify(payload),
             encoding: 'utf-8',
             env,
         });
@@ -284,6 +278,14 @@ describe.skipIf(!coreIsRepoRoot())('промежуточное состояни�
         expect(r.status, r.stderr).toBe(0);
         return allowed;
     };
+    const bridgeVerdict = (command: string, toolName: string, toolInput: object): Verdict =>
+        hookVerdict(command, {
+            session_id: 'bridge',
+            hook_event_name: 'PreToolUse',
+            cwd: CANON_ROOT,
+            tool_name: toolName,
+            tool_input: toolInput,
+        });
 
     // #232: патч данных контура совместимый вход пропускал (`apply_patch` ему незнаком), событие
     // нормализатора Codex судит патч по путям.
@@ -324,28 +326,87 @@ describe.skipIf(!coreIsRepoRoot())('промежуточное состояни�
         ).toEqual(allowed);
     });
 
-    it('Kimi Code и OpenCode: совместимый вход 16b — запреты держатся', () => {
-        expect(guardInputOf(HARNESS_REGISTRY, 'kimi-code')).toBe(GUARD_COMPAT_INPUT);
-        expect(guardInputOf(HARNESS_REGISTRY, 'opencode')).toBe(GUARD_COMPAT_INPUT);
-        const hooks = guardHooksOf(settings, CANON_ROOT).filter((h) =>
+    // #191: нормализатор Kimi Code знает `cwd` оболочки и инструменты CLI; совместимый вход судил
+    // оболочку от `cwd` сессии и пропускал незнакомые имена (`FetchURL`).
+    it('Kimi Code: регистрация судит событие своего нормализатора — cwd оболочки и сеть', () => {
+        const input = guardInputOf(HARNESS_REGISTRY, 'kimi-code', CANON_ROOT);
+        expect(input).not.toBe(GUARD_COMPAT_INPUT);
+        const [{ command }] = guardHooksOf(settings, CANON_ROOT, input).filter((h) =>
             /guard\.cjs/.test(h.command),
         );
-        expect(hooks).toHaveLength(1);
-        const [{ command }] = hooks;
-        expect(command).toContain(`${GUARD_INPUT_ENV}=${GUARD_COMPAT_INPUT}`);
-        expect(bridgeVerdict(command, 'Bash', { command: 'rm -rf ./x' })).toEqual(
-            blocked('destructive'),
+        expect(command).not.toContain(GUARD_COMPAT_INPUT);
+        const mv = { command: 'mv ralph ralph.bak', cwd: '.claude' };
+        expect(bridgeVerdict(command, 'Bash', mv)).toEqual(blocked('contour-data'));
+        expect(bridgeVerdict(command, 'Bash', { command: 'git status', cwd: '.claude' })).toEqual(
+            allowed,
         );
-        // Форма Kimi Code: путь файла — `path`.
-        expect(bridgeVerdict(command, 'Read', { path: '.env' })).toEqual(blocked('secret-env'));
-        expect(bridgeVerdict(command, 'mcp__probe__DeleteRepository', {})).toEqual(
-            blocked('mcp-not-allowed'),
+        expect(bridgeVerdict(command, 'Write', { path: '.env', content: 'A=1' })).toEqual(
+            blocked('secret-env'),
         );
-        expect(bridgeVerdict(command, 'Bash', { command: 'git status' })).toEqual(allowed);
-        // Субагент Kimi Code (`Task`) и OpenCode (`task` → `Task`) — по имени (#225).
-        expect(bridgeVerdict(command, 'Task', { prompt: 'p' })).toEqual(blocked('loop-delegation'));
-        // Незнакомое на совместимом входе проходит, как в 16b: строгость к нему у этих
-        // харнессов придёт с их нормализаторами (16d), а заглушка сейчас блокировала бы всё.
-        expect(bridgeVerdict(command, 'SendMessage', {})).toEqual(allowed);
+        const fetch = { url: 'http://example.com' };
+        expect(bridgeVerdict(command, 'FetchURL', fetch)).toEqual(blocked('capability-unjudged'));
+        expect(bridgeVerdict(command, 'SendMessage', {})).toEqual(blocked('unknown-tool'));
+        // От противного: совместимый вход тот же перенос и ту же сеть пропускает.
+        const [compat] = guardHooksOf(settings, CANON_ROOT).filter((h) =>
+            /guard\.cjs/.test(h.command),
+        );
+        expect(bridgeVerdict(compat.command, 'Bash', mv)).toEqual(allowed);
+        expect(bridgeVerdict(compat.command, 'FetchURL', fetch)).toEqual(allowed);
+    });
+
+    // #192: нормализатор OpenCode судит сырое событие, которое плагин кладёт рядом с формой
+    // Claude Code; совместимый вход судил перевод плагина, где `workdir` оболочки терялся.
+    it('OpenCode: регистрация судит событие своего нормализатора — workdir и патч', () => {
+        const input = guardInputOf(HARNESS_REGISTRY, 'opencode', CANON_ROOT);
+        expect(input).not.toBe(GUARD_COMPAT_INPUT);
+        const [{ command }] = guardHooksOf(settings, CANON_ROOT, input).filter((h) =>
+            /guard\.cjs/.test(h.command),
+        );
+        expect(command).not.toContain(GUARD_COMPAT_INPUT);
+        /** Вход хука в форме плагина: перевод в Claude Code плюс сырое событие CLI. */
+        const plugin = (
+            cmd: string,
+            tool: string,
+            args: object,
+            claude: string,
+            claudeIn: object,
+        ) =>
+            hookVerdict(cmd, {
+                session_id: 'ses_1',
+                hook_event_name: 'PreToolUse',
+                cwd: CANON_ROOT,
+                tool_name: claude,
+                tool_input: claudeIn,
+                opencode: { tool, sessionID: 'ses_1', callID: 'call_1', args },
+            });
+        const mv = { command: 'mv ralph ralph.bak', workdir: '.claude' };
+        expect(plugin(command, 'bash', mv, 'Bash', mv)).toEqual(blocked('contour-data'));
+        const status = { command: 'git status', workdir: '.claude' };
+        expect(plugin(command, 'bash', status, 'Bash', status)).toEqual(allowed);
+        const patch = (target: string) => ({
+            patchText: ['*** Begin Patch', `*** Add File: ${target}`, '+{}', '*** End Patch'].join(
+                '\n',
+            ),
+        });
+        const contour = patch('.claude/ralph/hooks.json');
+        expect(
+            plugin(command, 'apply_patch', contour, 'Edit', {
+                file_path: '.claude/ralph/hooks.json',
+            }),
+        ).toEqual(blocked('contour-data'));
+        const safe = patch('.ralph-probe/x.txt');
+        expect(
+            plugin(command, 'apply_patch', safe, 'Edit', { file_path: '.ralph-probe/x.txt' }),
+        ).toEqual(allowed);
+        const task = { description: 'd', prompt: 'p', subagent_type: 'general' };
+        expect(plugin(command, 'task', task, 'Task', task)).toEqual(blocked('loop-delegation'));
+        expect(plugin(command, 'question', {}, 'AskUserQuestion', {})).toEqual(
+            blocked('unknown-tool'),
+        );
+        // От противного: совместимый вход тот же перенос из workdir пропускает.
+        const [compat] = guardHooksOf(settings, CANON_ROOT).filter((h) =>
+            /guard\.cjs/.test(h.command),
+        );
+        expect(bridgeVerdict(compat.command, 'Bash', mv)).toEqual(allowed);
     });
 });

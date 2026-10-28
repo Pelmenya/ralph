@@ -18,10 +18,8 @@
  * не разобрался. Доказательство загрузки скилла живёт не здесь — его судит барьер скиллов
  * по транскрипту (до карточки 16e он получает сырой вход отдельной регистрацией).
  *
- * Заданное поле роли обязано быть строкой — и обязательное, и необязательное (ревью 16c):
- * `Grep{path: 123}` молча становился поиском от `cwd`, то есть не там, куда пойдёт CLI.
- * Пустая строка необязательного поля — «не задано»: так его читает и CLI. Шаблон содержимого
- * поиска остаётся и пустым — пустой шаблон совпадает с любой строкой, содержимое прочитано.
+ * Чтение ролей `argMap` (заданное поле роли — только строкой) общее для пакетов —
+ * `../event-roles.ts`.
  *
  * `WebSearch` — `fetch`, а не `inert`: текст запроса уходит наружу тем же каналом, что адрес, и
  * в сессии петли закрыт тем же правилом (роль `url` у него — поле `query`). `Workflow` с
@@ -40,15 +38,9 @@
  * общий с Codex — `../mcp-name.ts`.
  */
 import type { HarnessDescriptor } from '../descriptor.ts';
+import { isRecord, mcpEvent, roleReader, searchOperation, unknownOp } from '../event-roles.ts';
 import { MCP_PREFIX, mcpParts } from '../mcp-name.ts';
-import type { ToolEvent, ToolOperation, UnknownKind } from '../protocol.ts';
-
-const isRecord = (v: unknown): v is Record<string, unknown> =>
-    typeof v === 'object' && v !== null && !Array.isArray(v);
-
-const unknownOp = (why: string, kind: UnknownKind = 'field'): ToolEvent => ({
-    operations: [{ op: 'unknown', why, kind }],
-});
+import type { ToolEvent, ToolOperation } from '../protocol.ts';
 
 function operations(
     d: HarnessDescriptor,
@@ -57,21 +49,8 @@ function operations(
     baseDir: string,
     sessionId: string,
 ): ToolOperation[] {
-    const roles = d.argMap[tool] ?? {};
-    // Значение поля роли: не задано — undefined, задано не строкой — отказ разбора.
-    const arg = (role: keyof typeof roles): string | undefined => {
-        const field = roles[role];
-        const value = field === undefined ? undefined : input[field];
-        if (value === undefined) return undefined;
-        if (typeof value !== 'string') throw new Error(`${tool}: поле ${field} не строка`);
-        return value;
-    };
-    const optional = (role: keyof typeof roles): string | undefined => arg(role) || undefined;
-    const required = (role: keyof typeof roles): string => {
-        const value = optional(role);
-        if (value === undefined) throw new Error(`${tool}: нет строкового ${roles[role] ?? role}`);
-        return value;
-    };
+    const read = roleReader(d, tool, input);
+    const { optional, required } = read;
     const op = d.toolMap[tool];
     switch (op) {
         case 'exec':
@@ -82,18 +61,8 @@ function operations(
             return [{ op, path: required('path'), baseDir }];
         case 'move':
             return [{ op, path: required('path'), destination: required('destination'), baseDir }];
-        case 'search': {
-            const search: Extract<ToolOperation, { op: 'search' }> = {
-                op,
-                root: optional('root') ?? baseDir,
-                baseDir,
-            };
-            const contentPattern = arg('contentPattern');
-            const pathGlob = optional('pathGlob');
-            if (contentPattern !== undefined) search.contentPattern = contentPattern;
-            if (pathGlob !== undefined) search.pathGlob = pathGlob;
-            return [search];
-        }
+        case 'search':
+            return [searchOperation(read, baseDir)];
         case 'fetch':
             return [{ op, url: required('url') }];
         case 'agent': {
@@ -133,11 +102,7 @@ export function normalizeClaudeEvent(d: HarnessDescriptor, raw: unknown): ToolEv
     if (tool.startsWith(MCP_PREFIX)) {
         const mcp = mcpParts(tool, raw.mcp_server);
         if ('why' in mcp) return unknownOp(mcp.why);
-        return {
-            operations: [
-                { op: 'mcp', server: mcp.server, tool: mcp.tool, effect: 'unknown', derived: [] },
-            ],
-        };
+        return mcpEvent(mcp.server, mcp.tool);
     }
     if (!Object.hasOwn(d.toolMap, tool)) {
         return unknownOp(`инструмент ${tool} вне описания`, 'tool');

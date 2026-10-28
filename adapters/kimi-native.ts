@@ -25,7 +25,8 @@
 //     то, что CLI нашёл бы сам, плюс `.claude/skills` дерева сессии;
 //   • хуки у Kimi Code — только `[[hooks]]` в `config.toml` дома CLI (`KIMI_CODE_HOME`),
 //     флага файла настроек нет (стенд Фазы 11). Дом сессии собирает раннер: конфиг
-//     человека как есть плюс регистрация барьера, вход — ссылками на дом человека;
+//     человека как есть плюс регистрация барьера, вход — ссылками на дом человека; доверие
+//     каталогу, автообновление и окружение CLI раннера — `kimi-home.ts` (#196);
 //   • ПЕСОЧНИЦЫ НЕТ, а `docs/harness-adapters.md` требует её от `kimi-native`. Поэтому до
 //     неё рантайм — эксперимент оператора, как OpenCode (`KIMI_NATIVE_STATUS`): статус назван
 //     в конфиге дословно, маршрут `modelRouting` в него (метка, фолбэк лимита, эскалация) —
@@ -157,18 +158,6 @@ export function kimiSourceHome(configured: unknown, env: NodeJS.ProcessEnv): str
 export function kimiSessionConfig(humanToml: string, hooks: readonly GuardHook[]): string {
     const head = humanToml.endsWith('\n') || humanToml === '' ? humanToml : `${humanToml}\n`;
     return `${head}\n# Барьер сессии петли — собран раннером Ralph, правка руками теряется.\n${kimiHooksToml(hooks)}`;
-}
-
-/** Окружение сессии: свой дом и потолок шагов, если он задан. */
-export function kimiNativeSessionEnv(
-    base: NodeJS.ProcessEnv,
-    { home, maxTurns }: { home: string | null; maxTurns?: number },
-): NodeJS.ProcessEnv {
-    const env: NodeJS.ProcessEnv = { ...base };
-    if (home) env[KIMI_HOME_ENV] = home;
-    if (typeof maxTurns === 'number' && maxTurns > 0)
-        env[KIMI_MAX_STEPS_ENV] = String(Math.trunc(maxTurns));
-    return env;
 }
 
 /**

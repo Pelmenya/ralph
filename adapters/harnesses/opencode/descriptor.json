@@ -6,33 +6,75 @@
     "toolMap": {
         "bash": "exec",
         "read": "read",
-        "grep": "search"
+        "write": "write",
+        "edit": "write",
+        "apply_patch": "patch",
+        "grep": "search",
+        "glob": "search",
+        "webfetch": "fetch",
+        "task": "agent",
+        "skill": "inert",
+        "todowrite": "inert"
     },
     "argMap": {
         "bash": { "command": "command" },
         "read": { "path": "filePath" },
-        "grep": { "root": "path", "contentPattern": "pattern" }
+        "write": { "path": "filePath" },
+        "edit": { "path": "filePath" },
+        "apply_patch": { "patch": "patchText" },
+        "grep": { "root": "path", "contentPattern": "pattern", "pathGlob": "include" },
+        "glob": { "root": "path", "pathGlob": "pattern" },
+        "webfetch": { "url": "url" }
     },
     "allowedFields": {
         "envelope": ["tool", "sessionID", "callID", "args"],
         "tools": {
-            "bash": ["command"],
-            "read": ["filePath"],
-            "grep": ["pattern", "path"]
+            "bash": ["command", "timeout", "workdir", "description"],
+            "read": ["filePath", "offset", "limit"],
+            "write": ["filePath", "content"],
+            "edit": ["filePath", "oldString", "newString", "replaceAll"],
+            "apply_patch": ["patchText"],
+            "grep": ["pattern", "path", "include"],
+            "glob": ["pattern", "path"],
+            "webfetch": ["url", "format", "timeout"],
+            "task": ["description", "prompt", "subagent_type", "task_id", "command"],
+            "skill": ["name"],
+            "todowrite": ["todos"]
         }
     },
     "eventCoverage": {
         "tool.execute.before": {
             "mode": "intercepted",
-            "evidence": "плагин барьера в каталоге OPENCODE_CONFIG_DIR, который собирает раннер; проба исполняет тот исходник на событиях OpenCode перед каждой сессией (core/session-settings.ts, prepareOpencodeSession)"
+            "evidence": "плагин барьера в каталоге OPENCODE_CONFIG_DIR, который собирает раннер (core/session-settings.ts, prepareOpencodeSession): CLI зовёт tool.execute.before до эффекта на bash (в том числе с workdir вне дерева), read, write, edit, apply_patch (GPT-модели), grep с include, glob, webfetch, task, skill и MCP, брошенное исключение отменяет вызов — стенд 1.19.4 (adapters/harnesses/__fixtures__/opencode-1.19.4-stand.json). Регистрацию судит событие нормализатора пакета (#192); проба исполняет исходник плагина на событиях OpenCode перед каждой сессией"
         }
     },
-    "configSurfaces": [".opencode", "opencode.json"],
-    "forbiddenEnv": [],
+    "configSurfaces": [
+        ".opencode/plugin",
+        ".opencode/plugins",
+        ".opencode/tool",
+        ".opencode/tools",
+        ".opencode/opencode.json",
+        ".opencode/opencode.jsonc",
+        "opencode.json",
+        "opencode.jsonc"
+    ],
+    "forbiddenEnv": ["OPENCODE_PURE", "OPENCODE_CONFIG_CONTENT", "OPENCODE_PERMISSION"],
     "mcpNames": {},
-    "skillEvidence": {
-        "source": "заглушка: доказательства загрузки скилла нет — транскрипта плагин хуку не отдаёт (SKILL_BARRIER_LIMIT); поставщик — Фаза 16e"
+    "probeInputs": {
+        "write": { "content": "ralph-probe\n" },
+        "edit": { "oldString": "ralph-probe", "newString": "ralph-probe" },
+        "glob": { "pattern": "*" },
+        "task": {
+            "description": "ralph-probe",
+            "prompt": "ralph-probe",
+            "subagent_type": "general"
+        },
+        "skill": { "name": "ralph-probe" },
+        "todowrite": { "todos": [] }
     },
-    "rules": ["AGENTS.md"],
-    "inventorySource": "заглушка: перечень — событие живого прогона адаптера (adapters/__fixtures__/hook-events.json) и состав пробы 16b (adapters/harness-guard.ts); фикстуры и нормализатор — Фаза 16d"
+    "skillEvidence": {
+        "source": "заглушка: доказательства загрузки скилла нет — вызов skill только доставляет инструкции, транскрипта плагин хуку не отдаёт (SKILL_BARRIER_LIMIT); поставщик — Фаза 16e"
+    },
+    "rules": ["AGENTS.md", "CLAUDE.md"],
+    "inventorySource": "стенд 1.19.4 (adapters/harnesses/__fixtures__/opencode-1.19.4-stand.json): toolMap и allowedFields — перечень инструментов и полей, который CLI в режиме run отдал модели в запросе к провайдеру стенда (раздел inventory: модель gpt- получает apply_patch вместо edit и write), плюс description у bash — его модель шлёт, и CLI передал его плагину (стенд bash-workdir). Конверт — аргументы tool.execute.before. Встроенные вне режима run (list, question, lsp, multiedit, websearch, codesearch) здесь не описаны и блокируются как незнакомые; сверка с инвентарём машиной — Фаза 16f"
 }
