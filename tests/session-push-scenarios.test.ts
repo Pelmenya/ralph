@@ -105,3 +105,26 @@ describe('сессия разбора blocked оставила незапуше�
         expect(w.remoteHead()).toBe(foreign);
     });
 });
+
+// #224: сессия правок пушила после каждого коммита, и каждый пуш заводил полный прогон CI.
+// Теперь пуш — раннера, и круг правок из нескольких коммитов уезжает ОДНИМ пушем: голова
+// ветки на origin меняется один раз, значит и прогон CI на круг — один.
+describe('круг правок из нескольких коммитов — один пуш раннера (#224)', () => {
+    it('три незапушенных коммита уезжают одним git push, origin — на последнем', () => {
+        const w = buildWorld();
+        w.commit(w.work, 'f1.txt', 'fix: замечание 1');
+        w.commit(w.work, 'f2.txt', 'fix: замечание 2');
+        w.commit(w.work, 'f3.txt', 'fix: замечание 3');
+        const local = w.git(w.work, 'rev-parse', `refs/heads/${BRANCH}`);
+        const pushes: string[][] = [];
+        const runArgvFn: typeof w.runArgvFn = (file, args, opts) => {
+            if (args[0] === 'push') pushes.push(args);
+            return w.runArgvFn(file, args, opts);
+        };
+
+        expect(pushSessionCommits(BRANCH, { runArgvFn, logFn: () => {} }).kind).toBe('pushed');
+        expect(pushSessionCommits(BRANCH, { runArgvFn, logFn: () => {} }).kind).toBe('in-sync');
+        expect(pushes).toEqual([['push', 'origin', `${local}:refs/heads/${BRANCH}`]]);
+        expect(w.remoteHead()).toBe(local);
+    });
+});

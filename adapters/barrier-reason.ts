@@ -62,6 +62,16 @@ export const BARRIER_REASON_CODES = {
     'raw-address': { class: 'rule', emitter: 'guard', meaning: 'сетевой вызов на голый адрес' },
     'host-service': { class: 'rule', emitter: 'guard', meaning: 'изменение службы хоста' },
     'foreign-kill': { class: 'rule', emitter: 'guard', meaning: 'kill чужого процесса' },
+    'loop-push': {
+        class: 'rule',
+        emitter: 'guard',
+        meaning: 'git push из сессии петли: ветку фазы пушит раннер (#224)',
+    },
+    'loop-delegation': {
+        class: 'rule',
+        emitter: 'guard',
+        meaning: 'субагент или отложенный ход в сессии петли: раннер их не видит (#225)',
+    },
     'skill-required': {
         class: 'rule',
         emitter: 'skill-barrier',
@@ -87,7 +97,7 @@ export const BARRIER_REASON_CODES = {
     'capability-unjudged': {
         class: 'rule',
         emitter: 'guard',
-        meaning: 'возможность, которую барьер ещё не судит: fetch, agent (#186)',
+        meaning: 'возможность, которую барьер ещё не судит: fetch (#186)',
     },
     'input-invalid': {
         class: 'fault',

@@ -2,7 +2,7 @@
 // а он держит два инварианта ядра: №11 (секрет не в argv) и №1 (fail-closed там, где
 // пустой ответ петля прочитает как «очередь пуста»).
 import { describe, expect, it, vi } from 'vitest';
-import { createSourcecraftApi } from './sourcecraft-api.ts';
+import { createSourcecraftApi, parseRemote } from './sourcecraft-api.ts';
 
 type SpawnResult = { status: number | null; stdout: string; stderr: string };
 
@@ -81,5 +81,29 @@ describe('транспорт SourceCraft: форма вызова curl', () => {
         api('GET', '/x');
         const [, args] = spawnFn.mock.calls[0] as [string, string[]];
         expect(args).not.toContain('-d');
+    });
+});
+
+describe('parseRemote', () => {
+    // Координаты берём из origin, а не из кода: имя репозитория в продукте — это след
+    // конкретной установки, и в публичном ядре ему не место.
+    it('разбирает https и ssh', () => {
+        expect(parseRemote('https://git.example.dev/org/repo.git')).toEqual({
+            org: 'org',
+            repo: 'repo',
+        });
+        expect(parseRemote('git@git.example.dev:org/repo.git\n')).toEqual({
+            org: 'org',
+            repo: 'repo',
+        });
+        expect(parseRemote('https://git.example.dev/org/repo')).toEqual({
+            org: 'org',
+            repo: 'repo',
+        });
+    });
+
+    it('мусор — null, а не половина координат', () => {
+        expect(parseRemote('')).toBeNull();
+        expect(parseRemote('не-адрес')).toBeNull();
     });
 });

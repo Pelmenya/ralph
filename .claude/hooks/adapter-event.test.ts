@@ -218,6 +218,7 @@ describe('ответ адаптера разбирается строго', () =
             },
             fetch: { url: 'https://example.com' },
             agent: { parentSession: 'abc' },
+            defer: { what: 'ScheduleWakeup' },
             inert: { what: 'todo' },
             unknown: { why: 'нет в toolMap', kind: 'tool' },
         };

@@ -207,12 +207,6 @@ const TIGHTENINGS: {
         code: 'capability-unjudged',
     },
     {
-        what: 'субагент в сессии петли — наследование барьеров не доказано',
-        tool: 'Agent',
-        input: { description: 'd', prompt: 'p', subagent_type: 'Explore' },
-        code: 'capability-unjudged',
-    },
-    {
         what: 'эффект MCP задаёт политика, а не префикс Get имени',
         tool: 'mcp__sourcecraft__GetRepository',
         input: {},
@@ -232,6 +226,19 @@ describe.skipIf(!coreIsRepoRoot())('Изменения поведения у Cla
         expect(claudeVerdict(settings, t.tool, t.input)).toEqual(blocked(t.code));
         // Прежний вход тот же вызов пропускал: ужесточение настоящее, а не совпадение.
         expect(decide(t.tool, t.input, { loop: true }).blocked).toBe(false);
+    });
+
+    // #225: субагент и отложенный ход запрещены в петле ОБОИМИ входами — это не ужесточение
+    // события относительно 16b, а запрет, который держат и регистрации на совместимом входе.
+    it.each([
+        ['Agent', { description: 'd', prompt: 'p', subagent_type: 'Explore' }],
+        ['ScheduleWakeup', { delaySeconds: 1200, prompt: 'p', reason: 'r' }],
+        ['CronCreate', { cron: '*/5 * * * *', prompt: 'p' }],
+    ])('%s в сессии петли — loop-delegation на событии и на прежнем входе', (tool, input) => {
+        const settings = sessionSettings(humanTree());
+        expect(claudeVerdict(settings, tool, input)).toEqual(blocked('loop-delegation'));
+        expect(decide(tool, input, { loop: true }).code).toBe('loop-delegation');
+        expect(decide(tool, input, { loop: false }).blocked).toBe(false);
     });
 
     it('разрешённое политикой MCP-чтение по-прежнему проходит', () => {
@@ -287,6 +294,8 @@ describe.skipIf(!coreIsRepoRoot())('промежуточное состояни�
             blocked('mcp-not-allowed'),
         );
         expect(bridgeVerdict(command, 'Bash', { command: 'git status' })).toEqual(allowed);
+        // Субагент Kimi Code (`Task`) и OpenCode (`task` → `Task`) — по имени (#225).
+        expect(bridgeVerdict(command, 'Task', { prompt: 'p' })).toEqual(blocked('loop-delegation'));
         // Незнакомое на совместимом входе проходит, как в 16b: строгость к нему у этих
         // харнессов придёт с их нормализаторами (16d), а заглушка сейчас блокировала бы всё.
         expect(bridgeVerdict(command, 'SendMessage', {})).toEqual(allowed);

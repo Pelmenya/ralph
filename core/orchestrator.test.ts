@@ -61,6 +61,7 @@ import {
 import { attachSubmitJournal, finishStage, startStage } from './submit-journal.ts';
 import { MODEL_PROXY_RETRIES } from './runtime-availability.ts';
 import { classifyClaudeSessionEnd } from '../adapters/session-end.ts';
+import { HARNESS_REGISTRY } from '../adapters/harness-registry.ts';
 
 // Фаза 16: исход сессии называет адаптер рантайма, ядро текста не читает. Фейк рантайма
 // с выводом Claude получает исход тем же классификатором, что боевой spawnClaude, — тест
@@ -233,10 +234,28 @@ const mkCmdRecorders = (shImpl?: (cmd: string) => string) => {
 };
 
 describe('buildClaudeArgs — построение argv для claude -p (ядро порта; #607 — без промпта)', () => {
+    // #225: первый слой запрета субагентов и отложенного хода — флаг запуска; имена — из
+    // описания пакета Claude Code (операции agent и defer), а не из списка в ядре.
+    const LOOP_DENY = ['--disallowedTools', 'Task,Agent,Workflow,ScheduleWakeup,CronCreate'];
+
+    it('#225: сессия петли запускается с запретом Agent и ScheduleWakeup', () => {
+        const argv = buildClaudeArgs({ maxTurns: 200 }, {});
+        const denied = argv[argv.indexOf('--disallowedTools') + 1].split(',');
+        expect(denied).toEqual(expect.arrayContaining(['Agent', 'ScheduleWakeup']));
+    });
+
+    it('#225: запрет — по классу из описания пакета: новый инструмент класса уходит под него', () => {
+        const d = HARNESS_REGISTRY.packages.get('claude-code')!.descriptor;
+        const ops = Object.fromEntries(
+            Object.entries(d.toolMap).filter(([, op]) => op === 'agent' || op === 'defer'),
+        );
+        expect(Object.keys(ops)).toEqual(LOOP_DENY[1].split(','));
+    });
+
     it('минимальный вызов: -p --max-turns <n> и JSON-результат при пустом конфиге', () => {
         // Задача 95: `--output-format json` — источник токенов попытки (attempt-cost.ts).
         const argv = buildClaudeArgs({ maxTurns: 200 }, {});
-        expect(argv).toEqual(['-p', '--max-turns', '200', '--output-format', 'json']);
+        expect(argv).toEqual(['-p', '--max-turns', '200', ...LOOP_DENY, '--output-format', 'json']);
     });
 
     it('maxTurns приводится к строке (spawnSync требует строковые argv)', () => {
@@ -302,6 +321,7 @@ describe('buildClaudeArgs — построение argv для claude -p (ядр
             '-p',
             '--max-turns',
             '100',
+            ...LOOP_DENY,
             '--model',
             'claude-fable-5',
             '--permission-mode',
@@ -319,7 +339,7 @@ describe('buildClaudeArgs — построение argv для claude -p (ядр
     // фиксированного вида что для промпта в 10 байт, что в 200 КБ.
     it('#607: argv не содержит промпт вовсе — состав фиксирован флагами', () => {
         const argv = buildClaudeArgs({ maxTurns: 200 }, {});
-        expect(argv).toEqual(['-p', '--max-turns', '200', '--output-format', 'json']);
+        expect(argv).toEqual(['-p', '--max-turns', '200', ...LOOP_DENY, '--output-format', 'json']);
     });
 
     it('чистота: не мутирует переданный конфиг', () => {
@@ -4772,6 +4792,61 @@ describe('runLoop — основной while-цикл: итерации коде
     // за конкурента. Каждый раз петля вставала до человека, а человек делал ровно
     // `git add -A && git commit`. Теперь это делает раннер: работа не теряется, а качество
     // по-прежнему сторожит гейт — он гоняет чеки на точном sha PR-головы.
+    // #224: кодер-сессии пуш закрыт guard — её коммиты довозит раннер одним пушем после
+    // сессии. От противного: сессия оставила незапушенные коммиты — они не теряются.
+    it('#224: коммиты кодер-сессии пушит раннер — ровно один раз после сессии', () => {
+        const order: string[] = [];
+        const runClaudeFn = vi.fn<RunClaudeFake>(() => {
+            order.push('session');
+            return 0;
+        });
+        const pushSessionCommitsFn = vi.fn((branch: string) => {
+            order.push(`push:${branch}`);
+            return { kind: 'pushed' as const, local: 'b'.repeat(40), remote: 'a'.repeat(40) };
+        });
+        const commitLeftoversFn = vi.fn(() => true);
+        runLoop(
+            validCfg(),
+            ctx(mkState()),
+            deps([], {
+                once: true,
+                phaseIndexOfFn: () => 0,
+                openIssuesFn: () => [{ number: 5, title: 'задача', labels: [] }],
+                runClaudeFn,
+                pushSessionCommitsFn,
+                commitLeftoversFn,
+            }),
+        );
+        expect(order).toEqual(['session', 'push:feature/m1']);
+        // Остаток кодер-сессии решает разбор падения или вершина цикла, а не пуш (#390).
+        expect(commitLeftoversFn).not.toHaveBeenCalled();
+    });
+
+    it('#224: пуш коммитов кодер-сессии отвергнут → стоп session-unpushed, а не тишина', () => {
+        const pushEventFn = vi.fn((msg: string) => msg.length > 0);
+        runLoop(
+            validCfg(),
+            ctx(mkState()),
+            deps([], {
+                phaseIndexOfFn: () => 0,
+                openIssuesFn: () => [{ number: 5, title: 'задача', labels: [] }],
+                runClaudeFn: vi.fn<RunClaudeFake>(() => 0),
+                pushSessionCommitsFn: () => ({
+                    kind: 'failed' as const,
+                    why: 'не смог прочитать ветку feature/m1 на origin — Could not resolve host',
+                    local: 'b'.repeat(40),
+                    remote: null,
+                }),
+                pushEventFn,
+            }),
+        );
+        const stops = pushEventFn.mock.calls.map((c) => String(c[0]));
+        expect(stops).toHaveLength(1);
+        expect(stops[0]).toContain('(session-unpushed)');
+        expect(stops[0]).toContain('кодер-сессия Issue #5');
+        expect(stops[0]).toContain('bbbbbbbb');
+    });
+
     it('#66 остаток сессии коммитится раннером, цикл продолжается', () => {
         const logs: string[] = [];
         const state = mkState();
@@ -6604,6 +6679,84 @@ describe('runLoop — основной while-цикл: итерации коде
         expect(logs.join('\n')).toMatch(/намерения сессии.*не применились/i);
     });
 
+    // #226: рестарт после стопа на неразобранном батче шёл сразу в гейт, и PR мерджился
+    // поверх неприменённых `pr-comment` к нему. Хвост применяется ПОСЛЕДНИМ шагом до гейта,
+    // с контекстом фазы, — тогда комментарий ложится в PR, а блок ставит метку для гейта.
+    const submitDeps = (over: Record<string, unknown>) => ({
+        openIssuesFn: () => [],
+        allOpenIssuesFn: () => [],
+        hasAnyIssuesFn: () => true,
+        phaseMergedFn: () => false,
+        pickReviewModelFn: () => 'none',
+        runClaudeFn: () => 0,
+        ...over,
+    });
+    it('#226 хвост PR-намерений применяется с фазой ДО мерджа', () => {
+        const order: string[] = [];
+        const applySessionRequestsFn = vi.fn((args: { phase?: { branch: string } }) => {
+            order.push(`apply:${args.phase?.branch ?? '—'}`);
+            return {
+                applied: 0,
+                failed: false,
+                closedIssues: [],
+                prFindings: [],
+                prBlocked: false,
+            };
+        });
+        const tryMergePhaseFn = vi.fn(() => {
+            order.push('gate');
+            return 'merged';
+        });
+        runLoop(
+            validCfg(),
+            ctx(mkState()),
+            deps([], submitDeps({ applySessionRequestsFn, tryMergePhaseFn })),
+        );
+        expect(tryMergePhaseFn).toHaveBeenCalledTimes(1);
+        const gateAt = order.indexOf('gate');
+        expect(order[gateAt - 1]).toBe(`apply:${validCfg().phases[0].branch}`);
+    });
+
+    it('#226 хвост PR-намерений перед мерджем не применился → мердж не идёт', () => {
+        // Сколько применений до гейта в штатной сдаче — последнее из них и есть хвост.
+        let total = 0;
+        runLoop(
+            validCfg(),
+            ctx(mkState()),
+            deps(
+                [],
+                submitDeps({
+                    applySessionRequestsFn: () => {
+                        total += 1;
+                        return { applied: 0, failed: false };
+                    },
+                    tryMergePhaseFn: () => 'merged',
+                }),
+            ),
+        );
+        expect(total).toBeGreaterThan(0);
+        const logs: string[] = [];
+        let n = 0;
+        const tryMergePhaseFn = vi.fn(() => 'merged');
+        runLoop(
+            validCfg(),
+            ctx(mkState()),
+            deps(
+                logs,
+                submitDeps({
+                    applySessionRequestsFn: () => {
+                        n += 1;
+                        return { applied: 0, failed: n === total };
+                    },
+                    tryMergePhaseFn,
+                }),
+            ),
+        );
+        expect(n).toBe(total);
+        expect(tryMergePhaseFn).not.toHaveBeenCalled();
+        expect(logs.join('\n')).toMatch(/хвост намерений перед мерджем.*не применились/);
+    });
+
     // #39: milestone фазы без единой задачи (ни открытой, ни закрытой) выглядит для петли
     // ровно как сданная фаза — открытая очередь пуста в обоих случаях. Без барьера раннер
     // сжигает три сессии цикла сдачи (PR → ревью → правки) на ветке, которой не существует.
@@ -8264,8 +8417,9 @@ describe('runLoop — основной while-цикл: итерации коде
                 pushEventFn,
             }),
         );
-        // Разбор → пуш раннером → повторное ревью: ревью и гейт судят то, что в PR.
-        expect(order).toEqual(['session', 'push:feature/m1', 'session']);
+        // Довоз на входе в гейт → разбор → пуш раннером → повторное ревью: ревью и гейт
+        // судят то, что в PR.
+        expect(order).toEqual(['push:feature/m1', 'session', 'push:feature/m1', 'session']);
         expect(pushEventFn.mock.calls.some((c) => /оставлен человеку/.test(String(c[0])))).toBe(
             false,
         );
@@ -8292,11 +8446,13 @@ describe('runLoop — основной while-цикл: итерации коде
                 },
             }),
         );
-        expect(order).toEqual(['commit:разбор blocked', 'push']);
+        // Первый пуш — довоз на входе в гейт, без коммита остатка.
+        expect(order).toEqual(['push', 'commit:разбор blocked', 'push']);
     });
 
     it('#85: пуш коммитов сессии разбора отвергнут → стоп с причиной session-unpushed, без повторного ревью', () => {
         const logs: string[] = [];
+        let pushes = 0;
         const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
         const removeBlockedLabelFn = vi.fn();
         const pushEventFn = vi.fn((msg: string) => msg.length > 0);
@@ -8308,12 +8464,16 @@ describe('runLoop — основной while-цикл: итерации коде
                 pickReviewModelFn: () => 'claude-opus-4-8',
                 runClaudeFn,
                 removeBlockedLabelFn,
-                pushSessionCommitsFn: () => ({
-                    kind: 'failed' as const,
-                    why: 'git push отвергнут — ! [rejected] (non-fast-forward)',
-                    local: 'b'.repeat(40),
-                    remote: 'a'.repeat(40),
-                }),
+                // Первый пуш — довоз на входе в гейт: пушить нечего.
+                pushSessionCommitsFn: () =>
+                    ++pushes === 1
+                        ? { kind: 'in-sync' as const }
+                        : {
+                              kind: 'failed' as const,
+                              why: 'git push отвергнут — ! [rejected] (non-fast-forward)',
+                              local: 'b'.repeat(40),
+                              remote: 'a'.repeat(40),
+                          },
                 pushEventFn,
             }),
         );
@@ -8323,8 +8483,10 @@ describe('runLoop — основной while-цикл: итерации коде
         const stops = pushEventFn.mock.calls.map((c) => String(c[0]));
         expect(stops).toHaveLength(1);
         expect(stops[0]).toContain('(session-unpushed)');
-        expect(stops[0]).toContain('незапушенный коммит сессии разбора');
+        expect(stops[0]).toContain('коммиты сессии не доехали до origin');
         expect(stops[0]).toContain('non-fast-forward');
+        // Хвост вопроса этого шага: рестарт после ручного пуша ведёт сразу в гейт.
+        expect(stops[0]).toContain('сдача не повторится, пойдёт сразу гейт');
         expect(stops[0]).toContain('bbbbbbbb');
         expect(stops[0]).not.toContain('(unknown)');
     });
@@ -8370,6 +8532,297 @@ describe('runLoop — основной while-цикл: итерации коде
                 tryMergePhaseFn: () => 'blocked',
                 pickReviewModelFn: () => 'claude-opus-4-8',
                 pushSessionCommitsFn,
+            }),
+        );
+        expect(pushSessionCommitsFn).not.toHaveBeenCalled();
+    });
+
+    // #224: сессия правок пушила после каждого коммита — каждый пуш заводил полный гейт CI
+    // площадки. Пуш теперь раннера: один на круг правок, ДО гейта, который судит голову PR.
+    it('#224: круг правок из двух сессий (ходы) → один пуш раннера после них, до гейта', () => {
+        const order: string[] = [];
+        let calls = 0;
+        const runClaudeFn = vi.fn<RunClaudeFake>((_prompt, _opts, d) => {
+            order.push('session');
+            if (++calls === 1) {
+                emitOutput(d, 'Error: Reached max turns (200)');
+                return 1;
+            }
+            return 0;
+        });
+        runLoop(
+            validCfg(),
+            ctx(mkState()),
+            deps([], {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                findOpenPrFn: () => ({ number: 55, labels: [] }),
+                pickReviewModelFn: () => 'none',
+                runClaudeFn,
+                pushSessionCommitsFn: (branch: string) => {
+                    order.push(`push:${branch}`);
+                    return { kind: 'in-sync' as const };
+                },
+                tryMergePhaseFn: () => {
+                    order.push('gate');
+                    return 'merged';
+                },
+            }),
+        );
+        // Первый пуш — довоз остатка кодер-итераций до заведения PR, второй — круг правок.
+        expect(order).toEqual(['push:feature/m1', 'session', 'session', 'push:feature/m1', 'gate']);
+    });
+
+    it('#224: остаток сессии правок коммитится и уезжает тем же пушем', () => {
+        const order: string[] = [];
+        runLoop(
+            validCfg(),
+            ctx(mkState()),
+            deps([], {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                findOpenPrFn: () => ({ number: 55, labels: [] }),
+                pickReviewModelFn: () => 'none',
+                ensureCleanFn: (where: string) => where !== 'правки по ревью',
+                commitLeftoversFn: (where: string) => {
+                    order.push(`commit:${where}`);
+                    return true;
+                },
+                pushSessionCommitsFn: () => {
+                    order.push('push');
+                    return { kind: 'pushed' as const, local: 'b'.repeat(40), remote: null };
+                },
+                tryMergePhaseFn: () => 'merged',
+            }),
+        );
+        expect(order).toEqual(['push', 'commit:правки по ревью', 'push']);
+    });
+
+    it('#224: пуш круга правок отвергнут → стоп session-unpushed, гейт не зовётся', () => {
+        const tryMergePhaseFn = vi.fn(() => 'merged');
+        const pushEventFn = vi.fn((msg: string) => msg.length > 0);
+        const state = mkState();
+        let pushes = 0;
+        runLoop(
+            validCfg(),
+            ctx(state),
+            deps([], {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                findOpenPrFn: () => ({ number: 55, labels: [] }),
+                pickReviewModelFn: () => 'none',
+                pushSessionCommitsFn: () =>
+                    ++pushes === 1
+                        ? { kind: 'in-sync' as const }
+                        : {
+                              kind: 'failed' as const,
+                              why: 'git push отвергнут — ! [rejected] (non-fast-forward)',
+                              local: 'b'.repeat(40),
+                              remote: 'a'.repeat(40),
+                          },
+                pushEventFn,
+                tryMergePhaseFn,
+            }),
+        );
+        expect(tryMergePhaseFn).not.toHaveBeenCalled();
+        expect(state.submitted).toBeFalsy();
+        const stops = pushEventFn.mock.calls.map((c) => String(c[0]));
+        expect(stops).toHaveLength(1);
+        expect(stops[0]).toContain('(session-unpushed)');
+        expect(stops[0]).toContain('правки по ревью');
+        expect(stops[0]).toContain('non-fast-forward');
+    });
+
+    // Ревью 16c2: пуш чини-сессии гейта. Сессия пушить сама не может (`loop-push`), поэтому
+    // её коммиты довозит раннер — и у упавшей тоже, до стопа, а не только у успешной.
+    const healDeps = (order: string[], code: number, pushFn?: () => unknown) => ({
+        openIssuesFn: () => [],
+        allOpenIssuesFn: () => [],
+        phaseMergedFn: () => false,
+        tryMergePhaseFn: () => {
+            order.push('gate');
+            return 'red-checks' as const;
+        },
+        getLastRedCheck: () => ({ name: 'test', cmd: 'npm run test', excerpt: 'boom' }),
+        runClaudeFn: vi.fn<RunClaudeFake>(() => {
+            order.push('session');
+            return code;
+        }),
+        ensureCleanFn: (where: string) => {
+            if (where === 'чини-сессия гейта') order.push(`clean:${where}`);
+            return true;
+        },
+        pushSessionCommitsFn: () => {
+            order.push('push');
+            return (pushFn?.() ?? { kind: 'in-sync' }) as { kind: 'in-sync' };
+        },
+    });
+
+    it('ревью 16c2: коммиты чини-сессии гейта — один пуш раннера до следующего прохода', () => {
+        const order: string[] = [];
+        runLoop(
+            validCfg({ gateHealAttempts: 2 }),
+            ctx(mkState({ submitted: true, gateHeals: 0 })),
+            deps([], healDeps(order, 0)),
+        );
+        // Довоз на входе в гейт → гейт → сессия → (коммит остатка) → пуш.
+        const session = order.indexOf('session');
+        expect(order.slice(0, 2)).toEqual(['push', 'gate']);
+        expect(order.slice(session + 1)).toContain('push');
+        const after = order.slice(session + 1);
+        expect(after.indexOf('clean:чини-сессия гейта')).toBeLessThan(after.indexOf('push'));
+        expect(after.filter((x) => x === 'push').length).toBeGreaterThanOrEqual(1);
+        expect(after.indexOf('push')).toBeLessThan(
+            after.includes('gate') ? after.indexOf('gate') : Infinity,
+        );
+    });
+
+    it('ревью 16c2: чини-сессия гейта упала → её коммиты запушены до стопа, остаток не тронут', () => {
+        const order: string[] = [];
+        const pushEventFn = vi.fn((msg: string) => msg.length > 0);
+        const commitLeftoversFn = vi.fn(() => true);
+        runLoop(
+            validCfg({ gateHealAttempts: 2 }),
+            ctx(mkState({ submitted: true, gateHeals: 0 })),
+            deps([], { ...healDeps(order, 1), pushEventFn, commitLeftoversFn }),
+        );
+        expect(order).toEqual(['push', 'gate', 'session', 'push']);
+        expect(commitLeftoversFn).not.toHaveBeenCalledWith('чини-сессия гейта');
+        const stops = pushEventFn.mock.calls.map((c) => String(c[0]));
+        expect(stops.some((m) => /чини-сессия гейта .* упала/.test(m))).toBe(true);
+    });
+
+    it('ревью 16c2: пуш чини-сессии гейта отвергнут → стоп session-unpushed, второго гейта нет', () => {
+        const order: string[] = [];
+        const pushEventFn = vi.fn((msg: string) => msg.length > 0);
+        let pushes = 0;
+        runLoop(
+            validCfg({ gateHealAttempts: 2 }),
+            ctx(mkState({ submitted: true, gateHeals: 0 })),
+            deps([], {
+                ...healDeps(order, 0, () =>
+                    ++pushes === 1
+                        ? { kind: 'in-sync' }
+                        : {
+                              kind: 'failed',
+                              why: 'git push отвергнут — ! [rejected] (non-fast-forward)',
+                              local: 'b'.repeat(40),
+                              remote: 'a'.repeat(40),
+                          },
+                ),
+                pushEventFn,
+            }),
+        );
+        expect(order.filter((x) => x === 'gate')).toHaveLength(1);
+        const stops = pushEventFn.mock.calls.map((c) => String(c[0]));
+        expect(stops).toHaveLength(1);
+        expect(stops[0]).toContain('(session-unpushed)');
+        expect(stops[0]).toContain('чини-сессия гейта');
+    });
+
+    it('ревью 16c2: рестарт сразу в гейт сначала довозит незапушенное; отказ — стоп без гейта', () => {
+        const tryMergePhaseFn = vi.fn(() => 'merged' as const);
+        const pushEventFn = vi.fn((msg: string) => msg.length > 0);
+        runLoop(
+            validCfg(),
+            ctx(mkState({ submitted: true })),
+            deps([], {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => false,
+                tryMergePhaseFn,
+                pushSessionCommitsFn: () => ({
+                    kind: 'failed' as const,
+                    why: 'не смог прочитать ветку на origin — Could not resolve host',
+                    local: 'b'.repeat(40),
+                    remote: null,
+                }),
+                pushEventFn,
+            }),
+        );
+        expect(tryMergePhaseFn).not.toHaveBeenCalled();
+        const stops = pushEventFn.mock.calls.map((c) => String(c[0]));
+        expect(stops).toHaveLength(1);
+        expect(stops[0]).toContain('(session-unpushed)');
+        expect(stops[0]).toContain('продолжение сдачи');
+    });
+
+    it('ревью 16c2: стоп пуша правок → рестарт довозит пуш и идёт дальше, сессию правок не повторяет', () => {
+        const state = mkState();
+        const pushEventFn = vi.fn((msg: string) => msg.length > 0);
+        const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+        const tryMergePhaseFn = vi.fn(() => 'merged' as const);
+        let pushes = 0;
+        const base = {
+            openIssuesFn: () => [],
+            allOpenIssuesFn: () => [],
+            findOpenPrFn: () => ({ number: 55, labels: [] }),
+            pickReviewModelFn: () => 'none',
+            runClaudeFn,
+            pushEventFn,
+            tryMergePhaseFn,
+        };
+        runLoop(
+            validCfg(),
+            ctx(state),
+            deps([], {
+                ...base,
+                pushSessionCommitsFn: () =>
+                    ++pushes === 1
+                        ? { kind: 'in-sync' as const }
+                        : {
+                              kind: 'failed' as const,
+                              why: 'не смог прочитать ветку на origin — Could not resolve host',
+                              local: 'b'.repeat(40),
+                              remote: 'a'.repeat(40),
+                          },
+            }),
+        );
+        expect(runClaudeFn).toHaveBeenCalledTimes(1);
+        expect(tryMergePhaseFn).not.toHaveBeenCalled();
+        const stop = pushEventFn.mock.calls.map((c) => String(c[0])).join('\n');
+        expect(stop).toContain('(session-unpushed)');
+        expect(stop).toContain('правки не повторятся');
+
+        // Рестарт: этап правок закрыт `ok`, пуш довозится на входе в сдачу.
+        const order: string[] = [];
+        runLoop(
+            validCfg(),
+            ctx(state),
+            deps([], {
+                ...base,
+                pushSessionCommitsFn: () => {
+                    order.push('push');
+                    return {
+                        kind: 'pushed' as const,
+                        local: 'b'.repeat(40),
+                        remote: 'a'.repeat(40),
+                    };
+                },
+                tryMergePhaseFn: () => {
+                    order.push('gate');
+                    return 'merged' as const;
+                },
+            }),
+        );
+        expect(runClaudeFn).toHaveBeenCalledTimes(1);
+        expect(order[0]).toBe('push');
+        expect(order).toContain('gate');
+    });
+
+    it('#224: dry-прогон сдачи не пушит', () => {
+        const pushSessionCommitsFn = vi.fn(() => ({ kind: 'in-sync' as const }));
+        runLoop(
+            validCfg(),
+            ctx(mkState()),
+            deps([], {
+                dry: true,
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                findOpenPrFn: () => ({ number: 55, labels: [] }),
+                pickReviewModelFn: () => 'none',
+                pushSessionCommitsFn,
+                tryMergePhaseFn: () => 'merged',
             }),
         );
         expect(pushSessionCommitsFn).not.toHaveBeenCalled();
@@ -13738,6 +14191,8 @@ describe('runLoop → промпт ревью получает контекст 
                 }),
                 checkOnPhaseBranchFn: () => ({ ok: true, sha: 'a'.repeat(40) }),
                 branchPushedFn: () => true,
+                // #224: пуш раннера после сессии — настоящий git; пушить нечего.
+                pushSessionCommitsFn: () => ({ kind: 'in-sync' as const }),
                 // Намерения сессии — побочка по fs (общий deps выше делает то же).
                 applySessionRequestsFn: () => ({ applied: 0, failed: false }),
                 // #625: заглушки лестницы ревью правок — см. общий deps выше.
@@ -14699,20 +15154,120 @@ describe('applySessionRequests: намерения сессии применяе
         expect(pushEventFn.mock.calls[0][0]).toMatch(/метка blocked/i);
     });
 
-    it('#45 НЕГАТИВНЫЙ: намерение по PR вне цикла сдачи → отказ (PR неизвестен)', () => {
-        const { ts, calls } = prTaskSource();
+    // #226: хвост `pr-comment` от сдачи прошлой фазы держал в заложниках `close` карточки
+    // нового цикла — «Применено 0 из 4», и петля взяла бы ту же карточку повторно. PR,
+    // которого петля не знает, не появится и при повторе: строка выбывает, остальное идёт.
+    it('#226 от противного: pr-comment вне цикла сдачи выбывает строкой, close карточки ложится', () => {
+        const { ts, calls } = prTaskSource({
+            closeIssue: (n: number) => calls.push(`close:${n}`),
+        });
+        const written: string[] = [];
+        const logs: string[] = [];
+        const pushEventFn = vi.fn();
         const res = ralph.applySessionRequests({
+            cfg: CFG,
+            dry: false,
+            readFn: () =>
+                [
+                    line({ kind: 'pr-comment', comment: 'замечание к смердженному PR' }),
+                    line({ kind: 'pr-comment', comment: 'сводка', path: 'src/a.ts', line: 3 }),
+                    line({ kind: 'comment', issue: 7, comment: 'отчёт' }),
+                    line({ kind: 'close', issue: 7, comment: 'сделано' }),
+                ].join('\n'),
+            writeFn: (text: string) => written.push(text),
+            removeFn: () => {},
+            taskSource: ts,
+            logFn: (m: string) => logs.push(m),
+            pushEventFn,
+            orphanPrFn: () => 42,
+        });
+        expect(res.failed).toBe(false);
+        expect(res.closedIssues).toEqual([7]);
+        expect(res.applied).toBe(2);
+        // В PR не ушло ничего: петля в PR, которого не знает, не пишет.
+        expect(calls).toEqual(['close:7']);
+        // Строка ушла из файла: последняя запись остатка — пустая.
+        expect(written[written.length - 1].trim()).toBe('');
+        const text = logs.join('\n');
+        // Каждая выбывшая — строкой лога с причиной и самой строкой намерения.
+        expect(text).toMatch(
+            /pr-comment \(сводка\) отброшено: .*вне цикла сдачи.*замечание к смердженному PR/,
+        );
+        expect(text).toMatch(/pr-comment src\/a\.ts:3 отброшено/);
+        // Сводка называет число и PR.
+        expect(text).toMatch(/Отброшено PR-намерений вне цикла сдачи: 2 \(PR #42\)/);
+        // Комментарии без блока — без пуша: у них нет решения о мердже.
+        expect(pushEventFn).not.toHaveBeenCalled();
+    });
+
+    it('#226 номер PR не определился → сводка говорит это, а не молчит', () => {
+        const { ts } = prTaskSource();
+        const logs: string[] = [];
+        ralph.applySessionRequests({
             cfg: CFG,
             dry: false,
             readFn: () => line({ kind: 'pr-comment', comment: 'замечание' }),
             writeFn: () => {},
             removeFn: () => {},
             taskSource: ts,
-            logFn: () => {},
+            logFn: (m: string) => logs.push(m),
             pushEventFn: () => {},
+            orphanPrFn: () => {
+                throw new Error('форж молчит');
+            },
+        });
+        const text = logs.join('\n');
+        expect(text).toMatch(/Номер PR отброшенных намерений не определился: форж молчит/);
+        expect(text).toMatch(/Отброшено PR-намерений вне цикла сдачи: 1 \(PR не определён\)/);
+    });
+
+    // #226: блок означал «не мерджить» — его потеря не может быть строкой в логе.
+    it('#226 pr-block вне цикла сдачи не пропадает молча: пуш с причиной и текстом блока', () => {
+        const { ts, calls } = prTaskSource();
+        const pushEventFn = vi.fn();
+        const res = ralph.applySessionRequests({
+            cfg: CFG,
+            dry: false,
+            readFn: () => line({ kind: 'pr-block', comment: 'сборка красная' }),
+            writeFn: () => {},
+            removeFn: () => {},
+            taskSource: ts,
+            logFn: () => {},
+            pushEventFn,
+            orphanPrFn: () => 42,
         });
         expect(calls).toEqual([]);
-        expect(res.failed).toBe(true);
+        expect(res.applied).toBe(0);
+        expect(pushEventFn).toHaveBeenCalledTimes(1);
+        const msg = String(pushEventFn.mock.calls[0][0]);
+        expect(msg).toMatch(/^⛔/);
+        expect(msg).toMatch(/pr-block.*вне цикла сдачи.*PR #42/);
+        expect(msg).toMatch(/не мерджить/);
+        expect(msg).toMatch(/сборка красная/);
+    });
+
+    it('#226 длинный pr-block в уведомлении — первой строкой с обрезкой, целиком — в логе', () => {
+        const { ts } = prTaskSource();
+        const pushEventFn = vi.fn();
+        const logs: string[] = [];
+        const long = `заголовок блока ${'х'.repeat(1000)}\nвторая строка тела`;
+        ralph.applySessionRequests({
+            cfg: CFG,
+            dry: false,
+            readFn: () => line({ kind: 'pr-block', comment: long }),
+            writeFn: () => {},
+            removeFn: () => {},
+            taskSource: ts,
+            logFn: (m: string) => void logs.push(m),
+            pushEventFn,
+            orphanPrFn: () => 42,
+        });
+        const msg = String(pushEventFn.mock.calls[0][0]);
+        expect(msg).toContain('заголовок блока');
+        expect(msg).toMatch(/…$/);
+        expect(msg).not.toContain('вторая строка тела');
+        expect(msg.length).toBeLessThan(600);
+        expect(logs.join('\n')).toContain('вторая строка тела');
     });
 
     it('#45 НЕГАТИВНЫЙ: открытого PR фазы нет → отказ, замечание не теряется молча', () => {
@@ -16407,6 +16962,35 @@ describe('sessionSettingsArgs: отказ пробы посреди прогон
     it('без раскладки корней — пусто, settings не собирается', () => {
         expect(ralph.sessionSettingsArgs({}, { roots: null })).toEqual([]);
     });
+
+    // #225, ревью 16c2: пакет харнесса не принят — стоп с причиной, а не исключение из argv.
+    it('запрет субагентов не собрался — стоп guard-probe с причиной, а не бросок', () => {
+        const pushes: string[] = [];
+        expect(() =>
+            ralph.loopDeniedToolsArg({
+                deniedFn: () => {
+                    throw new Error('запрет субагентов в сессии петли: пакет не принят');
+                },
+                persistFn: null,
+                pushEventFn: (msg: string) => {
+                    pushes.push(msg);
+                    return false;
+                },
+                exitFn: (): never => {
+                    throw new Error('exit');
+                },
+            }),
+        ).toThrow('exit');
+        expect(pushes).toHaveLength(1);
+        expect(pushes[0]).toMatch(/пакет не принят — флаг запрета субагентов собрать нечем/);
+    });
+
+    it('запрет субагентов считается один раз и отдаётся строкой имён', () => {
+        expect(ralph.loopDeniedToolsArg()).toBe(ralph.loopDeniedToolsArg());
+        expect(ralph.loopDeniedToolsArg().split(',')).toEqual(
+            expect.arrayContaining(['Agent', 'ScheduleWakeup']),
+        );
+    });
 });
 
 // #119: барьер сессии Codex — тот же стоп, что у settings Claude, если проба не прошла.
@@ -16871,5 +17455,394 @@ describe('collectSessionIntents: намерения из вывода сесси
             seen: new Set<string>(),
         });
         expect(file.text).toBe(`${comment}\n${comment}\n`);
+    });
+});
+
+// #217: переспрос сессии-исправления при неразобранном батче намерений. Ночь 27→28.10 —
+// восемь стопов сдачи подряд на батче с `type`/`body` вместо `kind`/`comment`, и каждый
+// рестарт повторял ревью целиком. Здесь — применение после переспроса, отказы сверки «от
+// противного», второй отказ подряд без второго переспроса и запуск без инструментов у
+// каждого рантайма.
+describe('#217: переспрос намерений при отказе разбора батча', () => {
+    const CFG = { issueLabels: ['area:devops'], model: 'claude-sonnet-5' };
+    const PHASE = { branch: 'feature/m1' };
+    const line = (o: unknown) => JSON.stringify(o);
+    const DRIFTED = [
+        line({
+            type: 'pr-comment',
+            body: '🔴 [blocker] теряется отказ',
+            path: 'core/a.ts',
+            line: 42,
+        }),
+        line({ type: 'pr-comment', body: 'сводка прохода' }),
+    ].join('\n');
+    const FIXED = [
+        line({
+            kind: 'pr-comment',
+            comment: '🔴 [blocker] теряется отказ',
+            path: 'core/a.ts',
+            line: 42,
+        }),
+        line({ kind: 'pr-comment', comment: 'сводка прохода' }),
+    ].join('\n');
+    const block = (lines: string) =>
+        `готово\n<<<RALPH-INTENTS>>>\n${lines}\n<<<END-RALPH-INTENTS>>>\n`;
+    const TOOLLESS = { turnLimit: 'required', fallbackModel: true, toolless: true };
+
+    // Сессия-исправление фейком runClaude: отдаёт вывод и пишет, с чем её запустили.
+    const fakeRepairSession = (output: string, code = 0) => {
+        const calls: Array<{ prompt: string; opts: Record<string, unknown> }> = [];
+        const fn = (
+            prompt: string,
+            opts: Record<string, unknown>,
+            hooks: {
+                onOutput?: (o: string, e: string) => void;
+                collectIntentsFn?: (o: string, x: { seen: Set<string> }) => void;
+            } = {},
+        ) => {
+            calls.push({ prompt, opts });
+            // Боевой runClaude отдаёт вывод сборщику намерений — пустой сборщик и есть
+            // гарантия, что ответ исправления не ляжет в файл мимо сверки.
+            hooks.collectIntentsFn?.(output, { seen: new Set() });
+            hooks.onOutput?.(output, 'completed');
+            return code;
+        };
+        return { fn, calls };
+    };
+
+    const prSource = () => {
+        const calls: string[] = [];
+        return {
+            calls,
+            ts: {
+                commentOnIssue: () => {},
+                closeIssue: () => {},
+                blockIssue: () => {},
+                createIssue: () => 1,
+                findOpenPullRequest: () => ({ number: 55, labels: [] }),
+                commentOnPullRequest: (_n: number, input: { body: string; anchor?: unknown }) =>
+                    calls.push(
+                        `${JSON.stringify(input.anchor ?? null)}:${input.body.replace(/\n\n<!-- ralph-intent:[A-Za-z0-9-]+ -->$/, '')}`,
+                    ),
+                addBlockedLabel: () => {},
+            },
+        };
+    };
+
+    const apply = (
+        raw: string,
+        repairFn: ((b: string, w: string) => unknown) | undefined,
+        over: Record<string, unknown> = {},
+    ) => {
+        const { ts, calls } = prSource();
+        const logs: string[] = [];
+        const pushes: string[] = [];
+        const writes: string[] = [];
+        let file = raw;
+        const res = ralph.applySessionRequests({
+            cfg: CFG,
+            phase: PHASE,
+            currentMilestone: 'M1',
+            dry: false,
+            readFn: () => file,
+            writeFn: (t: string) => {
+                writes.push(t);
+                file = t;
+            },
+            removeFn: () => {
+                file = '';
+            },
+            taskSource: ts,
+            logFn: (m: string) => void logs.push(m),
+            pushEventFn: (m: string) => void pushes.push(m),
+            sleepFn: () => {},
+            intentIdFn: () => 'a1b2c3d4-e5f6',
+            repairFn,
+            ...over,
+        });
+        return { res, calls, logs, pushes, writes };
+    };
+
+    const repairWith =
+        (session: ReturnType<typeof fakeRepairSession>, caps: unknown = TOOLLESS) =>
+        (b: string, w: string) =>
+            ralph.repairIntentBatch(b, w, {
+                runClaudeFn: session.fn,
+                capabilities: caps,
+                cfg: CFG,
+                logFn: () => {},
+            });
+
+    it('батч с type/body у pr-comment после переспроса применяется, в логе строка переспроса', () => {
+        const session = fakeRepairSession(block(FIXED));
+        const { res, calls, logs, writes } = apply(DRIFTED, repairWith(session));
+        expect(res.failed).toBe(false);
+        expect(res.applied).toBe(2);
+        expect(calls).toEqual([
+            '{"path":"core/a.ts","line":42}:🔴 [blocker] теряется отказ',
+            'null:сводка прохода',
+        ]);
+        expect(logs).toContainEqual(
+            '🔁 Переспрос намерений: исправлено 2 строк (type→kind, body→comment).',
+        );
+        // Исправленный батч — на диске до первого эффекта: рестарт посреди применения
+        // нашёл бы иначе исходный, битый.
+        expect(writes[0]).toBe(`${FIXED}\n`);
+        // Сессии ушли отвергнутый батч и ошибка разбора с номером строки.
+        expect(session.calls).toHaveLength(1);
+        expect(session.calls[0].prompt).toContain(DRIFTED.split('\n')[0]);
+        expect(session.calls[0].prompt).toMatch(/строка 1/);
+    });
+
+    it('сессия-исправление идёт без инструментов, с малым бюджетом ходов и без записи в файл', () => {
+        const session = fakeRepairSession(block(FIXED));
+        expect(repairWith(session)(DRIFTED, 'Запрос сессии, строка 1: …')).toEqual({
+            ok: true,
+            text: FIXED,
+        });
+        expect(session.calls[0].opts).toEqual({
+            model: 'claude-sonnet-5',
+            maxTurns: 2,
+            toolless: true,
+        });
+    });
+
+    // От противного: исправление, сменившее смысл, отвергается, и петля встаёт с причиной.
+    it.each([
+        ['текст', FIXED.replace('сводка прохода', 'всё хорошо')],
+        ['файл якоря', FIXED.replace('core/a.ts', 'core/b.ts')],
+        ['строку якоря', FIXED.replace('"line":42', '"line":41')],
+        ['число строк', `${FIXED}\n${line({ kind: 'pr-block', comment: 'блок' })}`],
+    ])('исправление, сменившее %s, отвергается сверкой — стоп с причиной', (_what, bad) => {
+        const { res, calls, pushes, writes, logs } = apply(DRIFTED, () => ({
+            ok: true,
+            text: bad,
+        }));
+        expect(res.failed).toBe(true);
+        expect(calls).toEqual([]);
+        expect(writes).toEqual([]);
+        // Текст предложенной правки — в лог: по нему человек решает, править ли батч руками.
+        expect(logs).toContainEqual(`Отвергнутое исправление:\n${bad}`);
+        expect(pushes).toHaveLength(1);
+        // Причины обоих разборов: исходная ошибка и отказ сверки.
+        expect(pushes[0]).toMatch(/строка 1: неизвестный kind/);
+        expect(pushes[0]).toMatch(/исправление отвергнуто сверкой с исходным/);
+    });
+
+    it('исправление, сменившее адресат карточки, отвергается', () => {
+        const raw = line({ kind: 'close', issue: 7, body: 'сделано' });
+        const { res, pushes } = apply(raw, () => ({
+            ok: true,
+            text: line({ kind: 'close', issue: 8, comment: 'сделано' }),
+        }));
+        expect(res.failed).toBe(true);
+        expect(pushes[0]).toMatch(/поле issue было 7/);
+    });
+
+    it('второй отказ подряд — стоп без второго переспроса, причины обоих разборов', () => {
+        const repairFn = vi.fn(() => ({ ok: true, text: DRIFTED.replace(/type/g, 'kind_') }));
+        const { res, calls, pushes } = apply(DRIFTED, repairFn);
+        expect(repairFn).toHaveBeenCalledTimes(1);
+        expect(res.failed).toBe(true);
+        expect(calls).toEqual([]);
+        expect(pushes[0]).toMatch(/строка 1: неизвестный kind/);
+        expect(pushes[0]).toMatch(/исправление тоже не разобралось: Запрос сессии, строка 1/);
+    });
+
+    it('сессия-исправление без блока или с ненулевым кодом — стоп с её причиной', () => {
+        const noBlock = repairWith(fakeRepairSession('не смогла'))(DRIFTED, 'x');
+        expect(noBlock).toEqual({
+            ok: false,
+            why: 'переспрос не помог — в ответе исправления нет блока намерений',
+        });
+        expect(repairWith(fakeRepairSession(block(FIXED), 1))(DRIFTED, 'x')).toMatchObject({
+            ok: false,
+            why: expect.stringMatching(/кодом 1/),
+        });
+        expect(
+            repairWith(fakeRepairSession(`<<<RALPH-INTENTS>>>\n${FIXED}\n`))(DRIFTED, 'x'),
+        ).toMatchObject({ ok: false, why: expect.stringMatching(/блок исправления отвергнут/) });
+        const { pushes } = apply(DRIFTED, () => noBlock);
+        expect(pushes[0]).toMatch(/нет блока намерений/);
+    });
+
+    it('исправление, которое не разобралось, — тоже в лог текстом', () => {
+        const bad = '{"kind":"pr-comment"';
+        const { res, logs } = apply(DRIFTED, () => ({ ok: true, text: bad }));
+        expect(res.failed).toBe(true);
+        expect(logs).toContainEqual(`Отвергнутое исправление:\n${bad}`);
+    });
+
+    it('отказ рантайма запустить сессию без инструментов — его причина в стопе, а не один код', () => {
+        const refusal = "рантайм 'openai' не умеет сессию без инструментов — запуск отменён (#217)";
+        expect(repairWith(fakeRepairSession(`${refusal}\n`, 1))(DRIFTED, 'x')).toEqual({
+            ok: false,
+            why: `переспрос не помог — сессия-исправление вышла с кодом 1: ${refusal}`,
+        });
+    });
+
+    it('сессия-исправление, бросившая на запуске, — причина строкой, а не исключение', () => {
+        const r = ralph.repairIntentBatch(DRIFTED, 'x', {
+            runClaudeFn: () => {
+                throw new Error('spawn упал');
+            },
+            capabilities: TOOLLESS,
+            cfg: CFG,
+            logFn: () => {},
+        });
+        expect(r).toEqual({
+            ok: false,
+            why: 'переспрос не помог — сессия-исправление не запустилась: spawn упал',
+        });
+    });
+
+    it('рантайм без toolless — сессия не запускается вовсе', () => {
+        const session = fakeRepairSession(block(FIXED));
+        const r = repairWith(session, { turnLimit: 'best-effort', fallbackModel: false })(
+            DRIFTED,
+            'x',
+        );
+        expect(r).toMatchObject({ ok: false, why: expect.stringMatching(/toolless/) });
+        expect(session.calls).toEqual([]);
+    });
+
+    it('батч, который сверять не с чем (не JSON, отказ блока), не переспрашивается', () => {
+        const session = fakeRepairSession(block(FIXED));
+        for (const raw of ['{оборвано', '{"ralph":"rejected-block","why":"блок не закрыт"}']) {
+            expect(repairWith(session)(raw, 'x')).toMatchObject({
+                ok: false,
+                why: expect.stringMatching(/^переспроса нет/),
+            });
+        }
+        expect(session.calls).toEqual([]);
+    });
+
+    it('годный батч и dry-режим переспроса не зовут', () => {
+        const repairFn = vi.fn();
+        expect(apply(FIXED, repairFn).res.failed).toBe(false);
+        apply(DRIFTED, repairFn, { dry: true });
+        expect(repairFn).not.toHaveBeenCalled();
+    });
+
+    // Применение, а не работоспособность: шаги сдачи применяют намерения одной функцией, и
+    // переспрос обязан стоять именно в ней — иначе он есть, но его никто не зовёт.
+    it('проводка: сессии сдачи применяют намерения с переспросом', () => {
+        const src = fs.readFileSync(path.join(import.meta.dirname, 'orchestrator.ts'), 'utf8');
+        const at = src.indexOf('const sessionIntentsApplied = (what: string): boolean => {');
+        expect(at).toBeGreaterThan(0);
+        const body = src.slice(at, src.indexOf('return !res.failed;', at));
+        expect(body).toMatch(
+            /repairFn: \(batch, why\) =>\s+repairIntentBatch\(batch, why, \{ runClaudeFn, cfg, logFn \}\)/,
+        );
+    });
+
+    describe('запуск без инструментов — на аргументах каждого рантайма', () => {
+        const TOKEN_ENV = 'RALPH_KIMI_AUTH_TOKEN';
+        const saved = process.env[TOKEN_ENV];
+        beforeEach(() => {
+            vi.spyOn(console, 'log').mockImplementation(() => {});
+            vi.spyOn(fs, 'appendFileSync').mockImplementation(() => {});
+            vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+            vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+            process.env[TOKEN_ENV] = 'sk-moon-217';
+        });
+        afterEach(() => {
+            vi.restoreAllMocks();
+            if (saved === undefined) delete process.env[TOKEN_ENV];
+            else process.env[TOKEN_ENV] = saved;
+        });
+        const okSpawn = () =>
+            vi.fn<SpawnFake>(() => ({ status: 0, stdout: 'ok', stderr: '', signal: null }));
+
+        it('claude: --tools "" и --strict-mcp-config; без toolless их нет', () => {
+            const argv = buildClaudeArgs({ maxTurns: 2, toolless: true }, {});
+            expect(argv[argv.indexOf('--tools') + 1]).toBe('');
+            expect(argv).toContain('--strict-mcp-config');
+            const plain = buildClaudeArgs({ maxTurns: 2 }, {});
+            expect(plain).not.toContain('--tools');
+            expect(plain).not.toContain('--strict-mcp-config');
+        });
+
+        it('kimi (харнесс Claude Code): тот же запрет в argv настоящего запуска', () => {
+            const runtime = buildRuntime();
+            runtime.setConfigForTests({ ...REAL_CONFIG, kimiRuntime: { model: 'kimi-k2' } });
+            const spawnFn = okSpawn();
+            runtime.runKimiOnce(
+                'x',
+                { maxTurns: 2, toolless: true },
+                spawnFn as unknown as SpawnSyncFn,
+                VERSION_UNREAD,
+            );
+            const [, argv] = spawnFn.mock.calls[0];
+            expect(argv[argv.indexOf('--tools') + 1]).toBe('');
+            expect(argv).toContain('--strict-mcp-config');
+        });
+
+        // #225: запрет субагентов и отложенного хода — в argv настоящего запуска kimi; у
+        // сессии-исправления его заменяет запрет всех инструментов.
+        it('kimi (харнесс Claude Code): запрет Agent и ScheduleWakeup в argv запуска петли', () => {
+            const runtime = buildRuntime();
+            runtime.setConfigForTests({ ...REAL_CONFIG, kimiRuntime: { model: 'kimi-k2' } });
+            const spawnFn = okSpawn();
+            runtime.runKimiOnce(
+                'x',
+                { maxTurns: 2 },
+                spawnFn as unknown as SpawnSyncFn,
+                VERSION_UNREAD,
+            );
+            const [, argv] = spawnFn.mock.calls[0];
+            const denied = argv[argv.indexOf('--disallowedTools') + 1].split(',');
+            expect(denied).toEqual(expect.arrayContaining(['Agent', 'ScheduleWakeup']));
+            expect(buildClaudeArgs({ maxTurns: 2, toolless: true }, {})).not.toContain(
+                '--disallowedTools',
+            );
+        });
+
+        // Флага запрета ВСЕХ инструментов у этих CLI нет — запуск отменён до spawn.
+        type Rt = ReturnType<typeof buildRuntime>;
+        it.each([
+            [
+                'openai',
+                (rt: Rt, s: SpawnSyncFn) =>
+                    rt.runOpenAIOnce(
+                        'x',
+                        { maxTurns: 2, toolless: true },
+                        s,
+                        undefined,
+                        VERSION_UNREAD,
+                        () => [],
+                    ),
+            ],
+            [
+                'kimi-native',
+                (rt: Rt, s: SpawnSyncFn) =>
+                    rt.runKimiNativeOnce('x', { maxTurns: 2, toolless: true }, s, VERSION_UNREAD, {
+                        homeFn: () => '/h',
+                        writePromptFn: () => {},
+                        removePromptFn: () => {},
+                        isDirFn: () => false,
+                        sessionTree: '/w',
+                    }),
+            ],
+            [
+                'opencode',
+                (rt: Rt, s: SpawnSyncFn) =>
+                    rt.runOpencodeOnce('x', { maxTurns: 2, toolless: true }, s, VERSION_UNREAD, {
+                        configDirFn: () => '/c',
+                    }),
+            ],
+        ])('%s: сессия без инструментов не запускается, причина названа', (name, run) => {
+            const runtime = buildRuntime();
+            runtime.setConfigForTests(REAL_CONFIG);
+            const spawnFn = okSpawn();
+            const res = run(runtime, spawnFn as unknown as SpawnSyncFn);
+            expect(spawnFn).not.toHaveBeenCalled();
+            expect(res).toEqual({
+                code: 1,
+                output: `рантайм '${name}' не умеет сессию без инструментов — запуск отменён (#217)`,
+                failureKind: 'spawn-failed',
+                endReason: 'unknown',
+            });
+        });
     });
 });

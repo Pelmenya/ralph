@@ -648,11 +648,38 @@ describe('пишущая сессия оркестратора: проводка
         /const runSessionWithTurnRetries/.test(SRC[i] ?? '') ||
         /runFixSession =/.test(SRC[i - 1] ?? '');
 
+    // Диапазон строк функции или помощника: от объявления до закрывающей скобки с тем же
+    // отступом. Нет объявления — пустой диапазон, и проверка ниже это называет.
+    const rangeOf = (decl: RegExp): [number, number] => {
+        const start = SRC.findIndex((l) => decl.test(l));
+        if (start < 0) return [-1, -1];
+        const indent = /^ */.exec(SRC[start])![0];
+        const end = SRC.findIndex((l, i) => i > start && new RegExp(`^${indent}\\};?$`).test(l));
+        return [start, end];
+    };
+    const within = ([a, b]: [number, number], i: number): boolean => a >= 0 && i > a && i < b;
+
+    // Сессия без инструментов (#217, переспрос батча намерений) не пишущая: коммитить ей
+    // нечем. Исключается ПО МЕСТУ — тело `repairIntentBatch`, — а не по тексту `toolless: true`
+    // рядом с вызовом: скопированные опции выкинули бы из проверки настоящую пишущую сессию.
+    const REPAIR = rangeOf(/^\s*function repairIntentBatch\(/);
+    // Тело помощника повторов: пуш после него — работа вызывающего (тот сам место вызова).
+    const RETRIES = rangeOf(/const runSessionWithTurnRetries = \(/);
+
     const sites = SRC.flatMap((line, i) =>
-        WRITING.some((re) => re.test(line)) && !isDeclaration(i)
+        WRITING.some((re) => re.test(line)) && !isDeclaration(i) && !within(REPAIR, i)
             ? [{ line: i + 1, text: line.trim() }]
             : [],
     );
+
+    it('исключения по месту находятся — иначе исключать было бы нечего, а правило слепо', () => {
+        expect(REPAIR[0]).toBeGreaterThan(-1);
+        expect(REPAIR[1]).toBeGreaterThan(REPAIR[0]);
+        expect(RETRIES[0]).toBeGreaterThan(-1);
+        expect(RETRIES[1]).toBeGreaterThan(RETRIES[0]);
+        // Сама сессия-исправление в теле есть: исключение действительно что-то исключает.
+        expect(SRC.slice(...REPAIR).some((l) => WRITING.some((re) => re.test(l)))).toBe(true);
+    });
 
     it('пишущие сессии в оркестраторе вообще находятся — иначе проверки ниже пусты', () => {
         expect(sites.length).toBeGreaterThanOrEqual(5);
@@ -667,6 +694,19 @@ describe('пишущая сессия оркестратора: проводка
         const below = SRC.slice(line, line + WINDOW_DOWN);
         expect(below.some((l) => AFTER.test(l))).toBe(true);
     });
+
+    // #224: пуш сессии петли закрыт guard (`loop-push`), и пишущая сессия без пуша раннера
+    // оставила бы коммиты локально — всплыло бы это у гейта исходом `head-diverged`. Окно
+    // широкое: у кодер-итерации между спавном и пушем лежат разбор падения, намерения и
+    // журнал попытки (ревью 16c2).
+    const PUSH_WINDOW = 260;
+    it.each(sites.filter(({ line }) => !within(RETRIES, line - 1)))(
+        'строка $line ($text) — пуш раннера ниже в пределах окна',
+        ({ line }) => {
+            const below = SRC.slice(line, line + PUSH_WINDOW);
+            expect(below.some((l) => /pushAfterSession\(/.test(l))).toBe(true);
+        },
+    );
 
     // Помощник повторов запускает НЕСКОЛЬКО сессий подряд и применяет намерения после
     // каждой. Страж снаружи цикла срабатывал бы после всех повторов — то есть намерения

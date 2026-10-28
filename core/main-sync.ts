@@ -42,7 +42,7 @@ import {
     isExecTimeout,
     sleep,
 } from '../shared/ralph-util.ts';
-import type { ShArgvFn } from '../shared/ralph-util.ts';
+import type { ExecOpts, ShArgvFn } from '../shared/ralph-util.ts';
 import { classifyMergeFailure } from './merge-retry.ts';
 
 type LogFn = (msg: string) => void;
@@ -50,6 +50,45 @@ type LogFn = (msg: string) => void;
 /** Попыток сетевого шага (первая + повторы) и пауза перед повтором N — 15 с, 30 с. */
 export const NETWORK_ATTEMPTS = 3;
 const NETWORK_PAUSE_MS = 15_000;
+
+/**
+ * Сетевой git-шаг с повтором транзиента; исключение последней попытки уходит наверх, вывод
+ * успешной — вызывающему. Общий для влития `main` и пуша сессии (`session-push.ts`): две копии
+ * правила повтора разъехались бы так же, как однажды путь конфига. Опции исполнения —
+ * параметром (`gitNetworkOpts()` у вызывающего): так их видит барьер
+ * `tests/git-network-calls.test.ts` у каждого места вызова.
+ */
+export function gitNetworkRetry(
+    what: string,
+    args: string[],
+    opts: ExecOpts,
+    {
+        runArgvFn,
+        logFn,
+        sleepFn = sleep,
+    }: { runArgvFn: ShArgvFn; logFn: LogFn; sleepFn?: (ms: number) => void },
+): string {
+    for (let attempt = 1; ; attempt++) {
+        try {
+            return runArgvFn('git', args, opts);
+        } catch (e: unknown) {
+            // Срок не повторяется: он сам уже был ожиданием, и повтор растянул бы стоп
+            // втрое. Держит это явная ветка, а не то, что текст отказа по сроку сегодня
+            // не похож на транзиент: слово «сеть» в классификаторе молча включило бы повтор.
+            if (isExecTimeout(e)) throw e;
+            const why = gitErrorText(e);
+            if (attempt >= NETWORK_ATTEMPTS || classifyMergeFailure(why) !== 'transient') {
+                throw e;
+            }
+            const pauseMs = NETWORK_PAUSE_MS * attempt;
+            logFn(
+                `⚠ ${what} — транзиентный сбой сети (${why}), повтор через ${Math.round(pauseMs / 1000)}с ` +
+                    `(попытка ${attempt} из ${NETWORK_ATTEMPTS}).`,
+            );
+            sleepFn(pauseMs);
+        }
+    }
+}
 
 export type MainSyncResult =
     /** `origin/main` уже предок головы — подтягивать нечего. */
@@ -76,29 +115,8 @@ export function syncPhaseBranchWithMain(
         sleepFn = sleep,
     }: { runArgvFn: ShArgvFn; logFn: LogFn; sleepFn?: (ms: number) => void },
 ): MainSyncResult {
-    // Сетевой шаг с повтором транзиента; исключение последней попытки уходит наверх.
     const network = (what: string, args: string[]): void => {
-        for (let attempt = 1; ; attempt++) {
-            try {
-                runArgvFn('git', args, gitNetworkOpts());
-                return;
-            } catch (e: unknown) {
-                // Срок не повторяется: он сам уже был ожиданием, и повтор растянул бы стоп
-                // втрое. Держит это явная ветка, а не то, что текст отказа по сроку сегодня
-                // не похож на транзиент: слово «сеть» в классификаторе молча включило бы повтор.
-                if (isExecTimeout(e)) throw e;
-                const why = gitErrorText(e);
-                if (attempt >= NETWORK_ATTEMPTS || classifyMergeFailure(why) !== 'transient') {
-                    throw e;
-                }
-                const pauseMs = NETWORK_PAUSE_MS * attempt;
-                logFn(
-                    `⚠ ${what} — транзиентный сбой сети (${why}), повтор через ${Math.round(pauseMs / 1000)}с ` +
-                        `(попытка ${attempt} из ${NETWORK_ATTEMPTS}).`,
-                );
-                sleepFn(pauseMs);
-            }
-        }
+        gitNetworkRetry(what, args, gitNetworkOpts(), { runArgvFn, logFn, sleepFn });
     };
     try {
         network('git fetch origin main', ['fetch', 'origin', 'main']);

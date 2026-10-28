@@ -2,7 +2,8 @@
 // живёт в `.claude/hooks/` репозитория канона и в копию не едет (`tests/core-repo.ts`), а
 // живые сценарии проверяют код ядра, не guard, — поэтому у потребителя они идут под этой
 // заглушкой, а не пропускаются. Держит ровно пробу `core/guard-probe.ts`: рекурсивное
-// удаление, любое упоминание env-файла и правка данных контура в сессии петли — отказ кодом 2
+// удаление, любое упоминание env-файла, правка данных контура, субагент и отложенный ход в
+// сессии петли (#225) — отказ кодом 2
 // с кодом причины, остальное — пропуск. Боевым
 // барьером не является и в настройки сессий не подключается.
 const input = JSON.parse(require('node:fs').readFileSync(0, 'utf-8'));
@@ -16,7 +17,9 @@ const code = /rm\s+-\w*r/.test(text)
       ? 'secret-env'
       : loop && /\.claude\/ralph\/hooks\.json/.test(text)
         ? 'contour-data'
-        : null;
+        : loop && ['Agent', 'ScheduleWakeup'].includes(input.tool_name)
+          ? 'loop-delegation'
+          : null;
 if (code) {
     process.stderr.write(
         `stub-guard/guard.cjs: запрещено пробой барьера\nralph-reason-code: ${code}\n`,

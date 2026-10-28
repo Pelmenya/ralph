@@ -47,6 +47,14 @@ describe('capabilitiesProblems — форма объявления', () => {
         ]);
     });
 
+    it('toolless необязателен, но заданный — только булево', () => {
+        const base = { turnLimit: 'required', fallbackModel: true };
+        expect(capabilitiesProblems({ ...base, toolless: true })).toEqual([]);
+        expect(capabilitiesProblems({ ...base, toolless: 'yes' })).toEqual([
+            expect.stringMatching(/toolless = "yes"/),
+        ]);
+    });
+
     it('НЕГАТИВНЫЙ: пропущенные поля — каждое своей причиной', () => {
         const problems = capabilitiesProblems({});
         expect(problems).toHaveLength(2);
@@ -73,7 +81,25 @@ describe('объявления боевого реестра coderRuntime', () =
         // Kimi — харнесс Claude Code: флаг `--max-turns` тот же.
         expect(KIMI_CAPABILITIES.turnLimit).toBe('required');
         // `codex exec` аналога `--max-turns` не имеет и в argv его не получает.
-        expect(CODEX_CAPABILITIES).toEqual({ turnLimit: 'best-effort', fallbackModel: false });
+        expect(CODEX_CAPABILITIES).toEqual({
+            turnLimit: 'best-effort',
+            fallbackModel: false,
+            toolless: false,
+        });
+    });
+
+    // #217: сессию без инструментов объявляет только CLI с флагом запрета ВСЕХ инструментов.
+    it('toolless — только у харнесса Claude Code, остальные объявляют «не умеет» явно', () => {
+        const toolless = Object.fromEntries(
+            Object.entries(registry).map(([name, impl]) => [name, impl.capabilities.toolless]),
+        );
+        expect(toolless).toEqual({
+            claude: true,
+            kimi: true,
+            openai: false,
+            'kimi-native': false,
+            opencode: false,
+        });
     });
 });
 

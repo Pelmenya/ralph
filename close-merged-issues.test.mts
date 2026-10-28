@@ -10,7 +10,6 @@ import {
     closeMergedIssues,
     collectComments,
     closesFromDescription,
-    parseRemote,
     prNumberFromCommit,
 } from './close-merged-issues.mts';
 
@@ -123,30 +122,6 @@ describe('closeMergedIssues', () => {
         const d = deps({ prDescription: () => many });
         expect(() => closeMergedIssues(d)).toThrow(/предел/i);
         expect(d.closeFn).not.toHaveBeenCalled();
-    });
-});
-
-describe('parseRemote', () => {
-    // Координаты берём из origin, а не из кода: имя репозитория в продукте — это след
-    // конкретной установки, и в публичном ядре ему не место.
-    it('разбирает https и ssh', () => {
-        expect(parseRemote('https://git.example.dev/org/repo.git')).toEqual({
-            org: 'org',
-            repo: 'repo',
-        });
-        expect(parseRemote('git@git.example.dev:org/repo.git\n')).toEqual({
-            org: 'org',
-            repo: 'repo',
-        });
-        expect(parseRemote('https://git.example.dev/org/repo')).toEqual({
-            org: 'org',
-            repo: 'repo',
-        });
-    });
-
-    it('мусор — null, а не половина координат', () => {
-        expect(parseRemote('')).toBeNull();
-        expect(parseRemote('не-адрес')).toBeNull();
     });
 });
 

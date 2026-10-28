@@ -340,6 +340,35 @@ const CONTOUR_WRITE: TGuardProbe = {
 };
 
 /**
+ * Субагент и отложенный ход — запрещённое ТОЛЬКО в сессии петли (#225): раннер не видит ни
+ * ходов, ни обрыва субагента, а сессию `-p`, отложившую ход, снаружи никто не будит. Первый
+ * слой — флаг запуска (`--disallowedTools`), второй — guard; проба доказывает второй, потому
+ * что флаг держит CLI, а не исполняемое ядра, и молча снятый флаг иначе не увидел бы никто.
+ */
+const DELEGATION_CODE = 'loop-delegation';
+// Шаг миграции для раскладки без `roots` (докблок `sessionContextProblems`): там guard сессии —
+// копия хуков дерева, и старая копия правила `loop-delegation` не знает.
+export const DELEGATION_MIGRATION_HINT =
+    'если guard — копия хуков в дереве (раскладка без roots), она старше ядра: обнови ' +
+    '.claude/hooks из ядра той же ревизии';
+export const DELEGATION_PROBES: readonly TGuardProbe[] = [
+    {
+        what: 'субагент в сессии петли',
+        toolName: 'Agent',
+        toolInput: { description: 'ralph-probe', prompt: 'ralph-probe' },
+        expect: 'blocked',
+        reasonCode: DELEGATION_CODE,
+    },
+    {
+        what: 'отложенный ход в сессии петли',
+        toolName: 'ScheduleWakeup',
+        toolInput: { delaySeconds: 1200, prompt: 'ralph-probe', reason: 'ralph-probe' },
+        expect: 'blocked',
+        reasonCode: DELEGATION_CODE,
+    },
+];
+
+/**
  * Каждая регистрация guard'а в настройках сессии обязана получить контекст сессии (#184):
  * проба подаёт КАЖДОЙ правку данных контура с тем окружением, которое раннер даст сессии, и
  * ждёт от каждой блок кодом `contour-data`. Регистрация, до которой контекст не дошёл, сочла
@@ -349,6 +378,14 @@ const CONTOUR_WRITE: TGuardProbe = {
  * Доказывает проба это у хуков без контракта — хуков дерева и копии ядра без git. Канонический
  * хук установки несёт `RALPH_CORE_SHA` литералом в команде, петлю узнаёт по нему и блок дал бы
  * и без контекста; контекст ему не нужен, и снять контракт из окружения проба не может.
+ *
+ * Тем же контекстом проба подаёт субагента и отложенный ход (`DELEGATION_PROBES`, #225). Здесь
+ * хватает одной регистрации, назвавшей правило: CLI складывает хуки, и блок одного блокирует
+ * вызов. С `roots` эта регистрация — канонический хук установки, и копия хуков дерева старше
+ * ядра старт не роняет. Без `roots` регистрация одна — копия хуков в дереве потребителя, и пока
+ * она старше #225, проба падает и петля не стартует. Это шаг миграции, а не дефект пробы:
+ * ослабить её строкой `⚠` значило бы пустить сессию, в которой второй слой запрета не стоит
+ * вовсе. Строка отказа называет шаг (`DELEGATION_MIGRATION_HINT`).
  */
 export function sessionContextProblems(
     settings: unknown,
@@ -372,7 +409,7 @@ export function sessionContextProblems(
     }
     const payload = pkg.hookPayload(CONTOUR_WRITE, projectDir);
     const contextEnv = { [SESSION_CONTEXT_ENV]: contextValue };
-    return guards.flatMap((hook) => {
+    const contour = guards.flatMap((hook) => {
         const run = runHookFn(hook, payload, projectDir, {
             projectDirEnv: pkg.setsProjectDirEnv,
             env: contextEnv,
@@ -388,6 +425,32 @@ export function sessionContextProblems(
                 `или не держит забор (${got}; ждали ${CONTOUR_CODE})`,
         ];
     });
+    const delegation = DELEGATION_PROBES.flatMap((probe) => {
+        const covering = pkg
+            .guardRegistration(settings)
+            .hooks.filter(
+                (h) =>
+                    GUARD_HOOK_RE.test(h.command) &&
+                    h.cannotBlock === null &&
+                    pkg.matcherCovers(h.matcher, probe.toolName),
+            );
+        if (covering.length === 0) {
+            return [
+                `${probe.what} (${probe.toolName}): ни одна регистрация guard.cjs не накрывает ` +
+                    'инструмент — в сессии петли он прошёл бы без проверки',
+            ];
+        }
+        const probePayloadText = pkg.hookPayload(probe, projectDir);
+        const runs = covering.map((hook) => ({
+            hook,
+            run: runHookFn(hook, probePayloadText, projectDir, {
+                projectDirEnv: pkg.setsProjectDirEnv,
+                env: contextEnv,
+            }),
+        }));
+        return verdictProblems(probe, runs).map((p) => `${p} — ${DELEGATION_MIGRATION_HINT}`);
+    });
+    return [...contour, ...delegation];
 }
 
 /**

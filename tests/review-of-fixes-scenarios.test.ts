@@ -20,6 +20,7 @@ import ralph from '../ralph.js';
 import { LADDER_CARD_MARKER } from '../core/review-of-fixes.ts';
 import type { RalphConfig } from '../core/orchestrator.ts';
 import type { RalphState } from '../core/state-lock.ts';
+import type { SessionPushResult } from '../core/session-push.ts';
 import { normalizeReviewOfFixes } from '../core/review-of-fixes.ts';
 
 type Runtime = ReturnType<typeof import('../core/orchestrator.ts').createOrchestrator>;
@@ -141,8 +142,12 @@ function runPhase({
     // Задача 79: чтение PR после записи метки blocked. `true` — метка встала, `false` —
     // запись молча не легла, бросок — исход неизвестен.
     labelReadBack = (() => true) as () => boolean,
+    // Ревью 16c2: исход пуша раннера по его номеру (с нуля); `null` — пушить нечего.
+    pushResult = (() => null) as (nth: number) => SessionPushResult | null,
 } = {}) {
     const prompts: string[] = [];
+    // Сколько сессий уже отработало к каждому пушу раннера — так видно, после какой он стоит.
+    const pushes: number[] = [];
     // Сколько сессий уже отработало к каждой проводке — по этому видно, перед какой
     // сессией дерево ставилось на ветку.
     const placements: number[] = [];
@@ -305,7 +310,10 @@ function runPhase({
             },
             ensureCleanFn: () => true,
             // #85: см. тот же дефолт в tests/test-helpers.ts.
-            pushSessionCommitsFn: () => ({ kind: 'in-sync' as const }),
+            pushSessionCommitsFn: (): SessionPushResult => {
+                pushes.push(prompts.length);
+                return pushResult(pushes.length - 1) ?? { kind: 'in-sync' };
+            },
             // #134: см. тот же дефолт в tests/test-helpers.ts.
             ensurePhaseBranchFn: (branch: string) => {
                 placements.push(prompts.length);
@@ -352,6 +360,7 @@ function runPhase({
         heads: HEADS,
         applyArgs,
         placements,
+        pushes,
         pushTexts: () => pushEventFn.mock.calls.map((c: unknown[]) => c[0] as string),
         merged: () =>
             pushEventFn.mock.calls.some((c: unknown[]) => /смерджена в main/.test(c[0] as string)),
@@ -875,6 +884,50 @@ describe('крит. 2: поток новых minor/nit не продлевает
         // круг правок вместе с major и разбирался сессией.
         expect(s.issues).toHaveLength(2);
         expect(s.issues.map((i) => i.title).join(' ')).toContain('другой пробел');
+    });
+
+    // Ревью 16c2: следующий проход ревью правок судит то, что в PR, — круг лестницы
+    // уезжает одним пушем раннера до него. Убери пуш круга — краснеет этот тест.
+    it('круг лестницы → ровно один пуш раннера после сессии правок, до следующего прохода', () => {
+        const s = runPhase({
+            passes: [{ findings: [major('убита ветка отказа', 1)] }, { findings: [] }],
+        });
+        const isFix = (p: string) => s.fixPrompts().includes(p);
+        // Номер сессии (с единицы) второго круга правок — круга лестницы.
+        const ladderFix = s.prompts.map((p, i) => (isFix(p) ? i + 1 : -1)).filter((i) => i > 0)[1];
+        const nextReview = s.prompts.findIndex(
+            (p, i) => i >= ladderFix && s.fixReviewPrompts().includes(p),
+        );
+        expect(ladderFix).toBeGreaterThan(0);
+        expect(nextReview).toBeGreaterThanOrEqual(ladderFix);
+        // Ровно один пуш между кругом правок и следующим проходом ревью правок.
+        expect(s.pushes.filter((n) => n === ladderFix)).toHaveLength(1);
+        expect(s.merged()).toBe(true);
+    });
+
+    it('пуш круга лестницы отвергнут → стоп session-unpushed, следующего прохода нет', () => {
+        const ok = runPhase({
+            passes: [{ findings: [major('убита ветка отказа', 1)] }, { findings: [] }],
+        });
+        const isFix = (p: string) => ok.fixPrompts().includes(p);
+        const ladderFix = ok.prompts.map((p, i) => (isFix(p) ? i + 1 : -1)).filter((i) => i > 0)[1];
+        const nth = ok.pushes.indexOf(ladderFix);
+        const s = runPhase({
+            passes: [{ findings: [major('убита ветка отказа', 1)] }, { findings: [] }],
+            pushResult: (n) =>
+                n === nth
+                    ? {
+                          kind: 'failed',
+                          why: 'git push отвергнут — ! [rejected] (non-fast-forward)',
+                          local: 'b'.repeat(40),
+                          remote: 'a'.repeat(40),
+                      }
+                    : null,
+        });
+        expect(s.fixReviewPrompts()).toHaveLength(1);
+        expect(s.merged()).toBe(false);
+        expect(s.pushTexts().some((t) => /session-unpushed/.test(t))).toBe(true);
+        expect(s.pushTexts().some((t) => /правки по ревью правок/.test(t))).toBe(true);
     });
 
     it('отклонённая косметика не теряется: повторный minor уходит карточкой', () => {

@@ -17,7 +17,7 @@
 // «Закрывает» (маркеры списка и жирный шрифт перед ним допускаются). Граница узкая, но
 // писать «Закрывает #10 и #12» она не мешает.
 import { execFileSync } from 'node:child_process';
-import { createSourcecraftApi } from './adapters/sourcecraft-api.ts';
+import { createSourcecraftApi, parseRemote } from './adapters/sourcecraft-api.ts';
 import { createSourcecraftTaskSource } from './adapters/sourcecraft-task-source.ts';
 
 /** Больше этого за один мердж не закрываем: описание не должно уметь смести бэклог. */
@@ -266,12 +266,6 @@ export function closeMergedIssues(deps: CloseDeps): number[] {
         throw new Error(`Не удалось закрыть: ${failed.join('; ')}`);
     }
     return closed;
-}
-
-/** Координаты репозитория из origin — чтобы имя площадки и репо не жили в коде. */
-export function parseRemote(url: string): { org: string; repo: string } | null {
-    const m = /[:/]([^/:]+)\/([^/]+?)(?:\.git)?\s*$/.exec(url.trim());
-    return m ? { org: m[1], repo: m[2] } : null;
 }
 
 function main(): void {

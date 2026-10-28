@@ -11,6 +11,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { parseSessionContext } from '../.claude/hooks/session-context.cjs';
 import { reasonCodeOf } from '../adapters/barrier-reason.ts';
 import {
+    DELEGATION_PROBES,
     ensureGuardHolds,
     HOOK_COMMAND_ONLY_ENV,
     probeHookEnv,
@@ -357,5 +358,105 @@ describe('preflight: регистрация guard без контекста — 
             runHookFn: spawnHook,
         });
         expect(fails).toEqual([]);
+    });
+});
+
+// #225: субагент и отложенный ход в контексте петли — заведомо запрещённые вызовы стартовой
+// пробы. Флаг запуска держит CLI; guard — второй слой, и проба краснеет, если он снят.
+describe('preflight: субагент и отложенный ход в контексте петли', { timeout: 30_000 }, () => {
+    const settings = JSON.parse(readFileSync(path.join(CANON, '.claude/settings.json'), 'utf-8'));
+    const built = loopSessionContext({ humanRoot: null, sessionTree: CANON, coreSha: '' });
+    if (!built.ok) throw new Error(built.reason);
+    const guardPath = path.join(HOOKS, 'guard.cjs');
+
+    it('в составе пробы — Agent и ScheduleWakeup с кодом loop-delegation', () => {
+        expect(
+            DELEGATION_PROBES.map((p) => [p.toolName, p.expect === 'blocked' && p.reasonCode]),
+        ).toEqual([
+            ['Agent', 'loop-delegation'],
+            ['ScheduleWakeup', 'loop-delegation'],
+        ]);
+    });
+
+    it('настоящий guard дерева блокирует обе пробы своим кодом и называет причину', () => {
+        for (const probe of DELEGATION_PROBES) {
+            const r = spawnHook(
+                { command: `node '${guardPath}'`, timeoutSec: 10, cannotBlock: null },
+                JSON.stringify({
+                    session_id: 's',
+                    hook_event_name: 'PreToolUse',
+                    cwd: CANON,
+                    tool_name: probe.toolName,
+                    tool_input: probe.toolInput,
+                }),
+                CANON,
+                { env: { [SESSION_CONTEXT_ENV]: built.value } },
+            );
+            expect(r.status).toBe(2);
+            expect(reasonCodeOf(r.stderr)).toEqual({ code: 'loop-delegation' });
+            expect(r.stderr).toMatch(/раннер не видит/);
+        }
+    });
+
+    it('запрет снят (guard пропускает Agent) — проба красная и называет инструмент', () => {
+        const problems = sessionContextProblems(settings, CANON, built.value, {
+            runHookFn: (hook, payload, dir, opts) =>
+                payload.includes('"tool_name":"Agent"')
+                    ? { status: 0, stderr: '' }
+                    : spawnHook(hook, payload, dir, opts),
+        });
+        expect(problems).toEqual([
+            expect.stringMatching(/субагент в сессии петли \(Agent\): ни один хук не заблокировал/),
+        ]);
+    });
+
+    it('guard блокирует отложенный ход чужим кодом — не зачёт', () => {
+        const problems = sessionContextProblems(settings, CANON, built.value, {
+            runHookFn: (hook, payload, dir, opts) =>
+                payload.includes('"tool_name":"ScheduleWakeup"')
+                    ? { status: 2, stderr: 'ralph-reason-code: secret-env\n' }
+                    : spawnHook(hook, payload, dir, opts),
+        });
+        expect(problems).toEqual([
+            expect.stringMatching(
+                /ScheduleWakeup.*ждали код причины loop-delegation, получили: secret-env/,
+            ),
+        ]);
+    });
+
+    it('guard не накрывает Agent matcher-ом — проба красная, а не «проверять нечего»', () => {
+        const narrow = {
+            hooks: {
+                PreToolUse: [
+                    {
+                        matcher: 'Write|Edit|ScheduleWakeup',
+                        hooks: [{ type: 'command', command: `node '${guardPath}'`, timeout: 10 }],
+                    },
+                ],
+            },
+        };
+        const problems = sessionContextProblems(narrow, CANON, built.value, {
+            runHookFn: spawnHook,
+        });
+        expect(problems).toEqual([
+            expect.stringMatching(/\(Agent\): ни одна регистрация guard\.cjs не накрывает/),
+        ]);
+    });
+
+    it('ensureGuardHolds со снятым запретом отказывает старту', () => {
+        const fails: string[] = [];
+        ensureGuardHolds(CANON, {
+            failFn: (m) => fails.push(m),
+            logFn: () => {},
+            settings,
+            sessionContext: built.value,
+            runHookFn: (hook, payload, dir, opts) =>
+                /"tool_name":"(?:Agent|ScheduleWakeup)"/.test(payload)
+                    ? { status: 0, stderr: '' }
+                    : spawnHook(hook, payload, dir, opts),
+        });
+        expect(fails).toHaveLength(1);
+        expect(fails[0]).toMatch(/claude-code: субагент в сессии петли/);
+        expect(fails[0]).toMatch(/claude-code: отложенный ход в сессии петли/);
     });
 });

@@ -128,6 +128,8 @@ function runProcess(
                 sha: 'a'.repeat(40),
             }),
             checkOnPhaseBranchFn: () => ({ ok: true, sha: 'a'.repeat(40) }),
+            // #224: пуш раннера после кодер-сессии — настоящий git; пушить нечего.
+            pushSessionCommitsFn: () => ({ kind: 'in-sync' as const }),
             ensureMonitorAliveFn: () => null,
             syncProjectBoardFn: () => {},
             pickRouteFn: (issue: { number: number }) => {

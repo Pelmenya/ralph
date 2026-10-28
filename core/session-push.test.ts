@@ -151,3 +151,85 @@ describe('pushSessionCommits', () => {
         expect(res.kind === 'failed' && res.why).toContain('non-fast-forward');
     });
 });
+
+describe('pushSessionCommits — транзиент сети (ревью 16c2)', () => {
+    const transient = () => gitError(128, 'fatal: unable to access: Could not resolve host');
+
+    it('моргнувший push повторяется с паузой и доезжает', () => {
+        let pushes = 0;
+        const sleeps: number[] = [];
+        const { runArgvFn } = fakeGit({
+            revParse: () => LOCAL,
+            lsRemote: () => {
+                throw gitError(2, '');
+            },
+            push: () => {
+                pushes += 1;
+                if (pushes === 1) throw transient();
+                return '';
+            },
+        });
+        const res = pushSessionCommits(BRANCH, {
+            runArgvFn,
+            logFn,
+            sleepFn: (ms) => sleeps.push(ms),
+        });
+        expect(res.kind).toBe('pushed');
+        expect(pushes).toBe(2);
+        expect(sleeps).toHaveLength(1);
+    });
+
+    it('моргнувший ls-remote повторяется, а код 2 «ветки нет» — нет', () => {
+        let reads = 0;
+        const { runArgvFn } = fakeGit({
+            revParse: () => LOCAL,
+            lsRemote: () => {
+                reads += 1;
+                if (reads === 1) throw transient();
+                throw gitError(2, '');
+            },
+            push: () => '',
+        });
+        const res = pushSessionCommits(BRANCH, { runArgvFn, logFn, sleepFn: () => {} });
+        expect(res.kind).toBe('pushed');
+        expect(reads).toBe(2);
+    });
+
+    it('транзиент, переживший попытки, — failed; non-ff не повторяется вовсе', () => {
+        let pushes = 0;
+        const { runArgvFn } = fakeGit({
+            revParse: () => LOCAL,
+            lsRemote: () => {
+                throw gitError(2, '');
+            },
+            push: () => {
+                pushes += 1;
+                throw transient();
+            },
+        });
+        const res = pushSessionCommits(BRANCH, { runArgvFn, logFn, sleepFn: () => {} });
+        expect(res.kind).toBe('failed');
+        expect(pushes).toBe(3);
+
+        let nonFf = 0;
+        const refused = fakeGit({
+            revParse: () => LOCAL,
+            lsRemote: () => {
+                throw gitError(2, '');
+            },
+            push: () => {
+                nonFf += 1;
+                throw gitError(1, '! [rejected] (non-fast-forward)');
+            },
+        });
+        const sleeps: number[] = [];
+        const res2 = pushSessionCommits(BRANCH, {
+            runArgvFn: refused.runArgvFn,
+            logFn,
+            sleepFn: (ms) => sleeps.push(ms),
+        });
+        expect(res2.kind).toBe('failed');
+        expect(nonFf).toBe(1);
+        expect(sleeps).toEqual([]);
+    });
+});

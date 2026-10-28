@@ -126,6 +126,9 @@ const MAX_BODY = 20_000;
 
 const ISSUE_KINDS = ['comment', 'close', 'block'] as const;
 const PR_KINDS = ['pr-comment', 'pr-block'] as const;
+// Все виды, которые разбор принимает. Отдельной константой — по ней тест сверяет схему в
+// промптах (#217): новый вид без строки схемы краснеет, а не уезжает в промпт молча.
+export const SESSION_REQUEST_KINDS: readonly string[] = [...ISSUE_KINDS, 'new-issue', ...PR_KINDS];
 
 // Путь файла для якоря комментария. Проверяется не «на всякий случай»: строку пишет
 // модель, а уходит она в argv `gh api -f path=…`. Абсолютный путь и `..` отвергаем —
@@ -336,7 +339,7 @@ export function parseSessionRequests(
         }
         fail(
             no,
-            `неизвестный kind ${JSON.stringify(kind)}. Разрешено: ${[...ISSUE_KINDS, 'new-issue', ...PR_KINDS].join(', ')}. ` +
+            `неизвестный kind ${JSON.stringify(kind)}. Разрешено: ${SESSION_REQUEST_KINDS.join(', ')}. ` +
                 'Снятие hold и blocked, одобрение ревью и мердж намерениями сессии не являются.',
         );
     });

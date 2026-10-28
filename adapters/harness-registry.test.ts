@@ -11,6 +11,7 @@ import {
     discoverHarnessPackages,
     cliVersionDrift,
     harnessPackageProblems,
+    loopDeniedTools,
     selectHarness,
     type RegistryDeps,
 } from './harness-registry.ts';
@@ -271,5 +272,23 @@ describe('форма кода пакета', () => {
             'package.ts: нет функции plugin.event',
         ]);
         expect(of({ source: () => '', read: () => ({}), event: () => ({}) })).toEqual([]);
+    });
+});
+
+describe('loopDeniedTools — запрет субагентов и отложенного хода флагом (#225)', () => {
+    it('Claude Code: инструменты операций agent и defer из описания', () => {
+        expect(loopDeniedTools(HARNESS_REGISTRY, 'claude-code')).toEqual([
+            'Task',
+            'Agent',
+            'Workflow',
+            'ScheduleWakeup',
+            'CronCreate',
+        ]);
+    });
+
+    it('пакет не принят — бросок с причиной реестра, а не пустой запрет', () => {
+        expect(() => loopDeniedTools({ packages: new Map(), problems: new Map() }, 'x')).toThrow(
+            /запрет субагентов.*пакета харнесса «x» в реестре нет/,
+        );
     });
 });

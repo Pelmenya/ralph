@@ -39,6 +39,16 @@ export const SOURCECRAFT_BASE_URL = 'https://api.sourcecraft.tech';
 // переменную, из которой транспорт на самом деле берёт токен.
 export const SOURCECRAFT_TOKEN_ENV = 'SOURCECRAFT_TOKEN';
 
+/**
+ * Координаты репозитория из origin — чтобы имя площадки и репо не жили в коде. Живёт рядом с
+ * транспортом, а не в скрипте CI: его зовут два скрипта CI (`close-merged-issues.mts`,
+ * `ci-stale-run.mts`), и импорт одного из другого сцеплял бы их правку под ship человека.
+ */
+export function parseRemote(url: string): { org: string; repo: string } | null {
+    const m = /[:/]([^/:]+)\/([^/]+?)(?:\.git)?\s*$/.exec(url.trim());
+    return m ? { org: m[1], repo: m[2] } : null;
+}
+
 export function createSourcecraftApi(deps: SourcecraftApiDeps): SourcecraftApi {
     const {
         org,

@@ -283,7 +283,6 @@ describe('разрешение пути (#187): симлинки, перенос
         'git diff .claude',
         'git add .claude',
         'git log -- .claude',
-        'git push origin HEAD',
         'git checkout -b feat/x',
         'git restore src',
         'find .claude -name x',
@@ -300,7 +299,6 @@ describe('разрешение пути (#187): симлинки, перенос
         "git merge -m 'merge [skip ci]' other",
         "git stash push -m 'wip?'",
         "git fetch origin '+refs/heads/*:refs/remotes/origin/*'",
-        'git push origin :old-branch',
         'find . -exec grep -l foo {} + -exec wc -l {} +',
         // Склейка коротких флагов с `m` у `stash` — сообщение; окружение без пути (проход 3).
         "git stash push -qm 'wip?'",
@@ -310,6 +308,16 @@ describe('разрешение пути (#187): симлинки, перенос
         const dir = contourTree();
         expect(codeOf({ op: 'exec', command, baseDir: dir }, loop)).toBeNull();
     });
+
+    // Refspec у пуша — не pathspec: данных контура он не трогает, и судит его своё правило
+    // пуша петли (#224), а не забор данных — иначе отказ назвал бы не ту причину.
+    it.each(['git push origin HEAD', 'git push origin :old-branch'])(
+        'пуш с refspec — отказ пуша петли, а не данных контура: %s',
+        (command) => {
+            const dir = contourTree();
+            expect(codeOf({ op: 'exec', command, baseDir: dir }, loop)).toBe('loop-push');
+        },
+    );
 
     it('шаблон оболочки у переносящей команды раскрывается, как его раскроет оболочка', () => {
         const dir = contourTree();
@@ -497,13 +505,24 @@ describe('MCP — по политике контура', () => {
 });
 
 describe('возможности, которые барьер не судит', () => {
-    it('fetch и agent: в петле — блок, в сессии человека — как до карточки', () => {
+    it('fetch: в петле — блок, в сессии человека — как до карточки', () => {
         const fetch: TGuardOperation = { op: 'fetch', url: 'https://example.com' };
-        const agent: TGuardOperation = { op: 'agent', parentSession: 's' };
         expect(codeOf(fetch, { loop: true })).toBe('capability-unjudged');
-        expect(codeOf(agent, { loop: () => true })).toBe('capability-unjudged');
         expect(codeOf(fetch)).toBeNull();
-        expect(codeOf(agent)).toBeNull();
+    });
+
+    // #225: субагент и отложенный ход раннер не видит — в петле запрещены, у человека свободны.
+    it.each<[string, TGuardOperation, RegExp]>([
+        ['субагент', { op: 'agent', parentSession: 's' }, /Субагент \(сессия s\)/],
+        ['отложенный ход', { op: 'defer', what: 'ScheduleWakeup' }, /ScheduleWakeup/],
+    ])('%s: в петле — loop-delegation с причиной, вне петли — пропуск', (_what, op, named) => {
+        expect(codeOf(op, { loop: () => true })).toBe('loop-delegation');
+        const reason = one(op, { loop: true }).reason;
+        expect(reason).toMatch(named);
+        expect(reason).toMatch(/раннер не видит/);
+        expect(reason).toMatch(/закоммить сделанное/);
+        expect(codeOf(op)).toBeNull();
+        expect(codeOf(op, { loop: false })).toBeNull();
     });
 
     it('exec в петле держит забор данных контура и исполняющий вход git', () => {

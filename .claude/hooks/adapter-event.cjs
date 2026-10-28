@@ -49,6 +49,7 @@ const OPERATION_FIELDS = {
     mcp: ['server', 'tool'],
     fetch: ['url'],
     agent: ['parentSession'],
+    defer: ['what'],
     inert: ['what'],
     unknown: ['why'],
 };

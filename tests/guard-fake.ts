@@ -14,6 +14,8 @@ export function probeReasonCode(text: string): BarrierReasonCode {
     // Правка данных контура (#184) — запрещена только в сессии петли; фейк изображает хук,
     // которому контекст сессии дошёл.
     if (/\.claude\/ralph\/hooks\.json/.test(text)) return 'contour-data';
+    // Субагент и отложенный ход (#225) — тоже только в сессии петли, как контур выше.
+    if (/"tool_name":"(?:Agent|ScheduleWakeup)"/.test(text)) return 'loop-delegation';
     if (/rm -rf/.test(text)) return 'destructive';
     return 'secret-env';
 }

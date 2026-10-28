@@ -163,6 +163,9 @@ import {
 } from './session-requests.ts';
 // #41: выбывшее намерение — вид нужен брейкеру серии (#67), «что» с причиной — пушу.
 type TDroppedIntent = { kind: TSessionRequest['kind']; what: string };
+// #226: PR-намерение вне цикла сдачи — отказ одной строки, а не батча; класс отличает его
+// в общем catch применения от отказов форжа.
+class OrphanPrIntentError extends Error {}
 // #45: тексты промптов сессий — отдельным модулем, чтобы барьер чистоты мог их грепать
 // (в самом оркестраторе команды `gh` законны — там живёт реализация форжа GitHub).
 import {
@@ -174,9 +177,12 @@ import {
     buildFixByReviewPrompt,
     buildFixReviewPrompt,
     buildGateHealPrompt,
+    buildIntentRepairPrompt,
     buildReReviewPrompt,
     buildReviewPrompt,
 } from './prompts.ts';
+// #217: сверка исправленного батча намерений с исходным — чистый модуль рядом с разбором.
+import { checkIntentRepair, intentRepairObstacle } from './intent-repair.ts';
 import type { TSessionRequest } from './session-requests.ts';
 // #625: лестница «ревью правок». Чистая арифметика сходимости (дедуп находок, потолок
 // проходов, анти-пинг-понг, решение «мердж / ещё круг / арбитр») живёт отдельным модулем —
@@ -245,6 +251,7 @@ import type {
     RalphAdapters,
     ReviewComment,
     RunOptions,
+    RuntimeCapabilities,
     RunResult,
     SessionEndReason,
     TaskSourceAdapter,
@@ -301,7 +308,11 @@ import {
     type CliVersion,
     type RuntimeProfile,
 } from '../adapters/runtime-profile.ts';
-import { cliVersionDrift, HARNESS_REGISTRY } from '../adapters/harness-registry.ts';
+import {
+    cliVersionDrift,
+    HARNESS_REGISTRY,
+    loopDeniedTools,
+} from '../adapters/harness-registry.ts';
 import {
     describeRoots,
     doctorRootsLines,
@@ -379,6 +390,14 @@ const CLAUDE_DIR = '.claude';
 // `roots` в конфиге нет, всё остаётся здесь — умолчание, названное вслух (канон, задача 21).
 const LEGACY_DIR = path.join(CLAUDE_DIR, 'ralph');
 const CONFIG_PATH = CONSUMER_CONFIG_REL;
+
+// Исход переспроса: текст исправленного батча либо причина, по которой его нет.
+type TIntentRepair = { ok: true; text: string } | { ok: false; why: string };
+// #226: предел текста одного отброшенного `pr-block` в уведомлении ⛔ — мессенджер, а не лог.
+const ORPHAN_BLOCK_GIST_MAX = 300;
+// #217: бюджет ходов сессии-исправления. Инструментов у неё нет, ответ — один блок, и
+// второй ход нужен только как запас; больше — значит, сессия занялась не тем.
+const INTENT_REPAIR_MAX_TURNS = 2;
 
 /**
  * Пути СОСТОЯНИЯ экземпляра — один объект вместо россыпи констант, и собирается он той же
@@ -1025,6 +1044,10 @@ type ExecFn = (file: string, args: string[], opts?: Record<string, unknown>) => 
 type KillFn = (pid: number, signal?: number | string) => unknown;
 type ReadFileFn = typeof fs.readFileSync;
 type ReadCmdlineFn = (pid: number) => string;
+// Харнесс бинаря `claude` (рантаймы `claude` и `kimi`): по нему argv берёт из пакета, какие
+// инструменты сессии петли запрещены флагом (#225). Ключ — из профиля, не литералом.
+const CLAUDE_HARNESS = RUNTIME_IDENTITIES.claude.harness;
+
 // Опции claude-сессии: model/maxTurns/fallbackModel (см. buildClaudeArgs, #221).
 //
 // modelProvider (#393, ревью фазы 6) — ПРОВАЙДЕР, которому принадлежит `model`. Барьер
@@ -1043,7 +1066,24 @@ type ClaudeOpts = {
     // Задача 96: ключ подписки этой сессии, когда ключей больше одного (ротация). Нет —
     // сессия наследует env раннера, как до ротации. Значение не логируется нигде.
     authToken?: string;
+    // #217: сессия без единого инструмента (исправление батча намерений). Флагами запуска
+    // её держит только харнесс Claude Code; остальные рантаймы отказывают (`toollessRefusal`).
+    toolless?: boolean;
 };
+
+// #217: рантайм без флага запрета всех инструментов сессию-исправление не запускает. Отказ —
+// результатом запуска, а не броском: `runClaude` разбирает его как любой отказ запуска, и
+// переспрос кончается стопом с причиной, а не исключением посреди сдачи. Ядро до сюда не
+// доходит — оно сверяет `capabilities.toolless` раньше, — это вторая линия: маршрут фолбэка
+// лимита выбирает рантайм мимо той сверки.
+function toollessRefusal(runtime: string): RunResult {
+    return {
+        code: 1,
+        output: `рантайм '${runtime}' не умеет сессию без инструментов — запуск отменён (#217)`,
+        failureKind: 'spawn-failed',
+        endReason: 'unknown',
+    };
+}
 
 // Флаги режима из argv entry (ONCE/DRY/RESET/RESUBMIT/DEPLOY_RESOLVED как раньше).
 export type OrchestratorFlags = {
@@ -1738,14 +1778,49 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // Промпт со спецсимволами теперь тем же приёмом уходит через input (см. spawnClaude) —
     // не строкой в шелл, а сырыми байтами на stdin дочернего процесса.
     // См. docs/ralph-prod-mode/linux-port-audit.md (#66/#67).
+    // Имена запрета субагентов (#225) считаются один раз на процесс: пакет харнесса принимается
+    // при загрузке реестра и посреди прогона не меняется. Не принят — стоп `guard-probe` с
+    // причиной, как у прочих отказов барьера перед сессией, а не исключение из argv любой
+    // сессии мимо разбора «оставлен человеку». На старте это закрывает проба барьера: без
+    // принятого пакета настроек петля не стартует, и сюда отказ доходит только вне неё.
+    let loopDeniedToolsCache: string | null = null;
+
+    function loopDeniedToolsArg({
+        deniedFn,
+        ...stop
+    }: { deniedFn?: () => string[] } & TGuardStopDeps = {}): string {
+        if (!deniedFn && loopDeniedToolsCache !== null) return loopDeniedToolsCache;
+        try {
+            const names = (
+                deniedFn ?? (() => loopDeniedTools(HARNESS_REGISTRY, CLAUDE_HARNESS))
+            )().join(',');
+            if (!deniedFn) loopDeniedToolsCache = names;
+            return names;
+        } catch (e) {
+            return stopOnGuardProbe(
+                `${(e as Error)?.message ?? String(e)} — флаг запрета субагентов собрать нечем, ` +
+                    'сессия не стартует.',
+                stop,
+            );
+        }
+    }
+
     function buildClaudeArgs(
-        { model, maxTurns, fallbackModel }: ClaudeOpts,
+        { model, maxTurns, fallbackModel, toolless }: ClaudeOpts,
         cfg: Pick<RalphConfig, 'permissionMode' | 'fallbackModel'>,
     ): string[] {
         // `-p` БЕЗ значения — это не забытый аргумент (ревью #612: соблазн «починить» его
         // обратно на ['-p', prompt] велик). Флаг включает неинтерактивный режим, а сам
         // промпт уходит через stdin (spawnClaude, опция input) — см. докблок выше.
         const cmdArgs = ['-p', '--max-turns', String(maxTurns)];
+        // #217: сессия-исправление — без единого инструмента. `--tools ""` снимает встроенные,
+        // `--strict-mcp-config` без `--mcp-config` — все MCP-серверы. Запрет списком имён
+        // (`--disallowedTools`) не годится: инструмент новой версии CLI проехал бы мимо него.
+        if (toolless) cmdArgs.push('--tools', '', '--strict-mcp-config');
+        // #225: субагент и отложенный ход сессии петли запрещены флагом — первый слой; второй —
+        // guard (`loop-delegation`), на случай если флаг не сработал. Здесь список имён законен:
+        // это не единственный барьер, а класс инструментов объявляет описание пакета.
+        else cmdArgs.push('--disallowedTools', loopDeniedToolsArg());
         if (model) cmdArgs.push('--model', model);
         if (cfg.permissionMode) cmdArgs.push('--permission-mode', cfg.permissionMode);
         const fb = fallbackModel !== undefined ? fallbackModel : cfg.fallbackModel;
@@ -2314,14 +2389,16 @@ export function createOrchestrator(env: OrchestratorEnv) {
 
     function runClaudeOnce(
         prompt: string,
-        { model, maxTurns, fallbackModel, authToken }: ClaudeOpts,
+        { model, maxTurns, fallbackModel, authToken, toolless }: ClaudeOpts,
         cliVersionFn: (runtime: string) => CliVersion = (rt) => sessionCliVersion(rt),
     ): RunResult {
         // Работает кроссплатформенно, т.к. `claude` — нативный бинарник (claude.exe на
         // Windows, бинарь/симлинк на Linux), а НЕ npm .cmd-shim (тот без shell даёт ENOENT).
-        const cmdArgs = buildClaudeArgs({ model, maxTurns, fallbackModel }, config);
+        const cmdArgs = buildClaudeArgs({ model, maxTurns, fallbackModel, toolless }, config);
         log(
-            `▶ claude -p "${prompt.slice(0, 80)}…" --max-turns ${maxTurns}${model ? ` --model ${model}` : ''}`,
+            `▶ claude -p "${prompt.slice(0, 80)}…" --max-turns ${maxTurns}${model ? ` --model ${model}` : ''}` +
+                // #217: сессию-исправление по логу видно отдельно от обычной.
+                (toolless ? ' (без инструментов)' : ''),
         );
         if (DRY) return { code: 0, output: '' };
         cmdArgs.push(...sessionSettingsArgs());
@@ -2438,7 +2515,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // Фолбэк — kimi-специфичный (kimiRuntime.fallbackModel).
     function runKimiOnce(
         prompt: string,
-        { model, maxTurns, modelProvider }: ClaudeOpts,
+        { model, maxTurns, modelProvider, toolless }: ClaudeOpts,
         spawnFn: typeof spawnSync = spawnSync,
         cliVersionFn: (runtime: string) => CliVersion = (rt) => sessionCliVersion(rt),
     ): RunResult {
@@ -2455,7 +2532,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             model: routedModel,
         });
         const cmdArgs = buildClaudeArgs(
-            { model: resolvedModel, maxTurns, fallbackModel },
+            { model: resolvedModel, maxTurns, fallbackModel, toolless },
             // permissionMode — из конфига (bypassPermissions в бою); общий cfg.fallbackModel
             // НЕ прокидываем (opts.fallbackModel всегда задан → cfg.fallbackModel не читается).
             { permissionMode: config.permissionMode },
@@ -2960,12 +3037,13 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // безпровайдерных записей роутинга).
     function runOpenAIOnce(
         prompt: string,
-        { model, modelProvider }: ClaudeOpts,
+        { model, modelProvider, toolless }: ClaudeOpts,
         spawnFn: typeof spawnSync = spawnSync,
         readFileFn: (path: string, encoding: 'utf8') => string = fs.readFileSync,
         cliVersionFn: (runtime: string) => CliVersion = (rt) => sessionCliVersion(rt),
         guardArgsFn: () => string[] = () => codexGuardArgsFor(),
     ): RunResult {
+        if (toolless) return toollessRefusal('openai');
         // Провайдер-гейт: чужую (не-openai) модель к codex `-m` не пускаем — резолвер тогда
         // возьмёт openaiRuntime.model.
         const routedModel = modelProvider === 'openai' ? model : undefined;
@@ -3115,7 +3193,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // без него — умолчание CLI. maxTurns уходит потолком шагов CLI (KIMI_LOOP_MAX_STEPS_PER_TURN).
     function runKimiNativeOnce(
         prompt: string,
-        { model, maxTurns, modelProvider }: ClaudeOpts,
+        { model, maxTurns, modelProvider, toolless }: ClaudeOpts,
         spawnFn: typeof spawnSync = spawnSync,
         cliVersionFn: (runtime: string) => CliVersion = (rt) => sessionCliVersion(rt),
         {
@@ -3145,6 +3223,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             sessionTree?: string | null;
         } = {},
     ): RunResult {
+        if (toolless) return toollessRefusal('kimi-native');
         const configured = config?.kimiNativeRuntime?.model;
         const resolvedModel =
             modelProvider === 'kimi-native' && model
@@ -3312,11 +3391,12 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // неоткуда. maxTurns в argv не уходит — бюджета ходов у CLI нет (best-effort).
     function runOpencodeOnce(
         prompt: string,
-        { maxTurns }: ClaudeOpts,
+        { maxTurns, toolless }: ClaudeOpts,
         spawnFn: typeof spawnSync = spawnSync,
         cliVersionFn: (runtime: string) => CliVersion = (rt) => sessionCliVersion(rt),
         { configDirFn = () => opencodeConfigDirFor() }: { configDirFn?: () => string | null } = {},
     ): RunResult {
+        if (toolless) return toollessRefusal(OPENCODE_RUNTIME);
         const model = String(config?.opencodeRuntime?.model ?? '');
         log(
             `▶ opencode [${OPENCODE_STATUS}] (opencode run) "${prompt.slice(0, 80)}…" -m ${model}` +
@@ -3630,11 +3710,14 @@ export function createOrchestrator(env: OrchestratorEnv) {
         sleepFn = sleep,
         intentIdFn = randomUUID,
         quarantineFn,
+        repairFn,
+        orphanPrFn,
     }: {
         cfg: RalphConfig;
         // #45: контекст фазы нужен намерениям по PR — сам PR они не называют (сессия не
         // выбирает, куда пишет). Необязателен: у итерации по карточке фазы в этом смысле
-        // нет, и намерение по PR оттуда — ошибка, а не пропуск.
+        // нет, и намерение по PR оттуда выбывает одной строкой с причиной в логе (#226),
+        // а `pr-block` ещё и пушем — батч при этом применяется дальше.
         phase?: { branch: string };
         // #16-продолжение: веха ТЕКУЩЕЙ фазы под адрес карточки запрещена — та удлинила бы
         // фазу, которую сессия сейчас сдаёт. Отдельным параметром, а не полем `phase`:
@@ -3669,6 +3752,14 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // возвращается), и очередь следующей сессии разбирается отдельно. Не задан —
         // файл остаётся как есть: сдача на отказе встаёт, и разбирает его человек.
         quarantineFn?: () => string;
+        // #217: переспрос сессии-исправления при отказе разбора (`repairIntentBatch`). Задан —
+        // отвергнутый батч один раз уходит на исправление, и исправленный применяется, если
+        // прошёл тот же парсер и сверку с исходным (`checkIntentRepair`). Не задан — стоп,
+        // как до #217.
+        repairFn?: (batch: string, why: string) => TIntentRepair;
+        // #226: номер PR, к которому, вероятно, относился хвост PR-намерений вне цикла
+        // сдачи, — только для строки лога. Зовётся, лишь когда такие намерения есть.
+        orphanPrFn?: () => number | null;
     }): {
         applied: number;
         failed: boolean;
@@ -3756,9 +3847,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
             );
         }
 
-        let requests: TSessionRequest[];
-        try {
-            requests = parseSessionRequests(pending, {
+        const parseBatch = (text: string) =>
+            parseSessionRequests(text, {
                 labelAllowlist: cfg.issueLabels ?? [],
                 // Фаза 10: битая секция — отказ разбора батча, а не «формата нет»: вызов
                 // идёт и мимо preflight (публичная поверхность `ralph.js`).
@@ -3766,8 +3856,56 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     throw new Error(msg);
                 }),
             });
+        let requests: TSessionRequest[] = [];
+        let parseError: string | null = null;
+        try {
+            requests = parseBatch(pending);
         } catch (e) {
-            const why = (e as Error).message;
+            parseError = (e as Error).message;
+        }
+        // #217: один переспрос на батч. Исправление проходит тот же парсер и сверку с
+        // исходным; отказ любого из трёх шагов — стоп ниже с причинами обоих разборов, а
+        // второго переспроса нет: сессия, не справившаяся с формой, и второй раз ответила бы
+        // тем же, а каждый круг — это деньги и минуты сдачи. Не при сверке начатого
+        // намерения: метка и её строка разбираются отдельно, и переписанный файл потерял бы
+        // метку раньше, чем эффект сверен.
+        if (parseError !== null && repairFn && !dry && resume === null) {
+            const r = repairFn(pending, parseError);
+            if (!r.ok) {
+                parseError = `${parseError}; ${r.why}`;
+            } else {
+                let fixed: TSessionRequest[] | null = null;
+                try {
+                    fixed = parseBatch(r.text);
+                } catch (e) {
+                    parseError =
+                        `${parseError}; переспрос не помог — исправление тоже не разобралось: ` +
+                        (e as Error).message;
+                    // Решать, править ли батч руками и в какую сторону, человеку проще всего
+                    // по тексту предложенной правки — как `Отвергнутый батч намерений:`.
+                    logFn(`Отвергнутое исправление:\n${r.text}`);
+                }
+                if (fixed !== null) {
+                    const check = checkIntentRepair(pending, fixed, r.text);
+                    if (!check.ok) {
+                        parseError = `${parseError}; исправление отвергнуто сверкой с исходным — ${check.why}`;
+                        logFn(`Отвергнутое исправление:\n${r.text}`);
+                    } else {
+                        // Исправленный батч ложится на диск до первого эффекта: раннер, убитый
+                        // посреди применения, иначе нашёл бы после рестарта исходный, битый.
+                        writeFn(`${fixed.map(serializeSessionRequest).join('\n')}\n`);
+                        logFn(
+                            `🔁 Переспрос намерений: исправлено ${String(check.changed)} строк ` +
+                                `(${check.renames.length > 0 ? check.renames.join(', ') : 'только разметка'}).`,
+                        );
+                        requests = fixed;
+                        parseError = null;
+                    }
+                }
+            }
+        }
+        if (parseError !== null) {
+            const why = parseError;
             const failed = {
                 applied: 0,
                 failed: true,
@@ -3918,6 +4056,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // #41: выбывшие по отказу форжа — с видом и причиной, для пуша после батча и для
         // брейкера серии (#67): выбывшее `close` оставляет карточку открытой.
         const dropped: TDroppedIntent[] = [];
+        // #226: PR-намерения вне цикла сдачи — свой список, а не `dropped`: тот говорит
+        // «форж отказал по существу», а здесь до форжа дело не дошло.
+        const orphaned: TSessionRequest[] = [];
         // Подсказка про лимит форжа — одна на все ветки отказа (ревью #612): человек,
         // читающий сырую транспортную ошибку, не поймёт, что повтор имеет смысл только
         // после паузы.
@@ -3969,11 +4110,13 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         `🗂 Заведена карточка ${num ? `#${String(num)}` : '(номер не отдан форжем)'}: ${req.title}`,
                     );
                 } else if (req.kind === 'pr-comment' || req.kind === 'pr-block') {
-                    // Номер PR резолвит петля, а не сессия. Оба отказа fail-closed: без PR
-                    // замечание ревью деть некуда, а молчаливый пропуск означал бы «ревью
-                    // прошло, находок нет» — тот самый класс, ради которого весь этот путь.
+                    // Номер PR резолвит петля, а не сессия. В цикле сдачи отказ fail-closed:
+                    // без PR замечание ревью деть некуда, а молчаливый пропуск означал бы
+                    // «ревью прошло, находок нет» — тот самый класс, ради которого весь этот
+                    // путь. Вне цикла сдачи (#226) PR уже нет: выбывает вслух ОДНА строка, а
+                    // не батч (разбор в catch).
                     if (!phase) {
-                        throw new Error(
+                        throw new OrphanPrIntentError(
                             `намерение ${req.kind} пришло вне цикла сдачи фазы — PR неизвестен`,
                         );
                     }
@@ -4133,7 +4276,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 // #41: класс отказа — только по ответу форжа, не по сообщению исключения:
                 // в нём команда вместе с телом комментария из argv.
                 const failure = classifyIntentFailure(intentFailureText(e));
-                const applied = i - dropped.length;
+                const applied = i - dropped.length - orphaned.length;
                 const partial = commentLanded && (req.kind === 'close' || req.kind === 'block');
                 // #41: отказ по существу (карточка удалена, метки нет, прав нет) повтор не
                 // лечит — намерение выбывает с причиной, а хвост идёт дальше. Иначе одно
@@ -4146,7 +4289,19 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 // последний запрос, его эффекта нет. Лечь мог только комментарий
                 // `close`/`block` перед ним, и об этом раннер знает сам (`partial`) — пуш
                 // говорит «лёг частично», а не «не лёг».
-                if (req.kind !== 'pr-block' && failure === 'deterministic') {
+                if (e instanceof OrphanPrIntentError) {
+                    // #226: PR, которого петля не знает, не появится и при повторе — строка
+                    // выбывает, остаток батча применяется. Хвост с ней загораживал закрытие
+                    // карточки нового цикла («Применено 0 из 4»), и петля взяла бы ту же
+                    // карточку повторно. Строка целиком — в лог (и журнал событий): по ней
+                    // человек доставит замечание руками, если оно ещё нужно.
+                    orphaned.push(req);
+                    droppedNow = true;
+                    logFn(
+                        `🧹 Намерение ${describeRequest(req)} отброшено: ${message}, и повтор ` +
+                            `этого не изменит. Строка: ${serializeSessionRequest(req)}`,
+                    );
+                } else if (req.kind !== 'pr-block' && failure === 'deterministic') {
                     const what = describeRequest(req);
                     dropped.push({
                         kind: req.kind,
@@ -4284,14 +4439,14 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         (droppedNow ? 'выбыло' : 'применено') +
                         `, но отметить это в ${RUNTIME.requests} не удалось — ` +
                         `${(e as Error).message}. Применено ` +
-                        `${String(i + 1 - dropped.length)} из ${String(requests.length)}; метка начатого намерения ` +
+                        `${String(i + 1 - dropped.length - orphaned.length)} из ${String(requests.length)}; метка начатого намерения ` +
                         'осталась в файле, и петля остановится на ней, пока человек не уберёт её ' +
                         'вместе с этим намерением.',
                     cfg,
                     { logFn },
                 );
                 return {
-                    applied: i + 1 - dropped.length,
+                    applied: i + 1 - dropped.length - orphaned.length,
                     failed: true,
                     closedIssues,
                     prFindings,
@@ -4320,7 +4475,45 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 { logFn },
             );
         }
-        const applied = requests.length - dropped.length;
+        // #226: сводка отброшенного — число и PR, к которому хвост, вероятно, относился.
+        // Номер только называется, эффекта на нём нет: петля в чужой PR не пишет.
+        // `pr-block` громче строки лога: блок означал «не мерджить», и человек обязан
+        // узнать, что он не дошёл, — PR мог уйти в main с известным блокером.
+        if (orphaned.length > 0) {
+            let orphanPr: number | null = null;
+            try {
+                orphanPr = orphanPrFn ? orphanPrFn() : null;
+            } catch (e) {
+                logFn(`⚠ Номер PR отброшенных намерений не определился: ${(e as Error).message}`);
+            }
+            const where = orphanPr !== null ? `PR #${String(orphanPr)}` : 'PR не определён';
+            logFn(
+                `🧹 Отброшено PR-намерений вне цикла сдачи: ${String(orphaned.length)} (${where}) — ` +
+                    'хвост сдачи пережил мердж своего PR; остальные намерения батча применяются.',
+            );
+            // Тело блока допускает до 20 000 символов, а уведомление уходит в мессенджер:
+            // в нём — первая строка, обрезанная до предела; полный текст — строкой выше в логе.
+            const blockGist = (text: string): string => {
+                const first = text.split('\n').find((l) => l.trim() !== '') ?? '';
+                const line = first.trim();
+                return line.length > ORPHAN_BLOCK_GIST_MAX
+                    ? `${line.slice(0, ORPHAN_BLOCK_GIST_MAX)}…`
+                    : line;
+            };
+            const blocks = orphaned.filter(
+                (r): r is Extract<TSessionRequest, { kind: 'pr-block' }> => r.kind === 'pr-block',
+            );
+            if (blocks.length > 0) {
+                pushEventFn(
+                    `⛔ Ralph: pr-block пришёл вне цикла сдачи и отброшен (${where}): блок ` +
+                        'означал «не мерджить», а PR петле уже неизвестен. Проверь, не ушёл ли ' +
+                        `PR в main с блокером: ${blocks.map((b) => blockGist(b.comment)).join('; ')}`,
+                    cfg,
+                    { logFn },
+                );
+            }
+        }
+        const applied = requests.length - dropped.length - orphaned.length;
         try {
             removeFn();
         } catch (e) {
@@ -4420,6 +4613,97 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // сессия, успевшая напечатать блок до отказа, печатает его снова: без сверки в файл уехали
     // бы два `close` и два `pr-comment`. Сверка — только с прошлыми запусками: одинаковые
     // строки внутри одного блока — воля сессии, и раннер её не правит.
+    /**
+     * #217: сессия-исправление отвергнутого батча намерений. Сдача фазы, встававшая на батче,
+     * верном по смыслу и битом по именам полей, повторяла после рестарта всю сессию ревью
+     * (1–3 $ и до 10 минут), а исправить хвост мог только человек. Здесь — одна короткая
+     * сессия без инструментов: отвергнутый батч, ошибка с номером строки и схема на входе,
+     * исправленный блок на выходе.
+     *
+     * Всегда НОВАЯ сессия, а не продолжение той, что батч написала. Продолжение несло бы
+     * весь её транскрипт с вызовами инструментов, а у сессии-исправления инструментов нет:
+     * история с вызовами без объявленных инструментов — уже не та сессия, и что с ней
+     * сделает CLI, проверить без живого прогона нечем. Новая сессия дешевле и проверена.
+     *
+     * Блок ответа в файл намерений НЕ пишется: сборщик здесь пустой, и исправление уходит
+     * вызывающему текстом — применяет его только `applySessionRequests` после парсера и
+     * сверки. Отказ любой ступени — причина строкой, а не бросок: стоп называет её вместе
+     * с исходной ошибкой разбора.
+     */
+    function repairIntentBatch(
+        batch: string,
+        why: string,
+        {
+            runClaudeFn = runClaude,
+            capabilities = adapters.coderRuntime.capabilities,
+            cfg = config,
+            logFn = log,
+        }: {
+            runClaudeFn?: typeof runClaude;
+            capabilities?: RuntimeCapabilities;
+            cfg?: RalphConfig;
+            logFn?: typeof log;
+        } = {},
+    ): TIntentRepair {
+        const obstacle = intentRepairObstacle(batch);
+        if (obstacle !== null) return { ok: false, why: `переспроса нет: ${obstacle}` };
+        // Возможность объявляет рантайм (`capabilities.toolless`), и молчание — «не умеет»:
+        // сессия с полным набором инструментов по чужому тексту — уже не исправление формы.
+        if (capabilities.toolless !== true)
+            return {
+                ok: false,
+                why:
+                    'переспроса нет: рантайм сессий сдачи не умеет сессию без инструментов ' +
+                    '(capabilities.toolless)',
+            };
+        logFn(
+            '🔁 Батч намерений не разобрался — переспрашиваю сессию-исправление без инструментов.',
+        );
+        let output = '';
+        let code: number;
+        try {
+            code = runClaudeFn(
+                buildIntentRepairPrompt({ batch, why }),
+                { model: cfg.model, maxTurns: INTENT_REPAIR_MAX_TURNS, toolless: true },
+                {
+                    cfg,
+                    onOutput: (text: string) => {
+                        output = text;
+                    },
+                    collectIntentsFn: () => {},
+                },
+            );
+        } catch (e) {
+            return {
+                ok: false,
+                why: `переспрос не помог — сессия-исправление не запустилась: ${(e as Error).message}`,
+            };
+        }
+        // Первая строка вывода — причина отказа: рантайм без `toolless` на маршруте фолбэка
+        // (`toollessRefusal`) отдаёт её только текстом, и без неё стоп сказал бы один код.
+        if (code !== 0) {
+            const first = output.split('\n').find((line) => line.trim() !== '');
+            return {
+                ok: false,
+                why:
+                    `переспрос не помог — сессия-исправление вышла с кодом ${String(code)}` +
+                    (first ? `: ${first.trim()}` : ''),
+            };
+        }
+        const block = extractIntentBlock(output);
+        if (block.kind === 'none')
+            return {
+                ok: false,
+                why: 'переспрос не помог — в ответе исправления нет блока намерений',
+            };
+        if (block.kind === 'rejected')
+            return {
+                ok: false,
+                why: `переспрос не помог — блок исправления отвергнут: ${block.why}`,
+            };
+        return { ok: true, text: block.lines.join('\n') };
+    }
+
     function collectSessionIntents(
         output: string,
         {
@@ -7529,6 +7813,55 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 pushEventFn(`⛔ Ralph: ${stopMsg}`, cfg, { logFn });
                 return false;
             };
+            // #224: ветку фазы пушит РАННЕР — одним пушем после пишущей сессии, вместе с
+            // коммитом её остатка. Сессии пуш закрыт барьером (guard, `loop-push`): сессия
+            // правок по ревью пушила после каждого коммита, и каждый пуш заводил полный
+            // гейт CI площадки, из которого читается только прогон последней головы.
+            // Раньше так (#85) было только у разбора blocked; теперь — у каждой пишущей
+            // сессии и перед заведением PR. Отказ — стоп `session-unpushed` с sha обеих
+            // сторон: молча оставленная локально работа всплыла бы расхождением у гейта.
+            // `commitLeftover: false` — у кодер-итерации: её остаток решает разбор падения
+            // (#390) или общий коммит вершины цикла (#92), и второй коммитчик здесь увёл бы
+            // грязь упавшей сессии мимо разбора. `afterRestart` — хвост вопроса стопа: куда
+            // поведёт рестарт после ручного пуша, если не туда же, куда на других шагах.
+            const pushAfterSession = (
+                where: string,
+                {
+                    commitLeftover = true,
+                    afterRestart = '',
+                }: { commitLeftover?: boolean; afterRestart?: string } = {},
+            ): boolean => {
+                if (dry) return true;
+                if (commitLeftover && !ensureCleanFn(where) && !commitLeftoversFn(where)) {
+                    pushEventFn(
+                        `⛔ Ralph: остаток сессии (${where}) фазы "${phase.milestone}" не закоммичен — стоп, состояние дерева неизвестно. ` +
+                            'Разбери дерево раннера руками (git status, причина — в логе) и перезапусти loop.',
+                        cfg,
+                        { logFn },
+                    );
+                    return false;
+                }
+                const pushed = pushSessionCommitsFn(phase.branch, logFn);
+                if (pushed.kind !== 'failed') return true;
+                pushEventFn(
+                    `⛔ Ralph: фаза "${phase.milestone}" — коммиты сессии (${where}) не доехали до origin, работа оставлена человеку. ` +
+                        formatStopMessage({
+                            reason: 'session-unpushed',
+                            diagnosis:
+                                `ветка ${phase.branch}` +
+                                (pushed.local ? ` локально на ${pushed.local.slice(0, 8)}` : '') +
+                                (pushed.remote ? `, на origin ${pushed.remote.slice(0, 8)}` : '') +
+                                `: ${pushed.why}`,
+                            question:
+                                `сверь git log ${phase.branch} с origin/${phase.branch}, сведи их без --force, ` +
+                                'запушь и перезапусти loop' +
+                                (afterRestart ? ` — ${afterRestart}` : ''),
+                        }),
+                    cfg,
+                    { logFn },
+                );
+                return false;
+            };
             // Задача 11: дерево работы ставит на ветку фазы РАННЕР, до спавна сессии.
             // Раньше это делала сессия по промпту, и слабая модель, не подобравшая идиому,
             // коммитила на detached HEAD — коммит оставался недостижим ни из одной ветки.
@@ -7911,6 +8244,12 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         logFn,
                         pushEventFn,
                         quarantineFn: () => quarantineSessionRequestsFn(nowFn()),
+                        // #226: хвост PR-намерений здесь — от сдачи прошлой фазы; её PR
+                        // называется в строке отброшенного, эффекта на нём нет.
+                        orphanPrFn: () => {
+                            const prev = idx > 0 ? cfg.phases[idx - 1] : undefined;
+                            return prev ? mergedPhasePrFn(prev) : null;
+                        },
                     });
                     // `?? []` — не тихий дефолт, а совместимость шва: подменённая реализация
                     // (тест, чужой taskSource) может не знать про поле. Потеря фильтра здесь
@@ -8001,6 +8340,16 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 // Все четыре этапа с исходом — попытка доведена, журнал снимается: дальше
                 // идут брейкеры итерации, а не этапы попытки.
                 if (!journal('снятие доведённой попытки', () => stageJournal.close())) break;
+                // #224: коммиты кодер-сессии и её остатка уезжают одним пушем раннера —
+                // сессии пуш закрыт guard. После снятия попытки: стоп здесь не оставляет
+                // недоведённого этапа, а незапушенное подберёт пуш следующей итерации или
+                // сдачи.
+                if (
+                    !pushAfterSession(`кодер-сессия Issue #${next.number}`, {
+                        commitLeftover: false,
+                    })
+                )
+                    break;
 
                 // Оценка прогресса — только в AFK (в ONCE решает человек, в DRY сессии не было).
                 // Прогресс = сдвинулся HEAD (коммиты есть) ИЛИ очередь стала короче (issue
@@ -8326,6 +8675,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         dry,
                         logFn,
                         pushEventFn,
+                        // #217: отказ разбора батча этой сессии — один переспрос исправления,
+                        // а не стоп с повтором всего шага после рестарта.
+                        repairFn: (batch, why) =>
+                            repairIntentBatch(batch, why, { runClaudeFn, cfg, logFn }),
                     });
                     // Тесты инжектируют упрощённый applySessionRequestsFn без этих полей —
                     // читаем мягко, отсутствие полей означает «находок не сообщили».
@@ -8451,6 +8804,20 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         ),
                     );
 
+                // Ревью 16c2: продолжение сдачи с PR (рестарт, следующий проход после гейта)
+                // сначала довозит незапушенное. Шаг сдачи, чей пуш не доехал (стоп
+                // `session-unpushed` после правок, упавшая чини-сессия гейта), оставляет
+                // коммиты локально, а рестарт ведёт в следующий этап или сразу в гейт — тот
+                // увидел бы локальный ref впереди головы PR и встал на `head-diverged`.
+                // Остаток здесь не коммитится: дерево упавшей сессии разбирает её этап.
+                if (
+                    (state.submitted || subDone('pr')) &&
+                    !pushAfterSession(`продолжение сдачи фазы "${phase.milestone}"`, {
+                        commitLeftover: false,
+                    })
+                )
+                    break;
+
                 // M6: рестарт после красного гейта не дублирует PR/ревью/правки — сразу гейт.
                 if (state.submitted) {
                     logFn(
@@ -8487,6 +8854,12 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     // PR, заведённый прошлым процессом, — шаг пропускается целиком.
                     const prDone = subDone('pr');
                     if (!prDone && !subStart('pr')) break;
+                    // #224: остаток последней кодер-итерации коммитится на вершине цикла, уже
+                    // после её пуша, — довозим его до PR одним пушем раннера.
+                    if (!prDone && !pushAfterSession(`сдача фазы "${phase.milestone}"`)) {
+                        subFinish('pr', 'stop');
+                        break;
+                    }
                     if (!prDone && !branchPushedFn(phase.branch)) {
                         pushEventFn(
                             `⛔ Ralph: ветка ${phase.branch} не запушена в origin — сдавать нечего. ` +
@@ -8790,7 +9163,17 @@ export function createOrchestrator(env: OrchestratorEnv) {
                             subFinish('fixes', 'stop');
                             break;
                         }
-                        if (!subFinish('fixes', 'ok')) break;
+                        // #224: все коммиты круга правок — одним пушем раннера, одним
+                        // прогоном CI на голове, которую и будет судить гейт.
+                        //
+                        // Ревью 16c2: не доехал только пуш — этап правок сделан, и исход его
+                        // `ok`. Со `stop` рестарт повторял бы сессию правок целиком (деньги и
+                        // минуты) поверх уже закоммиченных правок; так он довозит пуш на входе
+                        // в сдачу и идёт к ревью правок.
+                        const fixesPushed = pushAfterSession('правки по ревью', {
+                            afterRestart: 'правки не повторятся, пойдёт ревью правок',
+                        });
+                        if (!subFinish('fixes', 'ok') || !fixesPushed) break;
                     }
 
                     // ── 3b. Ревью ПРАВОК (#625) ──────────────────────────────────
@@ -9565,6 +9948,12 @@ export function createOrchestrator(env: OrchestratorEnv) {
                                 ladderStop = true;
                                 break;
                             }
+                            // #224: следующий проход ревью правок судит то, что в PR, — круг
+                            // уезжает одним пушем раннера до него.
+                            if (!pushAfterSession('правки по ревью правок')) {
+                                ladderStop = true;
+                                break;
+                            }
                             continue;
                         }
 
@@ -9700,6 +10089,15 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     );
                     break;
                 }
+
+                // #226: хвост намерений к PR фазы доводится ДО гейта. Рестарт после стопа на
+                // неразобранном батче шёл сразу в гейт (ревью и правки уже сданы журналом),
+                // гейт был зелёный, PR мерджился, а два `pr-comment` к нему оставались в
+                // файле и держали в заложниках батч первой сессии следующей фазы. Применение
+                // здесь даёт хвосту его смысл: блок ставит метку, и гейт её прочитает,
+                // комментарий ложится в PR. Не применилось — мердж не идёт, причину назвал
+                // пуш применения; молча унести хвост в следующую фазу нельзя.
+                if (!sessionIntentsApplied('хвост намерений перед мерджем')) break;
 
                 // 4. Детерминированный гейт: раннер сам проверяет hold + blocked + HEAD==PR + чеки.
                 // #93: проход гейта — этап сдачи. Повторный вход (после разбора blocked,
@@ -10009,44 +10407,12 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     // вахта пушила руками. Пуш — работа раннера, как и коммит остатка: тот же
                     // довод «действие всегда одно». Пушим ДО повторного ревью — оно и гейт
                     // обязаны судить то, что лежит в PR, а не локальную копию.
-                    if (!dry) {
-                        if (
-                            !ensureCleanFn('разбор blocked') &&
-                            !commitLeftoversFn('разбор blocked')
-                        ) {
-                            pushEventFn(
-                                `⛔ Ralph: остаток сессии разбора blocked фазы "${phase.milestone}" не закоммичен — стоп, состояние дерева неизвестно. ` +
-                                    'Разбери дерево раннера руками (git status, причина — в логе) и перезапусти loop.',
-                                cfg,
-                                { logFn },
-                            );
-                            break;
-                        }
-                        const pushed = pushSessionCommitsFn(phase.branch, logFn);
-                        if (pushed.kind === 'failed') {
-                            pushEventFn(
-                                `⛔ Ralph: фаза "${phase.milestone}" — коммиты сессии разбора blocked не доехали до origin, PR оставлен человеку. ` +
-                                    formatStopMessage({
-                                        reason: 'session-unpushed',
-                                        diagnosis:
-                                            `ветка ${phase.branch}` +
-                                            (pushed.local
-                                                ? ` локально на ${pushed.local.slice(0, 8)}`
-                                                : '') +
-                                            (pushed.remote
-                                                ? `, на origin ${pushed.remote.slice(0, 8)}`
-                                                : '') +
-                                            `: ${pushed.why}`,
-                                        question:
-                                            `сверь git log ${phase.branch} с origin/${phase.branch}, сведи их без --force, ` +
-                                            'запушь и перезапусти loop — сдача не повторится, пойдёт сразу гейт',
-                                    }),
-                                cfg,
-                                { logFn },
-                            );
-                            break;
-                        }
-                    }
+                    if (
+                        !pushAfterSession('разбор blocked', {
+                            afterRestart: 'сдача не повторится, пойдёт сразу гейт',
+                        })
+                    )
+                        break;
 
                     // #217: повторное ревью проводит РАННЕР (не кодер-сессия), моделью НЕ
                     // слабее планки. Дифф собираем один раз — и на выбор модели, и на контекст.
@@ -10658,6 +11024,17 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     if (!guardAfterSession('чини-сессия гейта')) break;
                     // #45: чини-сессия гейта тоже просит блок намерением, а не командой.
                     if (!sessionIntentsApplied('самолечение гейта')) break;
+                    // #224: исправление гейта уезжает одним пушем раннера — без него форж
+                    // не заведёт новый прогон, и следующий гейт судил бы старую голову.
+                    // Пуш стоит ДО разбора кода (ревью 16c2): упавшая сессия (в том числе
+                    // исчерпав ходы) пушить сама не может (`loop-push`), и без пуша её
+                    // коммиты остались бы локально. Остаток упавшей не коммитится.
+                    if (
+                        !pushAfterSession('чини-сессия гейта', {
+                            commitLeftover: healCode === 0,
+                        })
+                    )
+                        break;
                     if (healCode !== 0) {
                         // Fail-closed как у шагов сдачи (H2): упавшая чини-сессия не должна
                         // молча зациклить гейт — но счётчик уже потрачен, рестарт продолжит.
@@ -11885,6 +12262,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         sweepOrphanMonitors,
         ensureMonitorAlive,
         buildClaudeArgs,
+        loopDeniedToolsArg,
         // #607: чистые хелперы детекции E2BIG экспортируются отдельно от spawnClaude —
         // юнит-тестам не нужен фейковый spawnFn, чтобы проверить саму классификацию ошибки.
         isArgvTooLong,
@@ -11925,6 +12303,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         phasePrBody,
         // #40: то же — у всех четырёх свой DI-хук на argv, контракт проверяет боевые.
         applySessionRequests,
+        repairIntentBatch,
         // #9: разбор вывода сессии в файл намерений — свой DI на чтение и запись.
         collectSessionIntents,
         stopOnInFlightIntent,

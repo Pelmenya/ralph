@@ -24,7 +24,12 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { coreIsRepoRoot } from '../tests/core-repo.ts';
 import { sideEffectAttempts } from '../shared/side-effect-guard.ts';
 import { stripComments } from '../tests/strip-comments.ts';
-import { hooksFor, type TRunHookFn, type TRunPluginFn } from './guard-probe.ts';
+import {
+    DELEGATION_MIGRATION_HINT,
+    hooksFor,
+    type TRunHookFn,
+    type TRunPluginFn,
+} from './guard-probe.ts';
 import {
     CODEX_HOOK_TRUST_FLAG,
     OPENCODE_PLUGIN_DRIVER,
@@ -584,12 +589,29 @@ describe('живые хуки: дерево сессии не решает за 
                 // Исправный — значит, и запрещённое называет своим кодом причины (#183).
                 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{if(s.includes("git status"))process.exit(0);' +
                     'const c=/mcp__/.test(s)?"mcp-not-allowed":/hooks\\.json/.test(s)?"contour-data":' +
+                    '/"tool_name":"(Agent|ScheduleWakeup)"/.test(s)?"loop-delegation":' +
                     '/rm -rf/.test(s)?"destructive":"secret-env";' +
                     'process.stderr.write("ralph-reason-code: "+c+"\\n");process.exit(2)});',
             ),
             tmp('session'),
         );
         expect(r.ok).toBe(true);
+    });
+
+    it('копия хуков старше #225 (без loop-delegation) — отказ называет шаг миграции', () => {
+        const { r } = prepare(
+            productWith(
+                'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{if(s.includes("git status"))process.exit(0);' +
+                    'if(/"tool_name":"(Agent|ScheduleWakeup)"/.test(s))process.exit(0);' +
+                    'const c=/mcp__/.test(s)?"mcp-not-allowed":/hooks\\.json/.test(s)?"contour-data":' +
+                    '/rm -rf/.test(s)?"destructive":"secret-env";' +
+                    'process.stderr.write("ralph-reason-code: "+c+"\\n");process.exit(2)});',
+            ),
+            tmp('session'),
+        );
+        expect(r.ok).toBe(false);
+        expect(!r.ok && r.reason).toMatch(/субагент в сессии петли/);
+        expect(!r.ok && r.reason).toContain(DELEGATION_MIGRATION_HINT);
     });
 });
 

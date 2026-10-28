@@ -143,6 +143,7 @@ describe('элементы описания, которых нет в образ
                 Grep: 'search',
                 Fetch: 'fetch',
                 Task: 'agent',
+                Wake: 'defer',
                 Mcp: 'mcp',
             },
             argMap: {
@@ -163,6 +164,7 @@ describe('элементы описания, которых нет в образ
                     Grep: ['path', 'glob', 'pattern'],
                     Fetch: ['url'],
                     Task: ['prompt'],
+                    Wake: ['delaySeconds'],
                     Mcp: [],
                 },
             },
@@ -197,14 +199,21 @@ describe('элементы описания, которых нет в образ
             pattern: 'ralph',
             glob: '**/.env',
         });
-        // fetch и agent барьер пока не судит: пара — общая разрешённая канала.
+        // fetch барьер пока не судит, agent и defer в петле запрещены (#225): пара — общая
+        // разрешённая канала.
         expect(rows.get('rule:Fetch:unjudged')).toEqual([
             'rule:Fetch:unjudged',
             'negative',
             'capability-unjudged',
             'rule:Bash:allowed',
         ]);
-        expect(rows.get('rule:Task:unjudged')?.[2]).toBe('capability-unjudged');
+        expect(rows.get('rule:Task:delegation')).toEqual([
+            'rule:Task:delegation',
+            'negative',
+            'loop-delegation',
+            'rule:Bash:allowed',
+        ]);
+        expect(rows.get('rule:Wake:delegation')?.[2]).toBe('loop-delegation');
         expect(rows.get('rule:Mcp:mcp-write')?.[2]).toBe('mcp-not-allowed');
         const disabled = probes.find((p) => p.id === 'disabled-channel:exec_command');
         expect(disabled).toMatchObject({ kind: 'disabled-channel', pair: 'rule:Bash:allowed' });

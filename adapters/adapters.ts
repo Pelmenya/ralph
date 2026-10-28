@@ -597,6 +597,10 @@ export type RunOptions = {
     model?: string;
     maxTurns: number;
     fallbackModel?: string | null;
+    // #217: сессия без единого инструмента — исправление отвергнутого батча намерений.
+    // Исполняет только рантайм, объявивший `capabilities.toolless`; остальные обязаны
+    // отказать запуском, а не молча выдать сессии полный набор.
+    toolless?: boolean;
 };
 
 // Классификация отказа ЗАПУСКА процесса (#611, milestone «Раннер · Устойчивость к
@@ -659,7 +663,14 @@ export type RunResult = {
 // тайм-аут. `fallbackModel` — есть ли фолбэк-модель внутри одной сессии. Объявления
 // реализаций и проверка формы — `adapters/runtime-capabilities.ts`.
 export type TurnLimitLevel = 'best-effort' | 'required';
-export type RuntimeCapabilities = { turnLimit: TurnLimitLevel; fallbackModel: boolean };
+// `toolless` (#217) — CLI умеет сессию без единого инструмента (встроенных и MCP). Поле
+// необязательное, и молчание значит «не умеет»: подменённые реализации и прежние объявления
+// о нём не знают, а «умеет» по умолчанию выдало бы сессии-исправлению полный набор.
+export type RuntimeCapabilities = {
+    turnLimit: TurnLimitLevel;
+    fallbackModel: boolean;
+    toolless?: boolean;
+};
 
 export type CoderRuntimeAdapter = {
     // Запустить кодер-сессию по промпту в дереве раннера (синхронно). Возвращает код

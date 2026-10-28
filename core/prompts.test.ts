@@ -22,9 +22,17 @@ import {
     buildFixReviewPrompt,
     buildGateHealPrompt,
     buildReReviewPrompt,
+    buildIntentRepairPrompt,
     buildReviewPrompt,
+    INTENT_SCHEMA_LINES,
 } from './prompts.ts';
-import { INTENTS_BEGIN, INTENTS_END, extractIntentBlock } from './session-requests.ts';
+import {
+    INTENTS_BEGIN,
+    INTENTS_END,
+    SESSION_REQUEST_KINDS,
+    extractIntentBlock,
+    parseSessionRequests,
+} from './session-requests.ts';
 
 const BRANCH = 'feature/m1';
 const GATE = 'npm run lint, npm run test';
@@ -525,5 +533,97 @@ describe('канал намерений в промпте — блок в выв
             sample.slice(0, sample.indexOf(INTENTS_END) + INTENTS_END.length),
         );
         expect(r.kind).toBe('block');
+    });
+});
+
+// #217: отсылка к ralph.md не держала имена полей — модель переносила `body` с new-issue на
+// pr-comment, и сдача вставала восемь раз за ночь. Строки схемы стоят в промптах дословно и
+// сверяются с ПАРСЕРОМ, а не с образцом: пример, разошедшийся со схемой, учил бы дрейфу.
+describe('#217: точные строки схемы намерений', () => {
+    const placeholderLabel = JSON.parse(
+        INTENT_SCHEMA_LINES.find((l) => l.includes('"new-issue"')) ?? '{}',
+    ).labels as string[];
+
+    it.each(INTENT_SCHEMA_LINES)('строка схемы проходит строгий парсер: %s', (schemaLine) => {
+        expect(() =>
+            parseSessionRequests(schemaLine, { labelAllowlist: placeholderLabel }),
+        ).not.toThrow();
+        // Голым текстом: строка в промпте — ровно то, что сессия печатает в блок.
+        expect(schemaLine).toBe(JSON.stringify(JSON.parse(schemaLine)));
+    });
+
+    it('схема покрывает каждый вид, который принимает парсер, и оба вида pr-comment', () => {
+        const kinds = INTENT_SCHEMA_LINES.map((l) => (JSON.parse(l) as { kind: string }).kind);
+        expect([...new Set(kinds)].sort()).toEqual([...SESSION_REQUEST_KINDS].sort());
+        const prComments = parseSessionRequests(
+            INTENT_SCHEMA_LINES.filter((l) => l.includes('"pr-comment"')).join('\n'),
+            { labelAllowlist: [] },
+        );
+        expect(prComments.map((r) => 'anchor' in r && r.anchor !== undefined)).toEqual([
+            true,
+            false,
+        ]);
+    });
+
+    it('текст замечания в схеме — comment; body только у new-issue', () => {
+        for (const l of INTENT_SCHEMA_LINES) {
+            const o = JSON.parse(l) as Record<string, unknown>;
+            expect('body' in o).toBe(o.kind === 'new-issue');
+        }
+    });
+
+    it.each(ALL)('%s несёт каждую строку схемы дословно', (_name, prompt) => {
+        for (const l of INTENT_SCHEMA_LINES) expect(prompt).toContain(l);
+    });
+
+    it('от противного: строка с дрейфом полей парсер не проходит — сверка ловила бы её', () => {
+        expect(() =>
+            parseSessionRequests('{"type":"pr-comment","body":"x"}', { labelAllowlist: [] }),
+        ).toThrow(/kind/);
+    });
+
+    describe('промпт сессии-исправления', () => {
+        const batch = '{"type":"pr-comment","body":"x"}';
+        const why = 'Запрос сессии, строка 1: неизвестный kind undefined';
+        const prompt = buildIntentRepairPrompt({ batch, why });
+
+        it('несёт батч и ошибку как ДАННЫЕ, схему и оба маркера', () => {
+            expect(prompt).toContain(`<<<ДАННЫЕ_НАЧАЛО>>>\n${batch}\n<<<ДАННЫЕ_КОНЕЦ>>>`);
+            expect(prompt).toContain(`<<<ДАННЫЕ_НАЧАЛО>>>\n${why}\n<<<ДАННЫЕ_КОНЕЦ>>>`);
+            for (const l of INTENT_SCHEMA_LINES) expect(prompt).toContain(l);
+            expect(prompt).toContain(INTENTS_BEGIN);
+            expect(prompt).toContain(INTENTS_END);
+        });
+
+        it('говорит, что меняется только форма, а инструментов нет', () => {
+            expect(prompt).toMatch(/только имена полей и разметку/);
+            expect(prompt).toMatch(/Инструментов у тебя нет/);
+        });
+
+        it('сам блока намерений не содержит — раннер не примет промпт за ответ', () => {
+            expect(extractIntentBlock(prompt).kind).not.toBe('block');
+        });
+    });
+});
+
+// #224: пуш ветки фазы — раннера. Промпт, велящий «запушь», отправлял бы сессию в отказ
+// guard (`loop-push`) и жёг бы её ходы; пишущие сессии сдачи узнают правило из промпта.
+describe('#224: ни один промпт сессии не велит пушить', () => {
+    it.each(ALL)('%s — без «запушь» и команды пуша', (_name, prompt) => {
+        expect(prompt).not.toMatch(/запушь/i);
+        expect(prompt).not.toMatch(/git push (?:-u )?origin/);
+    });
+
+    it.each(ALL.filter(([name]) => /правки по ревью$|blocked|самолечение/.test(name)))(
+        '%s — пишущая сессия знает, что пушит раннер',
+        (_name, prompt) => {
+            expect(prompt).toMatch(/Не пушь: git push из сессии петли блокирует guard/);
+        },
+    );
+
+    it('ralph.md запрещает пуш и не просит его в завершении', () => {
+        const rules = readFileSync(resolve(import.meta.dirname, '..', 'ralph.md'), 'utf-8');
+        expect(rules).toMatch(/\*\*Не пушь\*\*/);
+        expect(rules).not.toMatch(/git push -u origin/);
     });
 });

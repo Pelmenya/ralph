@@ -15,12 +15,18 @@
 // другую. Non-ff отказ git здесь — ровно тот стоп, который нужен: с названной причиной,
 // а не перезапись чужой работы.
 //
+// Сетевые шаги (`ls-remote`, `push`) переживают транзиент повтором (`gitNetworkRetry` из
+// `main-sync.ts`, правило 4 канона): пуш стоит после КАЖДОЙ пишущей сессии, в том числе
+// каждой кодер-итерации, и одна моргнувшая сеть без повтора роняла бы ночную петлю. Non-ff
+// и отказ кредов не повторяются — повтор их не лечит.
+//
 // Отставший локальный ref (он предок `origin`) — не повод пушить и не отказ: так выглядит
 // ветка, которую допушили снаружи, и гейт подтягивает его fast-forward сам. Молча он при
 // этом не проходит — строка в логе говорит, что пуш пропущен и почему.
 
-import { gitErrorText, gitExitStatus, gitNetworkOpts } from '../shared/ralph-util.ts';
+import { gitErrorText, gitExitStatus, gitNetworkOpts, sleep } from '../shared/ralph-util.ts';
 import type { ShArgvFn } from '../shared/ralph-util.ts';
+import { gitNetworkRetry } from './main-sync.ts';
 
 type LogFn = (msg: string) => void;
 
@@ -41,8 +47,14 @@ export type SessionPushResult =
  */
 export function pushSessionCommits(
     branch: string,
-    { runArgvFn, logFn }: { runArgvFn: ShArgvFn; logFn: LogFn },
+    {
+        runArgvFn,
+        logFn,
+        sleepFn = sleep,
+    }: { runArgvFn: ShArgvFn; logFn: LogFn; sleepFn?: (ms: number) => void },
 ): SessionPushResult {
+    const net = (what: string, args: string[]): string =>
+        gitNetworkRetry(what, args, gitNetworkOpts(), { runArgvFn, logFn, sleepFn });
     // Код 1 у `rev-parse --verify --quiet` — «ref нет», любой другой — отказ git. Склеить
     // их значило бы на битой ref-базе молча решить, что пушить нечего.
     let local: string;
@@ -67,11 +79,12 @@ export function pushSessionCommits(
     // или отказ кредов за «нет ветки» сойти не должны.
     let remote: string | null = null;
     try {
-        const out = runArgvFn(
-            'git',
-            ['ls-remote', '--exit-code', 'origin', `refs/heads/${branch}`],
-            gitNetworkOpts(),
-        );
+        const out = net('git ls-remote ветки фазы', [
+            'ls-remote',
+            '--exit-code',
+            'origin',
+            `refs/heads/${branch}`,
+        ]);
         remote = out.trim().split(/\s+/)[0] || null;
     } catch (e: unknown) {
         if (gitExitStatus(e) !== 2) {
@@ -98,7 +111,7 @@ export function pushSessionCommits(
         } catch {}
     }
     try {
-        runArgvFn('git', ['push', 'origin', `${local}:refs/heads/${branch}`], gitNetworkOpts());
+        net('git push ветки фазы', ['push', 'origin', `${local}:refs/heads/${branch}`]);
     } catch (e: unknown) {
         return {
             kind: 'failed',

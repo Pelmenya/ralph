@@ -24,10 +24,18 @@ export const TURN_LIMIT_LEVELS: ReadonlyArray<TurnLimitLevel> = ['best-effort', 
 // Фолбэк-модель — внутри одной сессии (`--fallback-model` у Claude Code). `false` — ядро не
 // имитирует её внешними повторами: повтор — другая сессия, а не та же с запасной моделью.
 
+// Сессия без инструментов (#217) — переспрос отвергнутого батча намерений. Объявляет её
+// только CLI, у которого запрет ВСЕХ инструментов — флаг запуска, а не просьба промптом:
+// у Claude Code это `--tools ""` (встроенные) и `--strict-mcp-config` без `--mcp-config`
+// (MCP). У Codex, Kimi Code и OpenCode такого флага нет — набор режется там конфигом
+// агента по именам инструментов, и новый инструмент версии CLI проехал бы мимо списка.
+// Им переспроса нет: стоп, как до #217.
+
 // Claude Code: `--max-turns` обрывает сессию самим CLI, `--fallback-model` есть.
 export const CLAUDE_CODE_CAPABILITIES: RuntimeCapabilities = {
     turnLimit: 'required',
     fallbackModel: true,
+    toolless: true,
 };
 
 // Kimi — тот же харнесс Claude Code с endpoint Moonshot: флаги те же, фолбэк — из
@@ -35,6 +43,7 @@ export const CLAUDE_CODE_CAPABILITIES: RuntimeCapabilities = {
 export const KIMI_CAPABILITIES: RuntimeCapabilities = {
     turnLimit: 'required',
     fallbackModel: true,
+    toolless: true,
 };
 
 // Codex (`codex exec`): аналога `--max-turns` нет, в argv он не передаётся сознательно
@@ -42,6 +51,7 @@ export const KIMI_CAPABILITIES: RuntimeCapabilities = {
 export const CODEX_CAPABILITIES: RuntimeCapabilities = {
     turnLimit: 'best-effort',
     fallbackModel: false,
+    toolless: false,
 };
 
 // Kimi Code (`kimi-native`, #120): потолок шагов хода исполняет сам CLI
@@ -50,6 +60,7 @@ export const CODEX_CAPABILITIES: RuntimeCapabilities = {
 export const KIMI_NATIVE_CAPABILITIES: RuntimeCapabilities = {
     turnLimit: 'required',
     fallbackModel: false,
+    toolless: false,
 };
 
 // OpenCode (`opencode`, #121): бюджета ходов, который CLI исполнял бы обрывом сессии, нет, и
@@ -57,6 +68,7 @@ export const KIMI_NATIVE_CAPABILITIES: RuntimeCapabilities = {
 export const OPENCODE_CAPABILITIES: RuntimeCapabilities = {
     turnLimit: 'best-effort',
     fallbackModel: false,
+    toolless: false,
 };
 
 // Ошибки формы объявления; пустой список — объявление годно. Отдельно от бросающей обёртки,
@@ -73,6 +85,10 @@ export function capabilitiesProblems(caps: unknown): string[] {
     if (typeof c.fallbackModel !== 'boolean')
         out.push(
             `capabilities.fallbackModel = ${JSON.stringify(c.fallbackModel)} — ожидалось true | false`,
+        );
+    if (c.toolless !== undefined && typeof c.toolless !== 'boolean')
+        out.push(
+            `capabilities.toolless = ${JSON.stringify(c.toolless)} — ожидалось true | false или нет поля`,
         );
     return out;
 }

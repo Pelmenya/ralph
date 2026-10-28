@@ -28,7 +28,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { parseHarnessDescriptor, type HarnessDescriptor } from './harnesses/descriptor.ts';
+import {
+    parseHarnessDescriptor,
+    type HarnessDescriptor,
+    type MAPPED_OPERATIONS,
+} from './harnesses/descriptor.ts';
 import { HARNESS_INTERFACE_VERSION, type HarnessPackage } from './harness-package.ts';
 import { BARRIER_REASON_CODES, isBarrierReasonCode } from './barrier-reason.ts';
 
@@ -244,6 +248,30 @@ export function normalizerPathIn(
         selected.harness.normalizerPath,
     );
     return { ok: true, path: path.join(coreRoot, fromCore) };
+}
+
+/**
+ * Операции, которых в сессии петли быть не должно (#225): субагент и отложенный ход. Раннер не
+ * видит ни ходов, ни стоимости, ни обрыва субагента, а сессию `-p`, отложившую ход, снаружи
+ * никто не будит. Guard держит их правилом `loop-delegation`; этот перечень — для первого слоя,
+ * флага запуска CLI.
+ */
+export const LOOP_DENIED_OPERATIONS: readonly (typeof MAPPED_OPERATIONS)[number][] = [
+    'agent',
+    'defer',
+];
+
+/**
+ * Инструменты принятого пакета, которые в сессии петли запрещает флаг запуска: класс объявляет
+ * описание (`toolMap`), а не перечень имён в ядре — новый инструмент того же класса уходит под
+ * запрет правкой описания. Пакет не принят — бросок: argv без запрета выглядел бы запретом.
+ */
+export function loopDeniedTools(registry: HarnessRegistry, harness: string): string[] {
+    const selected = selectHarness(registry, harness);
+    if (!selected.ok) throw new Error(`запрет субагентов в сессии петли: ${selected.reason}`);
+    return Object.entries(selected.harness.descriptor.toolMap)
+        .filter(([, op]) => LOOP_DENIED_OPERATIONS.includes(op))
+        .map(([tool]) => tool);
 }
 
 /** Реестр процесса: пакеты грузятся один раз, при первом импорте модуля. */

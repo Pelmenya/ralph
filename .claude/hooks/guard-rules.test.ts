@@ -449,3 +449,100 @@ describe('манифест правится файлом, а не командо
         expect(bash('(npm pkg set scripts.tmp=ls)').blocked).toBe(true);
     });
 });
+
+describe('пуш ветки фазы — работа раннера, а не сессии петли (#224)', () => {
+    const loopBash = (command: string) => decide('Bash', { command }, { loop: true });
+
+    it.each([
+        'git push',
+        'git push -u origin feature/x',
+        'git -C /path/to/app push origin HEAD',
+        '/usr/bin/git push origin HEAD',
+        'git commit -m "fix: x" && git push',
+        "sh -c 'git push origin HEAD'",
+        'git send-pack origin HEAD:refs/heads/x',
+        '/usr/lib/git-core/git-push origin HEAD',
+        'git-send-pack origin HEAD',
+        'git -c alias.p=push p origin HEAD',
+        'git -c Alias.P=push p',
+        'git --config-env alias.p=ENV_P p',
+        'git --config-env=alias.p=ENV_P p',
+        'git config alias.p push && git p',
+        'git config --local alias.p push',
+        'git config set alias.p push',
+        'git subtree push --prefix x origin br',
+        'git -C /path/to/app subtree push --prefix=x origin br',
+        "git submodule foreach 'git push'",
+        'git submodule foreach --recursive git push origin HEAD',
+    ])('в сессии петли блокирует кодом loop-push: %s', (command) => {
+        const verdict = loopBash(command);
+        expect(verdict.blocked).toBe(true);
+        expect(verdict.code).toBe('loop-push');
+        expect(verdict.reason).toMatch(/пушит раннер/);
+    });
+
+    it('вне петли пуш свободен — сессия человека пушит сама', () => {
+        expect(bash('git push -u origin feature/x').blocked).toBe(false);
+        expect(decide('Bash', { command: 'git push' }, { loop: false }).blocked).toBe(false);
+    });
+
+    it('в петле не задевает соседние git-вызовы и разговор о пуше', () => {
+        expect(loopBash('git commit -m "docs: раннер делает git push"').blocked).toBe(false);
+        expect(loopBash('git stash push -m wip').blocked).toBe(false);
+        expect(loopBash('git log --grep push').blocked).toBe(false);
+        expect(loopBash('rg -n "git push" core').blocked).toBe(false);
+        expect(loopBash('git config --get alias.p').blocked).toBe(false);
+        expect(loopBash('git config alias.p').blocked).toBe(false);
+        expect(loopBash('git -c core.quotepath=false status').blocked).toBe(false);
+        expect(loopBash('git subtree split --prefix x').blocked).toBe(false);
+        expect(loopBash("git submodule foreach 'git status'").blocked).toBe(false);
+    });
+
+    it('предел назван: rebase --exec и bisect run строку команды не раскрывают', () => {
+        expect(loopBash("git rebase --exec 'git push' main").blocked).toBe(false);
+    });
+
+    it('предел назван: алиас из конфига, записанного мимо git config, правило не видит', () => {
+        // `.git/config` правлен файлом раньше — в строке вызова только имя алиаса.
+        expect(loopBash('git p origin HEAD').blocked).toBe(false);
+    });
+
+    it('force-push в петле остаётся деструктивным — его причина сильнее', () => {
+        expect(loopBash('git push --force').code).toBe('destructive');
+    });
+
+    it('признак петли спрашивается только у пуша', () => {
+        let asked = 0;
+        const loop = () => {
+            asked += 1;
+            return true;
+        };
+        expect(decide('Bash', { command: 'npm test' }, { loop }).blocked).toBe(false);
+        expect(asked).toBe(0);
+        expect(decide('Bash', { command: 'git push' }, { loop }).code).toBe('loop-push');
+        expect(asked).toBe(1);
+    });
+});
+
+describe('субагент и отложенный ход в сессии петли — запрет совместимого входа (#225)', () => {
+    it.each([
+        ['Agent', { description: 'd', prompt: 'p' }],
+        ['Task', { prompt: 'p' }],
+        ['Workflow', { script: 's' }],
+        ['ScheduleWakeup', { delaySeconds: 1200, prompt: 'p', reason: 'r' }],
+        ['CronCreate', { cron: '*/5 * * * *', prompt: 'p' }],
+    ])('%s: в петле — loop-delegation с причиной, вне петли — пропуск', (tool, input) => {
+        const verdict = decide(tool, input, { loop: true });
+        expect(verdict.blocked).toBe(true);
+        expect(verdict.code).toBe('loop-delegation');
+        expect(verdict.reason).toMatch(/раннер не видит/);
+        expect(decide(tool, input, { loop: false }).blocked).toBe(false);
+        expect(decide(tool, input).blocked).toBe(false);
+    });
+
+    it('соседние инструменты без эффекта в петле свободны', () => {
+        for (const tool of ['CronList', 'CronDelete', 'TaskStop', 'TodoWrite']) {
+            expect(decide(tool, {}, { loop: true }).blocked).toBe(false);
+        }
+    });
+});

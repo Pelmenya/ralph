@@ -289,6 +289,16 @@ function runProcess(
                     },
                 ),
                 mergedPhasePrFn: read(() => PR),
+                // #226: хвост намерений перед мерджем — пуст; его сценарии в orchestrator.test.ts.
+                applySessionRequestsFn: () => ({
+                    applied: 0,
+                    failed: false,
+                    closedIssues: [],
+                    prFindings: [],
+                    prBlocked: false,
+                }),
+                // Ревью 16c2: довоз незапушенного на входе в гейт — пушить нечего.
+                pushSessionCommitsFn: () => ({ kind: 'in-sync' as const }),
                 // #139: доменный PR фазы — сверка защищаемых путей проходит, мердж идёт.
                 prChangedFilesFn: read(() => ['src/feature.ts']),
                 advancePhaseFn: (st: RalphState, idx: number) => {

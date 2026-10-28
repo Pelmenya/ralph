@@ -37,6 +37,7 @@ export const MAPPED_OPERATIONS = [
     'mcp',
     'fetch',
     'agent',
+    'defer',
     'inert',
 ] as const;
 

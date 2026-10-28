@@ -71,6 +71,7 @@ export type TGuardOperation =
       }
     | { op: 'fetch'; url: string }
     | { op: 'agent'; parentSession: string }
+    | { op: 'defer'; what: string }
     | { op: 'inert'; what: string }
     | { op: 'unknown'; why: string; kind?: 'tool' | 'field' };
 

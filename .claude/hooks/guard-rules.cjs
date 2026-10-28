@@ -660,6 +660,83 @@ function touchesContourData(toolName, input) {
     return null;
 }
 
+/** Сессия петли по `options.loop`: булево или функция — общий признак `decide` и `decideEvent`. */
+const inLoopOf = (options = {}) =>
+    typeof options.loop === 'function' ? options.loop() : !!options.loop;
+
+// Подкоманды git, которые отправляют объекты на удалённый: `send-pack` — низкоуровневый
+// пуш, тот же эффект без имени `push`.
+const GIT_PUSH_SUBCOMMANDS = new Set(['push', 'send-pack']);
+// Исполняемые файлы подкоманд под своими именами (`/usr/lib/git-core/git-push`).
+const GIT_PUSH_BINARIES = new Set(['git-push', 'git-send-pack']);
+const GIT_ALIAS_KEY_RE = /^alias\./i;
+
+/** Глобальная опция `-c`/`--config-env`, задающая алиас: `git -c alias.p=push p`. */
+function gitDefinesAlias(args) {
+    for (let i = 0; i < args.length && args[i].startsWith('-'); i += 1) {
+        const option = args[i];
+        let setting = null;
+        if (option === '-c' || option === '--config-env') setting = args[i + 1] ?? '';
+        else if (option.startsWith('--config-env=')) setting = option.slice('--config-env='.length);
+        if (GIT_VALUE_OPTIONS.has(option)) i += 1;
+        if (setting !== null && GIT_ALIAS_KEY_RE.test(setting)) return true;
+    }
+    return false;
+}
+
+/** `git config`, который записывает алиас: `git config alias.p push`. Чтение — не запись. */
+function gitConfigSetsAlias(args) {
+    if (gitSubcommand(args) !== 'config') return false;
+    if (args.some((arg) => GIT_CONFIG_READ_RE.test(arg))) return false;
+    const at = args.findIndex((arg) => GIT_ALIAS_KEY_RE.test(arg));
+    return at >= 0 && (at < args.length - 1 || args.includes('set'));
+}
+
+/** Первый не-опция после подкоманды: `git subtree push …` → `push`. */
+function gitSubSubcommand(args) {
+    const rest = args.slice(gitSubcommandAt(args) + 1);
+    return rest.find((arg) => !arg.startsWith('-'));
+}
+
+/** Команда, которую `git submodule foreach` исполнит в каждом подмодуле, — строкой. */
+function submoduleForeachCommand(args) {
+    const at = gitSubcommandAt(args);
+    if (args[at] !== 'submodule') return null;
+    const foreach = args.indexOf('foreach', at + 1);
+    if (foreach < 0) return null;
+    return args
+        .slice(foreach + 1)
+        .filter((arg) => !arg.startsWith('-'))
+        .join(' ');
+}
+
+/**
+ * Вызов, который пушит или может пушить в обход имени подкоманды (#224, ревью 16c2): `push` и
+ * `send-pack` после глобальных опций (`git -C <дерево> push`), исполняемый файл подкоманды по
+ * имени (`git-push`), алиас — заданный опцией в той же строке или записанный `git config`, —
+ * и подкоманды, которые пушат сами: `git subtree push` и `git submodule foreach <команда>`,
+ * чья команда разбирается как строка оболочки. Алиас блокируется целиком, а не только алиас на
+ * `push`: значение `!sh -c …` разбор не раскрывает. Предел назван: алиас, записанный в конфиг
+ * файлом мимо `git config` (`.git/config`, `~/.gitconfig`, `include.path`), и `GIT_CONFIG_*`
+ * из унаследованного окружения правило не видит — `GIT_CONFIG_*` в той же строке ловит
+ * `git-exec-input`. Прочие подкоманды, исполняющие строку (`rebase --exec`, `bisect run`),
+ * правило тоже не раскрывает.
+ */
+function pushesGit(calls) {
+    return calls.some((call) => {
+        const name = basenameOf(call.name);
+        if (GIT_PUSH_BINARIES.has(name)) return true;
+        if (name !== 'git') return false;
+        const args = argValues(call);
+        const sub = gitSubcommand(args);
+        if (GIT_PUSH_SUBCOMMANDS.has(sub)) return true;
+        if (sub === 'subtree' && gitSubSubcommand(args) === 'push') return true;
+        const foreach = submoduleForeachCommand(args);
+        if (foreach && pushesGit(shellCalls(foreach))) return true;
+        return gitDefinesAlias(args) || gitConfigSetsAlias(args);
+    });
+}
+
 /**
  * Правила над командой оболочки — общие для прежнего входа (`decide`, инструмент `Bash`) и
  * события (`decideEvent`, операция `exec`). Вердикт блока или null. Забор данных контура
@@ -760,6 +837,25 @@ function judgeShell(cmd, options) {
         };
     }
 
+    // Пуш ветки фазы — работа раннера, а не сессии петли (#224). Сессия правок по ревью
+    // пушила после каждого коммита: 14 пушей за полчаса, и каждый заводил полный гейт CI
+    // площадки, из которого читается только прогон последней головы. Раннер пушит ветку
+    // одним пушем после сессии (`core/session-push.ts`), поэтому здесь запрещён любой
+    // `git push` — правило в промпте сессия однажды уже нарушила. Обходы именем (`send-pack`,
+    // `git-push`, `subtree push`, `submodule foreach`, алиас) судятся тут же: отказ с причиной подталкивает модель искать обход
+    // (докблок `pushesGit`). Вне петли пуш свободен.
+    if (pushesGit(calls) && inLoopOf(options)) {
+        return {
+            blocked: true,
+            code: 'loop-push',
+            reason:
+                'git push (и send-pack, git-push, subtree push, submodule foreach, алиас git) ' +
+                'из сессии петли запрещён: ветку фазы пушит раннер одним пушем после сессии, ' +
+                'а каждый пуш сессии заводит отдельный прогон CI. ' +
+                'Закоммить работу и заверши сессию — незапушенные коммиты раннер довезёт сам.',
+        };
+    }
+
     // Сессия петли идёт в оболочке ХОСТА, где рядом крутится прод (#299): она не
     // ревьюер с ограниченным доступом, а полноценный шелл, и то, что для CI —
     // «локальная проверка», для хоста — боевая служба. Правило смотрит на ВЫЗОВ,
@@ -825,7 +921,7 @@ function decide(toolName, toolInput, options = {}) {
     }
 
     const contourData = touchesContourData(toolName, input);
-    const inLoop = () => (typeof options.loop === 'function' ? options.loop() : !!options.loop);
+    const inLoop = () => inLoopOf(options);
     if (contourData === GIT_EXEC_INPUT && inLoop()) {
         return {
             blocked: true,
@@ -874,6 +970,8 @@ function decide(toolName, toolInput, options = {}) {
         const cmd = typeof input.command === 'string' ? input.command : '';
         return judgeShell(cmd, options) || ALLOWED;
     }
+
+    if (COMPAT_DELEGATION_TOOLS.has(toolName) && inLoop()) return delegationBlock(toolName);
 
     return ALLOWED;
 }
@@ -1012,12 +1110,40 @@ const gitExecBlock = () =>
 const capabilityBlock = (op, what) =>
     blockedBy(
         'capability-unjudged',
-        `Операция ${op} (${what}) в сессии петли заблокирована: барьер её не судит — ${
-            op === 'fetch'
-                ? 'политики сети у него нет, и адрес наружу мог бы унести что угодно'
-                : 'наследование барьеров субагентом не доказано'
-        }. Возможность откроется вместе с правилом, которое её судит.`,
+        `Операция ${op} (${what}) в сессии петли заблокирована: барьер её не судит — ` +
+            'политики сети у него нет, и адрес наружу мог бы унести что угодно. Возможность ' +
+            'откроется вместе с правилом, которое её судит.',
     );
+
+/**
+ * Субагент и отложенный ход в сессии петли (#225). Сессия правок по ревью раздала темы
+ * субагентам, один оборвался посреди хода, а родитель спал по `ScheduleWakeup` и, просыпаясь,
+ * считал его работающим: пять коммитов субагента не доехали до ветки, петля стояла час. Раннер
+ * не видит ни ходов, ни стоимости, ни обрыва субагента, а сессию `-p` после отложенного хода
+ * снаружи никто не будит. Поэтому запрет — не просьба промпта: первый слой — флаг рантайма при
+ * запуске (`--disallowedTools`), этот — на случай, если флаг не сработал. Вне петли свободно.
+ */
+const delegationBlock = (what) =>
+    blockedBy(
+        'loop-delegation',
+        `${what} в сессии петли запрещён: раннер не видит ни ходов субагента, ни его обрыва, а ` +
+            'отложенный ход в сессии -p разбудить некому. Делай работу сам; не успеваешь — ' +
+            'закоммить сделанное и заверши сессию, раннер продолжит её новой.',
+    );
+
+/**
+ * Инструменты совместимого входа 16b, порождающие субагента или откладывающие ход (#225):
+ * у этого входа нет описания пакета, и класс инструмента он знает только по имени. Имена — в
+ * форме Claude Code: так их подают регистрации дерева, Kimi Code (`Task`) и плагин OpenCode
+ * (`task` → `Task`, `OPENCODE_TOOL_NAMES`).
+ */
+const COMPAT_DELEGATION_TOOLS = new Set([
+    'Agent',
+    'Task',
+    'Workflow',
+    'ScheduleWakeup',
+    'CronCreate',
+]);
 
 /**
  * Разрешён ли MCP-инструмент: по эффектам политики, если данные их заявили (`toolsDeclared`),
@@ -1433,7 +1559,9 @@ function judgeOperation(op, ctx, nested) {
         case 'fetch':
             return nested || ctx.inLoop() ? capabilityBlock('fetch', op.url) : null;
         case 'agent':
-            return ctx.inLoop() ? capabilityBlock('agent', `сессия ${op.parentSession}`) : null;
+            return ctx.inLoop() ? delegationBlock(`Субагент (сессия ${op.parentSession})`) : null;
+        case 'defer':
+            return ctx.inLoop() ? delegationBlock(`Отложенный ход (${op.what})`) : null;
         case 'inert':
             return null;
         default:
@@ -1451,8 +1579,8 @@ function judgeOperation(op, ctx, nested) {
  *
  * Чего правило на событии пока НЕ судит, сказано вслух. Поверхности конфига харнесса
  * (`config-surface`): их перечень у каждого пакета свой, общий барьер пакетов не читает, и
- * правило ждёт политики в контексте сессии. `fetch` и `agent` блокируются только в сессии
- * петли — в сессии человека сеть и субагенты остаются, как были до карточки.
+ * правило ждёт политики в контексте сессии. `fetch`, `agent` и `defer` блокируются только в
+ * сессии петли — в сессии человека сеть, субагенты и отложенный ход остаются.
  */
 function decideEvent(event, options = {}) {
     const contour = options.contour || emptyData();
@@ -1460,7 +1588,7 @@ function decideEvent(event, options = {}) {
         options,
         fsApi: options.fsApi || fs,
         mcp: { toolsDeclared: false, ...contour.mcp },
-        inLoop: () => (typeof options.loop === 'function' ? options.loop() : !!options.loop),
+        inLoop: () => inLoopOf(options),
     };
     for (const op of event.operations) {
         const verdict = judgeOperation(op, ctx, false);
