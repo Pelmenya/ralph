@@ -19,6 +19,7 @@
 | `live-sandbox.ts`                      | сборка песочницы живого цикла и запуск раннера в ней                                      |
 | `__fixtures__/live-hang-helper.mjs`    | подопытный владелец зависшего прогона — его убивают в барьере                             |
 | `__fixtures__/stub-guard/guard.cjs`    | исправный барьер-заглушка живого цикла в копии ядра у потребителя                         |
+| `__fixtures__/paged-mcp.mjs`           | подставной MCP-сервер с постраничным `tools/list` для сборщика инвентаря (#215)           |
 | `forge-exec-guard.ts` / `.test.ts`     | запуск бинаря форжа в процессе сьюта — по имени запущенного, а не по тексту кода          |
 | `seam-defaults.test.ts`                | дефолты примитивов форжа ведут к шву, а не к GitHub-реализации                            |
 | `harness-package-deps.ts` / `.test.ts` | `core/` и `.claude/hooks/` не импортируют пакеты `adapters/harnesses/`                    |

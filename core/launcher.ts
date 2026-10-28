@@ -1,7 +1,8 @@
 /**
- * Команды launcher `./ralph`: install, update, rollback, prune, doctor, start, stop, version (Фаза 12,
- * `#36` часть 1; update — Фаза 13, #102, `core-update.ts`; rollback — #103, `core-rollback.ts`;
- * prune — Ф15, #138, `consumer-registry.ts`).
+ * Команды launcher `./ralph`: install, update, rollback, prune, doctor, start, stop, version,
+ * verify-mcp (Фаза 12, `#36` часть 1; update — Фаза 13, #102, `core-update.ts`; rollback — #103,
+ * `core-rollback.ts`; prune — Ф15, #138, `consumer-registry.ts`; комплект PR и verify-mcp — #218,
+ * `update-bundle.ts`).
  *
  * Пока человек вбивал SHA и пути руками, продукта не было — была инструкция по сборке
  * (PRD, сценарий владельца проекта). Здесь механизм доставки (`core-install.ts`) и контракт
@@ -13,9 +14,16 @@
  *     который есть, но не читается, install не перезаписывает: битый lock — повод
  *     разобраться, а не начать с чистого листа. Смена ревизии — `update` (Фаза 13), и
  *     `--rev`, разошедшийся с lock, — отказ, а не тихая переустановка.
+ *   - **update** и **rollback** кладут в ветку PR комплект одним коммитом из одной базы:
+ *     lock, данные контура и снимок инвентаря MCP (#218). Update мигрирует данные прежней
+ *     формы на явные эффекты и сверяет уже мигрированные со свежим снимком; rollback
+ *     возвращает данные вместе с lock. Недоступный или пустой инвентарь — стоп до пуша.
  *   - **rollback** — обратная смена ревизии тем же путём PR, что update; цель — из журнала
  *     активации, а откат через необратимую миграцию state отвергается до правки lock
  *     (`core-rollback.ts`).
+ *   - **verify-mcp** — сверка гейта PR: данные контура головы против базы PR по снимку
+ *     головы, только git, без сети. Миграция, меняющая решение guard, — код 1 с именем
+ *     инструмента.
  *   - **prune** чистит каталог установок с учётом ВСЕХ потребителей реестра хоста: install и
  *     start записывают в него своего потребителя, чистка вычитает наборы «оставить» каждого
  *     и ревизии живых раннеров; нечитаемый lock или журнал любого — отказ целиком.
@@ -74,10 +82,21 @@ import {
 import {
     consumerLayerProblems,
     describeVersions,
+    gitFileReader,
     updateBranchName,
     updateCompatProblems,
     updatePrText,
+    type TBaseView,
+    type TBundleFile,
+    type TGitOpts,
 } from './core-update.ts';
+import {
+    rollbackBundle,
+    updateBundle,
+    verifyMcpMigration,
+    type TBundleResult,
+} from './update-bundle.ts';
+import type { THarnessMcpNames, TListPageFn } from './mcp-inventory.ts';
 import { ACTIVATION_RESTART_EXIT, parseActivationJournal } from './core-activation.ts';
 import {
     irreversibleStateProblem,
@@ -106,6 +125,7 @@ export const LAUNCHER_COMMANDS = [
     'start',
     'stop',
     'version',
+    'verify-mcp',
 ] as const;
 export type TLauncherCommand = (typeof LAUNCHER_COMMANDS)[number];
 
@@ -115,6 +135,8 @@ export type TLauncherArgs = {
     source: string | null;
     rev: string | null;
     profile: string | null;
+    /** База сверки `verify-mcp`: ревизия, с которой PR сливается (по умолчанию `origin/main`). */
+    base?: string | null;
     /** Флаги, которые уходят `ralph.js` как есть (`start`, `doctor`). */
     passthrough: string[];
 };
@@ -122,7 +144,7 @@ export type TLauncherArgs = {
 export type TParsedArgs = { ok: true; args: TLauncherArgs } | { ok: false; reason: string };
 
 const USAGE =
-    'Команды: install [--rev <ревизия>], update <ревизия>, rollback [--profile <имя>], prune, doctor, start [флаги ralph.js], stop [--profile <имя>], version.';
+    'Команды: install [--rev <ревизия>], update <ревизия>, rollback [--profile <имя>], prune, doctor, start [флаги ralph.js], stop [--profile <имя>], version, verify-mcp [--base <ревизия>].';
 
 /**
  * Разбор командной строки launcher. Свои флаги (`--consumer`, `--source`, `--rev`) launcher
@@ -214,12 +236,35 @@ export function parseLauncherArgv(argv: readonly string[]): TParsedArgs {
         }
         rest.length = 0;
     }
+    let base: string | null = null;
+    if (cmd === 'verify-mcp') {
+        for (let i = 0; i < rest.length; i++) {
+            const v = rest[i + 1];
+            if (rest[i] !== '--base') {
+                return { ok: false, reason: `verify-mcp не знает флага "${rest[i]}". ${USAGE}` };
+            }
+            if (v === undefined || v.startsWith('-')) {
+                return { ok: false, reason: `--base без значения. ${USAGE}` };
+            }
+            base = v;
+            i++;
+        }
+        rest.length = 0;
+    }
     if ((cmd === 'install' || cmd === 'version' || cmd === 'prune') && rest.length > 0) {
         return { ok: false, reason: `${cmd} не знает флага "${rest[0]}". ${USAGE}` };
     }
     return {
         ok: true,
-        args: { command: cmd, consumerRoot, source, rev, profile, passthrough: rest },
+        args: {
+            command: cmd,
+            consumerRoot,
+            source,
+            rev,
+            profile,
+            passthrough: rest,
+            ...(cmd === 'verify-mcp' ? { base } : {}),
+        },
     };
 }
 
@@ -258,15 +303,26 @@ export type TLauncherDeps = {
     /** Сырой `ralph.config.json` потребителя — для сверки `configVersion` в update. */
     rawConfigFn: (consumerRoot: string) => unknown;
     /**
-     * Коммит с новым lock поверх свежего `main` и пуш в новую ветку без касания дерева,
-     * индекса и HEAD человека (`commitLockOnBranch`). SHA коммита; отказ — бросок.
+     * Коммит комплекта поверх свежего `main` и пуш в новую ветку без касания дерева, индекса и
+     * HEAD человека (`commitBundleOnBranch`). Комплект собирает `buildFn` из той же базы,
+     * поверх которой ложится коммит (#218). SHA коммита; отказ — бросок.
      */
-    pushLockBranchFn: (p: {
+    pushBundleBranchFn: (p: {
         consumerRoot: string;
         branch: string;
-        lock: TCoreLock;
         message: string;
+        buildFn: (base: TBaseView) => TBundleFile[];
     }) => string;
+    /**
+     * Страница `tools/list` MCP-сервера потребителя (`stdioListPage`) — инвентарь update.
+     * Фабрика по корню потребителя: процесс сервера идёт с cwd этого дерева, а не каталога,
+     * откуда человек позвал `./ralph`.
+     */
+    mcpListPageFn: (consumerRoot: string) => TListPageFn;
+    /** Переводы имён MCP всех пакетов реестра харнессов (`harnessMcpNames`). */
+    mcpHarnessesFn: () => readonly THarnessMcpNames[];
+    /** Локальный git в дереве потребителя без сети: stdout; отказ — бросок (`verify-mcp`). */
+    gitFn: (consumerRoot: string, args: string[], opts?: TGitOpts) => string;
     /**
      * PR ветки в `main` швом форжа потребителя; номер или null, если форж его не назвал.
      * Шов — из `adapters` того профиля, что назван командой (`--profile`), иначе по умолчанию.
@@ -750,7 +806,22 @@ export function runUpdateCommand(args: TLauncherArgs, deps: TLauncherDeps): numb
         versions,
     };
     const branch = updateBranchName(sha);
-    const pub = publishLockChange('update', args, branch, next, updatePrText(cur.lock, next), deps);
+    const pub = publishBundleChange(
+        'update',
+        args,
+        branch,
+        updatePrText(cur.lock, next),
+        (base) =>
+            updateBundle({
+                lock: next,
+                base,
+                listPageFn: (server, cfg, cursor) =>
+                    deps.mcpListPageFn(args.consumerRoot)(server, cfg, cursor),
+                collectedAt: new Date(deps.nowFn()).toISOString(),
+                harnesses: deps.mcpHarnessesFn(),
+            }),
+        deps,
+    );
     if (!pub.ok) return pub.refused ? refuse(pub.why) : 1;
     deps.out(
         `📦 Ревизия ${sha} ${statusWord(res)} в ${res.dir} рядом с исполняемой ${cur.lock.sha}.`,
@@ -909,12 +980,12 @@ export function runRollbackCommand(args: TLauncherArgs, deps: TLauncherDeps): nu
 
     const prev: TCoreLock = { schema: CORE_LOCK_SCHEMA, sha, treeHash: res.treeHash, versions };
     const branch = rollbackBranchName(sha);
-    const pub = publishLockChange(
+    const pub = publishBundleChange(
         'rollback',
         args,
         branch,
-        prev,
         rollbackPrText(cur.lock, prev),
+        (base) => rollbackBundle({ lock: prev, base }),
         deps,
     );
     if (!pub.ok) return pub.refused ? refuse(pub.why) : 1;
@@ -929,30 +1000,58 @@ export function runRollbackCommand(args: TLauncherArgs, deps: TLauncherDeps): nu
 type TPublished = { ok: true; line: string } | { ok: false; refused: boolean; why: string };
 
 /**
- * Последние шаги смены ревизии — ветка с lock и PR — общие для update и rollback. Повтор
- * после обрыва (#104) их доводит: ветка прежней попытки с тем же lock берётся как есть
- * (`commitLockOnBranch`), открытый PR ветки — тоже, второй не заводится. Отказ пуша — это
- * отказ всей команды (`refused`: PR не заведён и lock не тронут); отказ после пуша уже
- * назван строкой здесь, с именем ветки — повтор команды найдёт её и доведёт PR.
+ * Последние шаги смены ревизии — ветка с комплектом и PR — общие для update и rollback. Повтор
+ * после обрыва (#104) их доводит: ветка прежней попытки с тем же комплектом берётся как есть
+ * (`commitBundleOnBranch`), открытый PR ветки — тоже, второй не заводится. Отказ собрать
+ * комплект (инвентарь MCP недоступен, миграция меняет решения) и отказ пуша — это отказ всей
+ * команды (`refused`: PR не заведён и lock не тронут); отказ после пуша уже назван строкой
+ * здесь, с именем ветки — повтор команды найдёт её и доведёт PR.
  */
-function publishLockChange(
+function publishBundleChange(
     cmd: 'update' | 'rollback',
     { consumerRoot, profile }: TLauncherArgs,
     branch: string,
-    lock: TCoreLock,
     text: { title: string; body: string; message: string },
+    bundleFn: (base: TBaseView) => TBundleResult,
     deps: TLauncherDeps,
 ): TPublished {
     let commit: string;
+    const lines: string[] = [];
+    let paths: string[] = [CORE_LOCK_PATH];
+    // Отказ сборки и отказ пуша — разные ремонты: «не запушена» при отказе инвентаря MCP
+    // отправило бы человека разбираться с сетью и правами ветки.
+    let buildFailure: Error | null = null;
+    const buildFn = (base: TBaseView) => {
+        let b: TBundleResult;
+        try {
+            b = bundleFn(base);
+        } catch (e) {
+            buildFailure = e as Error;
+            throw e;
+        }
+        lines.push(...b.lines);
+        paths = b.files.map((f) => f.path);
+        return b.files;
+    };
     try {
-        commit = deps.pushLockBranchFn({ consumerRoot, branch, lock, message: text.message });
+        commit = deps.pushBundleBranchFn({
+            consumerRoot,
+            branch,
+            message: text.message,
+            buildFn,
+        });
     } catch (e) {
+        for (const l of lines) deps.out(l);
         return {
             ok: false,
             refused: true,
-            why: `ветка ${branch} с правкой lock не запушена — ${(e as Error).message}.`,
+            why:
+                buildFailure === null
+                    ? `ветка ${branch} с комплектом не запушена — ${(e as Error).message}.`
+                    : `комплект PR не собран — ${(buildFailure as Error).message}.`,
         };
     }
+    for (const l of lines) deps.out(l);
     let pr: number | null;
     let existing = false;
     try {
@@ -979,7 +1078,7 @@ function publishLockChange(
     const num = pr === null ? '' : ` #${String(pr)}`;
     return {
         ok: true,
-        line: `🔀 PR${num} из ${branch} (${commit})${existing ? ' уже открыт' : ''}: правка ${CORE_LOCK_PATH}.`,
+        line: `🔀 PR${num} из ${branch} (${commit})${existing ? ' уже открыт' : ''}: правка ${paths.join(', ')}.`,
     };
 }
 
@@ -1251,6 +1350,40 @@ export function runVersionCommand(args: TLauncherArgs, deps: TLauncherDeps): num
     return 0;
 }
 
+/**
+ * verify-mcp (#218): третья сверка миграции данных контура — в гейте PR потребителя. База —
+ * точка слияния головы с `--base` (по умолчанию `origin/main`): с ней PR и сольётся, и данные
+ * базы — то, что guard судил до PR. Только локальный git: гейт не ходит в сеть за инвентарём,
+ * он сверяет по снимку, который едет в том же PR.
+ */
+export function runVerifyMcpCommand(args: TLauncherArgs, deps: TLauncherDeps): number {
+    const git = (a: string[], opts?: TGitOpts) =>
+        opts === undefined
+            ? deps.gitFn(args.consumerRoot, a)
+            : deps.gitFn(args.consumerRoot, a, opts);
+    let res: ReturnType<typeof verifyMcpMigration>;
+    try {
+        const head = git(['rev-parse', '--verify', 'HEAD^{commit}']);
+        const base = git(['merge-base', args.base ?? 'origin/main', head]);
+        res = verifyMcpMigration({
+            read: gitFileReader(git),
+            base,
+            head,
+            harnesses: deps.mcpHarnessesFn(),
+        });
+    } catch (e) {
+        deps.out(`⛔ verify-mcp: ${(e as Error).message}`);
+        return 1;
+    }
+    for (const l of res.lines) deps.out(l);
+    for (const p of res.problems) deps.out(`❌ ${p}`);
+    if (res.problems.length > 0) {
+        deps.out(`⛔ verify-mcp: данные контура не прошли сверку (${res.problems.length}).`);
+        return 1;
+    }
+    return 0;
+}
+
 export function runLauncher(argv: readonly string[], deps: TLauncherDeps): number {
     const parsed = parseLauncherArgv(argv);
     if (!parsed.ok) {
@@ -1275,5 +1408,7 @@ export function runLauncher(argv: readonly string[], deps: TLauncherDeps): numbe
             return runStopCommand(a, deps);
         case 'version':
             return runVersionCommand(a, deps);
+        case 'verify-mcp':
+            return runVerifyMcpCommand(a, deps);
     }
 }

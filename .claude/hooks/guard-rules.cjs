@@ -1154,10 +1154,37 @@ function mcpEventAllowed(name, mcp) {
     return mcp.toolsDeclared ? mcpAllowedByEffect(name, mcp) : mcpAllowed(name, mcp);
 }
 
+// Блок по политике эффектов называет свою причину (#215). Нет эффекта — дрейф конфигурации:
+// инструмент появился у сервера после снимка инвентаря, повтор вызова его не разрешит, и
+// сессия, принявшая блок за транзиент, жгла бы ходы на ретраях. Эффект есть, а блок держит
+// запрет ядра по слову, — это политика, а не дрейф: «обнови снимок» отправил бы человека
+// лечить не то.
+function mcpEffectBlockReason(name, mcp) {
+    const effect = mcp.tools.get(name);
+    if (effect === undefined) {
+        return (
+            'у него нет эффекта в mcp.tools данных `.claude/ralph/hooks.json`. Это дрейф ' +
+            'конфигурации, а не транзиент: вызов не повторяй — инструмент вне снимка ' +
+            'инвентаря MCP разрешает только PR обновления снимка и данных контура под ship человека'
+        );
+    }
+    if (mcp.neverExceptions.has(name)) {
+        return (
+            `он в mcp.neverExceptions, а эффект в mcp.tools — ${effect}: исключение из запрета ` +
+            'ядра по слову действует только на запись. Вызов не повторяй — это политика ' +
+            'данных контура, а не дрейф инвентаря'
+        );
+    }
+    return (
+        `эффект в mcp.tools есть (${effect}), но имя под запретом ядра по слову. Вызов не ` +
+        'повторяй — это политика, а не дрейф инвентаря: снять запрет может только исключение ' +
+        'mcp.neverExceptions с эффектом write в данных контура под ship человека'
+    );
+}
+
 function mcpBlock(name, mcp) {
     const how = mcp.toolsDeclared
-        ? 'у него нет эффекта в mcp.tools данных `.claude/ralph/hooks.json` или он под ' +
-          'запретом ядра по слову'
+        ? mcpEffectBlockReason(name, mcp)
         : 'данные `.claude/ralph/hooks.json` ещё прежней формы, без mcp.tools (чтение ' +
           'List*/Get* и mcp.writeAllowed), и по ним он не разрешён';
     return blockedBy(

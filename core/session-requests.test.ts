@@ -5,6 +5,8 @@
 // Почему отказов больше, чем успехов: файл пишет модель, читавшая тело чужого issue
 // (C3). Всё, что придёт неожиданной формой, обязано быть отказом на разборе — до того,
 // как из него соберётся мутация форжа.
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
     MAX_MUTATION_REQUESTS,
@@ -159,6 +161,32 @@ describe('parseSessionRequests — разбор намерений кодер-с
                 labels: ['complexity:low', 'area:devops'],
             },
         ]);
+    });
+
+    // #220: `blocks` — номер карточки фазы; форма — как у `issue`, принадлежность вехе
+    // сверяет применение.
+    it('blocks доезжает числом и переживает сериализацию', () => {
+        const raw = line({
+            kind: 'new-issue',
+            title: 'т',
+            body: 'б',
+            labels: ['area:devops'],
+            blocks: 186,
+        });
+        const [req] = parseSessionRequests(raw, opts);
+        expect(req).toMatchObject({ kind: 'new-issue', blocks: 186 });
+        expect(parseSessionRequests(serializeSessionRequest(req), opts)).toEqual([req]);
+    });
+
+    it.each([['186'], [0], [1.5], [null]])('НЕГАТИВНЫЙ: blocks %j — отказ', (blocks) => {
+        const raw = line({
+            kind: 'new-issue',
+            title: 'т',
+            body: 'б',
+            labels: ['area:devops'],
+            blocks,
+        });
+        expect(() => parseSessionRequests(raw, opts)).toThrow(/номер карточки/);
     });
 
     it('повторённая метка схлопывается: форж получает список без дублей', () => {
@@ -763,5 +791,80 @@ describe('serializeRejectedBlock: отказ блока доезжает до р
 
     it('другая служебная строка в батче — тоже отказ, а не неизвестный kind', () => {
         expect(() => parseSessionRequests('{"ralph":"что-то"}', opts)).toThrow(/служебн/);
+    });
+});
+
+// #219: живая проба — пара из каталога раннера, а не команда сессии.
+describe('live-probe: разбор (#219)', () => {
+    const OPTS = { labelAllowlist: ['complexity:low'] };
+    const probe = (o: Record<string, unknown>) =>
+        JSON.stringify({
+            kind: 'live-probe',
+            issue: 219,
+            cli: 'claude',
+            case: 'unknown-tool',
+            ...o,
+        });
+
+    it('пара из каталога разбирается', () => {
+        expect(parseSessionRequests(probe({}), OPTS)).toEqual([
+            { kind: 'live-probe', issue: 219, cli: 'claude', case: 'unknown-tool' },
+        ]);
+    });
+
+    it.each([
+        [{ case: 'rm-everything' }, /case пробы "rm-everything" не из каталога claude/],
+        [{ case: 'offline' }, /case пробы "offline"/],
+        [{ cli: 'codex' }, /cli пробы "codex" не из каталога/],
+        [{ cli: 'claude; printenv' }, /cli пробы/],
+        [{ command: 'printenv' }, /лишнее: command/],
+        [{ args: ['x'] }, /лишнее: args/],
+        [{ issue: '219' }, /номер карточки/],
+        [{ case: undefined }, /case пробы undefined/],
+    ])('%j — отказ разбора батча целиком', (over, re) => {
+        const batch = [
+            JSON.stringify({ kind: 'comment', issue: 219, comment: 'сделано' }),
+            probe(over),
+            JSON.stringify({ kind: 'close', issue: 219, comment: 'сделано' }),
+        ].join('\n');
+        expect(() => parseSessionRequests(batch, OPTS)).toThrow(re);
+    });
+
+    it('больше двух проб в батче — отказ', () => {
+        const batch = [probe({}), probe({ case: 'block' }), probe({ case: 'crash' })].join('\n');
+        expect(() => parseSessionRequests(batch, OPTS)).toThrow(/3 живых проб/);
+    });
+
+    it('проба — мутация: идёт в предел мутаций', () => {
+        const [r] = parseSessionRequests(probe({}), OPTS);
+        expect(classifySessionRequests([r]).mutations).toHaveLength(1);
+    });
+
+    it('сериализация — round-trip', () => {
+        const [r] = parseSessionRequests(probe({}), OPTS);
+        expect(parseSessionRequests(serializeSessionRequest(r), OPTS)).toEqual([r]);
+    });
+});
+
+// Ревью 16c3: prettier развернул однообъектные примеры промпта в многострочный JSON, а такой
+// блок парсер отвергает целиком — сессия, скопировавшая пример, теряла все намерения батча.
+describe('примеры намерений в ralph.md — каждая строка разбирается', () => {
+    const text = readFileSync(join(import.meta.dirname, '..', 'ralph.md'), 'utf-8');
+    const blocks = [...text.matchAll(/^```jsonl\n([\s\S]*?)^```$/gm)].map((m) => m[1]!);
+
+    it('блоки jsonl есть — пустой набор не зелёный', () => {
+        expect(blocks.length).toBeGreaterThanOrEqual(4);
+    });
+
+    it.each(blocks.map((b, i) => [i, b] as const))('блок %i: строка — объект JSON', (_i, block) => {
+        for (const line of block.split('\n').filter((l) => l.trim() !== '')) {
+            expect(() => JSON.parse(line) as unknown, line).not.toThrow();
+            expect(JSON.parse(line)).toHaveProperty('kind');
+        }
+        expect(() =>
+            parseSessionRequests(block, {
+                labelAllowlist: ['complexity:low', 'complexity:medium', 'area:docs', 'area:devops'],
+            }),
+        ).not.toThrow();
     });
 });

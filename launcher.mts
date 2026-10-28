@@ -32,7 +32,9 @@ import {
 } from './core/core-install.ts';
 import { CONSUMER_CONFIG_REL } from './core/consumer-config-path.ts';
 import { supportedVersions } from './core/compat.ts';
-import { commitLockOnBranch, type TRunArgvFn } from './core/core-update.ts';
+import { commitBundleOnBranch, type TRunArgvFn } from './core/core-update.ts';
+import { harnessMcpNames, stdioListPage } from './core/mcp-inventory.ts';
+import { HARNESS_REGISTRY } from './adapters/harness-registry.ts';
 import { runLauncher, type TLauncherDeps } from './core/launcher.ts';
 
 const argv = process.argv.slice(2);
@@ -74,6 +76,26 @@ const throwFail = (m: string): never => {
     throw new Error(m);
 };
 
+// Переменные ключа живой пробы во всех блоках конфига: серверу MCP они не отдаются (#219).
+// Конфиг не читается — ничего: окружение сервера и так собирается белым списком.
+const liveProbeKeyEnvOf = (consumerRoot: string): string[] => {
+    let raw: unknown;
+    try {
+        raw = readConfig(consumerRoot);
+    } catch {
+        return [];
+    }
+    const obj = (v: unknown): Record<string, unknown> =>
+        v !== null && typeof v === 'object' && !Array.isArray(v)
+            ? (v as Record<string, unknown>)
+            : {};
+    const root = obj(raw);
+    const blocks = [root, obj(root.common), ...Object.values(obj(root.profiles)).map(obj)];
+    return blocks
+        .map((b) => obj(b.liveProbe).keyEnv)
+        .filter((k): k is string => typeof k === 'string');
+};
+
 // argv без шелла со stdin, окружением и сроком — форма `shArgv` ядра для update.
 const runArgv: TRunArgvFn = (file, args, opts = {}) => {
     const r = spawnSync(file, args, {
@@ -87,7 +109,7 @@ const runArgv: TRunArgvFn = (file, args, opts = {}) => {
             `${file} ${args.join(' ')}: код ${String(r.status)} ${(r.stderr || String(r.error ?? '')).trim()}`,
         );
     }
-    return r.stdout.trim();
+    return opts.raw ? r.stdout : r.stdout.trim();
 };
 
 const deps: TLauncherDeps = {
@@ -169,23 +191,33 @@ const deps: TLauncherDeps = {
     writeStopFn: (p) =>
         writeFileSync(p, `${new Date().toISOString()} ./ralph stop\n`, { flag: 'wx' }),
     rawConfigFn: readConfig,
-    pushLockBranchFn: ({ consumerRoot, branch, lock, message }) => {
+    pushBundleBranchFn: ({ consumerRoot, branch, message, buildFn }) => {
         // Временный индекс — вне репозитория: индекс человека update не трогает.
         const tmp = mkdtempSync(join(tmpdir(), 'ralph-update-'));
         try {
-            return commitLockOnBranch({
+            return commitBundleOnBranch({
                 runArgvFn: runArgv,
                 consumerRoot,
                 env: process.env,
                 indexFile: join(tmp, 'index'),
                 branch,
-                lock,
                 message,
+                buildFn,
             });
         } finally {
             rmSync(tmp, { recursive: true, force: true });
         }
     },
+    // cwd — дерево потребителя, из которого update читает базу: относительный путь сервера
+    // ищется там же, где его видит человек. Предел назван в докблоке `update-bundle.ts`: файлы
+    // сервера — из рабочего дерева человека, а не из коммита базы.
+    mcpListPageFn: (consumerRoot) => (server, cfg, cursor) =>
+        stdioListPage(server, cfg, cursor, {
+            cwd: consumerRoot,
+            deniedEnv: liveProbeKeyEnvOf(consumerRoot),
+        }),
+    mcpHarnessesFn: () => harnessMcpNames(HARNESS_REGISTRY),
+    gitFn: (consumerRoot, args, opts) => runArgv('git', ['-C', consumerRoot, ...args], opts),
     openPrFn: (consumerRoot, pr, profile) => {
         const adapters = forgeOf(consumerRoot, profile);
         return adapters.taskSource.createPullRequest(pr);

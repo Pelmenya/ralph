@@ -142,9 +142,12 @@ export const INTENT_SCHEMA_LINES: readonly string[] = [
     '{"kind":"close","issue":7,"comment":"что сделано"}',
     '{"kind":"block","issue":7,"comment":"что нужно от человека"}',
     '{"kind":"new-issue","title":"заголовок","body":"симптом, причина, критерий готовности","labels":["метка из списка проекта"]}',
+    // #220: карточка, без которой не закрыть карточку текущей фазы, — с номером той.
+    '{"kind":"new-issue","title":"заголовок","body":"симптом, причина, критерий готовности","labels":["метка из списка проекта"],"blocks":7}',
     '{"kind":"pr-comment","comment":"замечание к строке","path":"src/app.tsx","line":42}',
     '{"kind":"pr-comment","comment":"сводка прохода"}',
     '{"kind":"pr-block","comment":"чем блокируется PR"}',
+    '{"kind":"live-probe","issue":7,"cli":"claude","case":"unknown-tool"}',
 ];
 
 const INTENT_SCHEMA_NOTE =

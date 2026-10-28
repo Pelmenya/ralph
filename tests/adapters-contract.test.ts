@@ -499,6 +499,8 @@ function buildRealTaskSource(): { adapter: TaskSourceAdapter; gateEnv: GateEnv }
         // #125: лента карточки — боевая функция, подменено только чтение gh.
         issueComments: (issue: number): string[] =>
             ralph.issueComments(issue, { ghJsonFn: (cmd: string) => ghJsonImpl(cmd) }),
+        setIssueBody: (issue: number, body: string) =>
+            ralph.setIssueBody(issue, body, { runArgvFn: mutationArgv }),
         closeIssue: (issue: number) => ralph.closeIssue(issue, { runArgvFn: mutationArgv }),
         blockIssue: (issue: number) => ralph.blockIssue(issue, { runArgvFn: mutationArgv }),
         createIssue: (input: {

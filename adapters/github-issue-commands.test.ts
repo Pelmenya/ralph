@@ -222,6 +222,15 @@ describe('намерения кодер-сессии: мутации через 
         ]);
     });
 
+    // #220: тело карточки фазы со ссылкой на блокирующую — тоже argv, без шелла.
+    it('setIssueBody — gh issue edit --body дословно', () => {
+        const runArgvFn = vi.fn(() => '');
+        make().setIssueBody(7, 'тело\n\n— заблокирована $(x) #9', { runArgvFn });
+        expect(runArgvFn.mock.calls).toEqual([
+            ['gh', ['issue', 'edit', '7', '--body', 'тело\n\n— заблокирована $(x) #9']],
+        ]);
+    });
+
     it('fail-closed: сбой мутации НЕ глушится — потерянное закрытие держит фазу вечно', () => {
         const runArgvFn = () => {
             throw new Error('форж отверг');

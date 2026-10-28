@@ -38,6 +38,9 @@
 # дала. Код решает вся строка проб, а не одна: `claude block override` с block FAIL и
 # override PASS — единица.
 #
+# STAND_SUBJECT_ROOT=<дерево> — хуки и пакеты харнессов под проверкой берутся оттуда, а не из
+# каталога этого скрипта (живая проба раннера, #219).
+#
 # STAND_ISOLATE=1 — сессия CLI идёт в изоляции ОС (`provision/stand/stand.mts`); проверка
 # самой изоляции — `node provision/stand/stand.mts check`.
 #
@@ -62,6 +65,11 @@ CLI="${1:?укажи CLI: claude | codex | kimi | opencode}"
 shift
 PROBES="${*:-block override crash merge offline}"
 CANON_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Откуда берётся ПРОВЕРЯЕМЫЙ код — хуки канона и пакеты харнессов (#219). Исполнитель стенда
+# (`provision/stand/*`, этот скрипт) идёт из `CANON_ROOT`; раннер зовёт его из установки ядра
+# и называет здесь дерево ветки: правленый в ветке исполнитель снял бы изоляцию той самой
+# пробой, которая её проверяет, а хуки из установки проверяли бы не ту правку.
+SUBJECT_ROOT="${STAND_SUBJECT_ROOT:-$CANON_ROOT}"
 SESSION_TIMEOUT="${STAND_SESSION_TIMEOUT:-300}"
 # Бинарь CLI. Подменяется, когда на PATH стоит обёртка, которая сама требует сеть (проверка
 # egress перед стартом): без сети она отказывает раньше, чем CLI вообще запустится.
@@ -444,9 +452,9 @@ probe_merge() {
 # он едет окружением, а не файлом, который сессия могла бы переписать.
 claude_event_guard_install() {
     mkdir -p "$EXT/hooks" "$EXT/harnesses"
-    cp "$CANON_ROOT"/.claude/hooks/*.cjs "$EXT/hooks/"
-    cp -r "$CANON_ROOT/adapters/harnesses/claude-code" "$EXT/harnesses/"
-    cp "$CANON_ROOT/adapters/harnesses/descriptor.ts" "$CANON_ROOT/adapters/harnesses/protocol.ts" \
+    cp "$SUBJECT_ROOT"/.claude/hooks/*.cjs "$EXT/hooks/"
+    cp -r "$SUBJECT_ROOT/adapters/harnesses/claude-code" "$EXT/harnesses/"
+    cp "$SUBJECT_ROOT/adapters/harnesses/descriptor.ts" "$SUBJECT_ROOT/adapters/harnesses/protocol.ts" \
         "$EXT/harnesses/"
     local context="''"
     if [ "${1:-}" = loop ]; then

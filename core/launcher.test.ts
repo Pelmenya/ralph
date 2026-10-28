@@ -39,6 +39,7 @@ import {
     type TLauncherDeps,
 } from './launcher.ts';
 import { registerConsumer } from './consumer-registry.ts';
+import type { TBaseView } from './core-update.ts';
 
 const SHA = 'a'.repeat(40);
 const OTHER = 'b'.repeat(40);
@@ -114,7 +115,14 @@ function world(over: Partial<TLauncherDeps> = {}, opts: { lock?: string | null }
             files.set(p, 'stop');
         }),
         rawConfigFn: vi.fn(() => ({ configVersion: 1 })),
-        pushLockBranchFn: vi.fn(() => 'c'.repeat(40)),
+        pushBundleBranchFn: vi.fn(() => 'c'.repeat(40)),
+        mcpListPageFn: vi.fn(() => () => {
+            throw new Error('MCP в этом мире не опрашивается');
+        }),
+        mcpHarnessesFn: vi.fn(() => []),
+        gitFn: vi.fn(() => {
+            throw new Error('git в этом мире не зовётся');
+        }),
         openPrFn: vi.fn(() => 7),
         findOpenPrFn: vi.fn(() => null),
         registryFs: {
@@ -791,11 +799,11 @@ describe('update (#102)', () => {
             versions: supportedVersions(),
         };
         const branch = `ralph/core-${OTHER.slice(0, 12)}`;
-        expect(w.deps.pushLockBranchFn).toHaveBeenCalledWith({
+        expect(w.deps.pushBundleBranchFn).toHaveBeenCalledWith({
             consumerRoot: CONSUMER,
             branch,
-            lock: next,
             message: expect.stringContaining(`стало: \`${OTHER}\``) as string,
+            buildFn: expect.any(Function) as unknown,
         });
         expect(w.deps.openPrFn).toHaveBeenCalledWith(
             CONSUMER,
@@ -864,7 +872,7 @@ describe('update (#102)', () => {
         expect(update(w, 'v2')).toBe(1);
         expect(w.out.join('\n')).toMatch(why);
         expect(w.out.at(-1)).toMatch(/несовместима с этим потребителем.*PR не заведён/);
-        expect(w.deps.pushLockBranchFn).not.toHaveBeenCalled();
+        expect(w.deps.pushBundleBranchFn).not.toHaveBeenCalled();
         expect(w.deps.openPrFn).not.toHaveBeenCalled();
     });
 
@@ -879,7 +887,7 @@ describe('update (#102)', () => {
         expect(w.out[0]).toBe(
             `❌ state: нынешняя ревизия пишет v${String(st + 1)}, новая читает только до v${String(st)} — откат схемы state не поддерживается`,
         );
-        expect(w.deps.pushLockBranchFn).not.toHaveBeenCalled();
+        expect(w.deps.pushBundleBranchFn).not.toHaveBeenCalled();
     });
 
     it.each([
@@ -896,7 +904,7 @@ describe('update (#102)', () => {
         const w = uworld({ rawConfigFn: vi.fn(rawConfigFn) });
         expect(update(w, 'v2')).toBe(1);
         expect(w.out.join('\n')).toMatch(why);
-        expect(w.deps.pushLockBranchFn).not.toHaveBeenCalled();
+        expect(w.deps.pushBundleBranchFn).not.toHaveBeenCalled();
     });
 
     it('недоскачанная ревизия: установка оборвалась — отказ до PR', () => {
@@ -908,7 +916,7 @@ describe('update (#102)', () => {
         expect(update(w, 'v2')).toBe(1);
         expect(w.out[0]).toMatch(/ревизия b+ не установлена — git checkout: обрыв.*PR не заведён/);
         expect(w.deps.versionsOfFn).not.toHaveBeenCalled();
-        expect(w.deps.pushLockBranchFn).not.toHaveBeenCalled();
+        expect(w.deps.pushBundleBranchFn).not.toHaveBeenCalled();
     });
 
     it('каталог ревизии уже лежал и разошёлся со своим манифестом — его код не исполняется', () => {
@@ -926,7 +934,7 @@ describe('update (#102)', () => {
         expect(update(w, 'v2')).toBe(1);
         expect(w.out[0]).toMatch(/не цела: .*Убери каталог и повтори update/);
         expect(w.deps.versionsOfFn).not.toHaveBeenCalled();
-        expect(w.deps.pushLockBranchFn).not.toHaveBeenCalled();
+        expect(w.deps.pushBundleBranchFn).not.toHaveBeenCalled();
     });
 
     it.each([
@@ -942,7 +950,7 @@ describe('update (#102)', () => {
         const w = uworld({ versionsOfFn: vi.fn(versionsOfFn) });
         expect(update(w, 'v2')).toBe(1);
         expect(w.out[0]).toMatch(why);
-        expect(w.deps.pushLockBranchFn).not.toHaveBeenCalled();
+        expect(w.deps.pushBundleBranchFn).not.toHaveBeenCalled();
     });
 
     it('lock уже называет эту ревизию — менять нечего, ничего не ставится', () => {
@@ -950,7 +958,7 @@ describe('update (#102)', () => {
         expect(update(w, 'v1')).toBe(0);
         expect(w.out[0]).toMatch(/уже называет a+ — менять нечего/);
         expect(w.deps.installFn).not.toHaveBeenCalled();
-        expect(w.deps.pushLockBranchFn).not.toHaveBeenCalled();
+        expect(w.deps.pushBundleBranchFn).not.toHaveBeenCalled();
     });
 
     it.each([
@@ -1004,13 +1012,13 @@ describe('update (#102)', () => {
 
     it('ветка не запушена — отказ, PR не заводится', () => {
         const w = uworld({
-            pushLockBranchFn: vi.fn(() => {
+            pushBundleBranchFn: vi.fn(() => {
                 throw new Error('non-fast-forward');
             }),
         });
         expect(update(w, 'v2')).toBe(1);
         expect(w.out[0]).toMatch(
-            /ветка ralph\/core-b+ с правкой lock не запушена — non-fast-forward/,
+            /ветка ralph\/core-b+ с комплектом не запушена — non-fast-forward/,
         );
         expect(w.deps.openPrFn).not.toHaveBeenCalled();
     });
@@ -1063,12 +1071,102 @@ describe('update (#102)', () => {
         expect(r.ok ? '' : r.reason).toMatch(why);
     });
 
+    // Комплект (#218): буилдер launcher'а исполняется на базе, которую даёт шов коммита.
+    const baseOf = (files: Record<string, string>): TBaseView => ({
+        sha: 'f'.repeat(40),
+        read: (p) => files[p] ?? null,
+        lastChange: () => null,
+    });
+    const pushThrough =
+        (files: Record<string, string>): TLauncherDeps['pushBundleBranchFn'] =>
+        ({ buildFn }) => {
+            buildFn(baseOf(files));
+            return 'c'.repeat(40);
+        };
+
+    it('инвентарь MCP недоступен — стоп с причиной, PR не заведён', () => {
+        const w = uworld({
+            pushBundleBranchFn: vi.fn(
+                pushThrough({
+                    '.mcp.json': '{"mcpServers":{"forge":{"command":"forge-mcp"}}}',
+                    '.claude/ralph/hooks.json': '{"mcp":{"writeAllowed":["mcp__forge__Create"]}}',
+                }),
+            ),
+        });
+        expect(update(w, 'v2')).toBe(1);
+        expect(w.out.join('\n')).toMatch(
+            /инвентарь MCP недоступен.*MCP в этом мире не опрашивается/,
+        );
+        expect(w.out.at(-1)).toMatch(/PR не заведён/);
+        // Отказ сборки назван сборкой, а не пушем (ревью 16c3).
+        expect(w.out.join('\n')).toMatch(/комплект PR не собран — инвентарь MCP недоступен/);
+        expect(w.out.join('\n')).not.toMatch(/не запушена/);
+        expect(w.deps.mcpListPageFn).toHaveBeenCalledWith(CONSUMER);
+        expect(w.deps.openPrFn).not.toHaveBeenCalled();
+        expect(w.deps.findOpenPrFn).not.toHaveBeenCalled();
+    });
+
+    it('строки комплекта и его файлы — в выводе update', () => {
+        const w = uworld({ pushBundleBranchFn: vi.fn(pushThrough({})) });
+        expect(update(w, 'v2')).toBe(0);
+        expect(w.out.join('\n')).toMatch(/мигрировать нечего/);
+        expect(w.out.join('\n')).toMatch(/правка \.ralph\/core\.lock\./);
+    });
+
     it('разбор: позиционная ревизия уходит в rev', () => {
         const r = parseLauncherArgv(['--consumer', CONSUMER, 'update', 'v2']);
         expect(r).toMatchObject({
             ok: true,
             args: { command: 'update', rev: 'v2', passthrough: [] },
         });
+    });
+});
+
+describe('verify-mcp (#218)', () => {
+    // Git головы PR без файла данных: команда идёт мимо сети и называет, что сверять нечего.
+    const gitWorld = () =>
+        world({
+            gitFn: vi.fn((_root: string, args: string[]) => {
+                if (args[0] === 'rev-parse') return 'e'.repeat(40);
+                if (args[0] === 'merge-base') return 'd'.repeat(40);
+                if (args[0] === 'ls-tree') return '';
+                throw new Error(`git ${args.join(' ')}`);
+            }),
+        });
+
+    it('база — точка слияния с --base; данных нет — код 0 и строка', () => {
+        const w = gitWorld();
+        expect(run(w, 'verify-mcp', '--base', 'upstream/main')).toBe(0);
+        expect(w.deps.gitFn).toHaveBeenCalledWith(CONSUMER, [
+            'merge-base',
+            'upstream/main',
+            'e'.repeat(40),
+        ]);
+        expect(w.out).toEqual([expect.stringMatching(/сверять нечего/)]);
+    });
+
+    it('по умолчанию база — origin/main', () => {
+        const w = gitWorld();
+        expect(run(w, 'verify-mcp')).toBe(0);
+        expect(w.deps.gitFn).toHaveBeenCalledWith(CONSUMER, [
+            'merge-base',
+            'origin/main',
+            'e'.repeat(40),
+        ]);
+    });
+
+    it('git отказал — код 1 с причиной, а не «сверять нечего»', () => {
+        const w = world();
+        expect(run(w, 'verify-mcp')).toBe(1);
+        expect(w.out).toEqual([expect.stringMatching(/⛔ verify-mcp: git в этом мире не зовётся/)]);
+    });
+
+    it.each([
+        [['verify-mcp', '--base'], /--base без значения/],
+        [['verify-mcp', '--force'], /verify-mcp не знает флага "--force"/],
+    ])('разбор %j — отказ', (argv, why) => {
+        const r = parseLauncherArgv(['--consumer', CONSUMER, ...argv]);
+        expect(r.ok ? '' : r.reason).toMatch(why);
     });
 });
 
@@ -1122,11 +1220,40 @@ describe('rollback (#103)', () => {
     };
     const rollback = (w: TWorld, ...argv: string[]) => run(w, 'rollback', ...argv);
     const untouched = (w: TWorld) => {
-        expect(w.deps.pushLockBranchFn).not.toHaveBeenCalled();
+        expect(w.deps.pushBundleBranchFn).not.toHaveBeenCalled();
         expect(w.deps.openPrFn).not.toHaveBeenCalled();
         expect(w.deps.writeLockFn).not.toHaveBeenCalled();
         expect(w.files.get(LOCK_PATH)).toBe(formatCoreLock(lock));
     };
+
+    // Комплект отката (#218): данные возвращаются вместе с lock тем же коммитом.
+    it('данные контура откатываются тем же коммитом, что lock', () => {
+        const files: Record<string, string> = {};
+        const w = rworld({
+            pushBundleBranchFn: vi.fn<TLauncherDeps['pushBundleBranchFn']>(({ buildFn }) => {
+                const rev = (r: string) => r.replace(/\^$/, '-parent');
+                const put = buildFn({
+                    sha: 'f'.repeat(40),
+                    read: (p: string, r = 'base') =>
+                        p === '.claude/ralph/hooks.json'
+                            ? ((
+                                  { base: 'new', u: 'new', 'u-parent': 'old' } as Record<
+                                      string,
+                                      string
+                                  >
+                              )[rev(r)] ?? null)
+                            : null,
+                    lastChange: () => 'u',
+                });
+                for (const f of put) files[f.path] = f.text ?? '';
+                return 'c'.repeat(40);
+            }),
+        });
+        expect(rollback(w)).toBe(0);
+        expect(files['.claude/ralph/hooks.json']).toBe('old');
+        expect(Object.keys(files).sort()).toEqual(['.claude/ralph/hooks.json', '.ralph/core.lock']);
+        expect(w.out.join('\n')).toMatch(/hooks\.json: возвращается/);
+    });
 
     it('без миграции: lock в ветке PR возвращается на прежнюю ревизию, state сохранён', () => {
         const w = rworld();
@@ -1139,11 +1266,11 @@ describe('rollback (#103)', () => {
             versions: supportedVersions(),
         };
         const branch = `ralph/rollback-${OTHER.slice(0, 12)}`;
-        expect(w.deps.pushLockBranchFn).toHaveBeenCalledWith({
+        expect(w.deps.pushBundleBranchFn).toHaveBeenCalledWith({
             consumerRoot: CONSUMER,
             branch,
-            lock: prev,
             message: expect.stringContaining(`стало: \`${OTHER}\``) as string,
+            buildFn: expect.any(Function) as unknown,
         });
         expect(w.deps.openPrFn).toHaveBeenCalledWith(
             CONSUMER,
@@ -1219,7 +1346,7 @@ describe('rollback (#103)', () => {
         const w = rworld({}, { lock: 'мусор' });
         expect(rollback(w)).toBe(1);
         expect(w.out[0]).toMatch(/откатывать нечего/);
-        expect(w.deps.pushLockBranchFn).not.toHaveBeenCalled();
+        expect(w.deps.pushBundleBranchFn).not.toHaveBeenCalled();
     });
 
     it('каталог состояния не определён — отказ', () => {
@@ -1281,12 +1408,12 @@ describe('rollback (#103)', () => {
 
     it('ветка не запушена — отказ, PR не заводится', () => {
         const w = rworld({
-            pushLockBranchFn: vi.fn(() => {
+            pushBundleBranchFn: vi.fn(() => {
                 throw new Error('non-fast-forward');
             }),
         });
         expect(rollback(w)).toBe(1);
-        expect(w.out[0]).toMatch(/ветка ralph\/rollback-b+ с правкой lock не запушена/);
+        expect(w.out[0]).toMatch(/ветка ralph\/rollback-b+ с комплектом не запушена/);
         expect(w.deps.openPrFn).not.toHaveBeenCalled();
     });
 

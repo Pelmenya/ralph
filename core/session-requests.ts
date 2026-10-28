@@ -18,6 +18,7 @@
 import { checkIssueFormat, describeFormatViolations, type TIssueFormat } from './issue-format.ts';
 import { MERGE_TRANSIENT_RE } from './merge-retry.ts';
 import { formatStopMessage } from './stop-message.ts';
+import { LIVE_PROBE_CASES } from '../adapters/live-probe-cases.ts';
 
 // Что сессия имеет право попросить. Список ЗАКРЫТЫЙ и намеренно короткий: снятие `hold`,
 // одобрение ревью (ship/decision) и мердж в него не входят и входить не могут — это
@@ -25,7 +26,11 @@ import { formatStopMessage } from './stop-message.ts';
 // шва и тестом, а не строкой в этот union.
 export type TSessionRequest =
     | { kind: 'comment' | 'close' | 'block'; issue: number; comment: string }
-    | { kind: 'new-issue'; title: string; body: string; labels: string[] }
+    // #220: `blocks` — номер карточки ТЕКУЩЕЙ фазы, которую новая блокирует. С ним карточка
+    // едет в веху фазы, а не во Входящие: без неё фазу не закрыть, и сортировка вахтой
+    // утром означала бы ночь на брейкере. Принадлежность вехе разбор не знает (он чистый) —
+    // её сверяет `applySessionRequests` тем же отказом батча (`blocksProblem`).
+    | { kind: 'new-issue'; title: string; body: string; labels: string[]; blocks?: number }
     // #45: намерения ревью-сессии по PR СВОЕЙ фазы. Номера PR в них нет намеренно — не
     // забывчивость, а граница: сессия не выбирает, какой PR комментировать, его знает
     // петля. Иначе к списку намерений добавилась бы возможность писать в любой PR
@@ -33,7 +38,12 @@ export type TSessionRequest =
     // Якорь — ВЛОЖЕННЫЙ объект, а не два независимых поля: «либо оба, либо ни одного» —
     // это инвариант, и в типе он выражается структурой, а не договорённостью с парсером.
     | { kind: 'pr-comment'; comment: string; anchor?: TRequestAnchor }
-    | { kind: 'pr-block'; comment: string };
+    | { kind: 'pr-block'; comment: string }
+    // #219: живая проба на стенде. Исполняет её раннер вне сессии (`core/live-probe.ts`):
+    // ключа CLI у сессии нет и быть не должно. Пара `cli` + `case` — из закрытого каталога
+    // (`adapters/live-probe-cases.ts`), а не команда: строка от сессии, исполненная с ключом
+    // пробы, была бы каналом в обход барьера.
+    | { kind: 'live-probe'; issue: number; cli: string; case: string };
 
 // Сторона диффа у якоря (#41). Удалённая строка живёт только в СТАРОЙ версии файла, и
 // замечание к ней с прошитой новой стороной форж либо отвергал, либо вешал на строку с
@@ -52,7 +62,8 @@ const DIFF_SIDES: readonly string[] = ['LEFT', 'RIGHT'];
 // Мутации — то, что меняет состояние проекта: закрывает/блокирует карточку, заводит
 // новую, ставит блокер на PR. Именно они опасны при сорвавшейся сессии (штампует их
 // пачками), и предел на них остаётся жёстким.
-const MUTATION_KINDS = ['close', 'block', 'new-issue', 'pr-block'] as const;
+// `live-probe` — тоже мутация: проба тратит квоту ключа и пишет комментарий в карточку.
+const MUTATION_KINDS = ['close', 'block', 'new-issue', 'pr-block', 'live-probe'] as const;
 // Комментарии ничего не закрывают, не блокируют и не создают сущностей — это текст в
 // ленте PR или карточки. Судить о сорвавшейся сессии по их числу — как судить о буйстве
 // по количеству сказанных слов.
@@ -82,6 +93,11 @@ export const MAX_REQUEST_LINES = MAX_MUTATION_REQUESTS + MAX_COMMENT_REQUESTS;
 // но повод сказать человеку «PR/фаза великоват(а)», тем же числом, что раньше отвергало
 // батч целиком.
 export const COMMENT_NOTICE_THRESHOLD = 20;
+// #219: живых проб в батче — не больше двух. Каждая — настоящая сессия CLI на стенде и
+// квота отдельного ключа, а раннер ждёт её синхронно до срока пробы (`LIVE_PROBE_TIMEOUT_MS`,
+// 15 мин; конфиг — не больше часа); карточке нужна одна, двух хватает на пару
+// «отрицательная + разрешённая».
+export const MAX_LIVE_PROBES = 2;
 
 // Классификация намерений на мутации/комментарии — используется и здесь (пределы), и
 // оркестратором (лог-заметка о размере батча комментариев).
@@ -128,7 +144,15 @@ const ISSUE_KINDS = ['comment', 'close', 'block'] as const;
 const PR_KINDS = ['pr-comment', 'pr-block'] as const;
 // Все виды, которые разбор принимает. Отдельной константой — по ней тест сверяет схему в
 // промптах (#217): новый вид без строки схемы краснеет, а не уезжает в промпт молча.
-export const SESSION_REQUEST_KINDS: readonly string[] = [...ISSUE_KINDS, 'new-issue', ...PR_KINDS];
+export const SESSION_REQUEST_KINDS: readonly string[] = [
+    ...ISSUE_KINDS,
+    'new-issue',
+    ...PR_KINDS,
+    'live-probe',
+];
+// #219: поля `live-probe` — ровно эти. Лишнее поле (`command`, `args`, `env`) — отказ, а не
+// «проигнорируем»: сессия, приписавшая пробе команду, рассчитывала, что та исполнится.
+const LIVE_PROBE_FIELDS: readonly string[] = ['kind', 'issue', 'cli', 'case'];
 
 // Путь файла для якоря комментария. Проверяется не «на всякий случай»: строку пишет
 // модель, а уходит она в argv `gh api -f path=…`. Абсолютный путь и `..` отвергаем —
@@ -243,6 +267,38 @@ function labels(value: unknown, lineNo: number, allowlist: readonly string[]): s
     return seen;
 }
 
+// #219: проба называется парой из каталога, и только ею. Незнакомый CLI и незнакомый
+// сценарий — отказ батча с перечнем допустимого: проба, тихо не исполненная, выглядела бы
+// для сессии как «не прошла», и следующая итерация чинила бы здоровый код.
+function liveProbe(
+    req: Record<string, unknown>,
+    lineNo: number,
+): Extract<TSessionRequest, { kind: 'live-probe' }> {
+    const extra = Object.keys(req).filter((k) => !LIVE_PROBE_FIELDS.includes(k));
+    if (extra.length > 0) {
+        fail(
+            lineNo,
+            `live-probe принимает только ${LIVE_PROBE_FIELDS.join(', ')}; лишнее: ${extra.join(', ')} — ` +
+                'команду пробы задаёт каталог раннера, а не сессия',
+        );
+    }
+    const issue = issueNumber(req['issue'], lineNo);
+    const cli = req['cli'];
+    const known = Object.keys(LIVE_PROBE_CASES);
+    if (typeof cli !== 'string' || !Object.hasOwn(LIVE_PROBE_CASES, cli)) {
+        fail(lineNo, `cli пробы ${JSON.stringify(cli)} не из каталога (${known.join(', ')})`);
+    }
+    const probeCase = req['case'];
+    const cases = LIVE_PROBE_CASES[cli];
+    if (typeof probeCase !== 'string' || !cases.includes(probeCase)) {
+        fail(
+            lineNo,
+            `case пробы ${JSON.stringify(probeCase)} не из каталога ${cli} (${cases.join(', ')})`,
+        );
+    }
+    return { kind: 'live-probe', issue, cli, case: probeCase };
+}
+
 /**
  * Разбирает файл-запрос (JSONL) в список намерений.
  *
@@ -303,6 +359,7 @@ export function parseSessionRequests(
                 title: text(req['title'], no, 'заголовок', MAX_TITLE),
                 body: text(req['body'], no, 'тело карточки', MAX_BODY),
                 labels: labels(req['labels'], no, labelAllowlist),
+                ...(req['blocks'] === undefined ? {} : { blocks: issueNumber(req['blocks'], no) }),
             };
             // Карточка не по формату потребителя не заводится: заведённая, она попала бы
             // в очередь и встала бы стопом preflight уже у человека — а причину лучше
@@ -335,6 +392,7 @@ export function parseSessionRequests(
                 comment: text(req['comment'], no, 'комментарий', MAX_COMMENT),
             };
         }
+        if (kind === 'live-probe') return liveProbe(req, no);
         if (typeof kind === 'string' && (ISSUE_KINDS as readonly string[]).includes(kind)) {
             return {
                 kind: kind as 'comment' | 'close' | 'block',
@@ -355,10 +413,18 @@ export function parseSessionRequests(
     const { mutations, comments } = classifySessionRequests(requests);
     if (mutations.length > MAX_MUTATION_REQUESTS) {
         throw new Error(
-            `Запрос сессии: ${String(mutations.length)} мутаций (close/block/new-issue/pr-block) — ` +
+            `Запрос сессии: ${String(mutations.length)} мутаций (close/block/new-issue/pr-block/live-probe) — ` +
                 `больше предела ${String(MAX_MUTATION_REQUESTS)}. Батч отвергнут целиком: столько мутаций ` +
                 'за одну итерацию похоже на сорвавшуюся сессию. ' +
                 `Разбивка по классам: ${String(requests.length)} намерений — ${breakdownByKind(requests)}.`,
+        );
+    }
+    const probes = requests.filter((r) => r.kind === 'live-probe').length;
+    if (probes > MAX_LIVE_PROBES) {
+        throw new Error(
+            `Запрос сессии: ${String(probes)} живых проб — больше предела ` +
+                `${String(MAX_LIVE_PROBES)}. Батч отвергнут целиком: каждая проба — сессия CLI ` +
+                'на стенде и квота ключа пробы.',
         );
     }
     if (comments.length > MAX_COMMENT_REQUESTS) {

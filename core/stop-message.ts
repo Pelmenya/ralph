@@ -34,6 +34,7 @@ export type TStopReason =
     | 'forge-unreadable'
     | 'issue-format'
     | 'guard-probe'
+    | 'config-reload'
     | 'breaker'
     | 'deadman'
     | 'unknown';
@@ -93,6 +94,8 @@ export const REASON_TITLES: Record<TStopReason, string> = {
     'issue-format': 'карточка не по формату потребителя',
     // Ревью Фазы 12: собранный settings сессии не прошёл пробу барьера посреди прогона.
     'guard-probe': 'барьер сессии не прошёл пробу',
+    // #221: конфиг, перечитанный на границе фаз, битый или потерял текущую фазу.
+    'config-reload': 'конфиг на границе фаз отвергнут',
     breaker: 'circuit breaker',
     deadman: 'тишина лога (deadman)',
     unknown: 'причина не установлена',

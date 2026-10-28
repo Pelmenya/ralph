@@ -38,7 +38,7 @@ const runArgv: TRunArgvFn = (file, args, opts = {}) => {
         env: opts.env ?? env,
     });
     if (r.status !== 0) throw new Error(`${file} ${args.join(' ')}: ${r.stderr}`);
-    return r.stdout.trim();
+    return opts.raw ? r.stdout : r.stdout.trim();
 };
 const git = (cwd: string, ...args: string[]) => runArgv('git', ['-C', cwd, ...args]);
 
@@ -144,7 +144,7 @@ describe('commitLockOnBranch на настоящем git (#102)', () => {
         git(other, 'rm', '--quiet', '.ralph/core.lock');
         git(other, 'commit', '--quiet', '-m', 'без lock');
         git(other, 'push', '--quiet', 'origin', `HEAD:refs/heads/${BRANCH}`);
-        expect(() => commit()).toThrow(/уже есть на origin.*другой lock/);
+        expect(() => commit()).toThrow(/уже есть на origin.*другой \.ralph\/core\.lock/);
     });
 
     it('база — свежий main origin, а не локальный HEAD человека', () => {
@@ -162,7 +162,7 @@ describe('commitLockOnBranch на настоящем git (#102)', () => {
     it('ветка с другим lock уже есть на origin — отказ без перезаписи, служебные ref убраны', () => {
         const first = commit();
         expect(() => commit({ lock: { ...NEW, treeHash: `sha256:${'3'.repeat(64)}` } })).toThrow(
-            /уже есть на origin.*другой lock/,
+            /уже есть на origin.*другой \.ralph\/core\.lock/,
         );
         expect(git(origin, 'rev-parse', `refs/heads/${BRANCH}`)).toBe(first);
         expect(git(consumer, 'for-each-ref', 'refs/ralph')).toBe('');

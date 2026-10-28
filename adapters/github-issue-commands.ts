@@ -269,6 +269,16 @@ export function createGithubIssueCommands(env: GithubIssueCommandsEnv) {
         runArgvFn('gh', ['issue', 'comment', String(issue), '--body', body]);
     }
 
+    // #220: тело карточки целиком — ссылка на блокирующую карточку (`new-issue` с `blocks`).
+    // Тело идёт значением argv, как у комментария: шелла в пути нет.
+    function setIssueBody(
+        issue: number,
+        body: string,
+        { runArgvFn = shArgv }: { runArgvFn?: ShArgvFn } = {},
+    ): void {
+        runArgvFn('gh', ['issue', 'edit', String(issue), '--body', body]);
+    }
+
     // #125: лента комментариев карточки — для сверки начатого намерения по метке (#94).
     // Те же `issues/N/comments`, что у первой поверхности ленты PR (`prComments`): у GitHub
     // карточка и PR делят этот маршрут. `--paginate` склеивает страницы в один массив —
@@ -407,6 +417,7 @@ export function createGithubIssueCommands(env: GithubIssueCommandsEnv) {
         milestoneLabels,
         issueDetails,
         commentOnIssue,
+        setIssueBody,
         issueComments,
         closeIssue,
         blockIssue,

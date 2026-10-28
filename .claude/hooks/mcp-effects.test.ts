@@ -7,7 +7,12 @@ import { describe, expect, it } from 'vitest';
 
 import { parseConsumerData } from './consumer-data.cjs';
 import { decide, mcpAllowed, mcpAllowedByEffect } from './guard-rules.cjs';
-import { decisionDrift, migrateMcpEffects } from './mcp-effects.cjs';
+import {
+    decisionDrift,
+    equivalenceProblems,
+    migrateMcpEffects,
+    toolsFreshness,
+} from './mcp-effects.cjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..', '..');
 const CANON = readFileSync(path.join(ROOT, '.claude/ralph/hooks.json'), 'utf-8');
@@ -66,7 +71,12 @@ describe('мигратор на данных канона', () => {
         expect(after.writeAllowed).toEqual(before.writeAllowed);
         expect(JSON.parse(text).mcp.notes).toEqual(JSON.parse(CANON).mcp.notes);
         expect(parseConsumerData(text).skills.files).toHaveLength(1);
-        expect(migrateMcpEffects(text, INVENTORY)).toEqual({ text, changed: false });
+        expect(migrateMcpEffects(text, INVENTORY)).toEqual({
+            text,
+            changed: false,
+            stale: [],
+            unlisted: [],
+        });
     });
 
     // Намеренное ужесточение контракта: чтение, которого нет в политике, — `unknown`.
@@ -144,5 +154,56 @@ describe('схема mcp.tools: битые и неполные эффекты �
         const excepted = { ...mcp, neverExceptions: new Set([sc('DiscardPullRequest')]) };
         expect(mcpAllowedByEffect(sc('DiscardPullRequest'), excepted)).toBe(true);
         expect(mcpAllowedByEffect(sc('GetIssue'))).toBe(false);
+    });
+});
+
+describe('эквивалентность и свежесть (#218)', () => {
+    const legacy = parseConsumerData(CANON).mcp;
+    const migrated = parseConsumerData(migrateMcpEffects(CANON, INVENTORY).text).mcp;
+    const names = [...new Set([...INVENTORY, ...legacy.writeAllowed])];
+
+    it('честная миграция эквивалентна на решениях guard на событии', () => {
+        expect(equivalenceProblems(legacy, migrated, names)).toEqual([]);
+    });
+
+    // От противного: каждый класс расхождения назван.
+    it('снятый вычет, сменённый writeAllowed и снятое чтение — каждое названо', () => {
+        const tampered = parseConsumerData(
+            JSON.stringify({
+                mcp: {
+                    writeAllowed: [...legacy.writeAllowed],
+                    tools: Object.fromEntries(
+                        [...migrated.tools]
+                            .filter(([n]) => n !== sc('GetIssue'))
+                            .map(([n, e]) => [n, { effect: e }]),
+                    ),
+                },
+            }),
+        ).mcp;
+        const problems = equivalenceProblems(legacy, tampered, names);
+        expect(problems).toContain('mcp.neverExceptions изменился при миграции');
+        expect(problems).toContain(
+            `решение по ${sc('GetIssue')} разошлось с прежним: был разрешён, стал запрещён`,
+        );
+        expect(problems).toContain(
+            `решение по ${sc('DiscardPullRequest')} разошлось с прежним: был разрешён, стал запрещён`,
+        );
+    });
+
+    it('свежесть: исчезнувшее чтение — stale, новое чтение по префиксу — unlisted', () => {
+        const fresh = [...INVENTORY.filter((n) => n !== sc('GetIssue')), sc('GetMilestone')];
+        expect(toolsFreshness(migrated, fresh)).toEqual({
+            stale: [sc('GetIssue')],
+            unlisted: [sc('GetMilestone')],
+        });
+    });
+
+    it('уже мигрированные данные сверяются с инвентарём, а не выходят молча', () => {
+        const text = migrateMcpEffects(CANON, INVENTORY).text;
+        expect(migrateMcpEffects(text, [sc('ListIssues')])).toMatchObject({
+            changed: false,
+            stale: expect.arrayContaining([sc('GetIssue')]) as string[],
+        });
+        expect(() => migrateMcpEffects(text, [])).toThrow('инвентарь инструментов пуст');
     });
 });

@@ -76,6 +76,22 @@ export const PROTECTED_PATHS: readonly ProtectedPath[] = [
         why: 'контракт потребителя: данные контура хуков открывают вызов, как код',
     },
     {
+        // Снимок — улика для `verify-mcp` и сверки перед сессией: правленый в PR, он
+        // переписал бы инвентарь, по которому решается эквивалентность эффектов (#215, #218).
+        path: '.claude/ralph/mcp-inventory.json',
+        exact: false,
+        pattern: '.claude/ralph/mcp-inventory.json',
+        why: 'снимок инвентаря MCP: по нему сверяются эффекты данных контура',
+    },
+    {
+        // Раннер исполняет команды серверов отсюда своим процессом (инвентарь перед сессией,
+        // update): строка файла решает, какой код он запустит.
+        path: '.mcp.json',
+        exact: true,
+        pattern: '.mcp.json',
+        why: 'серверы MCP потребителя: раннер исполняет их команды со своими правами',
+    },
+    {
         path: CONSUMER_CONFIG_REL,
         exact: false,
         pattern: CONSUMER_CONFIG_REL,

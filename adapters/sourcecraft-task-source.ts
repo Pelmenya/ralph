@@ -709,6 +709,12 @@ export function createSourcecraftTaskSource(deps: SourcecraftTaskSourceDeps): Ta
             api('POST', `${base}/issues/${String(issue)}/comments`, { body });
         },
 
+        // #220: тело карточки — то же поле `description`, что пишет `createIssue` и читает
+        // `getIssue`.
+        setIssueBody(issue: number, body: string): void {
+            api('PATCH', `${base}/issues/${String(issue)}`, { description: body });
+        },
+
         // #125: лента карточки для сверки начатого намерения по метке (#94). Ключ
         // `issue_comments` сверен живым ответом 27.10.2026 (пустая лента приходит
         // `{"issue_comments":[],"next_page_token":""}`, страницы — тем же `page_token`), а не

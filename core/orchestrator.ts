@@ -184,6 +184,7 @@ import {
 // #217: сверка исправленного батча намерений с исходным — чистый модуль рядом с разбором.
 import { checkIntentRepair, intentRepairObstacle } from './intent-repair.ts';
 import type { TSessionRequest } from './session-requests.ts';
+import { liveProbeForIntent } from './live-probe.ts';
 // #625: лестница «ревью правок». Чистая арифметика сходимости (дедуп находок, потолок
 // проходов, анти-пинг-понг, решение «мердж / ещё круг / арбитр») живёт отдельным модулем —
 // здесь остаётся оркестрация: сессии, дифф, журнал, карточки.
@@ -214,6 +215,21 @@ import {
     BACKLOG_MILESTONE_CAP,
     createBacklogAddress,
 } from './backlog-address.ts';
+// #220: дубль, квота и бюджет фазы для карточек сессии.
+import {
+    blocksProblem,
+    findDuplicateIssue,
+    phaseBudgetWarning,
+    resolveNewIssuePolicy,
+    type TOpenCard,
+} from './new-issue-policy.ts';
+// #221: список фаз перечитывается на границе фаз, без рестарта процесса.
+import {
+    formatPhaseReload,
+    formatRestartKeys,
+    reconcilePhases,
+    type TPhaseReload,
+} from './phase-reload.ts';
 import { minutesOrDefault, apiLimitWaitMs, apiLimitMessage } from './api-limit.ts';
 import {
     SUBSCRIPTION_KEY_ENV,
@@ -314,12 +330,23 @@ import {
     loopDeniedTools,
 } from '../adapters/harness-registry.ts';
 import {
+    checkMcpDrift,
+    harnessMcpNames,
+    MCP_DRIFT_RECHECK_MS,
+    MCP_INVENTORY_PATH,
+    MCP_SERVERS_PATH,
+    stdioListPage,
+    type TDriftCheck,
+    type TMcpDriftMemo,
+} from './mcp-inventory.ts';
+import {
     describeRoots,
     doctorRootsLines,
     parseLaunchConsumer,
     rootsDefaultRefusal,
     underRoot,
     writeFileAtomic,
+    type TLaunchContext,
     type TResolvedRoots,
 } from './roots.ts';
 import { checkCoreBeforeStart, describeStartCheck, productRootMismatch } from './core-install.ts';
@@ -726,6 +753,9 @@ export type RalphConfig = {
     // поведение: исчерпание ходов на грязном дереве = стоп). Парный ключ к
     // `review.fixTurnRetries`, который делает то же самое для шагов сдачи.
     coderTurnRetries?: unknown;
+    // #219: живая проба стенда силами раннера — переменная ключа пробы и прокси хоста.
+    // Разбирает `resolveLiveProbeConfig` (`live-probe.ts`) в момент пробы, fail-closed.
+    liveProbe?: unknown;
     modelRouting?: {
         labels?: Record<string, ModelRouteEntry | undefined>;
         default?: ModelRouteEntry;
@@ -822,6 +852,9 @@ export type RalphConfig = {
     // Форму держит `resolveIssueFormat` (issue-format.ts) — fail-closed на старте. Нет
     // секции — карточки не проверяются, как до неё.
     issueFormat?: unknown;
+    // #220: дубль, квота сессии и метка разбора для `new-issue` — `resolveNewIssuePolicy`
+    // (new-issue-policy.ts), fail-closed. Нет секции — дефолты: барьер молчанием не снимается.
+    newIssues?: unknown;
     maxIterations?: number;
     maxTurns?: number;
     // #118: строгость бюджета ходов — 'best-effort' (ключа нет) или 'required'. Строгое
@@ -1113,6 +1146,30 @@ export type OrchestratorEnv = {
     flags: OrchestratorFlags;
     external: OrchestratorExternal;
 };
+
+// Лимит итераций фазы — одно место на брейкер (`preflight`) и бюджет фазы (#220): три копии
+// дефолта однажды развели бы предупреждение и брейкер.
+export const DEFAULT_MAX_ITERATIONS = 10;
+export function phaseIterationLimit(cfg: { maxIterations?: number }): number {
+    return cfg.maxIterations || DEFAULT_MAX_ITERATIONS;
+}
+
+// Бюджет фазы строкой `⚠`; отказ чтения вехи — тоже строка, а не бросок: предупреждение не
+// вправе ронять ни применение намерений, ни вход в фазу.
+function logPhaseBudget(
+    milestone: string,
+    openCountFn: () => number,
+    maxIterations: number,
+    logFn: (m: string) => void,
+    when: string,
+): void {
+    try {
+        const warning = phaseBudgetWarning({ milestone, openCount: openCountFn(), maxIterations });
+        if (warning !== null) logFn(warning);
+    } catch (e) {
+        logFn(`⚠ Бюджет фазы "${milestone}" ${when} не сверен: ${(e as Error).message}`);
+    }
+}
 
 export function createOrchestrator(env: OrchestratorEnv) {
     const { argv, flags, external } = env;
@@ -1955,15 +2012,131 @@ export function createOrchestrator(env: OrchestratorEnv) {
         logFn(`⚠ ${drift}`);
     }
 
+    // #215: инвентарь MCP перед сессией — снимок дерева ЧЕЛОВЕКА (`consumerRoot`, прошёл ревью)
+    // против свежего `tools/list` серверов. Исход — диагноз строкой `⚠`, а не стоп и не
+    // разрешение: guard судит MCP по данным контура и снимок не читает, так что незнакомый
+    // инструмент заблокирован и без сверки. Сверка называет, ПОЧЕМУ он будет заблокирован, —
+    // дрейф конфигурации, а не транзиент, — чтобы человек лечил его PR обновления снимка под
+    // ship, а не перезапуском. Отказ снимка по существу держит обновление (#218), не сессию.
+    // Строка — один раз на текст за прогон: перед каждой сессией она тонула бы в логе.
+    const warnedMcpDrift = new Set<string>();
+    function mcpDriftLines(res: TDriftCheck): string[] {
+        switch (res.status) {
+            case 'clean':
+                return [];
+            case 'absent':
+                return [
+                    '⚠ Снимка инвентаря MCP нет (.claude/ralph/mcp-inventory.json): дрейф серверов ' +
+                        'не сверяется, а guard блокирует всё вне данных контура.',
+                ];
+            case 'drift':
+                return [
+                    '⚠ Дрейф инвентаря MCP от снимка — дрейф конфигурации, а не транзиент: ' +
+                        'новые инструменты не разрешены, повтор сессии их не разрешит; лечение — ' +
+                        'PR обновления снимка под ship человека.',
+                    ...res.lines.map((l) => `   ${l}`),
+                ];
+            case 'unreachable':
+                return [
+                    '⚠ Инвентарь MCP перед сессией не собран — дрейф не сверен:',
+                    ...res.problems.map((l) => `   ${l}`),
+                ];
+            case 'invalid':
+                return [
+                    '⚠ Снимок инвентаря MCP не прошёл проверку — обновление снимка его не примет:',
+                    ...res.problems.map((l) => `   ${l}`),
+                ];
+        }
+    }
+    // Опрос серверов — процесс на страницу, до 30 с каждая, а сессий за фазу десятки: опрос
+    // перед каждой добавлял бы секунды холодного `npx` к каждой, а зависший сервер — минуты.
+    // Поэтому при тех же `.mcp.json` и снимке повторный опрос — не чаще `MCP_DRIFT_RECHECK_MS`:
+    // дрейф — диагноз, а не барьер, и час опоздания строки дешевле минуты на каждой сессии.
+    const mcpDriftMemo: TMcpDriftMemo = { key: null, at: 0 };
+    const readConsumerFile = (root: string, rel: string): string | null => {
+        const p = path.join(root, rel);
+        return fs.existsSync(p) ? fs.readFileSync(p, 'utf-8') : null;
+    };
+    // Ключи, которых сервер не получает и по прямому указанию `.mcp.json`: к ключам петли
+    // (`LOOP_KEY_ENVS`, их снимает сам `stdioListPage`) — токены форжа и ключ живой пробы.
+    function mcpDeniedEnv(): string[] {
+        const out: string[] = [];
+        try {
+            out.push(...adapters.taskSource.secretEnvNames());
+        } catch {
+            // Шов ещё не собран (вне `main()`): белый список окружения держит и без этого.
+        }
+        const probe = (config as { liveProbe?: { keyEnv?: unknown } } | null)?.liveProbe;
+        if (typeof probe?.keyEnv === 'string') out.push(probe.keyEnv);
+        return out;
+    }
+    function warnMcpDrift({
+        logFn = log,
+        consumerRoot = config?.rootsResolved?.consumerRoot ?? null,
+        checkFn = (root: string): TDriftCheck =>
+            checkMcpDrift({
+                readFn: (rel) => readConsumerFile(root, rel),
+                // cwd — дерево человека, из которого прочитан `.mcp.json`, а не дерево ветки
+                // фазы, куда раннер сделал `chdir`: иначе относительный путь сервера исполнил
+                // бы код, который правила сессия.
+                listPageFn: (server, cfg, cursor) =>
+                    stdioListPage(server, cfg, cursor, { cwd: root, deniedEnv: mcpDeniedEnv() }),
+                harnesses: harnessMcpNames(HARNESS_REGISTRY),
+            }),
+        fingerprintFn = (root: string): string =>
+            [MCP_INVENTORY_PATH, MCP_SERVERS_PATH]
+                .map((rel) => readConsumerFile(root, rel) ?? '\0нет файла')
+                .join('\0'),
+        nowFn = Date.now,
+        memo = mcpDriftMemo,
+        dry = DRY,
+    }: {
+        logFn?: LogFn;
+        consumerRoot?: string | null;
+        checkFn?: (root: string) => TDriftCheck;
+        fingerprintFn?: (root: string) => string;
+        nowFn?: () => number;
+        memo?: TMcpDriftMemo;
+        dry?: boolean;
+    } = {}): void {
+        // Без `roots` снимок читать неоткуда, кроме дерева сессии, — а его правит PR.
+        if (consumerRoot === null) return;
+        // Сухой прогон только читает: процессы серверов он не порождает.
+        if (dry) return;
+        let key: string;
+        try {
+            key = fingerprintFn(consumerRoot);
+        } catch (e) {
+            key = `\0не прочитано: ${(e as Error).message}`;
+        }
+        if (memo.key === key && nowFn() - memo.at < MCP_DRIFT_RECHECK_MS) return;
+        memo.key = key;
+        memo.at = nowFn();
+        let res: TDriftCheck;
+        try {
+            res = checkFn(consumerRoot);
+        } catch (e) {
+            res = { status: 'unreachable', problems: [(e as Error).message] };
+        }
+        const lines = mcpDriftLines(res);
+        const text = lines.join('\n');
+        if (lines.length === 0 || warnedMcpDrift.has(text)) return;
+        warnedMcpDrift.add(text);
+        for (const l of lines) logFn(l);
+    }
+
     // Версия перед сессией рантайма по его ключу реестра: прочитать, сверить с прошлой и с
     // версией описания пакета. Это боевое умолчание параметра `cliVersionFn` у run*Once;
-    // тесты подменяют его целиком.
+    // тесты подменяют его целиком. Здесь же — сверка инвентаря MCP (`mcpDriftFn`, #215): это
+    // единственная точка «перед сессией», общая для всех рантаймов.
     function sessionCliVersion(
         runtime: string,
         readFn: typeof readCliVersion = readCliVersion,
         noteFn: typeof noteCliVersion = noteCliVersion,
         driftFn: typeof warnCliVersionDrift = warnCliVersionDrift,
+        mcpDriftFn: () => void = () => warnMcpDrift(),
     ): CliVersion {
+        mcpDriftFn();
         const id = RUNTIME_IDENTITIES[runtime];
         if (!id) {
             return {
@@ -3712,6 +3885,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         quarantineFn,
         repairFn,
         orphanPrFn,
+        liveProbeFn,
     }: {
         cfg: RalphConfig;
         // #45: контекст фазы нужен намерениям по PR — сам PR они не называют (сессия не
@@ -3760,6 +3934,13 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // #226: номер PR, к которому, вероятно, относился хвост PR-намерений вне цикла
         // сдачи, — только для строки лога. Зовётся, лишь когда такие намерения есть.
         orphanPrFn?: () => number | null;
+        // #219: исполнитель живой пробы (`live-probe`) вне сессии. Не задан — проба отказ с
+        // причиной в карточке, и `close` той же карточки не применяется: шаг, где пробу
+        // исполнить нечем, не вправе закрыть карточку, чей критерий она подтверждает.
+        liveProbeFn?: (probe: { issue: number; cli: string; case: string }) => {
+            verdict: string;
+            comment: string;
+        };
     }): {
         applied: number;
         failed: boolean;
@@ -3847,8 +4028,35 @@ export function createOrchestrator(env: OrchestratorEnv) {
             );
         }
 
-        const parseBatch = (text: string) =>
-            parseSessionRequests(text, {
+        // #220: открытые карточки вехи — одно чтение на веху за батч, общее у сверки `blocks`,
+        // пула дублей и счёта адреса накопителя: у площадки лимит запросов, и три канала,
+        // спрашивающие одно и то же, жгли бы его втрое. Отказ не кэшируется.
+        const openCache = new Map<string, Issue[]>();
+        const listOpenOnce = (milestone: string): Issue[] => {
+            const hit = openCache.get(milestone);
+            if (hit) return hit;
+            const read = taskSource.listAllOpenIssues(milestone);
+            openCache.set(milestone, read);
+            return read;
+        };
+        // Номера открытых карточек вехи фазы — для сверки `blocks`. Батч без `blocks` форж об
+        // этом не спрашивает. `null` — не прочитались.
+        let phaseOpen: number[] | null | undefined;
+        const phaseOpenNumbers = (): number[] | null => {
+            if (phaseOpen !== undefined) return phaseOpen;
+            try {
+                phaseOpen = listOpenOnce(currentMilestone).map((i) => i.number);
+            } catch (e) {
+                phaseOpen = null;
+                logFn(
+                    `⚠ Карточки вехи "${currentMilestone}" не прочитались (${(e as Error).message}) — ` +
+                        'new-issue с blocks уедут во Входящие без связи с фазой.',
+                );
+            }
+            return phaseOpen;
+        };
+        const parseBatch = (text: string) => {
+            const parsed = parseSessionRequests(text, {
                 labelAllowlist: cfg.issueLabels ?? [],
                 // Фаза 10: битая секция — отказ разбора батча, а не «формата нет»: вызов
                 // идёт и мимо preflight (публичная поверхность `ralph.js`).
@@ -3856,6 +4064,20 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     throw new Error(msg);
                 }),
             });
+            // #220: тем же правилом — битая секция `newIssues` отказывает батчу, а не
+            // выключает дубль и квоту.
+            resolveNewIssuePolicy(cfg.newIssues);
+            // #220: `blocks` вне открытых карточек вехи фазы — отказ батча, как любая
+            // неверная строка: сессия заявила связь, которой нет. Не прочиталась веха — не
+            // отказ (транзиент форжа не повод снимать батч в карантин), а разжалование ниже.
+            if (parsed.some((r) => r.kind === 'new-issue' && r.blocks !== undefined)) {
+                const open = phaseOpenNumbers();
+                const problem =
+                    open === null ? null : blocksProblem(parsed, open, currentMilestone);
+                if (problem !== null) throw new Error(`Запрос сессии: ${problem}`);
+            }
+            return parsed;
+        };
         let requests: TSessionRequest[] = [];
         let parseError: string | null = null;
         try {
@@ -4020,7 +4242,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
             currentPhase: currentMilestone,
             countOpenFn: (milestone) => {
                 try {
-                    return taskSource.listAllOpenIssues(milestone).length;
+                    // #220: из общего чтения батча — пул дублей мог уже спросить эту веху.
+                    // Заведённое батчем фабрика досчитывает сама.
+                    return listOpenOnce(milestone).length;
                 } catch {
                     // «Не сосчитали» — не ноль: иначе одно неотвеченное чтение делало бы
                     // годной сколь угодно переполненную веху, и потолок переставал бы
@@ -4059,6 +4283,156 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // #226: PR-намерения вне цикла сдачи — свой список, а не `dropped`: тот говорит
         // «форж отказал по существу», а здесь до форжа дело не дошло.
         const orphaned: TSessionRequest[] = [];
+        // #219: живые пробы исполняются ДО остальных намерений — до закрытия карточки, чей
+        // критерий они подтверждают. Каждая превращается в `comment` с итогом, а `close` той
+        // же карточки при итоге не PASS выбывает: следующая итерация может её чинить, петля
+        // из-за пробы не встаёт. Преобразованный батч ложится на диск до первого эффекта —
+        // раннер, убитый посреди применения, не гоняет пробу второй раз.
+        // Снятые пробой `close` — своим списком: `dropped` считает выбывших ВНУТРИ цикла, и
+        // арифметика «применено N из M» по нему разъехалась бы. В результат они идут вместе.
+        const probeHeld: TDroppedIntent[] = [];
+        // #220: политика new-issue — уже проверена разбором, здесь не бросает.
+        const newIssuePolicy = resolveNewIssuePolicy(cfg.newIssues);
+        // Пул сверки дублей: открытые карточки вехи фазы и Входящих с телами. Читается один
+        // раз на батч и только при `new-issue`; заведённые этим же батчем дописываются в
+        // него — сессия, повторившая находку дважды в одном блоке, тоже дубль. Отказ
+        // чтения — строка `⚠` и сверка по прочитанному: лишняя карточка дешевле
+        // потерянной находки.
+        let dedupPool: TOpenCard[] | null = null;
+        const readDedupPool = (): TOpenCard[] => {
+            if (dedupPool !== null) return dedupPool;
+            const pool: TOpenCard[] = [];
+            const seen = new Set<number>();
+            const milestones = [
+                currentMilestone,
+                ...backlogCandidates(cfg.review?.backlogMilestone),
+            ].filter((m, k, all) => m && all.indexOf(m) === k);
+            const misses: string[] = [];
+            for (const milestone of milestones) {
+                let open: Issue[];
+                try {
+                    open = listOpenOnce(milestone);
+                } catch (e) {
+                    misses.push(`веха "${milestone}": ${(e as Error).message}`);
+                    continue;
+                }
+                for (const issue of open) {
+                    if (seen.has(issue.number)) continue;
+                    seen.add(issue.number);
+                    try {
+                        const { body } = taskSource.getIssue(issue.number);
+                        pool.push({ number: issue.number, title: issue.title, body });
+                    } catch (e) {
+                        // Тело не прочиталось — сверка по одному заголовку честнее пропуска.
+                        pool.push({ number: issue.number, title: issue.title, body: '' });
+                        misses.push(`#${String(issue.number)}: ${(e as Error).message}`);
+                    }
+                }
+            }
+            if (misses.length > 0)
+                logFn(
+                    `⚠ Сверка дублей new-issue — не всё прочиталось (${misses.slice(0, 3).join('; ')}` +
+                        `${misses.length > 3 ? ` и ещё ${String(misses.length - 3)}` : ''}); сверяю по прочитанному.`,
+                );
+            dedupPool = pool;
+            return pool;
+        };
+        // Карточки, заведённые этим батчем, и те из них, что легли сверх квоты.
+        let createdNow = 0;
+        const overQuota: string[] = [];
+        // #220: карточка фазы получила блокирующую — ссылка в комментарий и в тело, строка
+        // о росте фазы и повторная сверка бюджета. Карточка уже заведена: отказ любого из
+        // этих шагов — строка `⚠`, а не отказ намерения, иначе повтор завёл бы её второй раз.
+        // `existing` — блокер оказался дублем карточки ВНЕ вехи фазы: она не новая, фаза не
+        // выросла, и текст в трекере обязан сказать «перенеси её в веху», а не «фазу держат» —
+        // иначе человек, читающий трекер, не узнал бы, что фаза сдастся без блокера.
+        const linkBlocked = (
+            num: number,
+            blocked: number,
+            title: string,
+            existing = false,
+        ): void => {
+            const ref = `#${String(num)} «${title}»`;
+            try {
+                taskSource.commentOnIssue(
+                    blocked,
+                    existing
+                        ? `🔗 Блокер этой карточки — существующая ${ref} вне вехи "${currentMilestone}": петля нашла её дублем находки с blocks #${String(blocked)}. Перенеси её в веху фазы руками, иначе фаза сдастся без неё.`
+                        : `🔗 Фазу держит новая карточка ${ref}: петля завела её с blocks #${String(blocked)} — без неё эту не закрыть.`,
+                );
+            } catch (e) {
+                logFn(
+                    `⚠ Ссылка на ${ref} в комментарий #${String(blocked)} не легла: ${(e as Error).message}`,
+                );
+            }
+            if (taskSource.setIssueBody) {
+                // Гонка названа: «прочитать → дописать → записать целиком», и правка тела
+                // человеком между чтением и записью теряется без следа. Условной записи
+                // (по версии тела) у шва нет; окно — два запроса подряд, а ссылка лежит ещё и
+                // в ленте карточки комментарием выше.
+                try {
+                    const { body } = taskSource.getIssue(blocked);
+                    taskSource.setIssueBody(
+                        blocked,
+                        `${body}\n\n— Заблокирована ${ref}${existing ? ' (вне вехи фазы)' : ''}.`,
+                    );
+                } catch (e) {
+                    logFn(
+                        `⚠ Ссылка на ${ref} в тело #${String(blocked)} не легла: ${(e as Error).message}`,
+                    );
+                }
+            } else {
+                logFn(
+                    `ℹ️ Шов форжа тело карточки не правит — ссылка на ${ref} в #${String(blocked)} только комментарием.`,
+                );
+            }
+            if (existing) return;
+            logFn(`📈 Фаза "${currentMilestone}" выросла: ${ref} блокирует #${String(blocked)}.`);
+            logPhaseBudget(
+                currentMilestone,
+                () => taskSource.listAllOpenIssues(currentMilestone).length,
+                phaseIterationLimit(cfg),
+                logFn,
+                'после роста',
+            );
+        };
+        if (requests.some((r) => r.kind === 'live-probe')) {
+            const notPassed = new Set<number>();
+            const converted: TSessionRequest[] = requests.map((r) => {
+                if (r.kind !== 'live-probe') return r;
+                let res: { verdict: string; comment: string };
+                if (!liveProbeFn) {
+                    res = {
+                        verdict: 'REFUSED',
+                        comment:
+                            `⚠️ Живая проба \`${r.cli} ${r.case}\` не исполнена: на этом шаге ` +
+                            'раннера исполнителя пробы нет. Карточка не закрыта.',
+                    };
+                } else {
+                    try {
+                        res = liveProbeFn(r);
+                    } catch (e) {
+                        res = {
+                            verdict: 'INCONCLUSIVE',
+                            comment:
+                                `⚠️ Живая проба \`${r.cli} ${r.case}\` упала в раннере: ` +
+                                `${(e as Error).message}. Карточка не закрыта.`,
+                        };
+                    }
+                }
+                logFn(`🧪 Живая проба ${r.cli} ${r.case} по #${String(r.issue)}: ${res.verdict}.`);
+                if (res.verdict !== 'PASS') notPassed.add(r.issue);
+                return { kind: 'comment', issue: r.issue, comment: res.comment.slice(0, 9_000) };
+            });
+            requests = converted.filter((r) => {
+                if (r.kind !== 'close' || !notPassed.has(r.issue)) return true;
+                const what = `#${String(r.issue)}: живая проба не дала PASS`;
+                probeHeld.push({ kind: 'close', what });
+                logFn(`⛔ Закрытие ${what} — карточка остаётся открытой.`);
+                return false;
+            });
+            writeFn(`${requests.map(serializeSessionRequest).join('\n')}\n`);
+        }
         // Подсказка про лимит форжа — одна на все ветки отказа (ревью #612): человек,
         // читающий сырую транспортную ошибку, не поймёт, что повтор имеет смысл только
         // после паузы.
@@ -4099,16 +4473,102 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     // Эффект уже на форже — повтор задвоил бы его. Намерение снимается
                     // штатной записью «применено» ниже.
                 } else if (req.kind === 'new-issue') {
-                    send();
-                    const num = taskSource.createIssue({
-                        title: req.title,
-                        body: req.body,
-                        labels: req.labels,
-                        milestone: backlogAddress(),
-                    });
-                    logFn(
-                        `🗂 Заведена карточка ${num ? `#${String(num)}` : '(номер не отдан форжем)'}: ${req.title}`,
+                    // #220: дубль открытой карточки не заводится — находка ложится
+                    // комментарием туда, где уже лежит история.
+                    const pool = readDedupPool();
+                    // Карточка, которую новая блокирует, в сверку не идёт: блокер по природе
+                    // похож на неё (те же пути и ссылки) и набирал порог, а связь `blocks`
+                    // тогда терялась молча — ровно инцидент #220.
+                    const dup = findDuplicateIssue(
+                        req,
+                        req.blocks === undefined
+                            ? pool
+                            : pool.filter((c) => c.number !== req.blocks),
+                        newIssuePolicy.dedupThreshold,
                     );
+                    if (dup !== null) {
+                        send();
+                        taskSource.commentOnIssue(
+                            dup.number,
+                            markIssue(
+                                (
+                                    `🔁 Петля снова наткнулась на это (сходство ${dup.why}).\n\n` +
+                                    `**${req.title}**\n\n${req.body}`
+                                ).slice(0, 9_000),
+                            ),
+                        );
+                        logFn(
+                            `🗂 Дубль #${String(dup.number)}: ${req.title} — новая карточка не заведена (${dup.why}).`,
+                        );
+                        // Дубль намерения с `blocks`: связь с фазой переносится на найденную
+                        // карточку. В вехе фазы она уже держит фазу; вне её (Входящие,
+                        // накопитель) веху раннер не переносит — шва нет, — поэтому ссылка в
+                        // заблокированную своим текстом и `⚠` с номером: фаза без блокера
+                        // молча не остаётся. Веха не прочиталась — `blocks` не сверен, и
+                        // ссылки нет, как у заведения карточки в том же случае.
+                        const open = req.blocks === undefined ? null : phaseOpenNumbers();
+                        if (req.blocks !== undefined && open === null) {
+                            logFn(
+                                `⚠ new-issue «${req.title}»: blocks #${String(req.blocks)} не сверен с вехой — дубль #${String(dup.number)} не связан с фазой.`,
+                            );
+                        } else if (req.blocks !== undefined && open !== null) {
+                            if (!open.includes(dup.number)) {
+                                const dupCard = pool.find((c) => c.number === dup.number);
+                                linkBlocked(
+                                    dup.number,
+                                    req.blocks,
+                                    dupCard?.title ?? req.title,
+                                    true,
+                                );
+                                logFn(
+                                    `⚠ Блокер #${String(req.blocks)} — дубль #${String(dup.number)} вне вехи "${currentMilestone}": ` +
+                                        'перенеси его в веху фазы руками, иначе фаза сдастся без него.',
+                                );
+                            }
+                        }
+                    } else {
+                        // #220: сверх квоты — во Входящие с меткой разбора, `blocks` не
+                        // действует: рост фазы и есть то, что квота держит. Счёт — после
+                        // создания: брошенный транзиентом createIssue квоты не съедает.
+                        const over = createdNow + 1 > newIssuePolicy.sessionQuota;
+                        const blocked =
+                            !over && req.blocks !== undefined && phaseOpenNumbers() !== null
+                                ? req.blocks
+                                : undefined;
+                        if (req.blocks !== undefined && blocked === undefined && !over)
+                            logFn(
+                                `⚠ new-issue «${req.title}»: blocks #${String(req.blocks)} не сверен с вехой — карточка уедет во Входящие.`,
+                            );
+                        send();
+                        const num = taskSource.createIssue({
+                            title: req.title,
+                            body: req.body,
+                            labels:
+                                over && newIssuePolicy.triageLabel !== null
+                                    ? [...req.labels, newIssuePolicy.triageLabel]
+                                    : req.labels,
+                            milestone: blocked !== undefined ? currentMilestone : backlogAddress(),
+                        });
+                        createdNow += 1;
+                        const shown = num ? `#${String(num)}` : '(номер не отдан форжем)';
+                        logFn(`🗂 Заведена карточка ${shown}: ${req.title}`);
+                        if (num) pool.push({ number: num, title: req.title, body: req.body });
+                        if (over) {
+                            overQuota.push(
+                                `${shown} «${req.title}»` +
+                                    (req.blocks !== undefined
+                                        ? ` (просила blocks #${String(req.blocks)})`
+                                        : ''),
+                            );
+                        }
+                        if (blocked !== undefined) {
+                            if (num) linkBlocked(num, blocked, req.title);
+                            else
+                                logFn(
+                                    `⚠ Номер карточки «${req.title}» не отдан — ссылку в #${String(blocked)} ставить не на что.`,
+                                );
+                        }
+                    }
                 } else if (req.kind === 'pr-comment' || req.kind === 'pr-block') {
                     // Номер PR резолвит петля, а не сессия. В цикле сдачи отказ fail-closed:
                     // без PR замечание ревью деть некуда, а молчаливый пропуск означал бы
@@ -4251,6 +4711,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         send();
                         taskSource.commentOnPullRequest(pr.number, { body: mark(req.comment) });
                     }
+                } else if (req.kind === 'live-probe') {
+                    // Пробы преобразованы в комментарии до цикла (#219); дошедшая сюда —
+                    // дефект раннера, и исполнять её мимо исполнителя нельзя.
+                    throw new Error('живая проба дошла до применения непреобразованной');
                 } else {
                     // Комментарий несут все три вида: и «закрой», и «заблокируй» обязаны
                     // объяснить человеку, что произошло. Сверка нашла его на форже (#94) —
@@ -4467,6 +4931,20 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // #41: выбывшее — не тишина. Строка в логе есть у каждого, но невыполненное
         // `close` оставляет карточку открытой, и человек обязан узнать это пушем, а не
         // находкой в логе.
+        // #220: квота — не отказ батча, но вахта узнаёт пушем, что лишнее ждёт разбора.
+        if (overQuota.length > 0) {
+            const label = newIssuePolicy.triageLabel;
+            pushEventFn(
+                `📥 Ralph: сессия завела больше ${String(newIssuePolicy.sessionQuota)} карточек (квота newIssues.sessionQuota) — ` +
+                    `${String(overQuota.length)} ушли во Входящие ` +
+                    (label !== null
+                        ? `с меткой ${label}`
+                        : 'без метки разбора (newIssues.triageLabel не задан)') +
+                    `, разбери:\n${overQuota.join('\n')}`,
+                cfg,
+                { logFn },
+            );
+        }
         if (dropped.length > 0) {
             pushEventFn(
                 `⚠ Ralph: ${String(dropped.length)} из ${String(requests.length)} намерений сессии ` +
@@ -4524,9 +5002,23 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 cfg,
                 { logFn },
             );
-            return { applied, failed: true, closedIssues, prFindings, prBlocked, dropped };
+            return {
+                applied,
+                failed: true,
+                closedIssues,
+                prFindings,
+                prBlocked,
+                dropped: [...probeHeld, ...dropped],
+            };
         }
-        return { applied, failed: false, closedIssues, prFindings, prBlocked, dropped };
+        return {
+            applied,
+            failed: false,
+            closedIssues,
+            prFindings,
+            prBlocked,
+            dropped: [...probeHeld, ...dropped],
+        };
     }
 
     // #41: чем было выбывшее намерение — для лога и пуша: человеку нужен адрес, по
@@ -4552,8 +5044,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
         const closes = (intents.dropped ?? []).filter((d) => d.kind === 'close');
         if (closes.length > 0) {
             return (
-                'Последнее `close` выбыло — форж отказал по существу, карточка осталась ' +
-                `открытой: ${closes.map((d) => d.what).join('; ')}.`
+                'Последнее `close` выбыло — форж отказал по существу или живая проба не дала ' +
+                `PASS (#219), карточка осталась открытой: ${closes.map((d) => d.what).join('; ')}.`
             );
         }
         if (intents.failed) {
@@ -5892,6 +6384,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         milestoneLabels,
         issueDetails,
         commentOnIssue,
+        setIssueBody,
         issueComments,
         closeIssue,
         blockIssue,
@@ -6091,6 +6584,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 syncProjectBoard,
                 commentOnIssue,
                 issueComments,
+                setIssueBody,
                 closeIssue,
                 blockIssue,
                 createIssue,
@@ -6235,8 +6729,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
         return idx;
     }
 
-    function advancePhase(st: RalphState, idx: number): void {
-        const next = config.phases[idx + 1];
+    // #221: `phases` — список, по которому выбрана следующая фаза. На границе фаз это
+    // свежий список из перечитанного конфига, и индекс `idx` — индекс в нём.
+    function advancePhase(st: RalphState, idx: number, phases: Phase[] = config.phases): void {
+        const next = phases[idx + 1];
         st.milestone = next ? next.milestone : null;
         st.count = 0;
         st.submitted = false;
@@ -6614,6 +7110,13 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // Фаза 10: формат карточек — тем же ранним отказом. Опечатка в ключе правила
         // выключила бы ровно то правило, ради которого секцию завели.
         const issueFormat = resolveIssueFormat(cfg, failFn);
+        // #220: дубль, квота и метка разбора — тем же ранним отказом: `sessionQuota: "3"`
+        // иначе всплыл бы отказом первого же батча с карточкой, посреди ночи.
+        try {
+            resolveNewIssuePolicy(cfg.newIssues);
+        } catch (e) {
+            failFn((e as Error).message);
+        }
 
         // Канон, задача 27: заданный скрипт потребителя ищется на диске ДО первой итерации.
         // Форму пути закрыл валидатор конфига (задача 23), но опечатка в САМОМ пути формы не
@@ -6762,7 +7265,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             );
         }
 
-        const maxIterations = once ? 1 : cfg.maxIterations || 10;
+        const maxIterations = once ? 1 : phaseIterationLimit(cfg);
         const maxTurns = cfg.maxTurns || 200;
         const state = loadStateFn(failFn as (msg: string) => void);
         if (resubmit) {
@@ -6842,6 +7345,17 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 );
             }
             if (phaseIssues) excludeHumanIssues(phaseIssues, failFn);
+            // #220: бюджет фазы — тем же чтением. Предупреждение, а не стоп: какая карточка
+            // лишняя, решает человек, а брейкер посреди ночи — худшее место узнать о ней.
+            // Лимит — из конфига, а не HITL-единица: `--once` бюджета фазы не меняет.
+            if (phaseIssues) {
+                const warning = phaseBudgetWarning({
+                    milestone: state.milestone,
+                    openCount: phaseIssues.length,
+                    maxIterations: phaseIterationLimit(cfg),
+                });
+                if (warning !== null) logFn(warning);
+            }
             // Фаза 10: формат — у той же выборки, что берёт очередь (без `blocked` и чужих
             // авторов), а не у полного списка #17. Карточка, которую петля не возьмёт,
             // к её работе отношения не имеет, и стоп старта из-за неё держал бы веху
@@ -6899,6 +7413,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // #65: статус вехи-накопителя для адреса карточек лестницы.
         milestoneOpenFn?: (title: string) => boolean;
         applySessionRequestsFn?: typeof applySessionRequests;
+        // #219: живая проба по намерению сессии — подменяется в тестах цикла.
+        liveProbeForIntentFn?: typeof liveProbeForIntent;
         // #46: заведение PR фазы, поиск уже открытого и сборка описания — все три с DI,
         // как и остальные побочки. Без хука на ПОИСК цикл сдачи ходил бы в боевой шов даже
         // в тестах: не «неудобно», а прогон с сетевыми ретраями и их паузами.
@@ -7010,6 +7526,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // «совпали» по той же причине, что у stopRequestedFn: чтение lock — чтение боевого
         // файла; main передаёт боевую сверку только ядру из установки.
         coreDriftFn?: () => TLockDrift | null;
+        // #221: перечитать конфиг на границе фаз. Дефолт «не перечитывать» по той же
+        // причине, что у stopRequestedFn: чтение боевого конфига в тесте — побочка; main
+        // передаёт боевое чтение, и это сторожит структурный тест.
+        reloadPhasesFn?: (currentMilestone: string) => TPhaseReload | null;
         // #92: журнал этапов кодер-попытки. Умолчание — в памяти, по той же причине, что
         // у stopRequestedFn: чтение боевого файла в тесте — побочка; main передаёт боевой.
         stageJournal?: TStageJournal;
@@ -7060,6 +7580,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             hasAnyIssuesFn = adapters.taskSource.hasAnyIssues,
             milestoneOpenFn = adapters.taskSource.isMilestoneOpen,
             applySessionRequestsFn = applySessionRequests,
+            liveProbeForIntentFn = liveProbeForIntent,
             findOpenPrFn = adapters.taskSource.findOpenPullRequest,
             getIssueFn = adapters.taskSource.getIssue,
             prCommentsFn = adapters.taskSource.listPullRequestComments,
@@ -7148,6 +7669,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             stopRequestedFn = () => false,
             clearStopRequestFn = () => {},
             coreDriftFn = () => null,
+            reloadPhasesFn = () => null,
             stageJournal = createStageJournal(memoryStageJournalStore()),
             monitorConfigPath,
             monitorExecutionRoot,
@@ -7170,6 +7692,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
         let iterationsThisRun = 0;
         // #38: ревизия lock, о расхождении с которой посреди сдачи уже сказано.
         let driftNoted: string | null = null;
+        // #220: вехи, бюджет которых сверен в этом прогоне. Стартовую сверил preflight; фаза,
+        // в которую петля перешла после мерджа, сверяется на первой вершине цикла в ней.
+        const budgetChecked = new Set<string>(state.milestone ? [state.milestone] : []);
         // #65: номера, закрытые намерениями сессий в этом прогоне (см. фильтр очереди ниже).
         const closedThisRun = new Set<number>();
         // #20: сколько повторов «по бюджету ходов» уже потрачено на карточку. Живёт в
@@ -7255,11 +7780,47 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // начатого мерджа на диске). Без него рестарт шёл бы веткой «уже смерджена», где нет
         // ни строки о мердже, ни проверки деплоя, — фаза уходила в прод молча и непроверенной.
         // Отдаёт, что делать циклу: остановиться или идти к следующей фазе.
+        // #221: граница фаз — конфиг перечитывается, и следующая фаза выбирается по свежему
+        // списку. Отдаёт индекс текущей фазы в списке, по которому идти дальше, либо `null`:
+        // стоп уже назван пушем. Зовётся ДО шагов после мерджа (строка в чат, веха, журнал
+        // находок): стоп здесь оставляет state на смердженной фазе, рестарт доводит эти шаги
+        // сам, и сделанные до стопа легли бы вторым разом — журнал находок посчитал бы фазу
+        // дважды. Отката к списку в памяти нет: битый конфиг — это либо правка человека
+        // посреди записи, либо его ошибка, и следующая фаза по старому списку была бы
+        // догадкой, а не его решением.
+        const phasesAtBoundary = (phase: Phase, idx: number): number | null => {
+            const reloaded = reloadPhasesFn(phase.milestone);
+            if (reloaded === null) return idx;
+            if (reloaded.kind === 'refused') {
+                pushEventFn(
+                    `⛔ Ralph: фаза "${phase.milestone}" смерджена, следующая не выбрана — конфиг на границе фаз отвергнут. ` +
+                        formatStopMessage({
+                            reason: 'config-reload',
+                            diagnosis: reloaded.reason,
+                            question:
+                                'почини ralph.config.json и перезапусти loop — следующую фазу по прежнему списку в памяти петля не берёт',
+                        }),
+                    cfg,
+                    { logFn },
+                );
+                return null;
+            }
+            // Тот же объект, что фабричный config (в проде runLoop получает его самого), —
+            // поэтому свежий список видят и phaseIndexOf, и всё, что читает фазы дальше.
+            cfg.phases = reloaded.phases;
+            logFn(formatPhaseReload(reloaded));
+            const restartWarning = formatRestartKeys(reloaded.restartKeys);
+            if (restartWarning !== null) logFn(restartWarning);
+            return reloaded.index;
+        };
+
         const finishMergedPhase = (
             phase: { milestone: string; branch: string },
             idx: number,
             prNumber: number | null,
         ): 'break' | 'continue' => {
+            const nextFrom = phasesAtBoundary(phase, idx);
+            if (nextFrom === null) return 'break';
             const mergedMsg = `✅ Ralph: фаза "${phase.milestone}" смерджена в main — готова к релизу.`;
             pushEventFn(mergedMsg, cfg, { logFn });
             closeMilestoneByTitleFn(phase.milestone); // закрыть milestone сразу, не ждать свипа
@@ -7295,7 +7856,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 };
             }
             state.mergeInFlight = null;
-            advancePhaseFn(state, idx);
+            advancePhaseFn(state, nextFrom, cfg.phases);
             // #87: prod — стоп перед деплоем. Деплой уже в руках CI (мердж его и
             // запустил), но loop не должен тут же хвататься за следующую фазу без
             // паузы на релиз человеком. Пауза теперь под флагом haltBeforeDeploy
@@ -7528,6 +8089,16 @@ export function createOrchestrator(env: OrchestratorEnv) {
             if (!phase) {
                 logFn('🎉 Все фазы завершены!');
                 break;
+            }
+            if (!budgetChecked.has(phase.milestone)) {
+                budgetChecked.add(phase.milestone);
+                logPhaseBudget(
+                    phase.milestone,
+                    () => allOpenIssuesFn(phase.milestone).length,
+                    phaseIterationLimit(cfg),
+                    logFn,
+                    'при входе',
+                );
             }
 
             // #88: граница шага — единственное место, где петля слушает запрос мягкой
@@ -8237,6 +8808,15 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     // #124: отвергнутый разбором батч снимается в карантин — иначе
                     // следующая сессия дописала бы к нему свои намерения, и разбор
                     // отвергал бы их снова до брейкера серии.
+                    // #219: живую пробу карточки исполняет раннер: стенд — из установки
+                    // ядра, проверяемое — из дерева работы.
+                    const liveProbeFn = (probe: { cli: string; case: string }) =>
+                        liveProbeForIntentFn(probe, {
+                            rawConfig: cfg.liveProbe,
+                            productRoot: cfg.rootsResolved?.productRoot ?? null,
+                            executionRoot: cfg.rootsResolved?.executionRoot ?? null,
+                            logFn,
+                        });
                     const intents = applySessionRequestsFn({
                         cfg,
                         currentMilestone: phase.milestone,
@@ -8250,6 +8830,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                             const prev = idx > 0 ? cfg.phases[idx - 1] : undefined;
                             return prev ? mergedPhasePrFn(prev) : null;
                         },
+                        liveProbeFn,
                     });
                     // `?? []` — не тихий дефолт, а совместимость шва: подменённая реализация
                     // (тест, чужой taskSource) может не знать про поле. Потеря фильтра здесь
@@ -8521,6 +9102,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     logFn(
                         `✅ Фаза "${phase.milestone}" уже смерджена — дерево раннера на свежем origin/main, переход к следующей.`,
                     );
+                    const nextFrom = phasesAtBoundary(phase, idx);
+                    if (nextFrom === null) break;
                     // #37: закрываем milestone ЗДЕСЬ. Раньше этот случай (мердж человеком
                     // либо рестарт после авто-мерджа) добирал свип на следующем старте —
                     // а он ходил в форж мимо шва и на площадке без `gh` не работал вовсе.
@@ -8548,7 +9131,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                             );
                         }
                     }
-                    advancePhaseFn(state, idx);
+                    advancePhaseFn(state, nextFrom, cfg.phases);
                     if (once || dry) break;
                     continue;
                 }
@@ -11650,6 +12233,59 @@ export function createOrchestrator(env: OrchestratorEnv) {
         return { dir, repoId };
     }
 
+    // #221: боевое перечитывание конфига на границе фаз — тот же резолв профиля, что на
+    // старте, с тем же профилем и контекстом launcher, но с отказом-исключением вместо
+    // process.exit: стоп на границе фаз решает петля, и решает его с пушем. Профиль — тот,
+    // на котором идёт процесс: сменённый `defaultProfile` не переключает его посреди
+    // прогона, а называется изменением, которому нужен рестарт.
+    function reloadPhasesFromConfig(
+        configPath: string,
+        currentMilestone: string,
+        {
+            profileFlag = null,
+            launch = null,
+            running = config,
+            readFileFn = (p: string) => fs.readFileSync(p, 'utf8'),
+        }: {
+            profileFlag?: unknown;
+            launch?: TLaunchContext | null;
+            running?: RalphConfig;
+            readFileFn?: (p: string) => string;
+        } = {},
+    ): TPhaseReload {
+        let raw: unknown;
+        try {
+            raw = JSON.parse(readFileFn(configPath));
+        } catch (e) {
+            const why = String((e as Error)?.message ?? e).split('\n')[0];
+            return { kind: 'refused', reason: `${configPath} не прочитался как JSON: ${why}` };
+        }
+        let fresh: unknown;
+        try {
+            fresh = resolveProfile(
+                raw,
+                profileFlag ?? running.profileName,
+                (m: string) => {
+                    throw new Error(m);
+                },
+                undefined,
+                launch,
+            );
+        } catch (e) {
+            return { kind: 'refused', reason: String((e as Error)?.message ?? e) };
+        }
+        const named =
+            profileFlag ??
+            ((raw as Record<string, unknown>).defaultProfile as string | undefined) ??
+            null;
+        return reconcilePhases({
+            running: running as unknown as Record<string, unknown>,
+            fresh: fresh as Record<string, unknown>,
+            currentMilestone,
+            profileChanged: named !== running.profileName ? String(named) : null,
+        });
+    }
+
     // main: тонкая оркестровка — загрузка конфига в фабричный config (его читают
     // runClaude/openIssues/pickModel и др.), обработка --reset, затем preflight → runLoop.
     function main(): void {
@@ -11671,12 +12307,15 @@ export function createOrchestrator(env: OrchestratorEnv) {
         } catch (e) {
             fail(`🔐 Старт отвергнут: ${(e as Error).message}`);
         }
+        const profileFlag = parseProfileFlag(argv);
+        const launchContext =
+            launchConsumer === null ? null : { consumerRoot: launchConsumer, env: process.env };
         config = resolveProfile(
             raw,
-            parseProfileFlag(argv),
+            profileFlag,
             undefined,
             undefined,
-            launchConsumer === null ? null : { consumerRoot: launchConsumer, env: process.env },
+            launchContext,
         ) as RalphConfig;
         // Канон, задача 25: команда проверяется ДО первой записи на диск (ревью Codex, !23).
         // Все три случая — молчаливый сдвиг режима, худший исход для автономного раннера:
@@ -12192,6 +12831,11 @@ export function createOrchestrator(env: OrchestratorEnv) {
             stopRequestedFn: stopRequested,
             clearStopRequestFn: clearStopRequest,
             coreDriftFn,
+            reloadPhasesFn: (milestone: string) =>
+                reloadPhasesFromConfig(runnerConfigPath, milestone, {
+                    profileFlag,
+                    launch: launchContext,
+                }),
             stageJournal: createStageJournal(stageJournalStore, { where: RUNTIME.stages }),
             ensureMonitorAliveFn: (o) => {
                 const fresh = ensureMonitorAlive(o);
@@ -12231,6 +12875,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // контракт закреплён orchestrator.test.ts (REQUIRED_API).
     return {
         setConfigForTests,
+        reloadPhasesFromConfig,
         sessionSettingsArgs,
         codexGuardArgsFor,
         kimiNativeHomeFor,
@@ -12315,6 +12960,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
         commentOnIssue,
         // #125: лента карточки — боевая функция для контрактного сьюта.
         issueComments,
+        // #220: тело карточки — тоже для контрактного сьюта.
+        setIssueBody,
         closeIssue,
         blockIssue,
         createIssue,
@@ -12348,6 +12995,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         noteCliVersion,
         sessionCliVersion,
         warnCliVersionDrift,
+        warnMcpDrift,
         runClaude,
         subscriptionKeyRing,
         // #373 (фаза 6): рантайм Kimi (тот же `claude` + endpoint Moonshot). Экспорт —

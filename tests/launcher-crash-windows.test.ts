@@ -15,7 +15,7 @@
 // классификатор не узнаёт, — отказ, а не пропуск.
 //
 // Мир настоящий там, где свойство принадлежит инструменту: установка — `installRevision` на
-// диске, ветка lock — `commitLockOnBranch` на git с голым origin. Форж — фейк с памятью,
+// диске, ветка lock — `commitBundleOnBranch` на git с голым origin. Форж — фейк с памятью,
 // переживающей процесс: PR, заведённый убитым процессом, остаётся на форже. Убийство —
 // `crash-world.ts`: после смерти диск, git, форж и вывод молчат.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -33,7 +33,7 @@ import {
     type TCoreLock,
     type TInstallFs,
 } from '../core/core-install.ts';
-import { commitLockOnBranch, updateBranchName, type TRunArgvFn } from '../core/core-update.ts';
+import { commitBundleOnBranch, updateBranchName, type TRunArgvFn } from '../core/core-update.ts';
 import { rollbackBranchName, rollbackTarget } from '../core/core-rollback.ts';
 import {
     ACTIVATION_RESTART_EXIT,
@@ -119,7 +119,7 @@ const runGit: TRunArgvFn = (file, args, opts = {}) => {
         env: opts.env ?? gitEnv,
     });
     if (r.status !== 0) throw new Error(`${file} ${args.join(' ')}: ${r.stderr}`);
-    return r.stdout.trim();
+    return opts.raw ? r.stdout : r.stdout.trim();
 };
 const git = (cwd: string, ...args: string[]) => runGit('git', ['-C', cwd, ...args]);
 
@@ -244,6 +244,9 @@ function gitStep(args: readonly string[]): string | null {
         case 'rev-parse':
         case 'ls-remote':
         case 'for-each-ref':
+        case 'ls-tree':
+        case 'cat-file':
+        case 'log':
             return null; // чтение: обрыв перед ним — тот же обрыв после предыдущего шага
     }
     throw new Error(`неизвестный шаг git: ${args.join(' ')} — впиши его в список шагов`);
@@ -322,16 +325,19 @@ function launcherProcess(killAt: { step: string; when: 'before' | 'after' } | nu
         ralphRevisionFn: unused('ralphRevisionFn'),
         writeStopFn: unused('writeStopFn'),
         rawConfigFn: () => read(() => ({ configVersion: V.config })),
-        pushLockBranchFn: ({ consumerRoot, branch, lock, message }) =>
-            commitLockOnBranch({
+        pushBundleBranchFn: ({ consumerRoot, branch, message, buildFn }) =>
+            commitBundleOnBranch({
                 runArgvFn: runArgv,
                 consumerRoot,
                 env: gitEnv,
                 indexFile: path.join(root, `index-${String(pid)}`),
                 branch,
-                lock,
                 message,
+                buildFn,
             }),
+        mcpListPageFn: unused('mcpListPageFn'),
+        mcpHarnessesFn: () => [],
+        gitFn: unused('gitFn'),
         findOpenPrFn: (_root, branch) => read(() => forge.get(branch) ?? null),
         openPrFn: (_root, pr) =>
             effect('pr:create', () => {

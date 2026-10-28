@@ -35,6 +35,7 @@
 // пробился до настоящего spawnSync и запустил живой процесс `claude` вместо фейка.
 // Явный параметр детерминирован независимо от того, как раннер загружен.
 
+import { tmpdir } from 'node:os';
 import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from 'vitest';
 import fs from 'node:fs';
 // @ts-expect-error — JS-entry раннера без деклараций типов (тот же приём, что в
@@ -62,6 +63,7 @@ import { attachSubmitJournal, finishStage, startStage } from './submit-journal.t
 import { MODEL_PROXY_RETRIES } from './runtime-availability.ts';
 import { classifyClaudeSessionEnd } from '../adapters/session-end.ts';
 import { HARNESS_REGISTRY } from '../adapters/harness-registry.ts';
+import { reconcilePhases } from './phase-reload.ts';
 
 // Фаза 16: исход сессии называет адаптер рантайма, ядро текста не читает. Фейк рантайма
 // с выводом Claude получает исход тем же классификатором, что боевой spawnClaude, — тест
@@ -4188,6 +4190,48 @@ describe('preflight — валидация конфига/среды и подг
         expect(logs.join('\n')).toMatch(/C2|сдач/);
     });
 
+    it('#220 НЕГАТИВНЫЙ: битая секция newIssues — отказ старта, а не дефолт', () => {
+        expect(() =>
+            preflight(
+                validCfg({ newIssues: { sessionQuota: -1 } }),
+                okDeps({ loadStateFn: fakeState }),
+            ),
+        ).toThrow(/newIssues\.sessionQuota/);
+    });
+
+    // #220: бюджет фазы — тем же чтением, предупреждением, а не стопом.
+    it('#220: веха с 11 карточками при лимите 10 → ⚠ с числами, старт продолжается', () => {
+        const logs: string[] = [];
+        const cards = Array.from({ length: 11 }, (_, k) => ({
+            number: k + 1,
+            title: `к${String(k)}`,
+        }));
+        const deps = okDeps({
+            loadStateFn: fakeState,
+            logFn: (m: string) => logs.push(m),
+            allOpenIssuesFn: () => cards,
+        });
+        expect(() => preflight(validCfg({ maxIterations: 10 }), deps)).not.toThrow();
+        expect(logs.join('\n')).toMatch(
+            /⚠ Бюджет фазы "M1": открытых карточек 11 при maxIterations 10/,
+        );
+    });
+
+    it('#220 ОТ ПРОТИВНОГО: 10 карточек при лимите 10 — без ⚠', () => {
+        const logs: string[] = [];
+        const cards = Array.from({ length: 10 }, (_, k) => ({
+            number: k + 1,
+            title: `к${String(k)}`,
+        }));
+        const deps = okDeps({
+            loadStateFn: fakeState,
+            logFn: (m: string) => logs.push(m),
+            allOpenIssuesFn: () => cards,
+        });
+        preflight(validCfg({ maxIterations: 10 }), deps);
+        expect(logs.join('\n')).not.toMatch(/Бюджет фазы/);
+    });
+
     it('#17: все фазы пройдены (state.milestone === null) → карточки не читаются', () => {
         const allOpenIssuesFn = vi.fn(() => []);
         const deps = okDeps({
@@ -6832,6 +6876,243 @@ describe('runLoop — основной while-цикл: итерации коде
         expect(advancePhaseFn).toHaveBeenCalledTimes(1);
         expect(logs.join('\n')).toMatch(/уже смерджена/);
         expect(logs.join('\n')).not.toMatch(/НЕ начата/);
+    });
+
+    // #220: стартовую фазу сверил preflight; фазу, в которую петля перешла, — первая вершина
+    // цикла в ней, по разу на веху.
+    it('#220: переход в веху с 11 карточками при лимите 10 → ⚠ при входе, стартовая не перечитана', () => {
+        const logs: string[] = [];
+        const asked: string[] = [];
+        let idx = 0;
+        runLoop(
+            validCfg({
+                maxIterations: 10,
+                phases: [
+                    { milestone: 'M1', branch: 'feature/m1' },
+                    { milestone: 'M2', branch: 'feature/m2' },
+                ],
+            }),
+            ctx(mkState()),
+            deps(logs, {
+                // Вершина 1 — M1 (смерджена), 2 — M2 (тоже), 3 — за концом списка.
+                phaseIndexOfFn: () => idx++,
+                openIssuesFn: () => [],
+                allOpenIssuesFn: (m: string) => {
+                    asked.push(m);
+                    return m === 'M2'
+                        ? Array.from({ length: 11 }, (_, k) => ({ number: k + 1, title: 'к' }))
+                        : [];
+                },
+                phaseMergedFn: () => true,
+                advancePhaseFn: vi.fn(),
+            }),
+        );
+        expect(logs.join('\n')).toMatch(
+            /⚠ Бюджет фазы "M2": открытых карточек 11 при maxIterations 10/,
+        );
+        expect(logs.join('\n')).not.toMatch(/Бюджет фазы "M1"/);
+        expect(logs.filter((l) => l.includes('Бюджет фазы "M2"'))).toHaveLength(1);
+        expect(asked).toContain('M2');
+    });
+
+    // #221: список фаз перечитывается на границе фаз. Фейк перечитывания — настоящий
+    // `reconcilePhases` на «файле» теста; индекс фазы на вершине цикла ищется по ИМЕНИ в
+    // cfg.phases, как у боевого phaseIndexOf, — иначе тест не увидел бы, что следующую
+    // фазу выбрал свежий список, а не старый.
+    describe('#221: список фаз на границе фаз', () => {
+        const PHASES_OLD = [
+            { milestone: 'M1', branch: 'feature/m1' },
+            { milestone: 'M2', branch: 'feature/m2' },
+        ];
+        const PHASES_NEW = [
+            { milestone: 'M1', branch: 'feature/m1' },
+            { milestone: 'M1b', branch: 'feature/m1b' },
+            { milestone: 'M2', branch: 'feature/m2' },
+        ];
+        const boundary = (
+            cfg: { phases: Array<{ milestone: string; branch: string }> },
+            state: FakeState,
+            visited: string[],
+        ) => ({
+            // Две вершины цикла с фазой, третья — за концом.
+            phaseIndexOfFn: () => {
+                if (visited.length >= 2) return 99;
+                visited.push(state.milestone);
+                return cfg.phases.findIndex((p) => p.milestone === state.milestone);
+            },
+            advancePhaseFn: (st: FakeState, idx: number, phases: Array<{ milestone: string }>) => {
+                st.milestone = phases[idx + 1]?.milestone ?? (null as never);
+            },
+        });
+
+        it.each<[string, Record<string, unknown>]>([
+            ['гейт смерджил фазу', { phaseMergedFn: () => false, tryMergePhaseFn: () => 'merged' }],
+            ['фаза уже смерджена', { phaseMergedFn: () => true }],
+        ])('%s: фаза, вставленная между текущей и следующей, выбирается следующей', (_n, route) => {
+            const logs: string[] = [];
+            const visited: string[] = [];
+            const state = mkState();
+            const cfg = validCfg({ active: true, phases: PHASES_OLD.map((p) => ({ ...p })) });
+            const running = { ...cfg, phases: PHASES_OLD };
+            runLoop(
+                cfg,
+                ctx(state),
+                deps(logs, {
+                    ...boundary(cfg, state, visited),
+                    pickReviewModelFn: () => 'none',
+                    getLastGatePr: () => 42,
+                    reloadPhasesFn: (current: string) =>
+                        reconcilePhases({
+                            running,
+                            fresh: { ...cfg, phases: PHASES_NEW },
+                            currentMilestone: current,
+                        }),
+                    ...route,
+                }),
+            );
+            expect(visited).toEqual(['M1', 'M1b']);
+            expect(logs.join('\n')).toMatch(
+                /🗂 Список фаз перечитан: добавлено "M1b", следующая — "M1b"\./,
+            );
+        });
+
+        it.each([
+            [
+                'битый JSON',
+                () =>
+                    ralph.reloadPhasesFromConfig('/path/to/app/ralph.config.json', 'M1', {
+                        running: REAL_CONFIG,
+                        readFileFn: () => '{ "common": ',
+                    }),
+                /не прочитался как JSON/,
+            ],
+            [
+                'текущая фаза удалена из списка',
+                () =>
+                    reconcilePhases({
+                        running: validCfg({ active: true, phases: PHASES_OLD }),
+                        fresh: validCfg({ active: true, phases: [PHASES_OLD[1]] }),
+                        currentMilestone: 'M1',
+                    }),
+                /текущей фазы "M1" нет в свежем списке/,
+            ],
+        ])('%s → стоп с причиной, следующей фазы по старому списку нет', (_n, reload, reason) => {
+            const logs: string[] = [];
+            const visited: string[] = [];
+            const pushed: string[] = [];
+            const state = mkState();
+            const cfg = validCfg({ active: true, phases: PHASES_OLD.map((p) => ({ ...p })) });
+            const advancePhaseFn = vi.fn();
+            const recordReviewFindingsFn = vi.fn();
+            runLoop(
+                cfg,
+                ctx(state),
+                deps(logs, {
+                    ...boundary(cfg, state, visited),
+                    advancePhaseFn,
+                    recordReviewFindingsFn,
+                    phaseMergedFn: () => true,
+                    mergedPhasePrFn: () => 42,
+                    reloadPhasesFn: reload,
+                    pushEventFn: (m: string) => {
+                        pushed.push(m);
+                        return false;
+                    },
+                }),
+            );
+            expect(advancePhaseFn).not.toHaveBeenCalled();
+            expect(state.milestone).toBe('M1');
+            expect(visited).toEqual(['M1']);
+            expect(cfg.phases).toEqual(PHASES_OLD);
+            // Шаги после мерджа не сделаны: рестарт доведёт их сам, без второго счёта фазы.
+            expect(recordReviewFindingsFn).not.toHaveBeenCalled();
+            expect(pushed).toHaveLength(1);
+            expect(pushed[0]).toMatch(/\(config-reload\)/);
+            expect(pushed[0]).toMatch(reason);
+            expect(logs.join('\n')).not.toMatch(/Список фаз перечитан/);
+        });
+
+        it('изменение roots между фазами — ⚠ и работа на прежних корнях', () => {
+            const logs: string[] = [];
+            const visited: string[] = [];
+            const state = mkState();
+            const oldRoots = { consumerRoot: '/path/to/app', runtimeDir: '/path/to/state' };
+            const cfg = validCfg({
+                active: true,
+                phases: PHASES_OLD.map((p) => ({ ...p })),
+                roots: { ...oldRoots },
+                rootsResolved: { ...oldRoots },
+            });
+            const running = { ...cfg, phases: PHASES_OLD };
+            runLoop(
+                cfg,
+                ctx(state),
+                deps(logs, {
+                    ...boundary(cfg, state, visited),
+                    phaseMergedFn: () => true,
+                    reloadPhasesFn: (current: string) =>
+                        reconcilePhases({
+                            running,
+                            fresh: {
+                                ...cfg,
+                                phases: PHASES_NEW,
+                                roots: { consumerRoot: '/path/to/other' },
+                                rootsResolved: { consumerRoot: '/path/to/other' },
+                            },
+                            currentMilestone: current,
+                        }),
+                }),
+            );
+            const text = logs.join('\n');
+            expect(text).toMatch(/⚠ Конфиг: изменились roots — .*на прежних значениях/);
+            expect((cfg as Record<string, unknown>).rootsResolved).toEqual(oldRoots);
+            expect((cfg as Record<string, unknown>).roots).toEqual(oldRoots);
+            // Список фаз при этом свежий: рестарт нужен корням, а не новой фазе.
+            expect(visited).toEqual(['M1', 'M1b']);
+        });
+
+        it('боевое перечитывание: тот же резолв профиля, что на старте, на фикстуре конфига', () => {
+            const raw = structuredClone(REAL_CONFIG_RAW);
+            const first = raw.common.phases[0];
+            raw.common.phases.push({ milestone: 'Новая фаза', branch: 'feature/new-phase' });
+            const read = (text: string) =>
+                ralph.reloadPhasesFromConfig('/path/to/app/ralph.config.json', first.milestone, {
+                    running: REAL_CONFIG,
+                    readFileFn: () => text,
+                });
+            expect(read(JSON.stringify(raw))).toMatchObject({
+                kind: 'ok',
+                index: 0,
+                added: ['Новая фаза'],
+                restartKeys: [],
+            });
+            // Сменённый defaultProfile профиль процесса не переключает — он назван рестартом.
+            const renamed = structuredClone(raw);
+            renamed.defaultProfile = 'other';
+            renamed.profiles.other = {};
+            expect(read(JSON.stringify(renamed))).toMatchObject({
+                kind: 'ok',
+                restartKeys: ['defaultProfile'],
+            });
+            // Профиль процесса исчез из файла — отказ резолва, а не process.exit.
+            const lost = structuredClone(raw);
+            lost.profiles = { other: {} };
+            lost.defaultProfile = 'other';
+            const refused = read(JSON.stringify(lost));
+            expect(refused.kind).toBe('refused');
+            expect(refused).toMatchObject({ reason: expect.stringMatching(/Неизвестный профиль/) });
+        });
+
+        it('main() передаёт петле боевое перечитывание: без него новая фаза ждёт рестарта', () => {
+            const src = stripComments(
+                fs.readFileSync(path.join(import.meta.dirname, 'orchestrator.ts'), 'utf8'),
+            );
+            const call = src.slice(src.indexOf('runLoop(config, ctx, {'));
+            const body = call.slice(0, call.indexOf('});'));
+            expect(body).toMatch(
+                /reloadPhasesFn: \(milestone: string\) =>\s+reloadPhasesFromConfig\(runnerConfigPath,/,
+            );
+        });
     });
 
     it('фаза уже смерджена (идемпотентность, AFK): fetch + detach origin/main, advancePhase, дальше', () => {
@@ -16212,7 +16493,9 @@ describe('applySessionRequests: намерения сессии применяе
             expect(created).toMatchObject([
                 { title: 'Течёт лимит', milestone: 'Ревью · Запасные' },
             ]);
-            expect(asked).toEqual(['Ревью · Запасные']);
+            // #220: вехи читает и сверка дублей (фаза и Входящие), но по разу на веху —
+            // наполнение закрытой адрес по-прежнему не спрашивает отдельно.
+            expect(asked).toEqual(['Gravity · Фаза 4', 'Ревью · Входящие', 'Ревью · Запасные']);
         });
 
         it('статус накопителя не читается → адреса нет, а не «веха открыта»', () => {
@@ -16339,7 +16622,8 @@ describe('applySessionRequests: намерения сессии применяе
                 pushEventFn: () => {},
             });
             expect(created).toMatchObject([{ title: 'Течёт лимит', milestone: undefined }]);
-            expect(asked).toEqual([]);
+            // #220: веху фазы читает сверка дублей; накопителей адрес не спрашивает.
+            expect(asked).toEqual(['Gravity · Фаза 4']);
             // «Прежнее поведение» — это и отсутствие новой строки в логе: предупреждение
             // про ненайденный адрес относится к заданному ключу, а не к незаданному.
             expect(logs.join('\n')).not.toMatch(/Накопительной вехи/);
@@ -16370,8 +16654,365 @@ describe('applySessionRequests: намерения сессии применяе
                 { title: 'Третья', milestone: 'Ревью · Запасные' },
             ]);
             // Наполнение спрашивается по разу на веху, а не на карточку: у площадки лимит
-            // запросов, и батч намерений не имеет права его жечь.
-            expect(asked).toEqual(['Ревью · Входящие', 'Ревью · Запасные']);
+            // запросов, и батч намерений не имеет права его жечь. #220: чтение общее со
+            // сверкой дублей, поэтому и с ней — по разу.
+            expect(asked).toEqual(['Gravity · Фаза 4', 'Ревью · Входящие', 'Ревью · Запасные']);
+        });
+
+        // #220: планирование без мусора — дубль, `blocks`, квота сессии.
+        describe('new-issue без мусора (#220)', () => {
+            const PHASE = 'Gravity · Фаза 4';
+            const OPEN_14 = {
+                number: 14,
+                title: 'Стенд не выходит наружу через прокси хоста',
+                body: 'Падает в `provision/install-stand.sh` и `core/live-probe.ts`, см. #12.',
+            };
+            // Шов с телами карточек и журналом мутаций по карточкам фазы.
+            const planningTaskSource = (
+                open: Record<string, Array<{ number: number; title: string; body?: string }>>,
+                over: Record<string, unknown> = {},
+            ) => {
+                const comments: Array<[number, string]> = [];
+                const bodies: Array<[number, string]> = [];
+                const all = Object.values(open).flat();
+                const base = addressingTaskSource(open, {
+                    getIssue: (n: number) => {
+                        const found = all.find((i) => i.number === n);
+                        if (!found) throw new Error(`нет #${String(n)}`);
+                        return { number: n, title: found.title, body: found.body ?? '' };
+                    },
+                    commentOnIssue: (n: number, body: string) => comments.push([n, body]),
+                    setIssueBody: (n: number, body: string) => bodies.push([n, body]),
+                    ...over,
+                });
+                return { ...base, comments, bodies };
+            };
+            const apply = (
+                ts: unknown,
+                lines: string[],
+                cfg: Record<string, unknown> = withBacklog(),
+                extra: Record<string, unknown> = {},
+            ) => {
+                const logs: string[] = [];
+                const pushes: string[] = [];
+                const res = ralph.applySessionRequests({
+                    cfg,
+                    currentMilestone: PHASE,
+                    dry: false,
+                    readFn: () => lines.join('\n'),
+                    writeFn: () => {},
+                    removeFn: () => {},
+                    taskSource: ts,
+                    logFn: (m: string) => logs.push(m),
+                    pushEventFn: (m: string) => pushes.push(m),
+                    ...extra,
+                });
+                return { res, logs: logs.join('\n'), pushes };
+            };
+            const issue = (o: Record<string, unknown>) =>
+                line({ kind: 'new-issue', body: 'симптом', labels: ['complexity:low'], ...o });
+
+            it('повтор открытой карточки вехи — не заводится, в найденной комментарий', () => {
+                const { ts, created, comments } = planningTaskSource({ [PHASE]: [OPEN_14] });
+                const { res, logs } = apply(ts, [
+                    issue({
+                        title: 'Egress стенда: сессия CLI не достаёт API',
+                        body: 'Цепочка provision/install-stand.sh → core/live-probe.ts рвётся, как в #12.',
+                    }),
+                ]);
+                expect(res.failed).toBe(false);
+                expect(created).toEqual([]);
+                expect(comments).toHaveLength(1);
+                expect(comments[0][0]).toBe(14);
+                expect(comments[0][1]).toMatch(/снова наткнулась/);
+                expect(comments[0][1]).toMatch(/Egress стенда/);
+                expect(logs).toMatch(/🗂 Дубль #14: Egress стенда/);
+            });
+
+            it('дубль ищется и во Входящих', () => {
+                const { ts, created, comments } = planningTaskSource({
+                    'Ревью · Входящие': [{ ...OPEN_14, number: 30 }],
+                });
+                apply(ts, [issue({ title: 'Другими словами', body: OPEN_14.body })]);
+                expect(created).toEqual([]);
+                expect(comments.map(([n]) => n)).toEqual([30]);
+            });
+
+            it('ОТ ПРОТИВНОГО: общие слова заголовка, разные пути — заводятся обе', () => {
+                const { ts, created, comments } = planningTaskSource({
+                    [PHASE]: [
+                        {
+                            number: 3,
+                            title: 'Лимит форжа на комментарии ревью',
+                            body: 'в `core/review.ts`',
+                        },
+                    ],
+                });
+                apply(ts, [
+                    issue({
+                        title: 'Лимит форжа на метки',
+                        body: 'в `adapters/sourcecraft-api.ts`',
+                    }),
+                    issue({
+                        title: 'Лимит форжа на вехи',
+                        body: 'в `adapters/github-issue-commands.ts`',
+                    }),
+                ]);
+                expect(created.map((c) => c.title)).toEqual([
+                    'Лимит форжа на метки',
+                    'Лимит форжа на вехи',
+                ]);
+                expect(comments).toEqual([]);
+            });
+
+            it('повтор внутри одного батча — второй ложится комментарием к первому', () => {
+                const { ts, created, comments } = planningTaskSource({});
+                apply(ts, [
+                    issue({ title: 'Первая', body: OPEN_14.body }),
+                    issue({ title: 'Вторая', body: OPEN_14.body }),
+                ]);
+                expect(created.map((c) => c.title)).toEqual(['Первая']);
+                expect(comments.map(([n]) => n)).toEqual([77]);
+            });
+
+            it('blocks: карточка в веху фазы, ссылка в тело и ленту, рост фазы в логе', () => {
+                const { ts, created, comments, bodies } = planningTaskSource({
+                    [PHASE]: [{ number: 186, title: 'Guard судит событие', body: 'тело' }],
+                });
+                const { logs } = apply(ts, [issue({ title: 'Нужен прокси стенда', blocks: 186 })]);
+                expect(created).toMatchObject([{ title: 'Нужен прокси стенда', milestone: PHASE }]);
+                expect(comments).toHaveLength(1);
+                expect(comments[0][0]).toBe(186);
+                expect(comments[0][1]).toMatch(/#77/);
+                expect(bodies).toEqual([
+                    [186, 'тело\n\n— Заблокирована #77 «Нужен прокси стенда».'],
+                ]);
+                expect(logs).toMatch(/📈 Фаза "Gravity · Фаза 4" выросла: #77/);
+            });
+
+            // Ревью 16c3, от противного: блокер с теми же путями и ссылками, что у
+            // заблокированной, набирал порог дубля против неё самой и не заводился.
+            it('blocks: блокер, похожий на заблокированную, всё равно заводится в веху фазы', () => {
+                const { ts, created, comments } = planningTaskSource({ [PHASE]: [OPEN_14] });
+                const { logs } = apply(ts, [
+                    issue({
+                        title: 'Стенд не выходит наружу: прокси хоста не в цепочке',
+                        body: OPEN_14.body,
+                        blocks: 14,
+                    }),
+                ]);
+                expect(created).toMatchObject([{ milestone: PHASE }]);
+                expect(
+                    comments.map(([n, b]) => [n, /Фазу держит новая карточка #77/.test(b)]),
+                ).toEqual([[14, true]]);
+                expect(logs).not.toMatch(/Дубль/);
+            });
+
+            it('blocks: дубль во Входящих — связь с фазой ссылкой и ⚠ с номером', () => {
+                const { ts, created, comments, bodies } = planningTaskSource({
+                    [PHASE]: [{ number: 186, title: 'Guard судит событие', body: 'тело' }],
+                    'Ревью · Входящие': [{ ...OPEN_14, number: 30 }],
+                });
+                const { logs } = apply(ts, [
+                    issue({ title: 'Другими словами', body: OPEN_14.body, blocks: 186 }),
+                ]);
+                expect(created).toEqual([]);
+                expect(comments.map(([n]) => n)).toEqual([30, 186]);
+                // Ревью 16c3: карточка не новая и фаза не выросла — текст трекера просит
+                // перенести существующую в веху, а не говорит «фазу держит новая».
+                expect(comments[1][1]).toMatch(
+                    /существующая #30 .* вне вехи "Gravity · Фаза 4".*Перенеси её в веху фазы/,
+                );
+                expect(comments[1][1]).not.toMatch(/новая карточка/);
+                expect(bodies).toEqual([
+                    [186, expect.stringMatching(/Заблокирована #30 .*\(вне вехи фазы\)\.$/)],
+                ]);
+                expect(logs).toMatch(/⚠ Блокер #186 — дубль #30 вне вехи "Gravity · Фаза 4"/);
+                expect(logs).not.toMatch(/📈 Фаза/);
+                expect(logs).not.toMatch(/Бюджет фазы/);
+            });
+
+            it('blocks: дубль при непрочитанной вехе — ссылки нет, ⚠ «не сверен»', () => {
+                const { ts, created, comments } = planningTaskSource(
+                    { 'Ревью · Входящие': [{ ...OPEN_14, number: 30 }] },
+                    {
+                        listAllOpenIssues: (m: string) => {
+                            if (m === PHASE) throw new Error('веха не читается');
+                            return m === 'Ревью · Входящие' ? [{ ...OPEN_14, number: 30 }] : [];
+                        },
+                    },
+                );
+                const { res, logs } = apply(ts, [
+                    issue({ title: 'Другими словами', body: OPEN_14.body, blocks: 186 }),
+                ]);
+                expect(res.failed).toBe(false);
+                expect(created).toEqual([]);
+                expect(comments.map(([n]) => n)).toEqual([30]);
+                expect(logs).toMatch(/blocks #186 не сверен с вехой — дубль #30 не связан с фазой/);
+                expect(logs).not.toMatch(/⚠ Блокер #186/);
+            });
+
+            it('blocks: дубль уже в вехе фазы — ссылка не задваивается', () => {
+                const { ts, created, comments } = planningTaskSource({
+                    [PHASE]: [
+                        { number: 186, title: 'Guard судит событие', body: 'тело' },
+                        { ...OPEN_14, number: 31 },
+                    ],
+                });
+                const { logs } = apply(ts, [
+                    issue({ title: 'Другими словами', body: OPEN_14.body, blocks: 186 }),
+                ]);
+                expect(created).toEqual([]);
+                expect(comments.map(([n]) => n)).toEqual([31]);
+                expect(logs).not.toMatch(/⚠ Блокер/);
+            });
+
+            it('blocks дорастил веху выше maxIterations — ⚠ с числами', () => {
+                const many = Array.from({ length: 3 }, (_, k) => ({
+                    number: 100 + k,
+                    title: `Карточка ${String(k)}`,
+                }));
+                const { ts } = planningTaskSource({ [PHASE]: many });
+                const { logs } = apply(ts, [issue({ title: 'Ещё одна', blocks: 100 })], {
+                    ...withBacklog(),
+                    maxIterations: 2,
+                });
+                expect(logs).toMatch(
+                    /⚠ Бюджет фазы "Gravity · Фаза 4": открытых карточек 3 при maxIterations 2/,
+                );
+            });
+
+            it('отказы шагов связи — строки ⚠, карточка заведена, намерение не повторяется', () => {
+                let reads = 0;
+                const { ts, created } = planningTaskSource(
+                    { [PHASE]: [{ number: 186, title: 'Guard' }] },
+                    {
+                        commentOnIssue: () => {
+                            throw new Error('лента отказала');
+                        },
+                        getIssue: () => {
+                            throw new Error('тело не читается');
+                        },
+                        listAllOpenIssues: (m: string) => {
+                            reads += 1;
+                            if (reads > 1) throw new Error('веха моргнула');
+                            return m === PHASE ? [{ number: 186, title: 'Guard' }] : [];
+                        },
+                    },
+                );
+                const { res, logs } = apply(ts, [issue({ title: 'Нужен прокси', blocks: 186 })]);
+                expect(res.failed).toBe(false);
+                expect(created).toHaveLength(1);
+                expect(logs).toMatch(/Сверка дублей new-issue — не всё прочиталось/);
+                expect(logs).toMatch(/в комментарий #186 не легла: лента отказала/);
+                expect(logs).toMatch(/в тело #186 не легла: тело не читается/);
+                expect(logs).toMatch(/после роста не сверен: веха моргнула/);
+            });
+
+            it('форж не отдал номер — ссылку ставить не на что, и это сказано', () => {
+                const { ts, comments } = planningTaskSource(
+                    { [PHASE]: [{ number: 186, title: 'Guard' }] },
+                    { createIssue: () => null },
+                );
+                const { logs } = apply(ts, [issue({ title: 'Нужен прокси', blocks: 186 })]);
+                expect(comments).toEqual([]);
+                expect(logs).toMatch(/ссылку в #186 ставить не на что/);
+            });
+
+            it('шов без setIssueBody — ссылка только комментарием, и это сказано', () => {
+                const { ts, comments } = planningTaskSource(
+                    { [PHASE]: [{ number: 186, title: 'Guard' }] },
+                    { setIssueBody: undefined },
+                );
+                const { logs } = apply(ts, [issue({ title: 'Нужен прокси', blocks: 186 })]);
+                expect(comments.map(([n]) => n)).toEqual([186]);
+                expect(logs).toMatch(/тело карточки не правит/);
+            });
+
+            it('НЕГАТИВНЫЙ: blocks с номером не из текущей вехи — отказ разбора батча', () => {
+                const { ts, created } = planningTaskSource({
+                    [PHASE]: [{ number: 186, title: 'Guard' }],
+                    'Ревью · Входящие': [{ number: 216, title: 'чужая' }],
+                });
+                const { res, pushes } = apply(ts, [
+                    line({ kind: 'close', issue: 186, comment: 'сделано' }),
+                    issue({ title: 'Нужен прокси', blocks: 216 }),
+                ]);
+                expect(res.failed).toBe(true);
+                expect(created).toEqual([]);
+                expect(pushes.join('\n')).toMatch(/blocks #216 — не открытая карточка вехи/);
+            });
+
+            it('веха фазы не прочиталась — blocks разжалован во Входящие, а не карантин', () => {
+                const { ts, created } = planningTaskSource(
+                    {},
+                    {
+                        listAllOpenIssues: (m: string) => {
+                            if (m === PHASE) throw new Error('форж моргнул');
+                            return [];
+                        },
+                    },
+                );
+                const { res, logs } = apply(ts, [issue({ title: 'Нужен прокси', blocks: 186 })]);
+                expect(res.failed).toBe(false);
+                expect(created).toMatchObject([{ milestone: 'Ревью · Входящие' }]);
+                expect(logs).toMatch(/blocks #186 не сверен/);
+            });
+
+            it('сверх квоты — во Входящие с меткой разбора и пуш вахте, батч применён', () => {
+                const { ts, created } = planningTaskSource({
+                    [PHASE]: [{ number: 186, title: 'Guard' }],
+                });
+                const { res, pushes } = apply(
+                    ts,
+                    [
+                        issue({ title: 'Альфа' }),
+                        issue({ title: 'Бета' }),
+                        issue({ title: 'Гамма', blocks: 186 }),
+                        line({ kind: 'close', issue: 186, comment: 'сделано' }),
+                    ],
+                    { ...withBacklog(), newIssues: { sessionQuota: 2, triageLabel: 'triage' } },
+                );
+                expect(res.failed).toBe(false);
+                expect(res.closedIssues).toEqual([186]);
+                expect(created).toMatchObject([
+                    { title: 'Альфа', labels: ['complexity:low'] },
+                    { title: 'Бета', labels: ['complexity:low'] },
+                    {
+                        title: 'Гамма',
+                        labels: ['complexity:low', 'triage'],
+                        milestone: 'Ревью · Входящие',
+                    },
+                ]);
+                expect(pushes).toHaveLength(1);
+                expect(pushes[0]).toMatch(/📥 .*больше 2 карточек.*с меткой triage/s);
+                expect(pushes[0]).toMatch(/«Гамма» \(просила blocks #186\)/);
+            });
+
+            it('метка разбора не задана — лишнее без метки, и пуш это называет', () => {
+                const { ts, created } = planningTaskSource({});
+                const { pushes } = apply(
+                    ts,
+                    [issue({ title: 'Альфа' }), issue({ title: 'Бета' })],
+                    {
+                        ...withBacklog(),
+                        newIssues: { sessionQuota: 1 },
+                    },
+                );
+                expect(created[1].labels).toEqual(['complexity:low']);
+                expect(pushes[0]).toMatch(/triageLabel не задан/);
+            });
+
+            it('НЕГАТИВНЫЙ: битая секция newIssues — отказ батча, а не дефолт', () => {
+                const { ts, created } = planningTaskSource({});
+                const { res, pushes } = apply(ts, [issue({ title: 'Альфа' })], {
+                    ...withBacklog(),
+                    newIssues: { sessionQuota: '3' },
+                });
+                expect(res.failed).toBe(true);
+                expect(created).toEqual([]);
+                expect(pushes.join('\n')).toMatch(/newIssues\.sessionQuota/);
+            });
         });
     });
 });
@@ -17089,6 +17730,134 @@ describe('версия CLI против описания пакета — стр
         const start = src.indexOf('    function sessionCliVersion(');
         const body = src.slice(start, src.indexOf('\n    }\n', start));
         expect(body).toMatch(/driftFn\(id\.harness, v\.version\)/);
+    });
+});
+
+// #215: сверка инвентаря MCP перед сессией — диагноз строкой ⚠, ни стопа, ни разрешения.
+describe('инвентарь MCP перед сессией — диагноз дрейфа', () => {
+    const run = (res: unknown, root: string | null = '/path/to/app') => {
+        const lines: string[] = [];
+        const checkFn = vi.fn(() => res as never);
+        ralph.warnMcpDrift({
+            logFn: (m: string) => lines.push(m),
+            consumerRoot: root,
+            checkFn,
+            fingerprintFn: () => 'f',
+            memo: { key: null, at: 0 },
+            dry: false,
+        });
+        return { lines, checkFn };
+    };
+
+    it('без roots снимок не читается вовсе', () => {
+        const { lines, checkFn } = run({ status: 'clean' }, null);
+        expect(checkFn).not.toHaveBeenCalled();
+        expect(lines).toEqual([]);
+    });
+
+    it('дрейф назван дрейфом конфигурации, а не транзиентом, один раз на текст', () => {
+        const drift = { status: 'drift', lines: ['MCP forge: добавлены mcp__forge__New'] };
+        const first = run(drift);
+        expect(first.checkFn).toHaveBeenCalledWith('/path/to/app');
+        expect(first.lines[0]).toMatch(/дрейф конфигурации, а не транзиент/);
+        expect(first.lines[0]).toMatch(/PR обновления снимка под ship/);
+        expect(first.lines[1]).toBe('   MCP forge: добавлены mcp__forge__New');
+        expect(run(drift).lines).toEqual([]);
+    });
+
+    it('совпадение молчит; нет снимка, битый снимок, молчащий сервер и бросок — ⚠ с причиной', () => {
+        expect(run({ status: 'clean' }).lines).toEqual([]);
+        expect(run({ status: 'invalid', problems: ['битый-215'] }).lines).toEqual([
+            expect.stringMatching(/^⚠ Снимок инвентаря MCP не прошёл проверку/),
+            '   битый-215',
+        ]);
+        expect(run({ status: 'unreachable', problems: ['сервер s-215: молчит'] }).lines[1]).toBe(
+            '   сервер s-215: молчит',
+        );
+        const lines: string[] = [];
+        ralph.warnMcpDrift({
+            logFn: (m: string) => lines.push(m),
+            consumerRoot: '/path/to/app',
+            checkFn: () => {
+                throw new Error('бросок-215');
+            },
+            fingerprintFn: () => 'f',
+            memo: { key: null, at: 0 },
+            dry: false,
+        });
+        expect(lines).toEqual([expect.stringMatching(/не собран/), '   бросок-215']);
+    });
+
+    // Ревью 16c3: опрос перед КАЖДОЙ сессией поднимал все серверы заново.
+    it('тот же отпечаток файлов в пределах срока — серверы не опрашиваются повторно', () => {
+        const memo = { key: null, at: 0 };
+        let now = 1_000;
+        let print = 'a';
+        const checkFn = vi.fn(() => ({ status: 'clean' }) as never);
+        const once = () =>
+            ralph.warnMcpDrift({
+                logFn: () => {},
+                consumerRoot: '/path/to/app',
+                checkFn,
+                fingerprintFn: () => print,
+                nowFn: () => now,
+                memo,
+                dry: false,
+            });
+        once();
+        once();
+        expect(checkFn).toHaveBeenCalledTimes(1);
+        print = 'b';
+        once();
+        expect(checkFn).toHaveBeenCalledTimes(2);
+        now += 60 * 60_000;
+        once();
+        expect(checkFn).toHaveBeenCalledTimes(3);
+    });
+
+    it('сухой прогон серверов не порождает', () => {
+        const checkFn = vi.fn(() => ({ status: 'clean' }) as never);
+        ralph.warnMcpDrift({
+            logFn: () => {},
+            consumerRoot: '/path/to/app',
+            checkFn,
+            fingerprintFn: () => 'f',
+            memo: { key: null, at: 0 },
+            dry: true,
+        });
+        expect(checkFn).not.toHaveBeenCalled();
+    });
+
+    it('проводка: опрос перед сессией идёт с cwd дерева человека и запретом ключей', () => {
+        const src = fs.readFileSync(path.join(import.meta.dirname, 'orchestrator.ts'), 'utf-8');
+        const start = src.indexOf('    function warnMcpDrift(');
+        const body = src.slice(start, src.indexOf('\n    }\n', start));
+        expect(body).toMatch(
+            /stdioListPage\(server, cfg, cursor, \{ cwd: root, deniedEnv: mcpDeniedEnv\(\) \}\)/,
+        );
+    });
+
+    // Строка «снимка нет» — одна на прогон, поэтому её видит только этот кейс.
+    it('боевая проверка: снимка в дереве нет — absent, серверы не опрашиваются', () => {
+        const dir = fs.mkdtempSync(path.join(tmpdir(), 'ralph-mcp-drift.'));
+        try {
+            const lines: string[] = [];
+            ralph.warnMcpDrift({
+                logFn: (m: string) => lines.push(m),
+                consumerRoot: dir,
+                memo: { key: null, at: 0 },
+                dry: false,
+            });
+            expect(lines.join('\n')).toMatch(/Снимка инвентаря MCP нет/);
+        } finally {
+            fs.rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    it('проводка: сверка стоит в sessionCliVersion — общей точке перед сессией', () => {
+        const fn = vi.fn();
+        ralph.sessionCliVersion('nope', undefined, undefined, undefined, fn);
+        expect(fn).toHaveBeenCalledTimes(1);
     });
 });
 

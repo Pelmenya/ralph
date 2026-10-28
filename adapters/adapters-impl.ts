@@ -240,6 +240,8 @@ export type GithubTaskSourceFns = {
     commentOnIssue: (issue: number, body: string) => void;
     // #125: лента карточки для сверки намерения (#94).
     issueComments: (issue: number) => string[];
+    // #220: тело карточки — ссылка на блокирующую.
+    setIssueBody: (issue: number, body: string) => void;
     closeIssue: (issue: number) => void;
     blockIssue: (issue: number) => void;
     createIssue: (input: {
@@ -280,6 +282,7 @@ export function createGithubTaskSource(fns: GithubTaskSourceFns): TaskSourceAdap
         syncBoard: fns.syncProjectBoard,
         commentOnIssue: fns.commentOnIssue,
         listIssueComments: fns.issueComments,
+        setIssueBody: fns.setIssueBody,
         closeIssue: fns.closeIssue,
         blockIssue: fns.blockIssue,
         createIssue: fns.createIssue,

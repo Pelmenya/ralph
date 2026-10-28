@@ -775,6 +775,14 @@ describe('намерения кодер-сессии: формы запросо�
         expect(call?.body).toEqual({ body: 'что сделано; и `бэктики`, и "кавычки"' });
     });
 
+    // #220: тело — поле `description`, как у создания и чтения карточки.
+    it('тело карточки — PATCH полем description', () => {
+        const { adapter, calls } = build();
+        adapter.setIssueBody?.(7, 'тело со ссылкой на #9');
+        const call = calls.find((c) => c.method === 'PATCH' && c.path.endsWith('/issues/7'));
+        expect(call?.body).toEqual({ description: 'тело со ссылкой на #9' });
+    });
+
     it('закрытие — PATCH со status_slug, значение camelCase-регистра записи', () => {
         const { adapter, calls } = build();
         adapter.closeIssue(7);

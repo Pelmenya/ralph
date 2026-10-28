@@ -484,6 +484,33 @@ describe('MCP — по политике контура', () => {
         expect(codeOf(mcp('ListSecrets'), { contour: declared })).toBe('mcp-not-allowed');
     });
 
+    it('незнакомое по политике эффектов — дрейф конфигурации, повтор не лечит (#215)', () => {
+        const reason = one(mcp('GetRepository'), { contour: declared }).reason;
+        expect(reason).toMatch(/дрейф конфигурации, а не транзиент: вызов не повторяй/);
+        expect(reason).toMatch(/PR обновления снимка/);
+        expect(one(mcp('DeleteRepository'), { contour: legacy }).reason).not.toMatch(/дрейф/);
+    });
+
+    // Ревью 16c3: «дрейф» на запрете по слову отправлял человека обновлять снимок.
+    it('эффект есть, а блок держит запрет по слову — политика, а не дрейф', () => {
+        const reason = one(mcp('ListSecrets'), { contour: declared }).reason;
+        expect(reason).toMatch(/эффект в mcp\.tools есть \(read\), но имя под запретом ядра/);
+        expect(reason).not.toMatch(/дрейф конфигурации/);
+        const excepted = parseConsumerData(
+            JSON.stringify({
+                mcp: {
+                    writeAllowed: [],
+                    neverExceptions: ['mcp__forge__ListSecrets'],
+                    tools: { mcp__forge__ListSecrets: { effect: 'read' } },
+                },
+            }),
+        );
+        const r = one(mcp('ListSecrets'), { contour: excepted });
+        expect(r.code).toBe('mcp-not-allowed');
+        expect(r.reason).toMatch(/neverExceptions, а эффект в mcp\.tools — read/);
+        expect(r.reason).not.toMatch(/дрейф конфигурации/);
+    });
+
     it('данные прежней формы — прежнее правило до миграции', () => {
         expect(codeOf(mcp('GetRepository'), { contour: legacy })).toBeNull();
         expect(codeOf(mcp('DeleteRepository'), { contour: legacy })).toBe('mcp-not-allowed');

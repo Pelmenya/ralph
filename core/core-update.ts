@@ -16,16 +16,17 @@
  *      Слои сверяются с тем, что ревизия встретит у потребителя: шим `./ralph`, `configVersion`
  *      конфига и state, который пишет нынешняя ревизия. Ядро и адаптеры едут внутри ревизии и
  *      с собой совпадают по построению — сверять их не с чем.
- *   3. **Lock меняется только в ветке PR** (`commitLockOnBranch`). Коммит собирается
+ *   3. **Lock меняется только в ветке PR** (`commitBundleOnBranch`), и вместе с ним — данные
+ *      контура и снимок инвентаря MCP (#218, `update-bundle.ts`): одним коммитом из одной базы. Коммит собирается
  *      плюмбингом git — объект, дерево во ВРЕМЕННОМ индексе, `commit-tree`, пуш по SHA — без
  *      локальной ветки, без `checkout`, без индекса и рабочего дерева человека. Дерево
  *      потребителя — дерево человека и, при раскладке без worktree, дерево работающей петли;
  *      переключение ветки в нём увело бы файлы из-под живой сессии.
  *
  * Повтор после обрыва доводит подготовку до конца (#104). Ветка с таким именем на `origin`,
- * в которой lock тот же, — это прежняя попытка той же подготовки, убитая после пуша: её коммит
+ * в которой тот же комплект, — это прежняя попытка той же подготовки, убитая после пуша: её коммит
  * и берётся, второго пуша нет. Без этого повтор упирался в собственную ветку, а подготовку
- * доводил человек. Ветка с ДРУГИМ lock — отказ, а не перезапись: `--force` здесь нет, чужую
+ * доводил человек. Ветка с ДРУГИМ комплектом — отказ, а не перезапись: `--force` здесь нет, чужую
  * попытку разбирает человек. PR заводит шов форжа (`adapters/`); ветка, запушенная без PR,
  * называется в отказе по имени, а повтор команды найдёт её и заведёт PR.
  *
@@ -36,9 +37,18 @@ import { COMPAT_LAYERS, type TCompatVersions, type TObservation } from './compat
 import { CORE_LOCK_PATH, formatCoreLock, type TCoreLock } from './core-install.ts';
 import { gitNetworkOpts } from '../shared/ralph-util.ts';
 
-/** Опции одного вызова git: stdin, окружение и срок (у сетевых — `gitNetworkOpts`). */
-export type TGitOpts = { input?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number };
-/** Исполнитель argv без шелла (форма `shArgv` со stdin): stdout без хвостовых пробелов; отказ — бросок. */
+/**
+ * Опции одного вызова git: stdin, окружение и срок (у сетевых — `gitNetworkOpts`). `raw` —
+ * stdout как есть: блоб файла читается байт в байт, иначе откат клал бы `hooks.json` без
+ * концевого перевода строки, и `format:check` потребителя краснел бы ровно на аварийном PR.
+ */
+export type TGitOpts = {
+    input?: string;
+    env?: NodeJS.ProcessEnv;
+    timeoutMs?: number;
+    raw?: boolean;
+};
+/** Исполнитель argv без шелла (форма `shArgv` со stdin): stdout без краевых пробелов, при `raw` — как есть; отказ — бросок. */
 export type TRunArgvFn = (file: string, args: string[], opts?: TGitOpts) => string;
 
 export type TUpdateCompatInput = {
@@ -164,7 +174,10 @@ export function pidAlive(pid: number): boolean {
  * прежняя с тем же номером уже кончилась) или мёртвый. Живого соседа не трогаем — это и
  * есть параллельная попытка; занятый чужим процессом номер оставляет сироту, и только.
  */
-function sweepOrphanRefs(o: TCommitLockOpts, gitFn: (args: string[]) => string): void {
+function sweepOrphanRefs(
+    o: Pick<TCommitLockOpts, 'pidAliveFn'>,
+    gitFn: (args: string[]) => string,
+): void {
     const alive = o.pidAliveFn ?? pidAlive;
     const refs = gitFn(['for-each-ref', '--format=%(refname)', 'refs/ralph/']);
     for (const ref of refs.split('\n')) {
@@ -181,12 +194,51 @@ function sweepOrphanRefs(o: TCommitLockOpts, gitFn: (args: string[]) => string):
 }
 
 /**
- * Коммит с новым lock поверх свежего `<remote>/<base>` и пуш его в новую ветку. Индекс,
- * HEAD и рабочее дерево человека не трогаются: дерево коммита собирается во временном
- * индексе (`GIT_INDEX_FILE`), локальная ветка не заводится. Возвращает SHA коммита — или
- * коммита прежней попытки, если ветка уже несёт этот же lock (повтор после обрыва).
+ * Файл комплекта PR смены ревизии (#218): путь от корня потребителя и текст; `null` — файл
+ * удаляется (откат данных, которых до обновления не было). `samePrior` — признак повтора той же
+ * попытки, если текст сам им быть не может: снимок инвентаря несёт время сбора, и повтор после
+ * обрыва собрал бы его заново с другим `collectedAt` при том же содержимом.
  */
+export type TBundleFile = {
+    path: string;
+    text: string | null;
+    samePrior?: (prior: string | null) => boolean;
+};
+
+/**
+ * База комплекта: коммит свежего `<remote>/<base>` и чтение файлов из НЕЁ, а не из дерева
+ * человека. `read` без ревизии читает базу; нет файла — `null`. `lastChange` — последний коммит
+ * базы по первым родителям, менявший путь, или `null`.
+ */
+export type TBaseView = {
+    sha: string;
+    read: (path: string, rev?: string) => string | null;
+    lastChange: (path: string) => string | null;
+};
+
+export type TCommitBundleOpts = Omit<TCommitLockOpts, 'lock'> & {
+    /** Комплект из базы; отказ собрать — бросок, и ветка не пушится. */
+    buildFn: (base: TBaseView) => TBundleFile[];
+};
+
+export function lockBundleFile(lock: TCoreLock): TBundleFile {
+    return { path: CORE_LOCK_PATH, text: formatCoreLock(lock) };
+}
+
+/** Коммит только с lock — комплект из одного файла (`commitBundleOnBranch`). */
 export function commitLockOnBranch(o: TCommitLockOpts): string {
+    return commitBundleOnBranch({ ...o, buildFn: () => [lockBundleFile(o.lock)] });
+}
+
+/**
+ * Коммит комплекта поверх свежего `<remote>/<base>` и пуш его в новую ветку (#218). Комплект —
+ * lock, данные контура и снимок инвентаря — собирается из ОДНОЙ базы: `buildFn` читает файлы из
+ * того же коммита, поверх которого ложится коммит, и данные, мигрированные из устаревшего дерева
+ * человека, в PR не попадут. Индекс, HEAD и рабочее дерево человека не трогаются: дерево коммита
+ * собирается во временном индексе (`GIT_INDEX_FILE`), локальная ветка не заводится. Возвращает
+ * SHA коммита — или коммита прежней попытки, если ветка уже несёт этот же комплект.
+ */
+export function commitBundleOnBranch(o: TCommitBundleOpts): string {
     const remote = o.remote ?? 'origin';
     const base = o.base ?? 'main';
     const gitFn = (args: string[], opts?: TGitOpts) =>
@@ -214,17 +266,24 @@ export function commitLockOnBranch(o: TCommitLockOpts): string {
     );
     try {
         const baseSha = gitFn(['rev-parse', '--verify', `${baseRef}^{commit}`]);
-        const blob = gitFn(['hash-object', '-w', '--stdin'], { input: formatCoreLock(o.lock) });
-        const prior = priorAttempt(o, remote, priorRef, blob);
+        const files = o.buildFn(baseView(gitFn, baseSha));
+        const blobs = files.map((f) =>
+            f.text === null ? null : gitFn(['hash-object', '-w', '--stdin'], { input: f.text }),
+        );
+        const prior = priorAttempt(o, remote, priorRef, files, blobs);
         if (prior !== null) return prior;
         const env = { ...o.env, GIT_INDEX_FILE: o.indexFile };
         gitFn(['read-tree', baseSha], { env });
-        gitFn(
-            ['update-index', '--add', '--cacheinfo', `100644,${blob},${toGitPath(CORE_LOCK_PATH)}`],
-            {
-                env,
-            },
-        );
+        files.forEach((f, i) => {
+            const blob = blobs[i];
+            const at = toGitPath(f.path);
+            gitFn(
+                blob === null || blob === undefined
+                    ? ['update-index', '--force-remove', '--', at]
+                    : ['update-index', '--add', '--cacheinfo', `100644,${blob},${at}`],
+                { env },
+            );
+        });
         const tree = gitFn(['write-tree'], { env });
         const commit = gitFn(['commit-tree', tree, '-p', baseSha, '-F', '-'], {
             input: o.message,
@@ -247,16 +306,52 @@ export function commitLockOnBranch(o: TCommitLockOpts): string {
     }
 }
 
+/** Блоб пути в ревизии или `null`, если пути там нет. Отказ git — бросок, а не «нет файла». */
+function blobAt(gitFn: (args: string[]) => string, rev: string, path: string): string | null {
+    // Вывод `<mode> <type> <sha>\t<путь>`: `--format` у ls-tree только с git 2.36.
+    const listed = gitFn(['ls-tree', rev, '--', path]);
+    if (listed === '') return null;
+    const [, type, sha] = listed.split(/\s+/);
+    if (type !== 'blob' || sha === undefined) {
+        throw new Error(`${path} в ${rev} — не файл (${listed})`);
+    }
+    return sha;
+}
+
+/** Git-вызов модуля: argv после `-C <дерево>` и опции; `raw` — stdout без обрезки. */
+export type TGitCallFn = (args: string[], opts?: TGitOpts) => string;
+
+/** Чтение файла ревизии git байт в байт: нет пути — `null`, отказ git — бросок. */
+export function gitFileReader(gitFn: TGitCallFn): (rev: string, path: string) => string | null {
+    return (rev, path) => {
+        const blob = blobAt(gitFn, rev, toGitPath(path));
+        return blob === null ? null : gitFn(['cat-file', 'blob', blob], { raw: true });
+    };
+}
+
+function baseView(gitFn: TGitCallFn, sha: string): TBaseView {
+    const readAt = gitFileReader(gitFn);
+    return {
+        sha,
+        read: (path, rev = sha) => readAt(rev, path),
+        lastChange: (path) =>
+            gitFn(['log', '-1', '--first-parent', '--format=%H', sha, '--', toGitPath(path)]) ||
+            null,
+    };
+}
+
 /**
- * Ветка уже на `origin` (#104): её коммит, если lock в ней — ровно `blob`, иначе бросок.
- * Нет ветки — `null`. Сравнивается lock, а не дерево: `main` мог уйти вперёд с прошлой
- * попытки, и дерево нового коммита разошлось бы с её деревом при той же правке.
+ * Ветка уже на `origin` (#104): её коммит, если в ней ВЕСЬ комплект — тот же (#218), иначе
+ * бросок. Нет ветки — `null`. Сравнивается комплект, а не дерево: `main` мог уйти вперёд с
+ * прошлой попытки, и дерево нового коммита разошлось бы с её деревом при той же правке. По одному
+ * lock повтор принял бы ветку, где данные контура мигрированы иначе, за свою.
  */
 function priorAttempt(
-    o: TCommitLockOpts,
+    o: TCommitBundleOpts,
     remote: string,
     priorRef: string,
-    blob: string,
+    files: readonly TBundleFile[],
+    blobs: readonly (string | null)[],
 ): string | null {
     const head = `refs/heads/${o.branch}`;
     const listed = o.runArgvFn(
@@ -270,17 +365,25 @@ function priorAttempt(
         ['-C', o.consumerRoot, 'fetch', '--no-recurse-submodules', remote, `+${head}:${priorRef}`],
         gitNetworkOpts(o.env),
     );
-    const gitFn = (args: string[]) => o.runArgvFn('git', ['-C', o.consumerRoot, ...args]);
+    const gitFn: TGitCallFn = (args, opts) =>
+        o.runArgvFn('git', ['-C', o.consumerRoot, ...args], opts);
     const commit = gitFn(['rev-parse', '--verify', `${priorRef}^{commit}`]);
-    let lockBlob: string | null;
-    try {
-        lockBlob = gitFn(['rev-parse', '--verify', `${priorRef}:${toGitPath(CORE_LOCK_PATH)}`]);
-    } catch {
-        lockBlob = null;
-    }
-    if (lockBlob !== blob) {
+    const differs = files.filter((f, i) => {
+        let blob: string | null;
+        try {
+            blob = blobAt(gitFn, priorRef, toGitPath(f.path));
+        } catch {
+            return true;
+        }
+        if (f.samePrior === undefined) return blob !== blobs[i];
+        return !f.samePrior(
+            blob === null ? null : gitFn(['cat-file', 'blob', blob], { raw: true }),
+        );
+    });
+    if (differs.length > 0) {
         throw new Error(
-            `ветка ${o.branch} уже есть на ${remote} (${commit}), и в ней другой lock — ` +
+            `ветка ${o.branch} уже есть на ${remote} (${commit}), и в ней другой ` +
+                `${differs.map((f) => f.path).join(', ')} — ` +
                 'это не повтор этой подготовки; разбери прежнюю попытку, перезаписи без --force нет',
         );
     }
