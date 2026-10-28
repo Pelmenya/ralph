@@ -113,12 +113,12 @@ describe('описание пакета харнесса: поля и перек
         [
             'toolMap: операция вне перечня',
             (d: any) => (d.toolMap.Bash = 'shell'),
-            'toolMap.Bash: операция "shell" вне exec/read/write/delete/move/search/mcp/fetch/agent/defer/inert',
+            'toolMap.Bash: операция "shell" вне exec/read/write/delete/move/search/patch/mcp/fetch/agent/defer/inert',
         ],
         [
             'toolMap: unknown отображением не бывает',
             (d: any) => (d.toolMap.Bash = 'unknown'),
-            'toolMap.Bash: операция "unknown" вне exec/read/write/delete/move/search/mcp/fetch/agent/defer/inert',
+            'toolMap.Bash: операция "unknown" вне exec/read/write/delete/move/search/patch/mcp/fetch/agent/defer/inert',
         ],
         ['allowedFields не объект', (d: any) => (d.allowedFields = 1), 'allowedFields: не объект'],
         [

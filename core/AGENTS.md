@@ -283,19 +283,25 @@ update, не называет ни один lock, и после удаления
 нормализатора пакета харнесса настроек из реестра, перенесённый в `productRoot`
 (`guardAdapterValue`). Пакет не принят — значение-причина вместо пути: guard на ней блокирует
 всё кодом `adapter-failed`, и проба перед сессией останавливает старт с этой причиной, а не
-пускает сессию на совместимом входе молча. Регистрации Codex, Kimi Code и OpenCode (`guardHooksOf`) получают
-`RALPH_GUARD_INPUT=compat-16b`: он сильнее пути, который уже стоит в команде, взятой из
-настроек сессии. Обе переменные — в `HOOK_COMMAND_ONLY_ENV`: унаследованные сессией, они
+пускает сессию на совместимом входе молча. Вход регистрации остальных харнессов
+(`guardHooksOf`) объявляет пакет полем `guardInput` (#232). Пакет с нормализатором (Codex)
+получает путь своей команды (`guardInputOf`, тем же переносом в `productRoot`) — в `export`
+регистрации и вместо пути Claude Code в команде канонического хука: присваивание перед `node`
+сильнее `export`. Пакеты-заглушки (Kimi Code, OpenCode) получают `RALPH_GUARD_INPUT=compat-16b`:
+он сильнее пути, который уже стоит в команде, взятой из настроек сессии. Пробу правила, которое
+действует только в петле (патч данных контура у Codex), проба старта подаёт с контекстом петли
+(`HarnessProbe.loop`). Обе переменные — в `HOOK_COMMAND_ONLY_ENV`: унаследованные сессией, они
 перевели бы guard дерева сессии на чужой вход.
 
 Не-Claude харнессы настроек Claude Code не читают, и регистрацию барьера раннер строит из тех
 же хуков перед каждой их сессией: Codex — аргументами `codex exec` (`prepareCodexGuardArgs`,
-#119), Kimi Code (`kimi-native`, #120) — домом CLI в `runtimeDir/kimi-native/home`
+#119) с недоверием проекту и своим домом CLI в `runtimeDir/codex-session/home`
+(`prepareCodexSession`, #195; слои `.codex/` в дереве — стоп), Kimi Code (`kimi-native`, #120) — домом CLI в `runtimeDir/kimi-native/home`
 (`prepareKimiNativeHome`): `config.toml` человека плюс `[[hooks]]`, вход ссылками на дом
 человека; OpenCode (`opencode`, #121) — каталогом `runtimeDir/opencode/config` для
 `OPENCODE_CONFIG_DIR` (`prepareOpencodeSession`): плагин барьера, настройки сессии, затем
 сверка полноты скиллов по `opencode debug skill`. Проба идёт на том, что уйдёт в CLI, стоп тот
-же — `guard-probe`. Каталоги `kimi-native` и `opencode` есть в описи состояния, но не
+же — `guard-probe`. Каталоги `kimi-native`, `opencode` и `codex-session` есть в описи состояния, но не
 переезжают: они пересобираются перед каждой сессией, а ссылки на ключи переезд файлов не
 переносит.
 

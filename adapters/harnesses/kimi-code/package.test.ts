@@ -45,6 +45,7 @@ describe('регистрация барьера Kimi Code', () => {
         expect(harnessPackage.setsProjectDirEnv).toBe(false);
         expect(harnessPackage.skillBarrier).toBe(false);
         expect(harnessPackage.guardLimit).toBeNull();
+        expect(harnessPackage.projectLayers).toBeNull();
     });
 });
 

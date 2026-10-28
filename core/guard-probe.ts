@@ -62,11 +62,13 @@ import {
     ALL_PACKAGES,
     HARNESS_REGISTRY,
     SESSION_SETTINGS_HARNESS,
+    normalizerPathIn,
     selectHarness,
     type HarnessRegistry,
 } from '../adapters/harness-registry.ts';
 import type { HarnessPackage, RegisteredGuardHook } from '../adapters/harness-package.ts';
 import { reasonCodeOf } from '../adapters/barrier-reason.ts';
+import { configLayerProblems } from '../adapters/config-layers.ts';
 import { SESSION_CONTEXT_ENV } from './session-context.ts';
 
 type LogFn = (msg: string) => void;
@@ -211,13 +213,30 @@ function probeHookList(
         // `CLAUDE_PROJECT_DIR` в окружение хука кладёт не каждый CLI — тем, кто не кладёт,
         // проба его не подкладывает: регистрация обязана нести каталог сама.
         const projectDirEnv = spec.setsProjectDirEnv;
+        const opts = probe.loop
+            ? { projectDirEnv, env: { [SESSION_CONTEXT_ENV]: probeLoopContext(projectDir) } }
+            : { projectDirEnv };
         const runs = covering.map((hook) => ({
             hook,
-            run: runHookFn(hook, payload, projectDir, { projectDirEnv }),
+            run: runHookFn(hook, payload, projectDir, opts),
         }));
         problems.push(...verdictProblems(probe, runs));
     }
     return problems;
+}
+
+/**
+ * Контекст петли для пробы правила сессии петли (`HarnessProbe.loop`, #232): та же форма, что
+ * раннер кладёт в env сессии (`loopSessionContext`), с деревом пробы обоими корнями. Ревизии нет:
+ * хук с контрактом петлю узнаёт и без контекста, а хуку дерева контракт не положен.
+ */
+function probeLoopContext(projectDir: string): string {
+    return JSON.stringify({
+        sessionId: 'ralph-guard-probe',
+        loop: true,
+        coreRevision: '',
+        roots: { consumer: projectDir, execution: projectDir },
+    });
 }
 
 function verdictProblems(
@@ -279,11 +298,12 @@ function settingsHooks(settings: unknown): TProbedHook[] {
  */
 function packageProblems(
     pkg: HarnessPackage,
+    input: TGuardInput,
     settings: unknown,
     projectDir: string,
     { runHookFn, runPluginFn }: { runHookFn: TRunHookFn; runPluginFn: TRunPluginFn },
 ): string[] {
-    const guardHooks = guardHooksOf(settings, projectDir);
+    const guardHooks = guardHooksOf(settings, projectDir, input);
     if (pkg.plugin) {
         return pluginProblems(pkg, pkg.plugin.source(guardHooks), projectDir, runPluginFn);
     }
@@ -461,7 +481,7 @@ export function sessionContextProblems(
  * тест с хуком.
  */
 export const GUARD_INPUT_ENV = 'RALPH_GUARD_INPUT';
-export const GUARD_COMPAT_INPUT = 'compat-16b';
+export const GUARD_COMPAT_INPUT = 'compat-16b' as const;
 
 /** Переменная, которой хук получает путь данных контура (читает `consumer-data.cjs`). */
 export const HOOKS_DATA_ENV = 'RALPH_HOOKS_DATA';
@@ -493,6 +513,18 @@ export const HOOK_COMMAND_ONLY_ENV: readonly string[] = [
     GUARD_INPUT_ENV,
 ];
 
+/** Вход guard регистрации не-Claude харнесса: событие нормализатора по пути либо вход 16b. */
+export type TGuardInput = { adapter: string } | typeof GUARD_COMPAT_INPUT;
+
+/**
+ * Путь нормализатора в команде канонического хука (`canonHookCommand`): присваивание перед
+ * `node`, значение — в одинарных кавычках оболочки (`'\''` внутри) или словом без них.
+ */
+const ADAPTER_ASSIGNMENT_RE = new RegExp(
+    `(^|\\s)${GUARD_ADAPTER_ENV}=(?:'(?:[^']|'\\\\'')*'|[^\\s;]*)`,
+    'g',
+);
+
 /** Хук, которому для вердикта нужен транскрипт Claude Code: вне Claude Code он не исполним. */
 const TRANSCRIPT_HOOK_RE = /(?:^|[\s/'"])skill-barrier\.cjs(?:$|[\s'"])/;
 
@@ -523,22 +555,55 @@ const quote = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
  * (абсолютный путь в установке ядра), и хук дерева (`${CLAUDE_PROJECT_DIR}/.claude/hooks/…`).
  * Цена: у этих харнессов каталог хуков сверяет с ревизией ядра один `guard.cjs`, а не два.
  *
- * Та же строка `export` ставит этим хукам совместимый вход guard (`GUARD_INPUT_ENV`, #186):
- * регистрация из настроек Claude Code без неё судила бы вход Codex, Kimi Code и OpenCode
- * нормализатором Claude Code, а их нормализаторы до 16d — заглушки.
+ * Та же строка `export` назначает этим хукам вход guard (`input`, #186, #232): регистрация из
+ * настроек Claude Code иначе судила бы вход другого CLI нормализатором Claude Code. Пакет с
+ * нормализатором (`guardInput: 'event'`) получает путь своей команды — и в `export` (хук дерева
+ * пути не несёт), и вместо пути Claude Code в команде канонического хука: присваивание перед
+ * `node` сильнее экспорта, и одного `export` хук установки не услышал бы. Совместимый вход
+ * сбрасывается явно. Пакет с заглушкой получает совместимый вход 16b.
  */
-export function guardHooksOf(settings: unknown, projectDir: string): GuardHook[] {
+export function guardHooksOf(
+    settings: unknown,
+    projectDir: string,
+    input: TGuardInput = GUARD_COMPAT_INPUT,
+): GuardHook[] {
+    const env =
+        input === GUARD_COMPAT_INPUT
+            ? `${GUARD_INPUT_ENV}=${GUARD_COMPAT_INPUT}`
+            : `${GUARD_ADAPTER_ENV}=${quote(input.adapter)} ${GUARD_INPUT_ENV}=''`;
+    const command = (c: string) =>
+        input === GUARD_COMPAT_INPUT
+            ? c
+            : c.replace(ADAPTER_ASSIGNMENT_RE, `$1${GUARD_ADAPTER_ENV}=${quote(input.adapter)}`);
     // Регистрации остальных пакетов строятся из регистрации харнесса настроек — её читает его
     // пакет.
     return settingsHooks(settings)
         .filter((h) => h.cannotBlock === null && !TRANSCRIPT_HOOK_RE.test(h.command))
         .map((h) => ({
             matcher: typeof h.matcher === 'string' ? h.matcher : '',
-            command:
-                `export CLAUDE_PROJECT_DIR=${quote(projectDir)} ` +
-                `${GUARD_INPUT_ENV}=${GUARD_COMPAT_INPUT}; ${h.command}`,
+            command: `export CLAUDE_PROJECT_DIR=${quote(projectDir)} ${env}; ` + command(h.command),
             timeoutSec: h.timeoutSec,
         }));
+}
+
+/**
+ * Вход guard в регистрации пакета (#232): путь команды нормализатора либо совместимый вход 16b.
+ * Пакет не принят — значение-причина вместо пути, как у `guardAdapterValue` ядра: она не
+ * абсолютный путь, guard на ней блокирует всё кодом `adapter-failed`, и проба называет отказ, а не
+ * пускает сессию на совместимом входе молча. `coreRoot` — каталог исполняемого ядра, куда
+ * переносится путь (`normalizerPathIn`); без него — путь пакета, загруженного этим ядром.
+ */
+export function guardInputOf(
+    registry: HarnessRegistry,
+    harness: string,
+    coreRoot?: string,
+): TGuardInput {
+    const selected = selectHarness(registry, harness);
+    if (!selected.ok) return { adapter: `пакет не принят: ${selected.reason}` };
+    if (selected.harness.pkg.guardInput === 'compat-16b') return GUARD_COMPAT_INPUT;
+    if (coreRoot === undefined) return { adapter: selected.harness.normalizerPath };
+    const found = normalizerPathIn(registry, harness, coreRoot);
+    return { adapter: found.ok ? found.path : `пакет не принят: ${found.reason}` };
 }
 
 /** Запуск плагина OpenCode на одном событии: исход в форме хука (2 — вызов отменён). */
@@ -708,7 +773,8 @@ export function harnessGuardProblems(
 ): string[] {
     const selected = selectHarness(registry, harness);
     if (selected.ok) {
-        return packageProblems(selected.harness.pkg, settings, projectDir, {
+        const input = guardInputOf(registry, harness);
+        return packageProblems(selected.harness.pkg, input, settings, projectDir, {
             runHookFn,
             runPluginFn,
         });
@@ -803,6 +869,44 @@ export function unguardedRoutes(
         });
 }
 
+/** Скан исполняемых слоёв конфига: дерево, поверхности пакета, исключённые дома CLI. */
+export type TLayersFn = (args: {
+    tree: string;
+    surfaces: readonly string[];
+    homes: readonly string[];
+}) => string[];
+
+/** Харнесс рантайма Codex — для сборщика его сессии (`session-settings.ts`). */
+export const CODEX_HARNESS = CODEX_RUNTIME_HARNESS;
+
+/**
+ * Исполняемые слои конфига харнесса в дереве сессии и его предках (#195): поверхности
+ * описания пакета, кроме домов CLI, которые пакет называет. Пакет без сборщика конфига
+ * (`projectLayers: null`) слоёв не отвергает — это предел, названный строкой старта; пакет, не
+ * принятый реестром, судит проба барьера.
+ */
+export function harnessLayerProblems(
+    harness: string,
+    tree: string,
+    env: NodeJS.ProcessEnv,
+    {
+        registry = HARNESS_REGISTRY,
+        layersFn = configLayerProblems,
+    }: { registry?: HarnessRegistry; layersFn?: TLayersFn } = {},
+): string[] {
+    const loaded = registry.packages.get(harness);
+    if (!loaded?.pkg.projectLayers) return [];
+    return layersFn({
+        tree,
+        surfaces: loaded.descriptor.configSurfaces,
+        homes: loaded.pkg.projectLayers.homes(env),
+    });
+}
+
+/** Предел пакета без сборщика конфига — строка `⚠` старта. */
+export const PROJECT_LAYERS_LIMIT =
+    'исполняемые слои конфига дерева не отвергаются — у пакета нет сборщика конфига';
+
 /**
  * Проверка перед первой сессией: не держит барьер хоть у одного достижимого харнесса —
  * `failFn` с полным списком причин. `projectDir` — дерево, в котором пойдут сессии.
@@ -822,6 +926,8 @@ export function ensureGuardHolds(
         settings: given,
         sessionContext,
         registry = HARNESS_REGISTRY,
+        env = process.env,
+        layersFn = configLayerProblems,
     }: {
         failFn: FailFn;
         logFn: LogFn;
@@ -830,6 +936,9 @@ export function ensureGuardHolds(
         settings?: unknown;
         /** Контекст сессии петли (#184): задан — каждая регистрация guard обязана его получить. */
         sessionContext?: string;
+        /** Окружение раннера: из него пакет называет дома CLI человека (#195). */
+        env?: NodeJS.ProcessEnv;
+        layersFn?: TLayersFn;
     } & TProbeRunners,
 ): void {
     const settingsPath = path.join(projectDir, '.claude', 'settings.json');
@@ -856,6 +965,10 @@ export function ensureGuardHolds(
                 .filter((h): h is string => h !== null && registry.packages.has(h)),
         ]),
     ];
+    // Остальные харнессы — один раз и рядом со сборкой: Set хранит порядок вставки, и харнесс
+    // настроек вставлен первым. Сравнение с ним по имени — ветвление ядра по харнессу, его
+    // ловит `tests/harness-identity.test.ts`.
+    const [, ...others] = harnesses;
     const problems = [
         ...unguardedRoutes(routes, registry),
         ...harnesses.flatMap((h) =>
@@ -879,6 +992,20 @@ export function ensureGuardHolds(
         );
         return;
     }
+    // Слои — отдельным отказом (#195): барьер исправен, а чинить надо дерево, и совет «почини
+    // хук» отправил бы человека не туда.
+    const layers = harnesses.flatMap((h) =>
+        harnessLayerProblems(h, projectDir, env, { registry, layersFn }).map((p) => `${h}: ${p}`),
+    );
+    if (layers.length > 0) {
+        failFn(
+            'Исполняемые слои конфига харнесса в дереве сессии или его предках — старт отменён:\n' +
+                layers.map((p) => `  - ${p}`).join('\n') +
+                '\nХуки, MCP-серверы и окружение из них CLI поднял бы при старте сессии. Убери слой ' +
+                'из дерева (или каталог из предков): петля его не исполняет и не обходит.',
+        );
+        return;
+    }
     logFn(
         `🛡  Проба барьера пройдена (${harnesses.join(', ')}): запрещённое заблокировано, безобидное пропущено`,
     );
@@ -886,12 +1013,16 @@ export function ensureGuardHolds(
         const limit = registry.packages.get(h)?.pkg.guardLimit;
         if (limit) logFn(`⚠ ${limit}`);
     }
+    // Харнесс настроек сессии без сборщика конфига — вне списка: его слои дерева
+    // (`.claude/settings.json`) раннер пока сам и читает (#194), строка шла бы на каждом старте
+    // каждого потребителя и ничего не сообщала бы. Остальные названы.
+    const noLayers = others.filter((h) => registry.packages.get(h)?.pkg.projectLayers === null);
+    if (noLayers.length > 0) logFn(`⚠ ${noLayers.join(', ')}: ${PROJECT_LAYERS_LIMIT}`);
     const noSkillBarrier = harnesses.filter((h) => !registry.packages.get(h)?.pkg.skillBarrier);
     if (noSkillBarrier.length > 0) logFn(`⚠ ${noSkillBarrier.join(', ')}: ${SKILL_BARRIER_LIMIT}`);
-    // Первый в списке — харнесс настроек сессии: контекст доказан пробой только у него.
-    const [, ...contextUnproven] = harnesses;
-    if (sessionContext !== undefined && contextUnproven.length > 0) {
-        logFn(`⚠ ${contextUnproven.join(', ')}: ${CONTEXT_UNPROVEN_LIMIT}`);
+    // Контекст доказан пробой только у харнесса настроек сессии.
+    if (sessionContext !== undefined && others.length > 0) {
+        logFn(`⚠ ${others.join(', ')}: ${CONTEXT_UNPROVEN_LIMIT}`);
     }
     // Отвергнутый пакет, в который конфиг сессию не отправит, старт не держит, но молчать о
     // нём нельзя: переключение рантайма в конфиге упёрлось бы в него посреди ночи.

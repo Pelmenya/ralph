@@ -33,6 +33,7 @@ export type TRuntimePaths = {
     sessionSettings: string;
     kimiNative: string;
     opencodeSession: string;
+    codexSession: string;
     activations: string;
 };
 
@@ -73,6 +74,10 @@ export function runtimePathsIn(runtimeDir: string): TRuntimePaths {
         // #121: КАТАЛОГ сессии `opencode` — `config/` для `OPENCODE_CONFIG_DIR`: плагин барьера
         // и настройки сессии. Пересобирается перед каждой сессией, как дом `kimi-native`.
         opencodeSession: path.join(runtimeDir, OPENCODE_RUNTIME),
+        // #195: КАТАЛОГ сессии рантайма `openai` — `home/`, дом CLI Codex для `CODEX_HOME`:
+        // конфиг без доверия, хуков и MCP и ссылка на вход человека. Пересобирается перед каждой
+        // сессией, как дом `kimi-native`.
+        codexSession: path.join(runtimeDir, 'codex-session'),
         // #38: журнал активации ревизий ядра — какая исполнялась, когда, с какой снята.
         activations: path.join(runtimeDir, 'ralph.activations.jsonl'),
     };

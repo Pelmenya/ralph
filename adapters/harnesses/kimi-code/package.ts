@@ -40,6 +40,8 @@ export const harnessPackage: HarnessPackage = {
     harness: HARNESS,
     guardRegistration: (_settings: unknown, guardHooks: readonly GuardHook[] = []) =>
         kimiRegistrationFromToml(kimiHooksToml(guardHooks)),
+    // Нормализатор пакета — заглушка до 16d: событием guard блокировал бы любой вызов.
+    guardInput: 'compat-16b',
     probes: HARNESS_PROBES[HARNESS],
     matcherCovers: (matcher, toolName) => harnessMatcherCovers(HARNESS, matcher, toolName),
     hookPayload: (probe: HarnessProbe, projectDir: string) =>
@@ -52,4 +54,6 @@ export const harnessPackage: HarnessPackage = {
     guardLimit: null,
     // Барьер — команды хуков, их исполняет проба сама.
     plugin: null,
+    // Сборщика конфига у пакета ещё нет (Фазы 16d2, 16d3): слои дерева не отвергаются.
+    projectLayers: null,
 };

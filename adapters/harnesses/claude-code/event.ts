@@ -36,9 +36,11 @@
  * (`unknown`): его задаёт политика контура, и судит его guard (#185, #186). Граница сервера —
  * по полю конверта `mcp_server`, а без него — по единственному разделителю `__`: ленивое
  * разбиение отдавало `mcp__sync__get__CreateReport` серверу `sync` с инструментом
- * `get__CreateReport`, а несколько возможных границ без имени сервера — `unknown`.
+ * `get__CreateReport`, а несколько возможных границ без имени сервера — `unknown`. Разбор имени
+ * общий с Codex — `../mcp-name.ts`.
  */
 import type { HarnessDescriptor } from '../descriptor.ts';
+import { MCP_PREFIX, mcpParts } from '../mcp-name.ts';
 import type { ToolEvent, ToolOperation, UnknownKind } from '../protocol.ts';
 
 const isRecord = (v: unknown): v is Record<string, unknown> =>
@@ -47,45 +49,6 @@ const isRecord = (v: unknown): v is Record<string, unknown> =>
 const unknownOp = (why: string, kind: UnknownKind = 'field'): ToolEvent => ({
     operations: [{ op: 'unknown', why, kind }],
 });
-
-const MCP_PREFIX = 'mcp__';
-
-/** Имя сервера из поля конверта `mcp_server`: строка или объект с `name`. */
-function envelopeServer(v: unknown): string | null {
-    if (typeof v === 'string' && v !== '') return v;
-    if (isRecord(v) && typeof v.name === 'string' && v.name !== '') return v.name;
-    return null;
-}
-
-/**
- * Сервер и инструмент MCP-имени или причина, почему граница не определена. Кандидаты —
- * каждое `__` с непустыми частями по обе стороны; сервер из конверта выбирает свой, иначе
- * кандидат обязан быть единственным.
- */
-function mcpParts(
-    name: string,
-    serverField: unknown,
-): { server: string; tool: string } | { why: string } {
-    const rest = name.slice(MCP_PREFIX.length);
-    const candidates: { server: string; tool: string }[] = [];
-    for (let at = rest.indexOf('__'); at !== -1; at = rest.indexOf('__', at + 1)) {
-        const server = rest.slice(0, at);
-        const tool = rest.slice(at + 2);
-        if (server !== '' && tool !== '' && !server.startsWith('_')) {
-            candidates.push({ server, tool });
-        }
-    }
-    const declared = envelopeServer(serverField);
-    const own = declared === null ? undefined : candidates.find((c) => c.server === declared);
-    if (own) return own;
-    if (candidates.length === 1) return candidates[0];
-    return {
-        why:
-            candidates.length === 0
-                ? `MCP-имя ${name} без сервера и инструмента`
-                : `MCP-имя ${name}: граница сервера неоднозначна`,
-    };
-}
 
 function operations(
     d: HarnessDescriptor,

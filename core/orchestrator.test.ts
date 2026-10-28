@@ -63,6 +63,7 @@ import { attachSubmitJournal, finishStage, startStage } from './submit-journal.t
 import { MODEL_PROXY_RETRIES } from './runtime-availability.ts';
 import { classifyClaudeSessionEnd } from '../adapters/session-end.ts';
 import { HARNESS_REGISTRY } from '../adapters/harness-registry.ts';
+import { codexUntrustArgs } from '../adapters/codex-home.ts';
 import { reconcilePhases } from './phase-reload.ts';
 
 // Фаза 16: исход сессии называет адаптер рантайма, ядро текста не читает. Фейк рантайма
@@ -1602,7 +1603,14 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
 
     // Регистрация барьера Codex без дерева сессии — стоп (ревью Фазы 16b); смоук сессии
     // проверяет argv и env, поэтому регистрация подменяется пустой.
-    const NO_CODEX_GUARD = (): string[] => [];
+    // #195: собранная сессия без хуков барьера — у тестов спавна барьер не предмет. Недоверие
+    // и свой дом на месте: без них сверка изоляции остановила бы спавн.
+    const CODEX_HOME_DIR = '/path/to/state/codex-session/home';
+    const NO_CODEX_GUARD = () => ({
+        args: codexUntrustArgs(['/path/to/app']),
+        home: CODEX_HOME_DIR,
+        keys: ['/path/to/app'],
+    });
 
     describe('runOpenAIOnce — смоук: кодер-сессия стартует и выдаёт дифф', () => {
         let runtime: ReturnType<typeof buildRuntime>;
@@ -1671,6 +1679,64 @@ describe('OpenAI-рантайм (#374) — codex exec, отдельный бин
             expect(argv.join(' ')).not.toContain('sk-openai-smoke');
             expect(opts.shell).toBe(false);
             expect(opts.env.OPENAI_API_KEY).toBe('sk-openai-smoke');
+        });
+
+        // #195: дом CLI — собранный раннером, окружение CLI раннера сессии не достаётся.
+        it('env спавна: CODEX_HOME — дом сессии, CODEX_* и адрес провайдера раннера вычищены', () => {
+            const saved = { ...process.env };
+            process.env.CODEX_HOME = '/path/to/human/.codex';
+            process.env.CODEX_SANDBOX = 'seatbelt';
+            process.env.OPENAI_BASE_URL = 'http://example.com/v1';
+            try {
+                const spawnFn = vi.fn<SpawnFake>(() => ({
+                    status: 0,
+                    stdout: 'ok',
+                    stderr: '',
+                    signal: null,
+                }));
+                runtime.runOpenAIOnce(
+                    'x',
+                    { maxTurns: 5 },
+                    spawnFn as unknown as SpawnSyncFn,
+                    undefined,
+                    VERSION_UNREAD,
+                    NO_CODEX_GUARD,
+                );
+                const [, argv, opts] = spawnFn.mock.calls[spawnFn.mock.calls.length - 1];
+                expect(opts.env.CODEX_HOME).toBe(CODEX_HOME_DIR);
+                expect(opts.env.CODEX_SANDBOX).toBeUndefined();
+                expect(opts.env.OPENAI_BASE_URL).toBeUndefined();
+                expect(argv).toEqual(expect.arrayContaining(codexUntrustArgs(['/path/to/app'])));
+            } finally {
+                process.env = saved;
+            }
+        });
+
+        it('сессия без недоверия проекту — стоп guard-probe до спавна', () => {
+            const spawnFn = vi.fn<SpawnFake>();
+            const pushes: string[] = [];
+            expect(() =>
+                runtime.runOpenAIOnce(
+                    'x',
+                    { maxTurns: 5 },
+                    spawnFn as unknown as SpawnSyncFn,
+                    undefined,
+                    VERSION_UNREAD,
+                    () => ({ args: [], home: CODEX_HOME_DIR, keys: ['/path/to/app'] }),
+                    {
+                        persistFn: null,
+                        pushEventFn: (msg: string) => {
+                            pushes.push(msg);
+                            return false;
+                        },
+                        exitFn: (code: number): never => {
+                            throw new Error(`exit ${String(code)}`);
+                        },
+                    },
+                ),
+            ).toThrow('exit 1');
+            expect(spawnFn).not.toHaveBeenCalled();
+            expect(pushes[0]).toMatch(/не изолированной[\s\S]*недоверия проекту/);
         });
 
         it('#8: промпт больше MAX_ARG_STRLEN доезжает до РЕАЛЬНОЙ сессии stdin-ом, argv короткий', () => {
@@ -17634,12 +17700,13 @@ describe('sessionSettingsArgs: отказ пробы посреди прогон
     });
 });
 
-// #119: барьер сессии Codex — тот же стоп, что у settings Claude, если проба не прошла.
-describe('codexGuardArgsFor: регистрация барьера Codex перед сессией', () => {
+// #119, #195: сессия Codex — тот же стоп, что у settings Claude, если проба не прошла; дом CLI
+// и недоверие проекту собираются там же.
+describe('codexSessionFor: барьер, недоверие и дом Codex перед сессией', () => {
     it('настройки дерева не читаются — стоп guard-probe с причиной и выход кодом 1', () => {
         const pushes: string[] = [];
         expect(() =>
-            ralph.codexGuardArgsFor(
+            ralph.codexSessionFor(
                 {
                     readFileFn: () => {
                         throw new Error('EACCES: нет прав');
@@ -17663,11 +17730,22 @@ describe('codexGuardArgsFor: регистрация барьера Codex пер�
         expect(pushes[0]).toMatch(/барьер сессии не прошёл пробу[\s\S]*Codex не собраны: EACCES/);
     });
 
-    it('проба прошла — аргументы регистрации с флагом доверия хуку', () => {
-        const args = ralph.codexGuardArgsFor(
+    it('проба прошла — регистрация с флагом доверия хуку, недоверие проекту, свой дом', () => {
+        const writes: string[] = [];
+        const links: string[][] = [];
+        const session = ralph.codexSessionFor(
             {
-                readFileFn: () => '{}',
+                readFileFn: (p: string) => {
+                    if (p.endsWith('.git')) throw new Error('EISDIR');
+                    return '{}';
+                },
                 runHookFn: (_h: unknown, payload: string) => heldRun(payload),
+                layersFn: () => [],
+                mkdirFn: () => {},
+                writeFileFn: (p: string) => writes.push(p),
+                existsFn: () => true,
+                entryKindFn: () => 'missing',
+                linkFn: (target: string, link: string) => links.push([target, link]),
             },
             {
                 tree: '/work',
@@ -17677,17 +17755,63 @@ describe('codexGuardArgsFor: регистрация барьера Codex пер�
                     sessionTree: '/work',
                     coreSha: '',
                 },
+                sourceHome: '/path/to/human/.codex',
+                env: {},
             },
         );
-        expect(args).toContain('--dangerously-bypass-hook-trust');
-        expect(args).toContain('hooks');
+        expect(session.args).toContain('--dangerously-bypass-hook-trust');
+        expect(session.args).toContain('hooks');
+        expect(session.args.slice(-2)).toEqual(codexUntrustArgs(['/work']));
+        expect(session.home).toMatch(/codex-session\/home$/);
+        expect(writes).toEqual([path.join(session.home, 'config.toml')]);
+        expect(links).toEqual([
+            ['/path/to/human/.codex/auth.json', path.join(session.home, 'auth.json')],
+        ]);
+    });
+
+    it('слой .codex/ в дереве — стоп guard-probe с путём и секциями, дом не собирается', () => {
+        const pushes: string[] = [];
+        const mkdirFn = vi.fn();
+        expect(() =>
+            ralph.codexSessionFor(
+                {
+                    readFileFn: () => '{}',
+                    runHookFn: (_h: unknown, payload: string) => heldRun(payload),
+                    layersFn: () => ['/work/.codex/config.toml: слой (секции: mcp_servers)'],
+                    mkdirFn,
+                },
+                {
+                    tree: '/work',
+                    roots: {
+                        productRoot: '/core',
+                        humanRoot: '/app',
+                        sessionTree: '/work',
+                        coreSha: '',
+                    },
+                    sourceHome: null,
+                    env: {},
+                    persistFn: null,
+                    pushEventFn: (msg: string) => {
+                        pushes.push(msg);
+                        return false;
+                    },
+                    exitFn: (code: number): never => {
+                        throw new Error(`exit ${String(code)}`);
+                    },
+                },
+            ),
+        ).toThrow('exit 1');
+        expect(pushes[0]).toMatch(
+            /слои конфига Codex[\s\S]*\.codex\/config\.toml[\s\S]*mcp_servers/,
+        );
+        expect(mkdirFn).not.toHaveBeenCalled();
     });
 
     // Ревью Фазы 16b: пустая регистрация пускала codex exec без хука — теперь стоп.
     it('вне main (дерево не задано) — стоп guard-probe, а не codex exec без хука', () => {
         const pushes: string[] = [];
         expect(() =>
-            ralph.codexGuardArgsFor(
+            ralph.codexSessionFor(
                 {},
                 {
                     tree: null,
@@ -18579,7 +18703,7 @@ describe('#217: переспрос намерений при отказе раз
                         s,
                         undefined,
                         VERSION_UNREAD,
-                        () => [],
+                        () => ({ args: [], home: '/h', keys: [] }),
                     ),
             ],
             [

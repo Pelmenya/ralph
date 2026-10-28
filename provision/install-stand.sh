@@ -309,7 +309,9 @@ prompt_for() {
 # стенд не едет сам: его называют `STAND_ISOLATE_ARGS` (`--pass-env ИМЯ`, `--bind файл:путь`,
 # `--allow host:port`), а без него CLI внутри не авторизован — и это честный отказ, а не
 # утечка. Функция `${CLI}_run` переезжает внутрь текстом: каталог канона в корне стенда виден
-# только каталогом `provision/stand/`.
+# только каталогом `provision/stand/`. Бинарь едет `--cli-bin`, а не `--ro`: Codex без
+# `codex-code-mode-host` из каталога релиза не исполняет внутри ни одного вызова (#231), и что
+# везти от бинаря, решает правило CLI в `stand.mts`.
 isolated_run() {
     local bin p ro=()
     bin="$(command -v "$BIN")" || { say "нет бинаря $BIN"; return 127; }
@@ -320,7 +322,7 @@ isolated_run() {
         if [ -e "$p" ]; then ro+=(--ro "$p"); fi
     done
     # shellcheck disable=SC2086
-    node "$CANON_ROOT/provision/stand/stand.mts" exec --stand "$W" --cli "$CLI" --ro "$bin" \
+    node "$CANON_ROOT/provision/stand/stand.mts" exec --stand "$W" --cli "$CLI" --cli-bin "$bin" \
         "${ro[@]}" ${STAND_ISOLATE_ARGS:-} -- bash -c \
         "$(declare -f "${CLI}_run"); $(declare -p LOOP EXT W BIN SESSION_TIMEOUT clean_env); ${CLI}_run \"\$1\"" \
         stand "$1"
@@ -700,7 +702,7 @@ if [ "${STAND_ISOLATE:-0}" = 1 ]; then
     # без них внутри «не найден», и строка версии врала бы о том, что поедет в пробу.
     # shellcheck disable=SC2086
     say "версия: $(node "$CANON_ROOT/provision/stand/stand.mts" exec --stand "$V" --cli "$CLI" \
-        --ro "$(command -v "$BIN")" ${STAND_ISOLATE_ARGS:-} -- "$BIN" --version 2>&1 | head -n 1)"
+        --cli-bin "$(command -v "$BIN")" ${STAND_ISOLATE_ARGS:-} -- "$BIN" --version 2>&1 | head -n 1)"
 else
     say "версия: $("${clean_env[@]}" "$BIN" --version 2>&1 | head -n 1)"
 fi

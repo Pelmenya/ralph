@@ -288,6 +288,7 @@ describe('чего описание не даёт — проблема матр�
         ['move', { Mv: 'move' }, { Mv: { path: 'from' } }, /роль destination/],
         ['search', { Grep: 'search' }, {}, /роль root/],
         ['read', { Cat: 'read' }, {}, /роль path/],
+        ['patch', { Patch: 'patch' }, {}, /роль patch/],
     ] as const)('%s без своей роли — проблема', (_op, toolMap, argMap, why) => {
         const d = sample();
         const fields = Object.fromEntries(Object.keys(toolMap).map((t) => [t, ['from']]));

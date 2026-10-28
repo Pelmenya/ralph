@@ -16,10 +16,11 @@
 //     без `--ignore-user-config` показал, что `[features] hooks = false` в `.codex/config.toml`
 //     снимает и хуки из `-c`. Под `--ignore-user-config` раннера недоверенный проектный конфиг
 //     не грузится вовсе, но флаг держит барьер, если доверие к дереву появится иным путём.
-//     Событие — форма Claude Code, `tool_name: "Bash"`;
-//     файловые инструменты хук не зовут — файл читается оболочкой, поэтому и проба у него
-//     только через Bash. Пишет же Codex и своим `apply_patch`, мимо барьера: предел назван
-//     строкой старта (`CODEX_GUARD_LIMIT`);
+//     Событие — форма Claude Code: `exec_command` приходит `tool_name: "Bash"` с одним
+//     `command`. Файловых инструментов чтения у Codex нет — файл читается оболочкой, поэтому
+//     и проба у него только через Bash. Пишет же Codex и своим `apply_patch`: хук на нём
+//     зовётся (стенд #188), и регистрация Codex судится событием его нормализатора (#232),
+//     который разбирает патч в запись, удаление и перенос по путям (#189);
 //   • Kimi Code 2.3 — `[[hooks]]` в `config.toml` дома CLI (`KIMI_CODE_HOME`). Имена
 //     инструментов — как у Claude Code, но путь у `Read`/`Grep`/`Write`/`Edit` — поле `path`,
 //     а не `file_path`; matcher — регулярное выражение БЕЗ якорей (`new RegExp(m).test`);
@@ -56,6 +57,12 @@ export type HarnessProbe = {
     what: string;
     toolName: string;
     toolInput: Record<string, unknown>;
+    /**
+     * Проба правила сессии петли (#232): хук получает контекст петли, как его получит сессия.
+     * Забор данных контура вне петли не действует, и без контекста хук дерева пропустил бы
+     * запрещённое — проба судила бы не то, что держит сессия.
+     */
+    loop?: true;
 } & ({ expect: 'blocked'; reasonCode: BarrierReasonCode } | { expect: 'allowed' });
 
 type ShellProbe = { what: string; command: string; reasonCode?: BarrierReasonCode };
@@ -88,6 +95,31 @@ const MCP_DELETE: HarnessProbe = {
     toolInput: {},
     expect: 'blocked',
     reasonCode: 'mcp-not-allowed',
+};
+
+/**
+ * Патч Codex (`apply_patch`, текст в `command`) — по одному на исход (#232). Запрещённый —
+ * данные контура: guard на событии судит патч по путям нормализатора, а совместимый вход 16b
+ * имя `apply_patch` пропускал, и проба без патча была зелёной на этой дыре. Разрешённый — пара:
+ * без неё сломанный нормализатор, блокирующий любой патч, прошёл бы пробу. Текст — тот же, что
+ * у `rule:apply_patch:contour-add` матрицы описания (сверяет тест пакета).
+ */
+const patchText = (target: string, line: string) =>
+    ['*** Begin Patch', `*** Add File: ${target}`, line, '*** End Patch', ''].join('\n');
+const CODEX_CONTOUR_PATCH: HarnessProbe = {
+    what: 'патч данных контура в сессии петли',
+    toolName: 'apply_patch',
+    toolInput: { command: patchText('.claude/ralph/hooks.json', '+{}') },
+    loop: true,
+    expect: 'blocked',
+    reasonCode: 'contour-data',
+};
+const CODEX_SAFE_PATCH: HarnessProbe = {
+    what: 'безобидный патч в сессии петли',
+    toolName: 'apply_patch',
+    toolInput: { command: patchText('.ralph-guard-probe/allowed.txt', '+x') },
+    loop: true,
+    expect: 'allowed',
 };
 
 /** Проба оболочки: с кодом причины — запрещённая, без него — безобидная. */
@@ -129,9 +161,20 @@ export const HARNESS_PROBES: Record<Harness, readonly HarnessProbe[]> = {
         MCP_DELETE,
         shell('Bash', SAFE),
     ],
-    // MCP-случая у Codex нет: PreToolUse `codex exec` зовёт только на оболочке (стенд).
-    // Предел назван строкой старта (`CODEX_GUARD_LIMIT`), а не умолчан.
-    codex: [shell('Bash', RM), shell('Bash', CAT), shell('Bash', SED), shell('Bash', SAFE)],
+    // Стенд #188 показал, что хук Codex зовётся и на MCP (`mcp__<сервер>__<инструмент>`,
+    // `harnesses/__fixtures__/codex-0.163.0-stand.json`). Нормализатор отображает такое имя в
+    // операцию `mcp` раньше сверки с `toolMap`, и вердикт даёт политика контура — тот же
+    // `mcp-not-allowed`, что у остальных. Дом сессии без серверов (#195) — второй слой, а не
+    // замена пробы. Патч судится событием (#232).
+    codex: [
+        shell('Bash', RM),
+        shell('Bash', CAT),
+        shell('Bash', SED),
+        MCP_DELETE,
+        CODEX_CONTOUR_PATCH,
+        shell('Bash', SAFE),
+        CODEX_SAFE_PATCH,
+    ],
     'kimi-code': [
         shell('Bash', RM),
         {
@@ -312,16 +355,22 @@ export function opencodeEvent(probe: HarnessProbe): {
 
 /**
  * Что барьер у Codex НЕ держит — строка старта рядом с «проба пройдена» (ревью Фазы 16b).
- * PreToolUse `codex exec` зовёт только на оболочке, а файлы Codex пишет и своим инструментом
- * `apply_patch`; кодер-сессии ходят с `danger-full-access`, и запись env-файла или данных
- * контура этим инструментом guard не видит. MCP закрыт не хуком, а `--ignore-user-config`
- * (`buildCodexArgs`): флаг снимает и конфиг, где записано доверие проекту, а `.codex/config.toml`
- * недоверенного проекта Codex 0.163 не грузит — MCP-сервер, дописанный туда сессией, следующая
- * сессия не поднимает (стенд 27.10: маркер сервера без флага есть, с флагом нет).
+ * Оболочку и `apply_patch` (`tool_name: "apply_patch"`, патч в `tool_input.command`) guard судит
+ * событием нормализатора пакета (#232): патч — по каждому пути записи, удаления и переноса. До
+ * карточки регистрация шла совместимым входом 16b, который незнакомое имя пропускал, и при
+ * `danger-full-access` кодер-сессий запись данных контура патчем проходила. Ввод в запущенный
+ * процесс (`write_stdin`) хук не зовёт вовсе (стенд #188,
+ * `harnesses/__fixtures__/codex-0.163.0-stand.json`), поэтому канал не судится, а выключен —
+ * `CODEX_DISABLE_TTY` в той же регистрации (#190). Вызов MCP guard судит событием политикой
+ * контура (проба `MCP_DELETE`), а серверы MCP и хуки проекта закрыты не хуком, а
+ * сборщиком конфига (#195, `codex-home.ts`): свой дом сессии, `--ignore-user-config`
+ * (`buildCodexArgs`) и недоверие проекту в argv — `.codex/` недоверенного проекта Codex 0.163 не
+ * исполняет (стенд `S-own`, `S-guard`), а слой в дереве или предке preflight отвергает.
  */
 export const CODEX_GUARD_LIMIT =
-    'codex: барьер держит только оболочку — запись файлов инструментом apply_patch идёт мимо ' +
-    'guard; MCP проекта закрыт --ignore-user-config (без доверия .codex/config.toml не грузится)';
+    'codex: ввод в процесс write_stdin хук не зовёт — канал выключен --disable unified_exec_tty; ' +
+    'серверы MCP и хуки проекта закрыты своим домом сессии и недоверием проекту, слой .codex/ в ' +
+    'дереве — отказ старта';
 
 /**
  * Что не держат регистрации всех харнессов, кроме Claude Code, — строка старта (ревью Фазы
@@ -336,6 +385,19 @@ export const SKILL_BARRIER_LIMIT =
 export const CODEX_HOOK_TRUST_FLAG = '--dangerously-bypass-hook-trust';
 export const CODEX_ENABLE_HOOKS: readonly string[] = ['--enable', 'hooks'];
 const CODEX_HOOKS_KEY = 'hooks.PreToolUse=';
+
+/**
+ * Ввод в запущенный процесс — канал мимо хука (#190). `write_stdin` Codex хуку не отдаёт ни
+ * прямым вызовом, ни из code mode, а судить ввод нечем: строка в REPL Python или Node — код,
+ * которого guard не видел. Перехвата нет, поэтому канал выключен: без TTY stdin процесса CLI
+ * закрывает сам («stdin is closed for this session»), а этот флаг убирает `tty` из схемы
+ * `exec_command` и отвергает `tty: true`. Стенд под argv петли (`L-tty-*`, `L-repl-*` в
+ * `harnesses/__fixtures__/codex-0.163.0-stand.json`): оболочка, `python3 -i` и `node -i` ввода
+ * не получают, тот же ввод в команде `exec_command` судит хук. `--disable unified_exec`
+ * `write_stdin` не снимает, `--disable shell_tool` снял бы всю оболочку.
+ */
+export const CODEX_DISABLE_TTY: readonly string[] = ['--disable', 'unified_exec_tty'];
+const CODEX_TTY_FEATURE = 'unified_exec_tty';
 
 /**
  * Строка JSON — годная базовая строка TOML: экранирование `\"`, `\\`, `\n`, `\uXXXX` у них
@@ -359,6 +421,7 @@ export function codexGuardArgs(hooks: readonly GuardHook[]): string[] {
     return [
         CODEX_HOOK_TRUST_FLAG,
         ...CODEX_ENABLE_HOOKS,
+        ...CODEX_DISABLE_TTY,
         '-c',
         `${CODEX_HOOKS_KEY}[${entries.join(',')}]`,
     ];
@@ -457,7 +520,69 @@ export function codexGuardFromArgs(argv: readonly string[]): {
             problems.push(`-c ${CODEX_HOOKS_KEY}… не разобрался: ${(error as Error).message}`);
         }
     });
+    problems.push(...codexTtyProblems(argv));
     return { hooks, problems };
+}
+
+/** Значения переопределений конфига в argv: `-c X`, `-cX`, `--config X`, `--config=X`. */
+function codexConfigOverrides(argv: readonly string[]): string[] {
+    const out: string[] = [];
+    argv.forEach((a, i) => {
+        if (a === '-c' || a === '--config') {
+            if (argv[i + 1] !== undefined) out.push(argv[i + 1]);
+        } else if (a.startsWith('--config=')) {
+            out.push(a.slice('--config='.length));
+        } else if (a.startsWith('-c') && !a.startsWith('--')) {
+            out.push(a.slice(2));
+        }
+    });
+    return out;
+}
+
+/** Ключ переопределения `key=value` по сегментам, без кавычек и пробелов у сегмента. */
+const overrideKey = (override: string): string[] =>
+    override
+        .split('=')[0]
+        .split('.')
+        .map((seg) => seg.trim().replace(/^"(.*)"$/, '$1'));
+
+/**
+ * Канал ввода в процесс закрыт, только если флаг стоит и TTY после него не включён обратно
+ * `--enable` (раздельно или `--enable=…`): у флагов Codex побеждает последнее слово.
+ * Переопределение конфига (`-c`, `-cX`, `--config`, `--config=`) ключом
+ * `features.unified_exec_tty` или всей таблицей `features` (`features={…}` — что она делает с
+ * остальными признаками, стендом не сверено) — отказ при любом значении и месте: порядок `-c`
+ * против `--disable` стендом не сверен. Другие ключи `features.*` канала не касаются. Argv
+ * собирает сам раннер, так что это сторож от регрессии сборки, а не от чужого argv.
+ */
+function codexTtyProblems(argv: readonly string[]): string[] {
+    let disabledAt = -1;
+    argv.forEach((a, i) => {
+        if (a === CODEX_DISABLE_TTY[0] && argv[i + 1] === CODEX_TTY_FEATURE) disabledAt = i;
+    });
+    if (disabledAt < 0) {
+        return [
+            `нет ${CODEX_DISABLE_TTY.join(' ')}: ввод в процесс write_stdin хук не зовёт, и с TTY он доходит до оболочки и REPL мимо барьера`,
+        ];
+    }
+    const enabledAgain = argv.some(
+        (a, i) =>
+            i > disabledAt &&
+            ((a === '--enable' && argv[i + 1] === CODEX_TTY_FEATURE) ||
+                a === `--enable=${CODEX_TTY_FEATURE}`),
+    );
+    const overridden = codexConfigOverrides(argv).some((o) => {
+        const key = overrideKey(o);
+        return (
+            key[0] === 'features' &&
+            (key.length === 1 || (key.length === 2 && key[1] === CODEX_TTY_FEATURE))
+        );
+    });
+    return enabledAgain || overridden
+        ? [
+              `${CODEX_TTY_FEATURE} переопределён рядом с ${CODEX_DISABLE_TTY.join(' ')}: ввод в процесс может быть открыт`,
+          ]
+        : [];
 }
 
 // ── Kimi Code: config.toml ───────────────────────────────────────────────────────────

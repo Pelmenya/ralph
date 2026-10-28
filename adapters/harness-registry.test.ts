@@ -39,8 +39,10 @@ const goodPackage = (harness: string, over: Record<string, unknown> = {}) => ({
         hookPayload: () => '{}',
         setsProjectDirEnv: false,
         skillBarrier: false,
+        guardInput: 'event',
         guardLimit: null,
         plugin: null,
+        projectLayers: null,
         ...over,
     },
 });
@@ -225,7 +227,9 @@ describe('форма кода пакета', () => {
                 probes: [],
                 setsProjectDirEnv: 'yes',
                 skillBarrier: undefined,
+                guardInput: 'compat',
                 guardLimit: '',
+                projectLayers: { homes: [] },
             }).harnessPackage,
             'a',
         );
@@ -236,7 +240,9 @@ describe('форма кода пакета', () => {
             'package.ts: нет состава пробы probes',
             'package.ts: setsProjectDirEnv не boolean',
             'package.ts: skillBarrier не boolean',
+            'package.ts: guardInput не event и не compat-16b',
             'package.ts: guardLimit не null и не непустая строка',
+            'package.ts: projectLayers не null и не объект с функцией homes',
         ]);
     });
 

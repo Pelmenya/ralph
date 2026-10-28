@@ -6,6 +6,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
+    CODEX_DISABLE_TTY,
     CODEX_HOOK_TRUST_FLAG,
     HARNESSES,
     HARNESS_PROBES,
@@ -174,6 +175,42 @@ describe('Codex: регистрация в argv', () => {
         expect(read('[{hooks = [{type = "command", command = "g", timeout = 3}]}]').hooks).toEqual([
             { matcher: '', command: 'g', timeoutSec: 3 },
         ]);
+    });
+
+    // #190: ввод в процесс (`write_stdin`) хук Codex не зовёт, а без TTY stdin процесса закрыт
+    // (стенд `L-repl-*`). Канал закрывает флаг, снимающий `tty`, — и argv без него не годится.
+    it('ввод в процесс закрыт: --disable unified_exec_tty в регистрации, без него — отказ', () => {
+        const argv = codexGuardArgs(HOOKS);
+        const at = argv.indexOf(CODEX_DISABLE_TTY[0]);
+        expect(argv.slice(at, at + 2)).toEqual([...CODEX_DISABLE_TTY]);
+        const without = argv.filter((a, i) => i !== at && i !== at + 1);
+        expect(codexGuardFromArgs(without).problems.join('\n')).toMatch(
+            /нет --disable unified_exec_tty[\s\S]*write_stdin/,
+        );
+    });
+
+    it('TTY, включённый обратно рядом с флагом, — тоже отказ: побеждает последнее слово', () => {
+        const argv = codexGuardArgs(HOOKS);
+        for (const extra of [
+            ['--enable', 'unified_exec_tty'],
+            ['-c', 'features.unified_exec_tty=true'],
+            ['-c', 'features.unified_exec_tty = true'],
+            ['--config', 'features.unified_exec_tty=true'],
+            ['--config=features.unified_exec_tty=true'],
+            ['-cfeatures.unified_exec_tty=true'],
+            ['-c', 'features={unified_exec_tty=true}'],
+            ['-c', '"features"."unified_exec_tty"=true'],
+            ['--enable=unified_exec_tty'],
+        ]) {
+            expect(
+                codexGuardFromArgs([...argv, ...extra]).problems.join('\n'),
+                extra.join(' '),
+            ).toMatch(/unified_exec_tty переопределён/);
+        }
+        // Другие ключи `features` канала не касаются.
+        expect(codexGuardFromArgs([...argv, '-c', 'features.hooks=true']).problems).toEqual([]);
+        // Оборванный `-c` в хвосте — не ключ TTY и не падение разбора.
+        expect(codexGuardFromArgs([...argv, '-c']).problems).toEqual([]);
     });
 
     it('хуков в argv нет — список пуст (отказ назовёт проба: «ни один хук не накрывает»)', () => {

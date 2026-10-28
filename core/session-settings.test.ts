@@ -29,8 +29,10 @@ import {
     hooksFor,
     type TRunHookFn,
     type TRunPluginFn,
+    type TLayersFn,
 } from './guard-probe.ts';
 import {
+    CODEX_DISABLE_TTY,
     CODEX_HOOK_TRUST_FLAG,
     OPENCODE_PLUGIN_DRIVER,
     codexGuardFromArgs,
@@ -38,6 +40,7 @@ import {
     opencodeHooksFromPlugin,
 } from '../adapters/harness-guard.ts';
 import { OPENCODE_CONFIG_DIR_ENV, OPENCODE_CONFIG_ENV } from '../adapters/opencode.ts';
+import { CODEX_SESSION_CONFIG, codexUntrustArgs } from '../adapters/codex-home.ts';
 import {
     CANON_SESSION_HOOKS,
     CORE_SHA_ENV,
@@ -50,6 +53,7 @@ import {
     describeSessionSettingsStart,
     doctorStartChecks,
     prepareCodexGuardArgs,
+    prepareCodexSession,
     prepareKimiNativeHome,
     prepareOpencodeSession,
     prepareSessionSettings,
@@ -57,6 +61,7 @@ import {
     resolveCoreSha,
     sessionStartChecks,
     shellQuote,
+    type TCodexSessionDeps,
     type TGitInDirFn,
 } from './session-settings.ts';
 import { heldRun } from '../tests/guard-fake.ts';
@@ -633,18 +638,24 @@ describe('prepareCodexGuardArgs — регистрация барьера Codex 
         );
         if (!r.ok) throw new Error(r.reason);
         expect(r.args).toContain(CODEX_HOOK_TRUST_FLAG);
+        // #190: ввод в процесс хук Codex не зовёт — канал выключен в том же argv.
+        expect(r.args.join(' ')).toContain(CODEX_DISABLE_TTY.join(' '));
         const { hooks } = codexGuardFromArgs(r.args);
         expect(hooks.map((h) => h.matcher)).toEqual(HARNESS_HOOK_MATCHERS);
         expect(hooks[0].command).toContain("CLAUDE_PROJECT_DIR='/work'");
+        // #232: судит событие нормализатора Codex — путь в каталоге ядра стоит и в export, и
+        // вместо пути Claude Code в команде канонического хука: присваивание перед node
+        // сильнее export, и хук установки иначе судил бы вход Codex нормализатором Claude Code.
+        const codexNormalizer = normalizerPathIn(HARNESS_REGISTRY, 'codex', '/core');
+        if (!codexNormalizer.ok) throw new Error(codexNormalizer.reason);
         expect(hooks[0].command).toContain(
-            canonHookCommand(
-                '/core',
-                'guard.cjs',
-                '/app',
-                'a'.repeat(40),
-                guardAdapterValue('/core'),
-            ),
+            canonHookCommand('/core', 'guard.cjs', '/app', 'a'.repeat(40), codexNormalizer.path),
         );
+        expect(hooks[0].command).toMatch(
+            /^export CLAUDE_PROJECT_DIR='\/work' RALPH_GUARD_ADAPTER='[^']+codex\/normalize\.ts' RALPH_GUARD_INPUT=''; /,
+        );
+        expect(hooks[0].command).not.toContain(guardAdapterValue('/core'));
+        expect(hooks[0].command).not.toContain('compat-16b');
     });
 
     it('без корней — хуки из .claude/settings.json дерева сессии', () => {
@@ -658,7 +669,7 @@ describe('prepareCodexGuardArgs — регистрация барьера Codex 
                         hooks: {
                             PreToolUse: [
                                 {
-                                    matcher: 'Bash',
+                                    matcher: '.*',
                                     hooks: [{ type: 'command', command: 'node g.cjs' }],
                                 },
                             ],
@@ -669,7 +680,11 @@ describe('prepareCodexGuardArgs — регистрация барьера Codex 
             },
         );
         expect(reads).toEqual([path.join('/work', '.claude', 'settings.json')]);
-        expect(r.ok).toBe(true);
+        if (!r.ok) throw new Error(r.reason);
+        // Хук дерева пути нормализатора не несёт — его даёт export регистрации (#232).
+        expect(codexGuardFromArgs(r.args).hooks[0].command).toMatch(
+            /RALPH_GUARD_ADAPTER='\/[^']+codex\/normalize\.ts' RALPH_GUARD_INPUT=''; node g\.cjs$/,
+        );
     });
 
     it('барьер не держит на событии Codex — отказ с причиной, аргументов нет', () => {
@@ -679,6 +694,19 @@ describe('prepareCodexGuardArgs — регистрация барьера Codex 
         );
         expect(r.ok).toBe(false);
         if (!r.ok) expect(r.reason).toMatch(/Проба барьера Codex[\s\S]*рекурсивное удаление/);
+    });
+
+    it('реестр — из параметра: без пакета Codex и вход guard, и проба судятся им, а не боевым', () => {
+        const registry = {
+            packages: new Map([...HARNESS_REGISTRY.packages].filter(([h]) => h !== 'codex')),
+            problems: new Map([['codex', ['подменён в тесте']]]),
+        };
+        const r = prepareCodexGuardArgs(
+            { roots, sessionTree: '/work' },
+            { readFileFn: () => '{}', runHookFn: codexGuard, registry },
+        );
+        expect(r.ok).toBe(false);
+        if (!r.ok) expect(r.reason).toMatch(/подменён в тесте/);
     });
 
     it('настройки не прочитались — отказ, а не сессия без хуков', () => {
@@ -693,6 +721,160 @@ describe('prepareCodexGuardArgs — регистрация барьера Codex 
         );
         expect(r.ok).toBe(false);
         if (!r.ok) expect(r.reason).toMatch(/Хуки для сессии Codex не собраны: ENOENT/);
+    });
+});
+
+// #195: дом сессии Codex — свой, проект недоверен, слои `.codex/` дерева — отказ. Дом человека
+// не читается и не пишется: в нём остаётся только цель ссылки входа.
+describe('prepareCodexSession — дом, недоверие и слои Codex перед сессией', () => {
+    const roots = { productRoot: '/core', humanRoot: '/app', coreSha: 'a'.repeat(40) };
+    const HOME = '/path/to/state/codex-session/home';
+    const HUMAN = '/path/to/human/.codex';
+    const codexGuard: TRunHookFn = (_h, payload) => heldRun(payload);
+    const fakeFs = (files: Record<string, string> = {}) => {
+        const touched: string[] = [];
+        const links: Array<[string, string]> = [];
+        const unlinked: string[] = [];
+        return {
+            touched,
+            links,
+            unlinked,
+            deps: {
+                readFileFn: (p: string) => {
+                    if (p in files) return files[p];
+                    if (p.endsWith('.git')) throw new Error('EISDIR');
+                    return '{}';
+                },
+                runHookFn: codexGuard,
+                layersFn: ((): string[] => []) as TLayersFn,
+                mkdirFn: (p: string) => touched.push(`mkdir ${p}`),
+                writeFileFn: (p: string, text: string) => touched.push(`write ${p} ${text}`),
+                existsFn: (p: string) => p.startsWith(HUMAN),
+                entryKindFn: (p: string): 'missing' | 'link' | 'other' =>
+                    p in files ? 'link' : 'missing',
+                unlinkFn: (p: string) => unlinked.push(p),
+                linkFn: (target: string, link: string) => links.push([target, link]),
+            },
+        };
+    };
+    const prepare = (
+        fs: ReturnType<typeof fakeFs>,
+        over: Partial<{ tree: string; source: string | null }> = {},
+    ) =>
+        prepareCodexSession(
+            {
+                roots,
+                sessionTree: over.tree ?? '/work',
+                home: HOME,
+                sourceHome: over.source === undefined ? HUMAN : over.source,
+                env: {},
+            },
+            fs.deps,
+        );
+
+    it('дом собран в каталоге состояния: config.toml без доверия и хуков, вход ссылкой', () => {
+        const fs = fakeFs();
+        const r = prepare(fs);
+        if (!r.ok) throw new Error(r.reason);
+        expect(r.home).toBe(HOME);
+        expect(fs.touched).toEqual([
+            `mkdir ${HOME}`,
+            `write ${HOME}/config.toml ${CODEX_SESSION_CONFIG}`,
+        ]);
+        expect(CODEX_SESSION_CONFIG).not.toMatch(/trust|hooks|mcp_servers/);
+        expect(fs.links).toEqual([[`${HUMAN}/auth.json`, `${HOME}/auth.json`]]);
+        // Дом человека не пишется: каждая запись — в доме сессии.
+        expect(fs.touched.every((t) => t.includes(HOME))).toBe(true);
+        expect(r.args.slice(-2)).toEqual(codexUntrustArgs(['/work']));
+        expect(r.args).toContain(CODEX_HOOK_TRUST_FLAG);
+    });
+
+    it('linked worktree — недоверие и ключом главного репозитория', () => {
+        const fs = fakeFs({
+            '/work/.git': 'gitdir: /app/.git/worktrees/work\n',
+            '/app/.git/worktrees/work/commondir': '../..\n',
+        });
+        const r = prepare(fs);
+        if (!r.ok) throw new Error(r.reason);
+        expect(r.keys).toEqual(['/work', '/app']);
+        expect(r.args.slice(-2)).toEqual(codexUntrustArgs(['/work', '/app']));
+    });
+
+    it('worktree без commondir — отказ: главный репозиторий не найден', () => {
+        const fs = fakeFs({ '/work/.git': 'gitdir: /app/.git/worktrees/work\n' });
+        fs.deps.readFileFn = (p: string) => {
+            if (p === '/work/.git') return 'gitdir: /app/.git/worktrees/work\n';
+            if (p.endsWith('commondir')) throw new Error('ENOENT');
+            return '{}';
+        };
+        const r = prepare(fs);
+        expect(r.ok).toBe(false);
+        if (!r.ok)
+            expect(r.reason).toMatch(/Недоверие проекту Codex не собрано: главный репозиторий/);
+        expect(fs.touched).toEqual([]);
+    });
+
+    it('слой .codex/ в дереве — отказ с путём до записи дома', () => {
+        const fs = fakeFs();
+        let asked: { tree: string; surfaces: readonly string[] } | null = null;
+        fs.deps.layersFn = (a) => {
+            asked = a;
+            return ['/work/.codex/config.toml: исполняемый слой (секции: mcp_servers)'];
+        };
+        const r = prepare(fs);
+        expect(r.ok).toBe(false);
+        if (!r.ok) expect(r.reason).toMatch(/слои конфига Codex[\s\S]*mcp_servers/);
+        expect(asked).toMatchObject({
+            tree: '/work',
+            surfaces: ['.codex/config.toml', '.codex/hooks.json'],
+        });
+        expect(fs.touched).toEqual([]);
+    });
+
+    it('дом сессии совпал с домом человека — отказ, дом человека не трогается', () => {
+        const fs = fakeFs();
+        const r = prepare(fs, { source: HOME });
+        expect(r.ok).toBe(false);
+        if (!r.ok) expect(r.reason).toMatch(/совпал с домом человека/);
+        expect(fs.touched).toEqual([]);
+    });
+
+    it('настоящий файл входа на месте ссылки — отказ, раннер его не удаляет', () => {
+        const fs = fakeFs();
+        fs.deps.entryKindFn = () => 'other';
+        const r = prepare(fs);
+        expect(r.ok).toBe(false);
+        if (!r.ok) expect(r.reason).toMatch(/В доме Codex сессии .*auth\.json — настоящий файл/);
+        expect(fs.unlinked).toEqual([]);
+    });
+
+    it('без дома человека — дом сессии без ссылок; старая ссылка снимается', () => {
+        const fs = fakeFs({ [`${HOME}/auth.json`]: '' });
+        const r = prepare(fs, { source: null });
+        expect(r.ok).toBe(true);
+        expect(fs.links).toEqual([]);
+        const again = fakeFs({ [`${HOME}/auth.json`]: '' });
+        again.deps.existsFn = () => false;
+        expect(prepare(again).ok).toBe(true);
+        expect(again.unlinked).toEqual([`${HOME}/auth.json`]);
+        expect(again.links).toEqual([]);
+    });
+
+    it('проба барьера не прошла — отказ раньше дома', () => {
+        const fs = fakeFs();
+        fs.deps.runHookFn = () => ({ status: 0, stderr: '' });
+        const r = prepare(fs);
+        expect(r.ok).toBe(false);
+        expect(fs.touched).toEqual([]);
+    });
+
+    it('запись дома упала — отказ с путём', () => {
+        const fs = fakeFs();
+        fs.deps.mkdirFn = () => {
+            throw new Error('EACCES');
+        };
+        const r = prepare(fs);
+        expect(!r.ok && r.reason).toMatch(/Дом Codex сессии не собран в .*EACCES/);
     });
 });
 
@@ -1112,14 +1294,19 @@ describe('проводка в оркестраторе', () => {
         }
     });
 
-    it('спавн codex-сессии идёт с регистрацией барьера, собранной после проверки DRY', () => {
+    it('спавн codex-сессии идёт с регистрацией барьера и домом, собранными после проверки DRY', () => {
         const fnStart = source.indexOf('function runOpenAIOnce(');
         const body = source.slice(fnStart, source.indexOf('return spawnCodex(', fnStart));
         const dry = body.indexOf('if (DRY) return');
-        const guard = body.indexOf('guardArgs: guardArgsFn()');
+        const session = body.indexOf('const session = sessionFn()');
+        const guard = body.indexOf('guardArgs: session.args');
         expect(dry).toBeGreaterThan(-1);
-        expect(guard).toBeGreaterThan(dry);
-        expect(source).toMatch(/guardArgsFn: \(\) => string\[\] = \(\) => codexGuardArgsFor\(\)/);
+        expect(session).toBeGreaterThan(dry);
+        expect(guard).toBeGreaterThan(session);
+        expect(source).toMatch(/sessionFn: \(\) => TCodexSession = \(\) => codexSessionFor\(\)/);
+        // #195: дом и окружение — сессии, и сверка изоляции до спавна.
+        expect(body).toMatch(/codexSessionEnv\([\s\S]*session\.home/);
+        expect(body.indexOf('codexIsolationProblems(')).toBeGreaterThan(guard);
         expect(source).toMatch(/cmdArgs\.push\(\.\.\.guardArgs, '--', '-'\)/);
     });
 
@@ -1381,6 +1568,50 @@ describe('подготовка сессий харнессов: боевые у�
     it('Codex: настройки человека читаются с диска — нет файла, есть хуки установки ядра', () => {
         const r = prepareCodexGuardArgs({ roots, sessionTree: missing }, { runHookFn: blockAll });
         expect(r.ok).toBe(true);
+    });
+
+    it('Codex: дерево и ссылки читаются с диска, запись дома — громкая побочка', () => {
+        const home = '/r/codex-session/home';
+        const human = `${missing}/.codex`;
+        const prepare = (deps: TCodexSessionDeps, sourceHome: string | null = human) =>
+            prepareCodexSession(
+                { roots, sessionTree: missing, home, sourceHome, env: {} },
+                {
+                    runHookFn: blockAll,
+                    layersFn: () => [],
+                    ...deps,
+                },
+            );
+        const noop = () => {};
+        // Каталог дома, файл конфига, снятие и установка ссылки — по одной побочке на шаг.
+        expect(prepare({}).ok).toBe(false);
+        expect(prepare({ mkdirFn: noop }).ok).toBe(false);
+        expect(prepare({ mkdirFn: noop, writeFileFn: noop, entryKindFn: () => 'link' }).ok).toBe(
+            false,
+        );
+        expect(
+            prepare({
+                mkdirFn: noop,
+                writeFileFn: noop,
+                entryKindFn: () => 'missing',
+                existsFn: () => true,
+            }).ok,
+        ).toBe(false);
+        expect(sideEffectAttempts.splice(0).join(' | ')).toMatch(
+            new RegExp(
+                [
+                    `prepareCodexSession:mkdir\\(${home}\\)`,
+                    `writeFileAtomic\\(${home}/[^)]*config\\.toml\\)`,
+                    `prepareCodexSession:unlink\\(${home}/auth\\.json\\)`,
+                    `prepareCodexSession:symlink\\(${home}/auth\\.json\\)`,
+                ].join('[\\s\\S]*'),
+            ),
+        );
+        // Входа у человека нет на диске, ссылки в доме нет — ставить нечего, побочек нет.
+        const r = prepare({ mkdirFn: noop, writeFileFn: noop });
+        if (!r.ok) throw new Error(r.reason);
+        expect(r.keys).toEqual([missing]);
+        expect(sideEffectAttempts.splice(0)).toEqual([]);
     });
 
     it('Kimi Code: конфиг человека читается с диска, запись дома — громкая побочка', () => {

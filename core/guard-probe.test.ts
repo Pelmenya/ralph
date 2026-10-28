@@ -7,14 +7,16 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { coreIsRepoRoot } from '../tests/core-repo.ts';
 import { sideEffectAttempts } from '../shared/side-effect-guard.ts';
 import {
     GUARD_PROBES,
     CONTEXT_UNPROVEN_LIMIT,
     ensureGuardHolds,
+    harnessLayerProblems,
     harnessRoutes,
+    PROJECT_LAYERS_LIMIT,
     harnessGuardProblems,
     hooksFor,
     matcherCovers,
@@ -22,6 +24,7 @@ import {
     probeProblems,
     codexArgsProblems,
     guardHooksOf,
+    guardInputOf,
     kimiTomlProblems,
     opencodePluginProblems,
     runHook,
@@ -38,7 +41,7 @@ import {
     type GuardHook,
 } from '../adapters/harness-guard.ts';
 import { readFileSync } from 'node:fs';
-import { HARNESS_REGISTRY } from '../adapters/harness-registry.ts';
+import { HARNESS_REGISTRY, normalizerPathIn } from '../adapters/harness-registry.ts';
 import { heldRun } from '../tests/guard-fake.ts';
 
 const CANON_ROOT = path.resolve(import.meta.dirname, '..');
@@ -60,7 +63,8 @@ const spawnHook: TRunHookFn = (hook, payload, projectDir, opts = {}) => {
         input: payload,
         encoding: 'utf-8',
         timeout: hook.timeoutSec * 1000,
-        env: hookEnv(projectDir, opts.projectDirEnv !== false),
+        // Контекст пробы правила петли (#232) — то, что кладёт боевой `runHook`.
+        env: { ...hookEnv(projectDir, opts.projectDirEnv !== false), ...opts.env },
     });
     return { status: r.status, stderr: r.stderr ?? '' };
 };
@@ -475,14 +479,79 @@ describe('ensureGuardHolds — старт отменяется до первой
         const c = calls();
         ensureGuardHolds('/path/to/app', {
             ...c,
-            readFileFn: () => JSON.stringify(settingsWith('Bash|Read|Edit|Grep|mcp__.*')),
+            readFileFn: () => JSON.stringify(settingsWith('.*')),
             runHookFn: goodGuard,
             runtimes: { coderRuntime: 'openai' },
+            layersFn: () => [],
         });
         expect(c.failed).toEqual([]);
         expect(c.logged[0]).toContain('claude-code, codex');
-        // Ревью Фазы 16b: «пройдена» у Codex — только про оболочку, и старт говорит это вслух.
-        expect(c.logged[1]).toMatch(/^⚠ codex: барьер держит только оболочку — .*apply_patch/);
+        // Ревью Фазы 16b: предел Codex старт говорит вслух. С #232 патч судится событием, и
+        // строка о нём больше не говорит — остаются каналы, закрытые не хуком.
+        expect(c.logged[1]).toMatch(/^⚠ codex: ввод в процесс write_stdin хук не зовёт/);
+        expect(c.logged[1]).not.toContain('apply_patch');
+    });
+
+    // #195: исполняемые слои конфига Codex — отказ старта с путём и секциями, своим текстом:
+    // барьер исправен, чинить надо дерево.
+    it('кодер в openai, .codex/config.toml с MCP-сервером в дереве — отказ старта с причиной', () => {
+        const c = calls();
+        const asked: unknown[] = [];
+        ensureGuardHolds('/path/to/app', {
+            ...c,
+            readFileFn: () => JSON.stringify(settingsWith('.*')),
+            runHookFn: goodGuard,
+            runtimes: { coderRuntime: 'openai' },
+            env: { HOME: '/path/to/home' },
+            layersFn: (a) => {
+                asked.push(a);
+                return ['/path/to/app/.codex/config.toml: исполняемый слой (секции: mcp_servers)'];
+            },
+        });
+        expect(asked).toEqual([
+            {
+                tree: '/path/to/app',
+                surfaces: ['.codex/config.toml', '.codex/hooks.json'],
+                homes: ['/path/to/home/.codex'],
+            },
+        ]);
+        expect(c.failed).toHaveLength(1);
+        expect(c.failed[0]).toMatch(
+            /^Исполняемые слои конфига харнесса[\s\S]*codex: \/path\/to\/app\/\.codex\/config\.toml[\s\S]*mcp_servers[\s\S]*Убери слой/,
+        );
+        expect(c.logged).toEqual([]);
+    });
+
+    it('пакет без сборщика конфига слоёв не проверяет — и старт говорит это строкой', () => {
+        const c = calls();
+        const layersFn = vi.fn(() => ['не должен звучать']);
+        ensureGuardHolds('/path/to/app', {
+            ...c,
+            settings: settingsWith('.*'),
+            runHookFn: (_h, payload) => heldRun(payload),
+            runtimes: { coderRuntime: 'claude' },
+            layersFn,
+        });
+        expect(c.failed).toEqual([]);
+        expect(layersFn).not.toHaveBeenCalled();
+        expect(harnessLayerProblems('kimi-code', '/w', {}, { layersFn })).toEqual([]);
+        expect(harnessLayerProblems('нет-такого', '/w', {}, { layersFn })).toEqual([]);
+        expect(c.logged.join('\n')).not.toContain(PROJECT_LAYERS_LIMIT);
+
+        const k = calls();
+        ensureGuardHolds('/path/to/app', {
+            ...k,
+            settings: settingsWith('.*'),
+            runHookFn: (_h, payload) => heldRun(payload),
+            runtimes: {
+                coderRuntime: 'claude',
+                modelRouting: { apiLimitFallback: { provider: 'kimi-native' } },
+            },
+            layersFn,
+        });
+        expect(k.failed).toEqual([]);
+        expect(layersFn).not.toHaveBeenCalled();
+        expect(k.logged).toContain(`⚠ kimi-code: ${PROJECT_LAYERS_LIMIT}`);
     });
 
     it('незнакомый рантайм при исправном барьере — fail с местом в конфиге', () => {
@@ -751,6 +820,43 @@ describe('живая проба: настоящие хуки процессом'
         expect(hooks.map((h) => h.matcher)).toEqual(['']);
     });
 
+    // #232: пакет с нормализатором получает путь своей команды и в export, и вместо пути харнесса
+    // настроек в команде канонического хука — присваивание перед node сильнее export.
+    it('guardHooksOf с путём нормализатора: путь заменён в команде, совместимый вход сброшен', () => {
+        const command = (adapter: string) =>
+            `RALPH_CORE_SHA='' RALPH_GUARD_ADAPTER=${adapter} node '/core/.claude/hooks/guard.cjs'`;
+        const of = (adapter: string) =>
+            guardHooksOf(
+                {
+                    hooks: {
+                        PreToolUse: [{ hooks: [{ type: 'command', command: command(adapter) }] }],
+                    },
+                },
+                '/work',
+                { adapter: "/co're/codex.ts" },
+            )[0].command;
+        const expected =
+            "export CLAUDE_PROJECT_DIR='/work' RALPH_GUARD_ADAPTER='/co'\\''re/codex.ts' " +
+            `RALPH_GUARD_INPUT=''; ${command("'/co'\\''re/codex.ts'")}`;
+        // В кавычках с экранированной кавычкой внутри и словом без кавычек.
+        expect(of("'/cl'\\''aude/normalize.ts'")).toBe(expected);
+        expect(of('/claude/normalize.ts')).toBe(expected);
+    });
+
+    it('guardInputOf: событие, совместимый вход и пакет, которого нет', () => {
+        const codex = guardInputOf(HARNESS_REGISTRY, 'codex');
+        expect(codex).toEqual({ adapter: HARNESS_REGISTRY.packages.get('codex')?.normalizerPath });
+        // Путь — от реестра: литерал каталога пакетов в коде ядра ловит `harness-package-deps`.
+        const moved = normalizerPathIn(HARNESS_REGISTRY, 'codex', '/core');
+        if (!moved.ok) throw new Error(moved.reason);
+        expect(moved.path.startsWith('/core/')).toBe(true);
+        expect(guardInputOf(HARNESS_REGISTRY, 'codex', '/core')).toEqual({ adapter: moved.path });
+        expect(guardInputOf(HARNESS_REGISTRY, 'kimi-code', '/core')).toBe('compat-16b');
+        // Значение-причина не абсолютный путь: guard на ней блокирует всё `adapter-failed`.
+        const missing = guardInputOf(HARNESS_REGISTRY, 'nope');
+        expect(missing).toEqual({ adapter: expect.stringMatching(/^пакет не принят: /) });
+    });
+
     it('guardHooksOf не переносит барьер скиллов ни каноническим путём, ни путём дерева', () => {
         const hooks = guardHooksOf(
             {
@@ -793,12 +899,13 @@ describe('живая проба: настоящие хуки процессом'
                 throw new Error(m);
             },
             logFn: (m) => lines.push(m),
-            settings: settingsWith('Bash|Read|Grep|mcp__.*'),
+            settings: settingsWith('.*'),
             runtimes: {
                 coderRuntime: 'claude',
                 modelRouting: { apiLimitFallback: { provider: 'openai' } },
             },
             runHookFn: (_h, payload) => heldRun(payload),
+            layersFn: () => [],
         });
         expect(lines.join('\n')).toMatch(/⚠ codex: барьер скиллов не зарегистрирован/);
     });
@@ -821,6 +928,7 @@ describe('живая проба: настоящие хуки процессом'
                           modelRouting: { apiLimitFallback: { provider: 'openai' } },
                       }
                     : { coderRuntime: 'claude' },
+                layersFn: () => [],
                 runHookFn: (_h, payload) =>
                     payload.includes('.claude/ralph/hooks.json')
                         ? { status: 2, stderr: 'ralph-reason-code: contour-data\n' }

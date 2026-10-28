@@ -4,10 +4,16 @@
     "cliVersion": "0.163.0",
     "normalizer": "normalize.ts",
     "toolMap": {
-        "Bash": "exec"
+        "Bash": "exec",
+        "apply_patch": "patch"
     },
     "argMap": {
-        "Bash": { "command": "command" }
+        "Bash": {
+            "command": "command"
+        },
+        "apply_patch": {
+            "patch": "command"
+        }
     },
     "allowedFields": {
         "envelope": [
@@ -19,24 +25,34 @@
             "model",
             "permission_mode",
             "tool_name",
-            "tool_input"
+            "tool_input",
+            "tool_use_id"
         ],
         "tools": {
-            "Bash": ["command"]
+            "Bash": ["command"],
+            "apply_patch": ["command"]
         }
     },
     "eventCoverage": {
-        "PreToolUse": {
+        "direct": {
             "mode": "intercepted",
-            "evidence": "-c hooks.PreToolUse в argv codex exec с --dangerously-bypass-hook-trust и --enable hooks; проба на том argv перед каждой сессией (core/session-settings.ts, prepareCodexGuardArgs); хук зовётся только на оболочке — apply_patch мимо него (CODEX_GUARD_LIMIT)"
+            "evidence": "прямой вызов инструмента (модели без code mode, gpt-5.5): PreToolUse из -c hooks.PreToolUse в argv codex exec с --dangerously-bypass-hook-trust и --enable hooks зовётся до эффекта на exec_command (как Bash) и apply_patch, код 2 останавливает вызов — стенд 0.163.0 `dx-exec`, `dx-patch`, `dx-patch-allowed`; регистрацию читает обратно проба перед каждой сессией (core/session-settings.ts, prepareCodexGuardArgs). судит регистрацию событие нормализатора пакета (#232), стартовая проба подаёт патч данных контура с контекстом петли"
+        },
+        "code-mode": {
+            "mode": "intercepted",
+            "evidence": "вложенные вызовы tools.* из exec code mode (gpt-6-astra, gpt-6-sol): хук получает каждый вложенный exec_command, apply_patch и MCP до эффекта — `cm-exec`, `cm-exec-allowed`, `cm-patch`, `cm-mcp`. Сам exec хук не получает, но среды для эффекта в нём нет: ни require, ни process, ни fetch, импорт отвергнут, наружу только tools.* — `L-exec-js` под argv петли"
+        },
+        "write_stdin": {
+            "mode": "disabled",
+            "evidence": "ввод в запущенный процесс хук не зовёт ни прямым вызовом, ни из code mode (`cm-stdin-live`, `dx-stdin-live`), поэтому канал выключен: --disable unified_exec_tty в регистрации барьера (codexGuardArgs) убирает tty из exec_command и отвергает tty=true, а у процесса без TTY stdin закрыт. Под argv петли оболочка, python3 -i и node -i ввода не получают, разрешённый ввод идёт командой exec_command под хуком — `L-tty-cm`, `L-tty-dx`, `L-repl-cm`, `L-repl-dx`; argv без флага или с TTY, включённым снова, отвергает проба старта (codexGuardFromArgs)"
         }
     },
-    "configSurfaces": [".codex/config.toml"],
+    "configSurfaces": [".codex/config.toml", ".codex/hooks.json"],
     "forbiddenEnv": [],
     "mcpNames": {},
     "skillEvidence": {
         "source": "заглушка: доказательства загрузки скилла нет — транскрипт rollout без вызова Skill (SKILL_BARRIER_LIMIT); поставщик — Фаза 16e"
     },
     "rules": ["AGENTS.md"],
-    "inventorySource": "заглушка: перечень — вход хука со стенда Фазы 11 (adapters/__fixtures__/hook-events.json); исследование CLI и нормализатор — Фаза 16d"
+    "inventorySource": "стенд 0.163.0 (adapters/harnesses/__fixtures__/codex-0.163.0-stand.json): хук зовётся на exec_command (Bash, вход — command), apply_patch (патч в command) и MCP (mcp__<сервер>__<инструмент>, без поля mcp_server); toolMap и allowedFields — ровно эти события (#189). Перечень инструментов CLI по моделям и флагам — раздел inventory; сверка с инвентарём машиной — Фаза 16f"
 }

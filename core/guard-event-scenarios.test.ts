@@ -7,8 +7,8 @@
 // намеренные ужесточения у Claude Code списком (`docs/harness-contract.md`, «Изменения
 // поведения у Claude Code»): каждое — с доказательством, что прежний вход пропускал вызов, иначе
 // «ужесточение» могло бы оказаться тем, что и так блокировалось. И промежуточное состояние
-// четырёх регистраций: Claude Code — через событие, Codex, Kimi Code и OpenCode — совместимым
-// входом 16b, где их запреты держатся, а незнакомое по-прежнему проходит.
+// четырёх регистраций: Claude Code и Codex (#232) — через событие своего нормализатора, Kimi Code
+// и OpenCode — совместимым входом 16b, где их запреты держатся, а незнакомое по-прежнему проходит.
 //
 // Пробы живые, но безопасные: хук решает, вызов не исполняется — исполнять его некому.
 import { spawnSync } from 'node:child_process';
@@ -20,7 +20,14 @@ import { describe, expect, it } from 'vitest';
 import { decide } from '../.claude/hooks/guard-rules.cjs';
 import { reasonCodeOf } from '../adapters/barrier-reason.ts';
 import { coreIsRepoRoot } from '../tests/core-repo.ts';
-import { GUARD_COMPAT_INPUT, GUARD_INPUT_ENV, guardHooksOf, hooksFor } from './guard-probe.ts';
+import { HARNESS_REGISTRY } from '../adapters/harness-registry.ts';
+import {
+    GUARD_COMPAT_INPUT,
+    GUARD_INPUT_ENV,
+    guardHooksOf,
+    guardInputOf,
+    hooksFor,
+} from './guard-probe.ts';
 import { GUARD_ADAPTER_ENV, buildSessionSettings } from './session-settings.ts';
 import { SESSION_CONTEXT_ENV } from './session-context.ts';
 
@@ -278,7 +285,48 @@ describe.skipIf(!coreIsRepoRoot())('промежуточное состояни�
         return allowed;
     };
 
-    it('Codex, Kimi Code и OpenCode: совместимый вход 16b — запреты держатся', () => {
+    // #232: патч данных контура совместимый вход пропускал (`apply_patch` ему незнаком), событие
+    // нормализатора Codex судит патч по путям.
+    it('Codex: регистрация судит событие своего нормализатора — патч контура блокирован', () => {
+        const input = guardInputOf(HARNESS_REGISTRY, 'codex', CANON_ROOT);
+        expect(input).not.toBe(GUARD_COMPAT_INPUT);
+        const hooks = guardHooksOf(settings, CANON_ROOT, input).filter((h) =>
+            /guard\.cjs/.test(h.command),
+        );
+        expect(hooks).toHaveLength(1);
+        const [{ command }] = hooks;
+        expect(command).not.toContain(GUARD_COMPAT_INPUT);
+        const patch = (target: string) => ({
+            command: [
+                '*** Begin Patch',
+                `*** Add File: ${target}`,
+                '+{}',
+                '*** End Patch',
+                '',
+            ].join('\n'),
+        });
+        expect(bridgeVerdict(command, 'apply_patch', patch('.claude/ralph/hooks.json'))).toEqual(
+            blocked('contour-data'),
+        );
+        expect(bridgeVerdict(command, 'apply_patch', patch('.ralph-probe/x.txt'))).toEqual(allowed);
+        expect(bridgeVerdict(command, 'Bash', { command: 'rm -rf ./x' })).toEqual(
+            blocked('destructive'),
+        );
+        expect(bridgeVerdict(command, 'Bash', { command: 'git status' })).toEqual(allowed);
+        // Незнакомое описанию пакета — запрет, а не проход, как было на совместимом входе.
+        expect(bridgeVerdict(command, 'SendMessage', {})).toEqual(blocked('unknown-tool'));
+        // От противного: тот же патч на совместимом входе проходит.
+        const [compat] = guardHooksOf(settings, CANON_ROOT).filter((h) =>
+            /guard\.cjs/.test(h.command),
+        );
+        expect(
+            bridgeVerdict(compat.command, 'apply_patch', patch('.claude/ralph/hooks.json')),
+        ).toEqual(allowed);
+    });
+
+    it('Kimi Code и OpenCode: совместимый вход 16b — запреты держатся', () => {
+        expect(guardInputOf(HARNESS_REGISTRY, 'kimi-code')).toBe(GUARD_COMPAT_INPUT);
+        expect(guardInputOf(HARNESS_REGISTRY, 'opencode')).toBe(GUARD_COMPAT_INPUT);
         const hooks = guardHooksOf(settings, CANON_ROOT).filter((h) =>
             /guard\.cjs/.test(h.command),
         );

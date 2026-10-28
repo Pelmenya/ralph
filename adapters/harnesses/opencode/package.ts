@@ -52,6 +52,8 @@ export const harnessPackage: HarnessPackage = {
     harness: HARNESS,
     guardRegistration: (_settings: unknown, guardHooks: readonly GuardHook[] = []) =>
         opencodeRegistrationFromPlugin(opencodeGuardPlugin(guardHooks)),
+    // Нормализатор пакета — заглушка до 16d: событием guard блокировал бы любой вызов.
+    guardInput: 'compat-16b',
     probes: HARNESS_PROBES[HARNESS],
     matcherCovers: (matcher, toolName) =>
         harnessMatcherCovers(HARNESS, matcher, opencodeClaudeToolName(toolName)),
@@ -66,4 +68,6 @@ export const harnessPackage: HarnessPackage = {
     // исполненным позже, — предел из докблока `opencodeGuardPlugin`, стендом не сверен.
     guardLimit: null,
     plugin,
+    // Сборщика конфига у пакета ещё нет (Фазы 16d2, 16d3): слои дерева не отвергаются.
+    projectLayers: null,
 };

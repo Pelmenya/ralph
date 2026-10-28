@@ -60,7 +60,22 @@ export const PROBE_TARGETS = {
 export const UNKNOWN_TOOL = 'ralph_probe_unknown_tool';
 export const UNKNOWN_FIELD = 'ralph_probe_unknown_field';
 
-type ToolProbes = { negatives: ProbeCase[]; positive: ProbeCase | null };
+/**
+ * `positive` — разрешённая пара по умолчанию; `extraPositives` — свои пары отрицательных, у
+ * которых разрешённая другой формы (патч: Update, Delete, Move и патч на три файла).
+ */
+type ToolProbes = {
+    negatives: ProbeCase[];
+    positive: ProbeCase | null;
+    extraPositives?: ProbeCase[];
+};
+
+/** Текст патча `*** Begin Patch` из строк тела. */
+export const patchText = (...body: string[]): string =>
+    ['*** Begin Patch', ...body, '*** End Patch', ''].join('\n');
+
+/** Hunk Update без контекста: дописать строку в конец существующего файла. */
+const UPDATE_BODY = ['@@', '+ralph-probe'];
 
 const T = PROBE_TARGETS;
 
@@ -192,6 +207,107 @@ function toolProbes(d: HarnessDescriptor, tool: string, problems: string[]): Too
                 }),
             };
         }
+        case 'patch': {
+            // Пути патча — в тексте, а не полями (#189): каждый класс hunk'а судится отдельно, и
+            // патч на три файла с одним защищённым обязан блокироваться целиком. Поверхности
+            // конфига здесь не пробуются: guard на событии их пока не судит (`decideEvent`), и
+            // их проба — полная матрица Фазы 16f.
+            const f = need('patch');
+            if (!f) return { negatives: [], positive: null };
+            const [patch] = f;
+            const a = '.ralph-probe/a.txt';
+            const c = '.ralph-probe/c.txt';
+            const allowed = (slug: string, what: string, ...body: string[]): ProbeCase => ({
+                ...pos(what, 'mutation', { [patch]: patchText(...body) }),
+                id: id(slug),
+            });
+            const contour = (slug: string, what: string, pair: string, ...body: string[]) => ({
+                ...neg(slug, what, 'mutation', 'contour-data', { [patch]: patchText(...body) }),
+                pair: id(pair),
+            });
+            return {
+                positive: allowed(
+                    'allowed',
+                    'патч Add разрешённого пути',
+                    `*** Add File: ${T.allowedWrite}`,
+                    '+ralph-probe',
+                ),
+                extraPositives: [
+                    allowed(
+                        'allowed-update',
+                        'патч Update разрешённого пути',
+                        `*** Update File: ${T.allowedWrite}`,
+                        ...UPDATE_BODY,
+                    ),
+                    allowed(
+                        'allowed-delete',
+                        'патч Delete разрешённого пути',
+                        `*** Delete File: ${T.victim}`,
+                    ),
+                    allowed(
+                        'allowed-move',
+                        'патч Update с Move to в разрешённый путь',
+                        `*** Update File: ${T.allowedWrite}`,
+                        `*** Move to: ${T.moved}`,
+                        ...UPDATE_BODY,
+                    ),
+                    allowed(
+                        'allowed-three',
+                        'патч на три разрешённых файла',
+                        `*** Add File: ${a}`,
+                        '+ralph-probe',
+                        `*** Add File: ${T.allowedWrite}`,
+                        '+ralph-probe',
+                        `*** Add File: ${c}`,
+                        '+ralph-probe',
+                    ),
+                ],
+                negatives: [
+                    contour(
+                        'contour-add',
+                        'патч Add данных контура',
+                        'allowed',
+                        `*** Add File: ${T.contour}`,
+                        '+{}',
+                    ),
+                    contour(
+                        'contour-update',
+                        'патч Update данных контура',
+                        'allowed-update',
+                        `*** Update File: ${T.contour}`,
+                        ...UPDATE_BODY,
+                    ),
+                    contour(
+                        'contour-delete',
+                        'патч Delete данных контура',
+                        'allowed-delete',
+                        `*** Delete File: ${T.contour}`,
+                    ),
+                    contour(
+                        'contour-move',
+                        'патч Move to на место данных контура',
+                        'allowed-move',
+                        `*** Update File: ${T.allowedWrite}`,
+                        `*** Move to: ${T.contour}`,
+                        ...UPDATE_BODY,
+                    ),
+                    contour(
+                        'contour-three',
+                        'патч на три файла, один — данные контура: блок всего вызова',
+                        'allowed-three',
+                        `*** Add File: ${a}`,
+                        '+ralph-probe',
+                        `*** Add File: ${T.contour}`,
+                        '+{}',
+                        `*** Add File: ${c}`,
+                        '+ralph-probe',
+                    ),
+                    neg('secret', 'патч Add env-файла', 'mutation', 'secret-env', {
+                        [patch]: patchText(`*** Add File: ${T.secret}`, '+A=1'),
+                    }),
+                ],
+            };
+        }
         case 'search': {
             const f = need('root');
             if (!f) return { negatives: [], positive: null };
@@ -297,10 +413,10 @@ export function probeMatrix(d: HarnessDescriptor): ProbeMatrix {
     const negatives: ProbeCase[] = [];
 
     for (const tool of Object.keys(d.toolMap)) {
-        const { negatives: neg, positive } = toolProbes(d, tool, problems);
+        const { negatives: neg, positive, extraPositives = [] } = toolProbes(d, tool, problems);
         // Пара той же операции — если она есть; иначе общая, ниже.
         for (const n of neg) negatives.push(positive ? n : { ...n, pair: undefined });
-        if (positive) positives.push(positive);
+        if (positive) positives.push(positive, ...extraPositives);
         // Незнакомое поле входа — у инструмента, чей вход разбирается по argMap.
         if (positive && Object.keys(positive.input ?? {}).length > 0) {
             const fieldName = freeName(UNKNOWN_FIELD, (n) =>

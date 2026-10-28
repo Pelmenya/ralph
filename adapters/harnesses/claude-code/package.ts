@@ -90,6 +90,8 @@ export const harnessPackage: HarnessPackage = {
     interfaceVersion: 1,
     harness: HARNESS,
     guardRegistration,
+    // Путь своего нормализатора регистрация получает от сборки настроек (`guardAdapterValue`).
+    guardInput: 'event',
     probes: HARNESS_PROBES[HARNESS],
     matcherCovers: (matcher, toolName) => harnessMatcherCovers(HARNESS, matcher, toolName),
     hookPayload: (probe: HarnessProbe, projectDir: string) =>
@@ -102,4 +104,6 @@ export const harnessPackage: HarnessPackage = {
     guardLimit: null,
     // Барьер — команды хуков, их исполняет проба сама.
     plugin: null,
+    // Сборщика конфига у пакета ещё нет (Фазы 16d2, 16d3): слои дерева не отвергаются.
+    projectLayers: null,
 };

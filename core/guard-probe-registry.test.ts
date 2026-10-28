@@ -24,6 +24,7 @@ import {
     unguardedRoutes,
     type TRunHookFn,
 } from './guard-probe.ts';
+import { codexGuardArgs } from '../adapters/harness-guard.ts';
 import { heldRun } from '../tests/guard-fake.ts';
 
 const CANON_ROOT = path.resolve(import.meta.dirname, '..');
@@ -186,6 +187,19 @@ describe('выбор харнесса — реестром', () => {
         expect(opencodePluginProblems('', '/x', { registry })).toEqual([
             'пакета харнесса «opencode» в реестре нет — доказать guard нечем',
         ]);
+    });
+
+    // #190: argv Codex без флага, закрывающего ввод в процесс, — отказ старта с причиной,
+    // даже если хуки на месте и пробу проходят.
+    it('Codex: argv без --disable unified_exec_tty — отказ пробы с причиной write_stdin', () => {
+        const argv = codexGuardArgs([{ matcher: '.*', command: 'node g.cjs', timeoutSec: 10 }]);
+        const at = argv.indexOf('unified_exec_tty');
+        const problems = codexArgsProblems(
+            argv.filter((_, i) => i !== at - 1 && i !== at),
+            '/x',
+            { runHookFn: () => ({ status: 0, stderr: '' }) },
+        );
+        expect(problems.join('\n')).toMatch(/нет --disable unified_exec_tty[\s\S]*write_stdin/);
     });
 
     it('исходник плагина пакету без регистрации плагином — отказ, а не проба хуками', () => {

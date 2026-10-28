@@ -10,8 +10,9 @@
  * Отказ разбора argv — регистрация непригодна целиком: без флага доверия Codex молча не
  * зовёт хук из `-c`, и проба, запустившая хуки сама, увидела бы барьер, которого нет.
  *
- * Поля, которых у Codex ещё нет, — объявленные заглушки: нормализатор (`normalize.ts`) и
- * доказательство скилла в описании ждут Фаз 16d и 16e.
+ * Поля, которых у Codex ещё нет, — объявленные заглушки: доказательство скилла в описании
+ * ждёт Фазы 16e. Сборщик конфига — `codex-home.ts` (#195): своя функция у пакета здесь одна —
+ * какие дома CLI не считать слоем проекта.
  *
  * Версия интерфейса — литерал: под неё пакет написан (`harness-package.ts`).
  */
@@ -26,6 +27,7 @@ import {
     type HarnessProbe,
 } from '../../harness-guard.ts';
 import type { GuardRegistration, HarnessPackage } from '../../harness-package.ts';
+import { codexHumanHome } from '../../codex-home.ts';
 
 const HARNESS = 'codex';
 
@@ -41,6 +43,9 @@ export const harnessPackage: HarnessPackage = {
     harness: HARNESS,
     guardRegistration: (_settings: unknown, guardHooks: readonly GuardHook[] = []) =>
         codexRegistrationFromArgs(codexGuardArgs(guardHooks)),
+    // Нормализатор разбирает `apply_patch` в запись, удаление и перенос (#189), и guard судит
+    // патч по путям — совместимый вход его пропускал (#232).
+    guardInput: 'event',
     probes: HARNESS_PROBES[HARNESS],
     matcherCovers: (matcher, toolName) => harnessMatcherCovers(HARNESS, matcher, toolName),
     hookPayload: (probe: HarnessProbe, projectDir: string) =>
@@ -53,4 +58,14 @@ export const harnessPackage: HarnessPackage = {
     guardLimit: CODEX_GUARD_LIMIT,
     // Барьер — команды хуков, их исполняет проба сама.
     plugin: null,
+    // Слои `.codex/` дерева и предков preflight отвергает (#195). Дом CLI человека — тоже
+    // `.codex` в предке (`~/.codex`), но это дом, а не слой проекта: сессия его не читает, у неё
+    // свой (`codex-home.ts`). Исключены оба дома: `CODEX_HOME`, если задан, и `~/.codex` — его
+    // мог оставить прежний запуск CLI без переменной, а Codex при заданной его не читает.
+    projectLayers: {
+        homes: (env: NodeJS.ProcessEnv) => {
+            const homes = [codexHumanHome(env), codexHumanHome({ HOME: env.HOME })];
+            return [...new Set(homes.filter((h): h is string => h !== null))];
+        },
+    },
 };

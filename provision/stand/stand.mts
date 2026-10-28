@@ -19,8 +19,10 @@
  * ЗАПУСК:
  *   node provision/stand/stand.mts check [--human-home <дом>]
  *   node provision/stand/stand.mts exec --stand <каталог> --cli <имя> [--allow host:port]…
- *        [--ro <путь>]… [--bind <файл>:<путь в стенде>]… [--pass-env <ИМЯ>]…
+ *        [--cli-bin <бинарь CLI>] [--ro <путь>]… [--bind <файл>:<путь в стенде>]…
+ *        [--pass-env <ИМЯ>]…
  *        [--upstream-proxy http://host:port | --upstream-proxy-env <ИМЯ>] -- <команда…>
+ *   `--cli-bin` — бинарь CLI: что от него едет внутрь, решает правило CLI (`cliBinary`).
  *   `--upstream-proxy` — прокси хоста, через который прокси стенда выходит к провайдеру
  *   (`egress.mts`); без него соединение с провайдером прямое. Адрес с кредами — только
  *   `--upstream-proxy-env`: argv процесса виден любому пользователю хоста, окружение — нет.
@@ -314,6 +316,39 @@ export function extraReadOnly(paths: readonly string[]): string[] {
 }
 
 /**
+ * CLI, которым бинаря мало: рядом с ним лежит исполнитель, без которого CLI внутри не
+ * работает (#231). Codex исполняет code mode моделей отдельным бинарём `codex-code-mode-host`
+ * из каталога релиза: стенд #188 с одним `codex` получил «host executable was not found»,
+ * code mode отказал закрыто, и ни один вложенный вызов не дошёл до хука — проба судила бы
+ * отказ CLI, а не барьер. Каталог едет целиком только тогда, когда этот сосед в нём есть:
+ * иначе это не каталог релиза, а, например, общий `bin` в доме человека. Сам релиз
+ * standalone-установки лежит в доме CLI человека (`~/.codex/packages/…/bin`), но едет только
+ * этот `bin`: конфиг и ключ человека рядом с ним внутрь не попадают.
+ */
+const CLI_RELEASE_COMPANIONS: Readonly<Record<string, string>> = {
+    codex: 'codex-code-mode-host',
+};
+
+/**
+ * Что едет внутрь от бинаря CLI: `ro` — путь на чтение, `pathDir` — каталог в начало PATH
+ * внутри. Обычно — сам файл по реальному пути (почему файлом — докблок `extraReadOnly`), PATH
+ * не трогается. CLI с соседом по релизу — каталог релиза, и он же на PATH: симлинк из дома
+ * человека (`~/.local/bin`) внутри не виден, а имя CLI должно найти тот бинарь, рядом с
+ * которым лежит сосед.
+ */
+export function cliBinary(cli: string, bin: string): { ro: string; pathDir: string | null } {
+    const real = realpathSync(bin);
+    const companion = CLI_RELEASE_COMPANIONS[cli];
+    if (!companion) return { ro: real, pathDir: null };
+    const dir = dirname(real);
+    if (!existsSync(join(dir, companion)))
+        throw new Error(
+            `stand exec: рядом с ${real} нет ${companion} — без него ${cli} внутри не исполнит ни одного вызова`,
+        );
+    return { ro: dir, pathDir: dir };
+}
+
+/**
  * Текст списка для `isolate.sh`: `ro <путь>` и `bind <файл> <путь в стенде>`. Строки `ro`
  * связываются ПОСЛЕ стенда, поэтому `ro` предка стенда (или его самого) закрыл бы стенд на
  * запись: проба падала бы на собственной раскладке, и причину называли бы только красные
@@ -595,6 +630,7 @@ export function parseExecArgs(
     cli: string;
     allow: string[];
     ro: string[];
+    pathDirs: string[];
     binds: { src: string; dst: string }[];
     passEnv: string[];
     upstream: TUpstreamProxy | null;
@@ -605,11 +641,13 @@ export function parseExecArgs(
         cli: '',
         allow: [] as string[],
         ro: [] as string[],
+        pathDirs: [] as string[],
         binds: [] as { src: string; dst: string }[],
         passEnv: [] as string[],
         upstream: null as TUpstreamProxy | null,
         command: [] as string[],
     };
+    let cliBin: string | null = null;
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i];
         const v = argv[i + 1];
@@ -623,6 +661,7 @@ export function parseExecArgs(
         else if (a === '--cli') out.cli = v;
         else if (a === '--allow') out.allow.push(v);
         else if (a === '--ro') out.ro.push(v);
+        else if (a === '--cli-bin') cliBin = v;
         else if (a === '--pass-env') out.passEnv.push(v);
         else if (a === '--upstream-proxy') {
             out.upstream = parseUpstreamProxy(v);
@@ -644,6 +683,11 @@ export function parseExecArgs(
     if (!(out.cli in PROVIDER_ADDRESSES))
         throw new Error(`stand exec: незнакомый CLI «${out.cli}»`);
     if (out.command.length === 0) throw new Error('stand exec: нет команды после --');
+    if (cliBin !== null) {
+        const b = cliBinary(out.cli, cliBin);
+        out.ro.push(b.ro);
+        if (b.pathDir) out.pathDirs.push(b.pathDir);
+    }
     return out;
 }
 
@@ -681,7 +725,7 @@ async function execInStand(argv: readonly string[]): Promise<number> {
         : a.command;
     const cmd = isolatedCommand(layout, inner, {
         env: standEnv(layout, {
-            path: process.env.PATH ?? '/usr/bin:/bin',
+            path: [...a.pathDirs, process.env.PATH ?? '/usr/bin:/bin'].join(':'),
             passEnv,
             proxyPort: proxy ? port : undefined,
         }),

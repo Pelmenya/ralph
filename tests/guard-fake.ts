@@ -22,6 +22,7 @@ export function probeReasonCode(text: string): BarrierReasonCode {
 
 /** Исход исправного барьера на входе: безобидное пропущено, запрещённое названо своим кодом. */
 export function heldRun(text: string): { status: number; stderr: string } {
-    if (text.includes('git status')) return { status: 0, stderr: '' };
+    // Безобидное — команда оболочки и патч Codex в разрешённый файл (#232).
+    if (/git status|\.ralph-guard-probe\/allowed\.txt/.test(text)) return { status: 0, stderr: '' };
     return { status: 2, stderr: `заблокировано\n${reasonLine(probeReasonCode(text))}\n` };
 }

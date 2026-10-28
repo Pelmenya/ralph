@@ -1,0 +1,1450 @@
+{
+    "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026, карточка #188. Модель — фиктивный провайдер Responses API на loopback стенда (-c model_provider=mock): он отдаёт заранее заданный вызов инструмента (поле call) и пишет запросы CLI. Диспетчер инструментов, хуки, исполнение, запись конфига — настоящего бинаря. Хук стенда пишет свой stdin целиком и выходит кодом 2 на маркере ralph-stand-forbidden. Заменены только корень стенда (/path/to/stand; его дом — /path/to/stand-home) и каталог скриптов стенда (/path/to/stand-scripts).",
+    "cliVersion": "0.163.0",
+    "assembled": false,
+    "conditions": "Воспроизведение: kit['stand.sh'] <случай> на хосте поднимает новый стенд и исполняет kit['drive.sh'] в изоляции ОС; drive.sh создаёт репозиторий потребителя work/consumer с коммитом, исполняет pre() из caseScript (исходный конфиг дома и проекта), коммитит и ставит linked worktree work/loop, поднимает kit['mock.mjs'] и зовёт codex exec из work/loop (или work/loop/sub при LOOPSUB). Окружение — standEnv стенда: HOME и CODEX_HOME внутри стенда, ключей нет, NO_PROXY=127.0.0.1. Кроме argv случая, в каждый вызов идут -c model_provider=mock -c model=<model> -c model_providers.mock={…wire_api=responses…} (см. drive.sh); промпт — 'go'. Исходный CODEX_HOME пуст, если pre() не пишет туда config.toml. Случаи sessionHome (#195) и S-anc — тем же набором: kit['steps3.py'] даёт три ответа провайдера (запрещённый вызов, разрешённый, конец), а S-own и S-guard перед вызовом переводят CODEX_HOME в свой каталог стенда (дом сессии раннера), оставляя CODEX_HOME стенда домом человека; guard канона в стенде — только для чтения (--ro .claude/hooks).",
+    "kit": {
+        "stand.sh": "#!/usr/bin/env bash\n# Хост: новый стенд под случай, исполнение drive.sh в изоляции.\nset -u\nCASE=\"$1\"; ST=\"/path/to/stand/$CASE.$(date +%s)\"; mkdir -p /path/to/stand\nBIN=$(readlink -f \"$(command -v codex)\")\ncd /path/to/canon\nCODEX_BIN=\"$BIN\" node provision/stand/stand.mts exec --stand \"$ST\" --cli codex --ro \"$(dirname \"$(dirname \"$BIN\")\")\" --ro /path/to/stand-scripts --ro /path/to/canon/provision/stand --ro /path/to/canon/.claude/hooks --pass-env CODEX_BIN \\\n  -- bash /path/to/stand-scripts/drive.sh \"$CASE\"\necho \"stand=$ST rc=$?\"\n",
+        "drive.sh": "#!/usr/bin/env bash\n# Внутри стенда: фиктивный провайдер, репозиторий потребителя + linked worktree, codex exec.\nset -uo pipefail\nCASE=\"$1\"; S=\"$(dirname \"$HOME\")\"; OUT=\"$S/journal/$CASE\"; mkdir -p \"$OUT\"\nD=\"$(dirname \"${BASH_SOURCE[0]}\")\"; CODEX=\"${CODEX_BIN:?}\"\nC=\"$S/work/consumer\"; LOOP=\"$S/work/loop\"; PORT=18999\nmkdir -p \"$CODEX_HOME\"\ngit init -q \"$C\"; git -C \"$C\" -c user.name=s -c user.email=s@example.com commit -q --allow-empty -m init\nARGS=(); STEPS='[[{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"m1\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}]]'\npre() { :; }; post() { :; }\nhookreg() { printf 'hooks.PreToolUse=[{matcher=\"%s\",hooks=[{type=\"command\",command=\"node %s %s\",timeout=10}]}]' \"${2:-.*}\" \"$D/hook.cjs\" \"$1\"; }\nHOOK=(--enable hooks --dangerously-bypass-hook-trust -c \"$(hookreg \"$OUT/hook.jsonl\")\")\njs() { python3 -c 'import json,sys;print(json.dumps([[{\"type\":\"custom_tool_call\",\"name\":\"exec\",\"call_id\":\"call-1\",\"input\":sys.argv[1]}],[{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"m2\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}]]))' \"$1\"; }\nfc() { python3 -c 'import json,sys;print(json.dumps([[{\"type\":sys.argv[1],\"name\":sys.argv[2],\"call_id\":\"call-1\",(\"input\" if sys.argv[1]==\"custom_tool_call\" else \"arguments\"):sys.argv[3]}],[{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"m2\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}]]))' \"$@\"; }\nMCP=(-c \"mcp_servers.stand={command=\\\"node\\\",args=[\\\"/path/to/canon/provision/stand/fake-mcp.mts\\\",\\\"$RALPH_STAND_MCP_JOURNAL\\\"]}\")\n. \"$D/cases/$CASE.sh\"\npre\ngit -C \"$C\" add -A; git -C \"$C\" -c user.name=s -c user.email=s@example.com commit -q --allow-empty -m cfg\ngit -C \"$C\" worktree add -q --detach \"$LOOP\"\nprintf '%s' \"$STEPS\" >\"$OUT/steps.json\"\nnode \"$D/mock.mjs\" $PORT \"$OUT/steps.json\" \"$OUT/provider.jsonl\" & MP=$!\nfor i in $(seq 50); do grep -q ready \"$OUT/provider.jsonl\" 2>/dev/null && break; sleep 0.1; done\ncp \"$CODEX_HOME/config.toml\" \"$OUT/config.before.toml\" 2>/dev/null\nPROV=(-c model_provider=mock -c \"model=${MODEL:-gpt-6-astra}\"\n  -c \"model_providers.mock={name=\\\"mock\\\",base_url=\\\"http://127.0.0.1:$PORT/v1\\\",wire_api=\\\"responses\\\",requires_openai_auth=false,request_max_retries=0,stream_max_retries=0}\")\nprintf '%q ' codex exec \"${ARGS[@]}\" >\"$OUT/argv.txt\"\n(cd \"$LOOP${LOOPSUB:+/sub}\" && HOOK_LOG=\"$OUT/hook.jsonl\" timeout 120 \"$CODEX\" exec \"${PROV[@]}\" \"${ARGS[@]}\" 'go' </dev/null >\"$OUT/stdout.txt\" 2>\"$OUT/stderr.txt\"); echo \"exit=$?\" >\"$OUT/exit.txt\"\ncp \"$CODEX_HOME/config.toml\" \"$OUT/config.after.toml\" 2>/dev/null\npost\nkill $MP\n( cd \"$LOOP\" && git status --porcelain --ignored ) >\"$OUT/loop-status.txt\"\nls -la \"$CODEX_HOME\" >\"$OUT/codex-home.txt\"\n",
+        "mock.mjs": "// Фиктивный провайдер Responses API: отдаёт шаги сценария по одному на POST /responses\n// и пишет каждый запрос в журнал.\nimport http from 'node:http';\nimport fs from 'node:fs';\nconst [port, scriptFile, journal] = process.argv.slice(2);\nconst steps = JSON.parse(fs.readFileSync(scriptFile, 'utf8'));\nlet n = 0;\nconst sse = (res, events) => {\n  res.writeHead(200, { 'content-type': 'text/event-stream' });\n  for (const e of events) res.write(`event: ${e.type}\\ndata: ${JSON.stringify(e)}\\n\\n`);\n  res.end();\n};\nhttp.createServer((req, res) => {\n  let body = '';\n  req.on('data', (d) => (body += d));\n  req.on('end', () => {\n    fs.appendFileSync(journal, JSON.stringify({ method: req.method, url: req.url, body: body.slice(0, 400000) }) + '\\n');\n    if (req.method === 'GET') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end('{\"object\":\"list\",\"data\":[],\"models\":[]}'); }\n    if (!req.url.includes('responses')) { res.writeHead(404); return res.end(); }\n    let items = steps[Math.min(n, steps.length - 1)];\n    const sid = [...body.matchAll(/session ID (\\d+)|\\\\?\"session_id\\\\?\":\\s*(\\d+)/g)].pop();\n    if (sid) items = JSON.parse(JSON.stringify(items).replaceAll('__SID__', sid[1] ?? sid[2]));\n    const id = 'resp-' + ++n;\n    const ev = [{ type: 'response.created', response: { id } }];\n    for (const it of items) ev.push({ type: 'response.output_item.done', item: it });\n    ev.push({ type: 'response.completed', response: { id, usage: { input_tokens: 1, input_tokens_details: null, output_tokens: 1, output_tokens_details: null, total_tokens: 2 } } });\n    sse(res, ev);\n  });\n}).listen(Number(port), '127.0.0.1', () => fs.appendFileSync(journal, '{\"ready\":true}\\n'));\n",
+        "hook.cjs": "// Хук стенда: пишет сырой вход целиком в файл из argv, блокирует на маркере.\nconst fs = require('fs');\nlet s = '';\nprocess.stdin.on('data', (d) => (s += d));\nprocess.stdin.on('end', () => {\n  fs.appendFileSync(process.argv[2], JSON.stringify({ argv: process.argv.slice(3), env: { CODEX_HOME: process.env.CODEX_HOME, PWD: process.cwd() }, input: s }) + '\\n');\n  if (s.includes('ralph-stand-forbidden')) { process.stderr.write('blocked by stand hook'); process.exit(2); }\n  process.exit(0);\n});\n",
+        "common-h.sh": "MODEL=gpt-5.5; STEPS=$(fc function_call exec_command \"{\\\"cmd\\\":\\\"echo ralph-stand-allowed\\\"}\")\nCJ() { printf \"{\\\"hooks\\\":{\\\"PreToolUse\\\":[{\\\"matcher\\\":\\\".*\\\",\\\"hooks\\\":[{\\\"type\\\":\\\"command\\\",\\\"command\\\":\\\"node %s %s %s\\\",\\\"timeout\\\":10}]}]}}\\n\" \"$D/hook.cjs\" \"$OUT/$1.jsonl\" \"$1\"; }\nCT() { printf \"[[hooks.PreToolUse]]\\nmatcher = \\\".*\\\"\\n[[hooks.PreToolUse.hooks]]\\ntype = \\\"command\\\"\\ncommand = \\\"node %s %s %s\\\"\\ntimeout = 10\\n\" \"$D/hook.cjs\" \"$OUT/$1.jsonl\" \"$1\"; }\nBASE=(--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox)\n",
+        "steps3.py": "import json,sys\ndef call(i,cmd): return [{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":f\"call-{i}\",\"arguments\":json.dumps({\"cmd\":cmd})}]\nprint(json.dumps([call(1,sys.argv[1]),call(2,sys.argv[2]),[{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"m3\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}]]))\n"
+    },
+    "events": [
+        {
+            "id": "cm-exec",
+            "title": "code mode: вложенный exec_command, запрещённый — блок",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай cm-exec: вход хука -c hooks.PreToolUse записан целиком со stdin; заменён только корень стенда",
+            "cliVersion": "0.163.0",
+            "model": "gpt-6-astra",
+            "mode": "code-mode",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/cm-exec/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "call": "{\"type\": \"custom_tool_call\", \"name\": \"exec\", \"call_id\": \"call-1\", \"input\": \"const r = await tools.exec_command({cmd: \\\"touch ralph-stand-forbidden; echo made\\\"}); text(r);\"}",
+            "hookStdin": [
+                "{\"session_id\":\"01a18297-9b47-7f33-9d22-3a315b8c91d5\",\"turn_id\":\"01a18297-9b62-7231-9ad5-e657c8d36257\",\"transcript_path\":\"/path/to/stand-home/.codex/sessions/2026/10/28/rollout-2026-10-28T12-58-56-01a18297-9b47-7f33-9d22-3a315b8c91d5.jsonl\",\"cwd\":\"/path/to/stand/work/loop\",\"hook_event_name\":\"PreToolUse\",\"model\":\"gpt-6-astra\",\"permission_mode\":\"bypassPermissions\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"touch ralph-stand-forbidden; echo made\"},\"tool_use_id\":\"exec-30d49649-a0ca-46b3-9f9d-60e86a99b4f8\"}"
+            ],
+            "hookExit": 2,
+            "loopStatus": [],
+            "caseScript": "ARGS=(--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox \"${HOOK[@]}\")\nSTEPS=$(js 'const r = await tools.exec_command({cmd: \"touch ralph-stand-forbidden; echo made\"}); text(r);')\n"
+        },
+        {
+            "id": "cm-exec-allowed",
+            "title": "code mode: вложенный exec_command с workdir — в событии нет workdir, эффект в sub/",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай cm-exec-allowed: вход хука -c hooks.PreToolUse записан целиком со stdin; заменён только корень стенда",
+            "cliVersion": "0.163.0",
+            "model": "gpt-6-astra",
+            "mode": "code-mode",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/cm-exec-allowed/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "call": "{\"type\": \"custom_tool_call\", \"name\": \"exec\", \"call_id\": \"call-1\", \"input\": \"const r = await tools.exec_command({cmd: \\\"touch ralph-stand-allowed; echo made\\\", workdir: \\\"sub\\\", tty: false}); text(r);\"}",
+            "hookStdin": [
+                "{\"session_id\":\"01a18297-9fd2-75d0-9db9-521defb5b001\",\"turn_id\":\"01a18297-9feb-7d60-94f8-4556a84c8b14\",\"transcript_path\":\"/path/to/stand-home/.codex/sessions/2026/10/28/rollout-2026-10-28T12-58-57-01a18297-9fd2-75d0-9db9-521defb5b001.jsonl\",\"cwd\":\"/path/to/stand/work/loop\",\"hook_event_name\":\"PreToolUse\",\"model\":\"gpt-6-astra\",\"permission_mode\":\"bypassPermissions\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"touch ralph-stand-allowed; echo made\"},\"tool_use_id\":\"exec-610eb4ba-c950-4f7b-b31c-694e3006a908\"}"
+            ],
+            "hookExit": 0,
+            "loopStatus": ["?? sub/ralph-stand-allowed"],
+            "caseScript": "ARGS=(--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox \"${HOOK[@]}\")\nSTEPS=$(js 'const r = await tools.exec_command({cmd: \"touch ralph-stand-allowed; echo made\", workdir: \"sub\", tty: false}); text(r);')\npre() { mkdir -p \"$C/sub\"; touch \"$C/sub/.keep\"; }\n"
+        },
+        {
+            "id": "cm-patch",
+            "title": "code mode: вложенный apply_patch (add, update, delete), запрещённый — блок",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай cm-patch: вход хука -c hooks.PreToolUse записан целиком со stdin; заменён только корень стенда",
+            "cliVersion": "0.163.0",
+            "model": "gpt-6-astra",
+            "mode": "code-mode",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/cm-patch/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "call": "{\"type\": \"custom_tool_call\", \"name\": \"exec\", \"call_id\": \"call-1\", \"input\": \"const r = await tools.apply_patch(\\\"*** Begin Patch\\\\n*** Add File: ralph-stand-forbidden.txt\\\\n+x\\\\n*** Update File: keep.txt\\\\n@@\\\\n-a\\\\n+b\\\\n*** Delete File: gone.txt\\\\n*** End Patch\\\\n\\\"); text(r);\"}",
+            "hookStdin": [
+                "{\"session_id\":\"01a18297-a47a-7923-8d0c-d052d14729f5\",\"turn_id\":\"01a18297-a493-7132-bc7e-cad96ed28dae\",\"transcript_path\":\"/path/to/stand-home/.codex/sessions/2026/10/28/rollout-2026-10-28T12-58-58-01a18297-a47a-7923-8d0c-d052d14729f5.jsonl\",\"cwd\":\"/path/to/stand/work/loop\",\"hook_event_name\":\"PreToolUse\",\"model\":\"gpt-6-astra\",\"permission_mode\":\"bypassPermissions\",\"tool_name\":\"apply_patch\",\"tool_input\":{\"command\":\"*** Begin Patch\\n*** Add File: ralph-stand-forbidden.txt\\n+x\\n*** Update File: keep.txt\\n@@\\n-a\\n+b\\n*** Delete File: gone.txt\\n*** End Patch\\n\"},\"tool_use_id\":\"exec-cbb2d635-62cd-4534-bb73-4655cc8fe79b\"}"
+            ],
+            "hookExit": 2,
+            "loopStatus": [],
+            "caseScript": "ARGS=(--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox \"${HOOK[@]}\")\nSTEPS=$(js 'const r = await tools.apply_patch(\"*** Begin Patch\\n*** Add File: ralph-stand-forbidden.txt\\n+x\\n*** Update File: keep.txt\\n@@\\n-a\\n+b\\n*** Delete File: gone.txt\\n*** End Patch\\n\"); text(r);')\npre() { echo a >\"$C/keep.txt\"; echo g >\"$C/gone.txt\"; }\n"
+        },
+        {
+            "id": "cm-patch-allowed",
+            "title": "code mode: вложенный apply_patch (add, update с move) — эффект есть",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай cm-patch-allowed: вход хука -c hooks.PreToolUse записан целиком со stdin; заменён только корень стенда",
+            "cliVersion": "0.163.0",
+            "model": "gpt-6-astra",
+            "mode": "code-mode",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/cm-patch-allowed/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "call": "{\"type\": \"custom_tool_call\", \"name\": \"exec\", \"call_id\": \"call-1\", \"input\": \"const r = await tools.apply_patch(\\\"*** Begin Patch\\\\n*** Add File: ralph-stand-allowed.txt\\\\n+x\\\\n*** Update File: keep.txt\\\\n*** Move to: moved.txt\\\\n@@\\\\n-a\\\\n+b\\\\n*** End Patch\\\\n\\\"); text(r);\"}",
+            "hookStdin": [
+                "{\"session_id\":\"01a18297-a917-7671-9fae-e3330514b3f5\",\"turn_id\":\"01a18297-a92f-7af0-b155-8bfb448acc78\",\"transcript_path\":\"/path/to/stand-home/.codex/sessions/2026/10/28/rollout-2026-10-28T12-58-59-01a18297-a917-7671-9fae-e3330514b3f5.jsonl\",\"cwd\":\"/path/to/stand/work/loop\",\"hook_event_name\":\"PreToolUse\",\"model\":\"gpt-6-astra\",\"permission_mode\":\"bypassPermissions\",\"tool_name\":\"apply_patch\",\"tool_input\":{\"command\":\"*** Begin Patch\\n*** Add File: ralph-stand-allowed.txt\\n+x\\n*** Update File: keep.txt\\n*** Move to: moved.txt\\n@@\\n-a\\n+b\\n*** End Patch\\n\"},\"tool_use_id\":\"exec-26b7fb9a-2af7-469c-ac1d-ee51d3e81fc2\"}"
+            ],
+            "hookExit": 0,
+            "loopStatus": [" D keep.txt", "?? moved.txt", "?? ralph-stand-allowed.txt"],
+            "caseScript": "ARGS=(--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox \"${HOOK[@]}\")\nSTEPS=$(js 'const r = await tools.apply_patch(\"*** Begin Patch\\n*** Add File: ralph-stand-allowed.txt\\n+x\\n*** Update File: keep.txt\\n*** Move to: moved.txt\\n@@\\n-a\\n+b\\n*** End Patch\\n\"); text(r);')\npre() { echo a >\"$C/keep.txt\"; }\n"
+        },
+        {
+            "id": "cm-mcp",
+            "title": "code mode: MCP-чтение и MCP-мутация фиктивного сервера, мутация с маркером — блок",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай cm-mcp: вход хука -c hooks.PreToolUse записан целиком со stdin; заменён только корень стенда",
+            "cliVersion": "0.163.0",
+            "model": "gpt-6-astra",
+            "mode": "code-mode",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/cm-mcp/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\] -c mcp_servers.stand=\\{command=\\\"node\\\"\\,args=\\[\\\"/path/to/canon/provision/stand/fake-mcp.mts\\\"\\,\\\"/path/to/stand/journal/mcp.jsonl\\\"\\]\\}",
+            "call": "{\"type\": \"custom_tool_call\", \"name\": \"exec\", \"call_id\": \"call-1\", \"input\": \"text(await tools.mcp__stand__stand_read({key: \\\"k\\\"})); text(await tools.mcp__stand__stand_write({key: \\\"k\\\", value: \\\"ralph-stand-forbidden\\\"})); text(await tools.mcp__stand__stand_write({key: \\\"k2\\\", value: \\\"v\\\"}));\"}",
+            "hookStdin": [
+                "{\"session_id\":\"01a18297-b735-7c72-8cef-ae8503de7891\",\"turn_id\":\"01a18297-b74f-7191-b934-9d9d7ca3f042\",\"transcript_path\":\"/path/to/stand-home/.codex/sessions/2026/10/28/rollout-2026-10-28T12-59-03-01a18297-b735-7c72-8cef-ae8503de7891.jsonl\",\"cwd\":\"/path/to/stand/work/loop\",\"hook_event_name\":\"PreToolUse\",\"model\":\"gpt-6-astra\",\"permission_mode\":\"bypassPermissions\",\"tool_name\":\"mcp__stand__stand_read\",\"tool_input\":{\"key\":\"k\"},\"tool_use_id\":\"exec-548f9ae6-e2e4-4afd-ad02-3c9cd7888e5d\"}",
+                "{\"session_id\":\"01a18297-b735-7c72-8cef-ae8503de7891\",\"turn_id\":\"01a18297-b74f-7191-b934-9d9d7ca3f042\",\"transcript_path\":\"/path/to/stand-home/.codex/sessions/2026/10/28/rollout-2026-10-28T12-59-03-01a18297-b735-7c72-8cef-ae8503de7891.jsonl\",\"cwd\":\"/path/to/stand/work/loop\",\"hook_event_name\":\"PreToolUse\",\"model\":\"gpt-6-astra\",\"permission_mode\":\"bypassPermissions\",\"tool_name\":\"mcp__stand__stand_write\",\"tool_input\":{\"key\":\"k\",\"value\":\"ralph-stand-forbidden\"},\"tool_use_id\":\"exec-072b2b42-348e-467d-b713-af592fd5ce6b\"}"
+            ],
+            "hookExit": 2,
+            "loopStatus": [],
+            "caseScript": "ARGS=(--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox \"${HOOK[@]}\" \"${MCP[@]}\")\nSTEPS=$(js 'text(await tools.mcp__stand__stand_read({key: \"k\"})); text(await tools.mcp__stand__stand_write({key: \"k\", value: \"ralph-stand-forbidden\"})); text(await tools.mcp__stand__stand_write({key: \"k2\", value: \"v\"}));')\n"
+        },
+        {
+            "id": "dx-exec",
+            "title": "прямой вызов: exec_command с workdir, запрещённый — блок",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай dx-exec: вход хука -c hooks.PreToolUse записан целиком со stdin; заменён только корень стенда",
+            "cliVersion": "0.163.0",
+            "model": "gpt-5.5",
+            "mode": "direct",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/dx-exec/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "call": "{\"type\": \"function_call\", \"name\": \"exec_command\", \"call_id\": \"call-1\", \"arguments\": \"{\\\"cmd\\\":\\\"touch ralph-stand-forbidden\\\",\\\"workdir\\\":\\\"sub\\\",\\\"yield_time_ms\\\":1000}\"}",
+            "hookStdin": [
+                "{\"session_id\":\"01a18299-37e0-78a0-8426-8bd28055b00b\",\"turn_id\":\"01a18299-37fc-71d0-b927-eaa7f5a3ed88\",\"transcript_path\":\"/path/to/stand-home/.codex/sessions/2026/10/28/rollout-2026-10-28T13-00-41-01a18299-37e0-78a0-8426-8bd28055b00b.jsonl\",\"cwd\":\"/path/to/stand/work/loop\",\"hook_event_name\":\"PreToolUse\",\"model\":\"gpt-5.5\",\"permission_mode\":\"bypassPermissions\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"touch ralph-stand-forbidden\"},\"tool_use_id\":\"call-1\"}"
+            ],
+            "hookExit": 2,
+            "loopStatus": [],
+            "caseScript": "MODEL=gpt-5.5; ARGS=(--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox \"${HOOK[@]}\")\nSTEPS=$(fc function_call exec_command '{\"cmd\":\"touch ralph-stand-forbidden\",\"workdir\":\"sub\",\"yield_time_ms\":1000}')\npre() { mkdir -p \"$C/sub\"; touch \"$C/sub/.keep\"; }\n"
+        },
+        {
+            "id": "dx-patch",
+            "title": "прямой вызов: apply_patch (freeform), запрещённый — блок",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай dx-patch: вход хука -c hooks.PreToolUse записан целиком со stdin; заменён только корень стенда",
+            "cliVersion": "0.163.0",
+            "model": "gpt-5.5",
+            "mode": "direct",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/dx-patch/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "call": "{\"type\": \"custom_tool_call\", \"name\": \"apply_patch\", \"call_id\": \"call-1\", \"input\": \"*** Begin Patch\\n*** Add File: ralph-stand-forbidden.txt\\n+x\\n*** End Patch\\n\"}",
+            "hookStdin": [
+                "{\"session_id\":\"01a18299-3c67-7963-8184-10afaad476bd\",\"turn_id\":\"01a18299-3c7e-7ce1-a196-20c8ae617a57\",\"transcript_path\":\"/path/to/stand-home/.codex/sessions/2026/10/28/rollout-2026-10-28T13-00-42-01a18299-3c67-7963-8184-10afaad476bd.jsonl\",\"cwd\":\"/path/to/stand/work/loop\",\"hook_event_name\":\"PreToolUse\",\"model\":\"gpt-5.5\",\"permission_mode\":\"bypassPermissions\",\"tool_name\":\"apply_patch\",\"tool_input\":{\"command\":\"*** Begin Patch\\n*** Add File: ralph-stand-forbidden.txt\\n+x\\n*** End Patch\\n\"},\"tool_use_id\":\"call-1\"}"
+            ],
+            "hookExit": 2,
+            "loopStatus": [],
+            "caseScript": "MODEL=gpt-5.5; ARGS=(--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox \"${HOOK[@]}\")\nSTEPS=$(fc custom_tool_call apply_patch $'*** Begin Patch\\n*** Add File: ralph-stand-forbidden.txt\\n+x\\n*** End Patch\\n')\n"
+        },
+        {
+            "id": "dx-patch-allowed",
+            "title": "прямой вызов: apply_patch в подкаталог — эффект есть",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай dx-patch-allowed: вход хука -c hooks.PreToolUse записан целиком со stdin; заменён только корень стенда",
+            "cliVersion": "0.163.0",
+            "model": "gpt-5.5",
+            "mode": "direct",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/dx-patch-allowed/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "call": "{\"type\": \"custom_tool_call\", \"name\": \"apply_patch\", \"call_id\": \"call-1\", \"input\": \"*** Begin Patch\\n*** Add File: sub/ralph-stand-allowed.txt\\n+x\\n*** End Patch\\n\"}",
+            "hookStdin": [
+                "{\"session_id\":\"01a18299-413f-7b43-b3a2-63865d5b6a84\",\"turn_id\":\"01a18299-4155-7a41-9c4b-f97190393944\",\"transcript_path\":\"/path/to/stand-home/.codex/sessions/2026/10/28/rollout-2026-10-28T13-00-44-01a18299-413f-7b43-b3a2-63865d5b6a84.jsonl\",\"cwd\":\"/path/to/stand/work/loop\",\"hook_event_name\":\"PreToolUse\",\"model\":\"gpt-5.5\",\"permission_mode\":\"bypassPermissions\",\"tool_name\":\"apply_patch\",\"tool_input\":{\"command\":\"*** Begin Patch\\n*** Add File: sub/ralph-stand-allowed.txt\\n+x\\n*** End Patch\\n\"},\"tool_use_id\":\"call-1\"}"
+            ],
+            "hookExit": 0,
+            "loopStatus": ["?? sub/"],
+            "caseScript": "MODEL=gpt-5.5; ARGS=(--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox \"${HOOK[@]}\")\nSTEPS=$(fc custom_tool_call apply_patch $'*** Begin Patch\\n*** Add File: sub/ralph-stand-allowed.txt\\n+x\\n*** End Patch\\n')\n"
+        }
+    ],
+    "noEvent": [
+        {
+            "id": "cm-stdin-hook",
+            "title": "code mode: write_stdin с маркером в chars в несуществующий процесс — хук не позван",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай cm-stdin-hook: журнал хука и ответ CLI модели (вывод инструмента) из журнала фиктивного провайдера",
+            "cliVersion": "0.163.0",
+            "model": "gpt-6-astra",
+            "mode": "code-mode",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/cm-stdin-hook/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "call": [
+                "{\"type\": \"custom_tool_call\", \"name\": \"exec\", \"call_id\": \"call-1\", \"input\": \"try { text(await tools.write_stdin({session_id: 4242, chars: \\\"touch ralph-stand-forbidden\\\\n\\\", yield_time_ms: 300})); } catch (e) { text(\\\"ERR \\\" + e); } try { text(await tools.write_stdin({session_id: 4243, chars: \\\"\\\", yield_time_ms: 300})); } catch (e) { text(\\\"ERR \\\" + e); }\"}"
+            ],
+            "hookStdin": [],
+            "cliToolOutput": [
+                "[{\"type\": \"input_text\", \"text\": \"Script completed\\nWall time 0.0 seconds\\nOutput:\\n\"}, {\"type\": \"input_text\", \"text\": \"ERR write_stdin failed: Unknown process id 4242\"}, {\"type\": \"input_text\", \"text\": \"ERR write_stdin failed: Unknown process id 4243\"}]"
+            ],
+            "loopStatus": [],
+            "caseScript": "ARGS=(--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox \"${HOOK[@]}\")\nSTEPS=$(js 'try { text(await tools.write_stdin({session_id: 4242, chars: \"touch ralph-stand-forbidden\\n\", yield_time_ms: 300})); } catch (e) { text(\"ERR \" + e); } try { text(await tools.write_stdin({session_id: 4243, chars: \"\", yield_time_ms: 300})); } catch (e) { text(\"ERR \" + e); }')\n"
+        },
+        {
+            "id": "cm-stdin-live",
+            "title": "code mode: write_stdin с маркером в ЖИВОЙ процесс (exec_command без tty) — хук не позван, stdin закрыт",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай cm-stdin-live: журнал хука и ответ CLI модели (вывод инструмента) из журнала фиктивного провайдера",
+            "cliVersion": "0.163.0",
+            "model": "gpt-6-astra",
+            "mode": "code-mode",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/cm-stdin-live/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "call": [
+                "{\"type\": \"custom_tool_call\", \"name\": \"exec\", \"call_id\": \"call-1\", \"input\": \"const a = await tools.exec_command({cmd: \\\"sleep 4\\\", tty: false, yield_time_ms: 250}); text(a); try { text(await tools.write_stdin({session_id: a.session_id, chars: \\\"touch ralph-stand-forbidden\\\\n\\\", yield_time_ms: 250})); } catch (e) { text(\\\"ERR \\\" + e); } try { text(await tools.write_stdin({session_id: a.session_id, chars: \\\"\\\", yield_time_ms: 5000})); } catch (e) { text(\\\"ERR \\\" + e); }\"}"
+            ],
+            "hookStdin": [
+                "{\"session_id\":\"01a18299-bb0b-7341-8625-b3548be60379\",\"turn_id\":\"01a18299-bb24-7900-b0b2-cd784fc175ab\",\"transcript_path\":\"/path/to/stand-home/.codex/sessions/2026/10/28/rollout-2026-10-28T13-01-15-01a18299-bb0b-7341-8625-b3548be60379.jsonl\",\"cwd\":\"/path/to/stand/work/loop\",\"hook_event_name\":\"PreToolUse\",\"model\":\"gpt-6-astra\",\"permission_mode\":\"bypassPermissions\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"sleep 4\"},\"tool_use_id\":\"exec-64e07b87-0270-4b6a-8b41-99ade537a763\"}"
+            ],
+            "cliToolOutput": [
+                "[{\"type\": \"input_text\", \"text\": \"Script completed\\nWall time 4.1 seconds\\nOutput:\\n\"}, {\"type\": \"input_text\", \"text\": \"{\\\"chunk_id\\\":\\\"016d91\\\",\\\"wall_time_seconds\\\":0.251505231,\\\"session_id\\\":17629,\\\"original_token_count\\\":0,\\\"output\\\":\\\"\\\"}\"}, {\"type\": \"input_text\", \"text\": \"ERR write_stdin failed: stdin is closed for this session; rerun exec_command with tty=true to keep stdin open\"}, {\"type\": \"input_text\", \"text\": \"{\\\"chunk_id\\\":\\\"ecd09c\\\",\\\"wall_time_seconds\\\":3.601932235,\\\"exit_code\\\":0,\\\"original_token_count\\\":0,\\\"output\\\":\\\"\\\"}\"}]"
+            ],
+            "loopStatus": [],
+            "caseScript": "ARGS=(--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox \"${HOOK[@]}\")\nSTEPS=$(js 'const a = await tools.exec_command({cmd: \"sleep 4\", tty: false, yield_time_ms: 250}); text(a); try { text(await tools.write_stdin({session_id: a.session_id, chars: \"touch ralph-stand-forbidden\\n\", yield_time_ms: 250})); } catch (e) { text(\"ERR \" + e); } try { text(await tools.write_stdin({session_id: a.session_id, chars: \"\", yield_time_ms: 5000})); } catch (e) { text(\"ERR \" + e); }')\n"
+        },
+        {
+            "id": "dx-stdin-live",
+            "title": "прямой вызов: write_stdin в живой процесс — хук не позван, stdin закрыт",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай dx-stdin-live: журнал хука и ответ CLI модели (вывод инструмента) из журнала фиктивного провайдера",
+            "cliVersion": "0.163.0",
+            "model": "gpt-5.5",
+            "mode": "direct",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/dx-stdin-live/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "call": [
+                "{\"type\": \"function_call\", \"name\": \"exec_command\", \"call_id\": \"call-1\", \"arguments\": \"{\\\"cmd\\\":\\\"sleep 4\\\",\\\"yield_time_ms\\\":250}\"}",
+                "{\"type\": \"function_call\", \"name\": \"write_stdin\", \"call_id\": \"call-2\", \"arguments\": \"{\\\"session_id\\\":__SID__,\\\"chars\\\":\\\"touch ralph-stand-forbidden\\\\n\\\",\\\"yield_time_ms\\\":250}\"}"
+            ],
+            "hookStdin": [
+                "{\"session_id\":\"01a18299-cf5a-78d1-9ce6-3764d94c7935\",\"turn_id\":\"01a18299-cf6f-73d0-a788-8bccfbcf5516\",\"transcript_path\":\"/path/to/stand-home/.codex/sessions/2026/10/28/rollout-2026-10-28T13-01-20-01a18299-cf5a-78d1-9ce6-3764d94c7935.jsonl\",\"cwd\":\"/path/to/stand/work/loop\",\"hook_event_name\":\"PreToolUse\",\"model\":\"gpt-5.5\",\"permission_mode\":\"bypassPermissions\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"sleep 4\"},\"tool_use_id\":\"call-1\"}"
+            ],
+            "cliToolOutput": [
+                "\"Chunk ID: 28b077\\nWall time: 0.2511 seconds\\nProcess running with session ID 4355\\nOriginal token count: 0\\nOutput:\\n\"",
+                "\"write_stdin failed: stdin is closed for this session; rerun exec_command with tty=true to keep stdin open\""
+            ],
+            "loopStatus": [],
+            "caseScript": "MODEL=gpt-5.5; ARGS=(--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox \"${HOOK[@]}\")\nSTEPS='[[{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"call-1\",\"arguments\":\"{\\\"cmd\\\":\\\"sleep 4\\\",\\\"yield_time_ms\\\":250}\"}],[{\"type\":\"function_call\",\"name\":\"write_stdin\",\"call_id\":\"call-2\",\"arguments\":\"{\\\"session_id\\\":__SID__,\\\"chars\\\":\\\"touch ralph-stand-forbidden\\\\n\\\",\\\"yield_time_ms\\\":250}\"}],[{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"m3\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}]]'\n"
+        },
+        {
+            "id": "cm-stdin",
+            "title": "code mode: exec_command tty=true — в стенде нет devpts, openpty отказывает; ввод в PTY не воспроизведён",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай cm-stdin: журнал хука и ответ CLI модели (вывод инструмента) из журнала фиктивного провайдера",
+            "cliVersion": "0.163.0",
+            "model": "gpt-6-astra",
+            "mode": "code-mode",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/cm-stdin/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "call": [
+                "{\"type\": \"custom_tool_call\", \"name\": \"exec\", \"call_id\": \"call-1\", \"input\": \"const a = await tools.exec_command({cmd: \\\"bash --noprofile --norc\\\", tty: true, yield_time_ms: 500}); text(a); const b = await tools.write_stdin({session_id: a.session_id, chars: \\\"touch ralph-stand-forbidden; exit\\\\n\\\", yield_time_ms: 1000}); text(b);\"}"
+            ],
+            "hookStdin": [
+                "{\"session_id\":\"01a18297-add3-7ce2-b779-d7167807561d\",\"turn_id\":\"01a18297-adeb-7ef1-8d6d-b461bd39abe9\",\"transcript_path\":\"/path/to/stand-home/.codex/sessions/2026/10/28/rollout-2026-10-28T12-59-00-01a18297-add3-7ce2-b779-d7167807561d.jsonl\",\"cwd\":\"/path/to/stand/work/loop\",\"hook_event_name\":\"PreToolUse\",\"model\":\"gpt-6-astra\",\"permission_mode\":\"bypassPermissions\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"bash --noprofile --norc\"},\"tool_use_id\":\"exec-1da17b28-535d-4950-b180-6dbf1208af7f\"}"
+            ],
+            "cliToolOutput": [
+                "[{\"type\": \"input_text\", \"text\": \"Script failed\\nWall time 0.1 seconds\\nOutput:\\n\"}, {\"type\": \"input_text\", \"text\": \"Script error:\\nexec_command failed: CreateProcess { message: \\\"Rejected(\\\\\\\"Failed to create unified exec process: failed to openpty: Os { code: 2, kind: NotFound, message: \\\\\\\\\\\\\\\"No such file or directory\\\\\\\\\\\\\\\" }\\\\\\\")\\\" }\"}]"
+            ],
+            "loopStatus": [],
+            "caseScript": "ARGS=(--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox \"${HOOK[@]}\")\nSTEPS=$(js 'const a = await tools.exec_command({cmd: \"bash --noprofile --norc\", tty: true, yield_time_ms: 500}); text(a); const b = await tools.write_stdin({session_id: a.session_id, chars: \"touch ralph-stand-forbidden; exit\\n\", yield_time_ms: 1000}); text(b);')\n"
+        },
+        {
+            "id": "cm-notty",
+            "title": "--disable unified_exec_tty: tty=true отвергнут CLI после хука",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай cm-notty: журнал хука и ответ CLI модели (вывод инструмента) из журнала фиктивного провайдера",
+            "cliVersion": "0.163.0",
+            "model": "gpt-6-astra",
+            "mode": "code-mode",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --disable unified_exec_tty --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/cm-notty/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "call": [
+                "{\"type\": \"custom_tool_call\", \"name\": \"exec\", \"call_id\": \"call-1\", \"input\": \"try { const a = await tools.exec_command({cmd: \\\"bash --noprofile --norc\\\", tty: true, yield_time_ms: 500}); text(a); text(await tools.write_stdin({session_id: a.session_id, chars: \\\"touch ralph-stand-forbidden-stdin; exit\\\\n\\\", yield_time_ms: 1000})); } catch (e) { text(\\\"ERR \\\" + e); }\"}"
+            ],
+            "hookStdin": [
+                "{\"session_id\":\"01a1829a-3277-7742-b536-56c8c52dfb05\",\"turn_id\":\"01a1829a-3290-7e53-8c1e-c39a1152cf0a\",\"transcript_path\":\"/path/to/stand-home/.codex/sessions/2026/10/28/rollout-2026-10-28T13-01-45-01a1829a-3277-7742-b536-56c8c52dfb05.jsonl\",\"cwd\":\"/path/to/stand/work/loop\",\"hook_event_name\":\"PreToolUse\",\"model\":\"gpt-6-astra\",\"permission_mode\":\"bypassPermissions\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"bash --noprofile --norc\"},\"tool_use_id\":\"exec-c6ca150a-fc83-4264-99d9-09a23fda0ccc\"}"
+            ],
+            "cliToolOutput": [
+                "[{\"type\": \"input_text\", \"text\": \"Script completed\\nWall time 0.1 seconds\\nOutput:\\n\"}, {\"type\": \"input_text\", \"text\": \"ERR TTY execution is disabled by config; omit `tty` or set it to false.\"}]"
+            ],
+            "loopStatus": [],
+            "caseScript": "ARGS=(--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --disable unified_exec_tty \"${HOOK[@]}\")\nSTEPS=$(js 'try { const a = await tools.exec_command({cmd: \"bash --noprofile --norc\", tty: true, yield_time_ms: 500}); text(a); text(await tools.write_stdin({session_id: a.session_id, chars: \"touch ralph-stand-forbidden-stdin; exit\\n\", yield_time_ms: 1000})); } catch (e) { text(\"ERR \" + e); }')\n"
+        },
+        {
+            "id": "dx-notty",
+            "title": "--disable unified_exec_tty, прямой вызов: tty=true отвергнут",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай dx-notty: журнал хука и ответ CLI модели (вывод инструмента) из журнала фиктивного провайдера",
+            "cliVersion": "0.163.0",
+            "model": "gpt-5.5",
+            "mode": "direct",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --disable unified_exec_tty --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/dx-notty/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "call": [
+                "{\"type\": \"function_call\", \"name\": \"exec_command\", \"call_id\": \"call-1\", \"arguments\": \"{\\\"cmd\\\":\\\"bash --noprofile --norc\\\",\\\"tty\\\":true,\\\"yield_time_ms\\\":500}\"}",
+                "{\"type\": \"function_call\", \"name\": \"write_stdin\", \"call_id\": \"call-2\", \"arguments\": \"{\\\"session_id\\\":__SID__,\\\"chars\\\":\\\"touch ralph-stand-x; exit\\\\n\\\",\\\"yield_time_ms\\\":500}\"}"
+            ],
+            "hookStdin": [
+                "{\"session_id\":\"01a1829a-3723-7003-8cd8-d9546e12c01a\",\"turn_id\":\"01a1829a-3737-7fe0-978a-89a91b35871a\",\"transcript_path\":\"/path/to/stand-home/.codex/sessions/2026/10/28/rollout-2026-10-28T13-01-47-01a1829a-3723-7003-8cd8-d9546e12c01a.jsonl\",\"cwd\":\"/path/to/stand/work/loop\",\"hook_event_name\":\"PreToolUse\",\"model\":\"gpt-5.5\",\"permission_mode\":\"bypassPermissions\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"bash --noprofile --norc\"},\"tool_use_id\":\"call-1\"}"
+            ],
+            "cliToolOutput": [
+                "\"TTY execution is disabled by config; omit `tty` or set it to false.\"",
+                "\"failed to parse function arguments: expected value at line 1 column 15\""
+            ],
+            "loopStatus": [],
+            "caseScript": "MODEL=gpt-5.5; ARGS=(--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --disable unified_exec_tty \"${HOOK[@]}\")\nSTEPS='[[{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"call-1\",\"arguments\":\"{\\\"cmd\\\":\\\"bash --noprofile --norc\\\",\\\"tty\\\":true,\\\"yield_time_ms\\\":500}\"}],[{\"type\":\"function_call\",\"name\":\"write_stdin\",\"call_id\":\"call-2\",\"arguments\":\"{\\\"session_id\\\":__SID__,\\\"chars\\\":\\\"touch ralph-stand-x; exit\\\\n\\\",\\\"yield_time_ms\\\":500}\"}],[{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"m3\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}]]'\n"
+        },
+        {
+            "id": "noshell-call",
+            "title": "--disable shell_tool: exec_command и write_stdin нет в tools кода",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай noshell-call: журнал хука и ответ CLI модели (вывод инструмента) из журнала фиктивного провайдера",
+            "cliVersion": "0.163.0",
+            "model": "gpt-6-astra",
+            "mode": "code-mode",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --disable shell_tool --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/noshell-call/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "call": [
+                "{\"type\": \"custom_tool_call\", \"name\": \"exec\", \"call_id\": \"call-1\", \"input\": \"for (const n of [\\\"exec_command\\\",\\\"write_stdin\\\",\\\"shell\\\",\\\"local_shell\\\"]) { try { text(n + \\\": \\\" + JSON.stringify(await tools[n]({cmd: \\\"touch ralph-stand-allowed-\\\" + n, command: [\\\"touch\\\",\\\"ralph-stand-allowed-\\\"+n], session_id: 1, chars: \\\"x\\\"}))); } catch (e) { text(n + \\\" ERR \\\" + e); } } text(JSON.stringify(ALL_TOOLS.map(t => t.name)));\"}"
+            ],
+            "hookStdin": [],
+            "cliToolOutput": [
+                "[{\"type\": \"input_text\", \"text\": \"Script completed\\nWall time 0.0 seconds\\nOutput:\\n\"}, {\"type\": \"input_text\", \"text\": \"exec_command ERR TypeError: tools[n] is not a function\"}, {\"type\": \"input_text\", \"text\": \"write_stdin ERR TypeError: tools[n] is not a function\"}, {\"type\": \"input_text\", \"text\": \"shell ERR TypeError: tools[n] is not a function\"}, {\"type\": \"input_text\", \"text\": \"local_shell ERR TypeError: tools[n] is not a function\"}, {\"type\": \"input_text\", \"text\": \"[\\\"apply_patch\\\",\\\"clock__curr_time\\\",\\\"create_goal\\\",\\\"get_goal\\\",\\\"list_mcp_resource_templates\\\",\\\"list_mcp_resources\\\",\\\"read_mcp_resource\\\",\\\"update_goal\\\",\\\"view_image\\\"]\"}]"
+            ],
+            "loopStatus": [],
+            "caseScript": "ARGS=(--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --disable shell_tool \"${HOOK[@]}\")\nSTEPS=$(js 'for (const n of [\"exec_command\",\"write_stdin\",\"shell\",\"local_shell\"]) { try { text(n + \": \" + JSON.stringify(await tools[n]({cmd: \"touch ralph-stand-allowed-\" + n, command: [\"touch\",\"ralph-stand-allowed-\"+n], session_id: 1, chars: \"x\"}))); } catch (e) { text(n + \" ERR \" + e); } } text(JSON.stringify(ALL_TOOLS.map(t => t.name)));')\n"
+        },
+        {
+            "id": "dx-noshell",
+            "title": "--disable shell_tool, прямой вызов: unsupported call, хук не позван",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай dx-noshell: журнал хука и ответ CLI модели (вывод инструмента) из журнала фиктивного провайдера",
+            "cliVersion": "0.163.0",
+            "model": "gpt-5.5",
+            "mode": "direct",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --disable shell_tool --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/dx-noshell/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "call": [
+                "{\"type\": \"function_call\", \"name\": \"exec_command\", \"call_id\": \"call-1\", \"arguments\": \"{\\\"cmd\\\":\\\"touch ralph-stand-allowed\\\"}\"}",
+                "{\"type\": \"function_call\", \"name\": \"write_stdin\", \"call_id\": \"call-2\", \"arguments\": \"{\\\"session_id\\\":1,\\\"chars\\\":\\\"x\\\"}\"}"
+            ],
+            "hookStdin": [],
+            "cliToolOutput": [
+                "\"unsupported call: exec_command\"",
+                "\"unsupported call: write_stdin\""
+            ],
+            "loopStatus": [],
+            "caseScript": "MODEL=gpt-5.5; ARGS=(--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --disable shell_tool \"${HOOK[@]}\")\nSTEPS='[[{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"call-1\",\"arguments\":\"{\\\"cmd\\\":\\\"touch ralph-stand-allowed\\\"}\"},{\"type\":\"function_call\",\"name\":\"write_stdin\",\"call_id\":\"call-2\",\"arguments\":\"{\\\"session_id\\\":1,\\\"chars\\\":\\\"x\\\"}\"}],[{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"m3\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}]]'\n"
+        },
+        {
+            "id": "dx-mcp",
+            "title": "прямой вызов MCP-имени у gpt-5.5: unsupported call — MCP отложены за tool_search; прямой MCP не воспроизведён",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай dx-mcp: журнал хука и ответ CLI модели (вывод инструмента) из журнала фиктивного провайдера",
+            "cliVersion": "0.163.0",
+            "model": "gpt-5.5",
+            "mode": "direct",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/dx-mcp/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\] -c mcp_servers.stand=\\{command=\\\"node\\\"\\,args=\\[\\\"/path/to/canon/provision/stand/fake-mcp.mts\\\"\\,\\\"/path/to/stand/journal/mcp.jsonl\\\"\\]\\}",
+            "call": [
+                "{\"type\": \"function_call\", \"name\": \"mcp__stand__stand_write\", \"call_id\": \"call-1\", \"arguments\": \"{\\\"key\\\":\\\"k\\\",\\\"value\\\":\\\"ralph-stand-forbidden\\\"}\"}"
+            ],
+            "hookStdin": [],
+            "cliToolOutput": ["\"unsupported call: mcp__stand__stand_write\""],
+            "loopStatus": [],
+            "caseScript": "MODEL=gpt-5.5; ARGS=(--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox \"${HOOK[@]}\" \"${MCP[@]}\")\nSTEPS=$(fc function_call mcp__stand__stand_write '{\"key\":\"k\",\"value\":\"ralph-stand-forbidden\"}')\n"
+        }
+    ],
+    "inventory": [
+        {
+            "id": "t-bypass",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай t-bypass: первый запрос CLI к провайдеру (поля tools и input[type=additional_tools]), имена и типы дословно",
+            "cliVersion": "0.163.0",
+            "model": "gpt-6-astra",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox",
+            "note": "модель code mode: наружу только exec (JavaScript) и wait, инструменты — вложенные",
+            "tools": [],
+            "additionalTools": [
+                {
+                    "namespace": "functions",
+                    "tools": [
+                        {
+                            "type": "custom",
+                            "name": "exec"
+                        },
+                        {
+                            "type": "function",
+                            "name": "wait"
+                        },
+                        {
+                            "type": "function",
+                            "name": "request_user_input"
+                        },
+                        {
+                            "type": "function",
+                            "name": "request_user_input_async"
+                        }
+                    ]
+                },
+                {
+                    "namespace": "clock",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "sleep"
+                        }
+                    ]
+                },
+                {
+                    "namespace": "collaboration",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "followup_task"
+                        },
+                        {
+                            "type": "function",
+                            "name": "interrupt_agent"
+                        },
+                        {
+                            "type": "function",
+                            "name": "list_agents"
+                        },
+                        {
+                            "type": "function",
+                            "name": "send_message"
+                        },
+                        {
+                            "type": "function",
+                            "name": "spawn_agent"
+                        },
+                        {
+                            "type": "function",
+                            "name": "wait_agent"
+                        }
+                    ]
+                }
+            ],
+            "codeModeNested": [
+                "apply_patch",
+                "create_goal",
+                "exec_command",
+                "get_goal",
+                "list_mcp_resource_templates",
+                "list_mcp_resources",
+                "read_mcp_resource",
+                "update_goal",
+                "view_image",
+                "write_stdin",
+                "clock__curr_time"
+            ],
+            "caseScript": "ARGS=(--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox)\n"
+        },
+        {
+            "id": "inv-sol",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай inv-sol: первый запрос CLI к провайдеру (поля tools и input[type=additional_tools]), имена и типы дословно",
+            "cliVersion": "0.163.0",
+            "model": "gpt-6-sol",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox",
+            "note": "тоже code mode",
+            "tools": [],
+            "additionalTools": [
+                {
+                    "namespace": "functions",
+                    "tools": [
+                        {
+                            "type": "custom",
+                            "name": "exec"
+                        },
+                        {
+                            "type": "function",
+                            "name": "wait"
+                        },
+                        {
+                            "type": "function",
+                            "name": "request_user_input"
+                        },
+                        {
+                            "type": "function",
+                            "name": "request_user_input_async"
+                        }
+                    ]
+                },
+                {
+                    "namespace": "clock",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "sleep"
+                        }
+                    ]
+                },
+                {
+                    "namespace": "collaboration",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "followup_task"
+                        },
+                        {
+                            "type": "function",
+                            "name": "interrupt_agent"
+                        },
+                        {
+                            "type": "function",
+                            "name": "list_agents"
+                        },
+                        {
+                            "type": "function",
+                            "name": "send_message"
+                        },
+                        {
+                            "type": "function",
+                            "name": "spawn_agent"
+                        },
+                        {
+                            "type": "function",
+                            "name": "wait_agent"
+                        }
+                    ]
+                }
+            ],
+            "codeModeNested": [
+                "apply_patch",
+                "create_goal",
+                "exec_command",
+                "get_goal",
+                "list_mcp_resource_templates",
+                "list_mcp_resources",
+                "read_mcp_resource",
+                "update_goal",
+                "view_image",
+                "write_stdin",
+                "clock__curr_time"
+            ],
+            "caseScript": "MODEL=gpt-6-sol; ARGS=(--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox)\n"
+        },
+        {
+            "id": "inv-gpt55",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай inv-gpt55: первый запрос CLI к провайдеру (поля tools и input[type=additional_tools]), имена и типы дословно",
+            "cliVersion": "0.163.0",
+            "model": "gpt-5.5",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox",
+            "note": "прямые инструменты: exec_command, write_stdin, apply_patch (custom)",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec_command"
+                },
+                {
+                    "type": "function",
+                    "name": "write_stdin"
+                },
+                {
+                    "type": "function",
+                    "name": "request_user_input"
+                },
+                {
+                    "type": "custom",
+                    "name": "apply_patch"
+                },
+                {
+                    "type": "function",
+                    "name": "view_image"
+                },
+                {
+                    "type": "function",
+                    "name": "get_goal"
+                },
+                {
+                    "type": "function",
+                    "name": "create_goal"
+                },
+                {
+                    "type": "function",
+                    "name": "update_goal"
+                },
+                {
+                    "type": "tool_search",
+                    "name": null
+                },
+                {
+                    "type": "web_search",
+                    "name": null
+                }
+            ],
+            "additionalTools": [],
+            "codeModeNested": null,
+            "caseScript": "MODEL=gpt-5.5; ARGS=(--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox)\n"
+        },
+        {
+            "id": "inv-gpt55-mcp",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай inv-gpt55-mcp: первый запрос CLI к провайдеру (поля tools и input[type=additional_tools]), имена и типы дословно",
+            "cliVersion": "0.163.0",
+            "model": "gpt-5.5",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -c mcp_servers.stand=\\{command=\\\"node\\\"\\,args=\\[\\\"/path/to/canon/provision/stand/fake-mcp.mts\\\"\\,\\\"/path/to/stand/journal/mcp.jsonl\\\"\\]\\}",
+            "note": "с MCP-сервером: MCP-инструментов в tools нет — отложены за tool_search",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec_command"
+                },
+                {
+                    "type": "function",
+                    "name": "write_stdin"
+                },
+                {
+                    "type": "function",
+                    "name": "list_mcp_resources"
+                },
+                {
+                    "type": "function",
+                    "name": "list_mcp_resource_templates"
+                },
+                {
+                    "type": "function",
+                    "name": "read_mcp_resource"
+                },
+                {
+                    "type": "function",
+                    "name": "request_user_input"
+                },
+                {
+                    "type": "custom",
+                    "name": "apply_patch"
+                },
+                {
+                    "type": "function",
+                    "name": "view_image"
+                },
+                {
+                    "type": "function",
+                    "name": "get_goal"
+                },
+                {
+                    "type": "function",
+                    "name": "create_goal"
+                },
+                {
+                    "type": "function",
+                    "name": "update_goal"
+                },
+                {
+                    "type": "tool_search",
+                    "name": null
+                },
+                {
+                    "type": "web_search",
+                    "name": null
+                }
+            ],
+            "additionalTools": [],
+            "codeModeNested": null,
+            "caseScript": "MODEL=gpt-5.5; ARGS=(--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox \"${MCP[@]}\")\n"
+        },
+        {
+            "id": "inv-nounified",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай inv-nounified: первый запрос CLI к провайдеру (поля tools и input[type=additional_tools]), имена и типы дословно",
+            "cliVersion": "0.163.0",
+            "model": "gpt-6-astra",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --disable unified_exec",
+            "note": "--disable unified_exec: write_stdin остаётся",
+            "tools": [],
+            "additionalTools": [
+                {
+                    "namespace": "functions",
+                    "tools": [
+                        {
+                            "type": "custom",
+                            "name": "exec"
+                        },
+                        {
+                            "type": "function",
+                            "name": "wait"
+                        },
+                        {
+                            "type": "function",
+                            "name": "request_user_input"
+                        },
+                        {
+                            "type": "function",
+                            "name": "request_user_input_async"
+                        }
+                    ]
+                },
+                {
+                    "namespace": "clock",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "sleep"
+                        }
+                    ]
+                },
+                {
+                    "namespace": "collaboration",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "followup_task"
+                        },
+                        {
+                            "type": "function",
+                            "name": "interrupt_agent"
+                        },
+                        {
+                            "type": "function",
+                            "name": "list_agents"
+                        },
+                        {
+                            "type": "function",
+                            "name": "send_message"
+                        },
+                        {
+                            "type": "function",
+                            "name": "spawn_agent"
+                        },
+                        {
+                            "type": "function",
+                            "name": "wait_agent"
+                        }
+                    ]
+                }
+            ],
+            "codeModeNested": [
+                "apply_patch",
+                "create_goal",
+                "exec_command",
+                "get_goal",
+                "list_mcp_resource_templates",
+                "list_mcp_resources",
+                "read_mcp_resource",
+                "update_goal",
+                "view_image",
+                "write_stdin",
+                "clock__curr_time"
+            ],
+            "caseScript": "ARGS=(--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --disable unified_exec)\n"
+        },
+        {
+            "id": "inv-gpt55-nounified",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай inv-gpt55-nounified: первый запрос CLI к провайдеру (поля tools и input[type=additional_tools]), имена и типы дословно",
+            "cliVersion": "0.163.0",
+            "model": "gpt-5.5",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --disable unified_exec",
+            "note": "--disable unified_exec: write_stdin остаётся",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec_command"
+                },
+                {
+                    "type": "function",
+                    "name": "write_stdin"
+                },
+                {
+                    "type": "function",
+                    "name": "request_user_input"
+                },
+                {
+                    "type": "custom",
+                    "name": "apply_patch"
+                },
+                {
+                    "type": "function",
+                    "name": "view_image"
+                },
+                {
+                    "type": "function",
+                    "name": "get_goal"
+                },
+                {
+                    "type": "function",
+                    "name": "create_goal"
+                },
+                {
+                    "type": "function",
+                    "name": "update_goal"
+                },
+                {
+                    "type": "tool_search",
+                    "name": null
+                },
+                {
+                    "type": "web_search",
+                    "name": null
+                }
+            ],
+            "additionalTools": [],
+            "codeModeNested": null,
+            "caseScript": "MODEL=gpt-5.5; ARGS=(--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --disable unified_exec)\n"
+        },
+        {
+            "id": "inv-noshell",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай inv-noshell: первый запрос CLI к провайдеру (поля tools и input[type=additional_tools]), имена и типы дословно",
+            "cliVersion": "0.163.0",
+            "model": "gpt-6-astra",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --disable shell_tool",
+            "note": "--disable shell_tool: нет ни exec_command, ни write_stdin",
+            "tools": [],
+            "additionalTools": [
+                {
+                    "namespace": "functions",
+                    "tools": [
+                        {
+                            "type": "custom",
+                            "name": "exec"
+                        },
+                        {
+                            "type": "function",
+                            "name": "wait"
+                        },
+                        {
+                            "type": "function",
+                            "name": "request_user_input"
+                        },
+                        {
+                            "type": "function",
+                            "name": "request_user_input_async"
+                        }
+                    ]
+                },
+                {
+                    "namespace": "clock",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "sleep"
+                        }
+                    ]
+                },
+                {
+                    "namespace": "collaboration",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "followup_task"
+                        },
+                        {
+                            "type": "function",
+                            "name": "interrupt_agent"
+                        },
+                        {
+                            "type": "function",
+                            "name": "list_agents"
+                        },
+                        {
+                            "type": "function",
+                            "name": "send_message"
+                        },
+                        {
+                            "type": "function",
+                            "name": "spawn_agent"
+                        },
+                        {
+                            "type": "function",
+                            "name": "wait_agent"
+                        }
+                    ]
+                }
+            ],
+            "codeModeNested": [
+                "apply_patch",
+                "create_goal",
+                "get_goal",
+                "list_mcp_resource_templates",
+                "list_mcp_resources",
+                "read_mcp_resource",
+                "update_goal",
+                "view_image",
+                "clock__curr_time"
+            ],
+            "caseScript": "ARGS=(--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --disable shell_tool)\n"
+        },
+        {
+            "id": "inv-nohost",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай inv-nohost: первый запрос CLI к провайдеру (поля tools и input[type=additional_tools]), имена и типы дословно",
+            "cliVersion": "0.163.0",
+            "model": "gpt-6-astra",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --disable code_mode_host",
+            "note": "--disable code_mode_host: exec объявлен, но code mode «fail closed» (stderr)",
+            "tools": [],
+            "additionalTools": [
+                {
+                    "namespace": "functions",
+                    "tools": [
+                        {
+                            "type": "custom",
+                            "name": "exec"
+                        },
+                        {
+                            "type": "function",
+                            "name": "wait"
+                        },
+                        {
+                            "type": "function",
+                            "name": "request_user_input"
+                        },
+                        {
+                            "type": "function",
+                            "name": "request_user_input_async"
+                        }
+                    ]
+                },
+                {
+                    "namespace": "clock",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "sleep"
+                        }
+                    ]
+                },
+                {
+                    "namespace": "collaboration",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "followup_task"
+                        },
+                        {
+                            "type": "function",
+                            "name": "interrupt_agent"
+                        },
+                        {
+                            "type": "function",
+                            "name": "list_agents"
+                        },
+                        {
+                            "type": "function",
+                            "name": "send_message"
+                        },
+                        {
+                            "type": "function",
+                            "name": "spawn_agent"
+                        },
+                        {
+                            "type": "function",
+                            "name": "wait_agent"
+                        }
+                    ]
+                }
+            ],
+            "codeModeNested": [
+                "apply_patch",
+                "create_goal",
+                "exec_command",
+                "get_goal",
+                "list_mcp_resource_templates",
+                "list_mcp_resources",
+                "read_mcp_resource",
+                "update_goal",
+                "view_image",
+                "write_stdin",
+                "clock__curr_time"
+            ],
+            "caseScript": "ARGS=(--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --disable code_mode_host)\n"
+        },
+        {
+            "id": "baseline",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай baseline: первый запрос CLI к провайдеру (поля tools и input[type=additional_tools]), имена и типы дословно",
+            "cliVersion": "0.163.0",
+            "model": "mock-model",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox",
+            "note": "модель без метаданных в бинаре: fallback-набор без apply_patch",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec_command"
+                },
+                {
+                    "type": "function",
+                    "name": "write_stdin"
+                },
+                {
+                    "type": "function",
+                    "name": "request_user_input"
+                },
+                {
+                    "type": "function",
+                    "name": "view_image"
+                },
+                {
+                    "type": "namespace",
+                    "name": "multi_agent_v1"
+                },
+                {
+                    "type": "function",
+                    "name": "get_goal"
+                },
+                {
+                    "type": "function",
+                    "name": "create_goal"
+                },
+                {
+                    "type": "function",
+                    "name": "update_goal"
+                },
+                {
+                    "type": "web_search",
+                    "name": null
+                }
+            ],
+            "additionalTools": [],
+            "codeModeNested": null,
+            "caseScript": "ARGS=(--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox)\n"
+        }
+    ],
+    "trust": [
+        {
+            "id": "t-default",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай t-default: $CODEX_HOME/config.toml до и после прогона дословно",
+            "cliVersion": "0.163.0",
+            "argv": "codex exec --skip-git-repo-check",
+            "note": "sandbox по умолчанию exec (read-only): доверие не пишется",
+            "configBefore": "",
+            "configAfter": "",
+            "caseScript": "ARGS=(--skip-git-repo-check)\n"
+        },
+        {
+            "id": "t-ro",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай t-ro: $CODEX_HOME/config.toml до и после прогона дословно",
+            "cliVersion": "0.163.0",
+            "argv": "codex exec --skip-git-repo-check -s read-only",
+            "note": "-s read-only: не пишется",
+            "configBefore": "",
+            "configAfter": "",
+            "caseScript": "ARGS=(--skip-git-repo-check -s read-only)\n"
+        },
+        {
+            "id": "t-ws",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай t-ws: $CODEX_HOME/config.toml до и после прогона дословно",
+            "cliVersion": "0.163.0",
+            "argv": "codex exec --skip-git-repo-check -s workspace-write",
+            "note": "-s workspace-write: пишется ключом главного репозитория linked worktree",
+            "configBefore": "",
+            "configAfter": "[projects.\"/path/to/stand/work/consumer\"]\ntrust_level = \"trusted\"\n",
+            "caseScript": "ARGS=(--skip-git-repo-check -s workspace-write)\n"
+        },
+        {
+            "id": "t-dfa",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай t-dfa: $CODEX_HOME/config.toml до и после прогона дословно",
+            "cliVersion": "0.163.0",
+            "argv": "codex exec --skip-git-repo-check -s danger-full-access",
+            "note": "-s danger-full-access: пишется",
+            "configBefore": "",
+            "configAfter": "[projects.\"/path/to/stand/work/consumer\"]\ntrust_level = \"trusted\"\n",
+            "caseScript": "ARGS=(--skip-git-repo-check -s danger-full-access)\n"
+        },
+        {
+            "id": "t-bypass",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай t-bypass: $CODEX_HOME/config.toml до и после прогона дословно",
+            "cliVersion": "0.163.0",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox",
+            "note": "--dangerously-bypass-approvals-and-sandbox: пишется",
+            "configBefore": "",
+            "configAfter": "[projects.\"/path/to/stand/work/consumer\"]\ntrust_level = \"trusted\"\n",
+            "caseScript": "ARGS=(--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox)\n"
+        },
+        {
+            "id": "t-untrusted",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай t-untrusted: $CODEX_HOME/config.toml до и после прогона дословно",
+            "cliVersion": "0.163.0",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox",
+            "note": "запись untrusted уже есть: не переписывается",
+            "configBefore": "[projects.\"/path/to/stand/work/consumer\"]\ntrust_level = \"untrusted\"\n",
+            "configAfter": "[projects.\"/path/to/stand/work/consumer\"]\ntrust_level = \"untrusted\"\n",
+            "caseScript": "ARGS=(--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox)\npre() { printf '[projects.\"%s\"]\\ntrust_level = \"untrusted\"\\n' \"$C\" >\"$CODEX_HOME/config.toml\"; }\n"
+        },
+        {
+            "id": "t-cflag",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай t-cflag: $CODEX_HOME/config.toml до и после прогона дословно",
+            "cliVersion": "0.163.0",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -c projects=\\{\\\"/path/to/stand/work/consumer\\\"=\\{trust_level=\\\"untrusted\\\"\\}\\}",
+            "note": "-c projects={<репо>={trust_level=untrusted}}: не пишется",
+            "configBefore": "",
+            "configAfter": "",
+            "caseScript": "ARGS=(--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -c \"projects={\\\"$C\\\"={trust_level=\\\"untrusted\\\"}}\")\n"
+        },
+        {
+            "id": "L-proj",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай L-proj: $CODEX_HOME/config.toml до и после прогона дословно",
+            "cliVersion": "0.163.0",
+            "argv": "codex exec --ignore-user-config -s danger-full-access --skip-git-repo-check --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/L-proj/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "note": "argv петли (--ignore-user-config -s danger-full-access): ПИШЕТСЯ, хотя конфиг дома не читается",
+            "configBefore": "",
+            "configAfter": "[projects.\"/path/to/stand/work/consumer\"]\ntrust_level = \"trusted\"\n",
+            "caseScript": ". \"$D/common-h.sh\"\n# argv петли (buildCodexArgs + регистрация guard), провайдер — фиктивный стенда.\n# Проектные слои: хуки файлом Codex и в config.toml, MCP-сервер.\nARGS=(--ignore-user-config -s danger-full-access --skip-git-repo-check \"${HOOK[@]}\")\npre() {\n  mkdir -p \"$C/.codex\"\n  CJ projjson >\"$C/.codex/hooks.json\"\n  CT projtoml >\"$C/.codex/config.toml\"\n  printf '[mcp_servers.projmcp]\\ncommand = \"node\"\\nargs = [\"/path/to/canon/provision/stand/fake-mcp.mts\", \"%s\"]\\n' \"$OUT/projmcp.jsonl\" >>\"$C/.codex/config.toml\"\n}\n"
+        },
+        {
+            "id": "L-proj-pretrusted",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай L-proj-pretrusted: $CODEX_HOME/config.toml до и после прогона дословно",
+            "cliVersion": "0.163.0",
+            "argv": "codex exec --ignore-user-config -s danger-full-access --skip-git-repo-check --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/L-proj-pretrusted/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "note": "argv петли при уже записанном доверии: запись не меняется",
+            "configBefore": "[projects.\"/path/to/stand/work/consumer\"]\ntrust_level = \"trusted\"\n",
+            "configAfter": "[projects.\"/path/to/stand/work/consumer\"]\ntrust_level = \"trusted\"\n",
+            "caseScript": ". \"$D/common-h.sh\"\n# То же, но доверие проекту уже записано в конфиге дома Codex.\nARGS=(--ignore-user-config -s danger-full-access --skip-git-repo-check \"${HOOK[@]}\")\npre() {\n  printf '[projects.\"%s\"]\\ntrust_level = \"trusted\"\\n' \"$C\" >\"$CODEX_HOME/config.toml\"\n  mkdir -p \"$C/.codex\"\n  CJ projjson >\"$C/.codex/hooks.json\"\n  CT projtoml >\"$C/.codex/config.toml\"\n}\n"
+        }
+    ],
+    "hookLayers": [
+        {
+            "id": "h-notrust",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай h-notrust: какие хуки записали вызов на одном exec_command (журнал каждого хука — свой файл)",
+            "cliVersion": "0.163.0",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --enable hooks -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/h-notrust/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "note": "-c хук с --enable hooks, без --dangerously-bypass-hook-trust: не позван никто",
+            "hooksCalled": [],
+            "caseScript": ". \"$D/common-h.sh\"\nARGS=(\"${BASE[@]}\" --enable hooks -c \"$(hookreg \"$OUT/hook.jsonl\")\")\n"
+        },
+        {
+            "id": "h-noenable",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай h-noenable: какие хуки записали вызов на одном exec_command (журнал каждого хука — свой файл)",
+            "cliVersion": "0.163.0",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/h-noenable/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "note": "-c хук с флагом доверия, без --enable hooks: позван (features.hooks по умолчанию true)",
+            "hooksCalled": ["hook"],
+            "caseScript": ". \"$D/common-h.sh\"\nARGS=(\"${BASE[@]}\" --dangerously-bypass-hook-trust -c \"$(hookreg \"$OUT/hook.jsonl\")\")\n"
+        },
+        {
+            "id": "h-projtoml",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай h-projtoml: какие хуки записали вызов на одном exec_command (журнал каждого хука — свой файл)",
+            "cliVersion": "0.163.0",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/h-projtoml/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "note": "доверенный проект, хук в .codex/config.toml: позваны оба",
+            "hooksCalled": ["hook", "projtoml"],
+            "caseScript": ". \"$D/common-h.sh\"\nARGS=(\"${BASE[@]}\" \"${HOOK[@]}\"); pre() { mkdir -p \"$C/.codex\"; CT projtoml >\"$C/.codex/config.toml\"; }\n"
+        },
+        {
+            "id": "h-projjson",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай h-projjson: какие хуки записали вызов на одном exec_command (журнал каждого хука — свой файл)",
+            "cliVersion": "0.163.0",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/h-projjson/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "note": "доверенный проект, хук в .codex/hooks.json: позваны оба",
+            "hooksCalled": ["hook", "projjson"],
+            "caseScript": ". \"$D/common-h.sh\"\n# Проектный файл хуков Codex в дереве потребителя (стенд, не данные контура канона).\nARGS=(\"${BASE[@]}\" \"${HOOK[@]}\"); pre() { mkdir -p \"$C/.codex\"; CJ projjson >\"$C/.codex/hooks.json\"; }\n"
+        },
+        {
+            "id": "h-subtoml",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай h-subtoml: какие хуки записали вызов на одном exec_command (журнал каждого хука — свой файл)",
+            "cliVersion": "0.163.0",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/h-subtoml/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "note": "доверенный проект, хук в sub/.codex/config.toml при cwd sub/: позваны оба",
+            "hooksCalled": ["hook", "subtoml"],
+            "caseScript": ". \"$D/common-h.sh\"\nARGS=(\"${BASE[@]}\" \"${HOOK[@]}\"); LOOPSUB=1; pre() { mkdir -p \"$C/sub/.codex\"; CT subtoml >\"$C/sub/.codex/config.toml\"; touch \"$C/sub/.keep\"; }\n"
+        },
+        {
+            "id": "h-projoff",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай h-projoff: какие хуки записали вызов на одном exec_command (журнал каждого хука — свой файл)",
+            "cliVersion": "0.163.0",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/h-projoff/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "note": "проектный features.hooks=false, --enable hooks в argv: наш позван",
+            "hooksCalled": ["hook"],
+            "caseScript": ". \"$D/common-h.sh\"\nARGS=(\"${BASE[@]}\" \"${HOOK[@]}\"); pre() { mkdir -p \"$C/.codex\"; printf \"[features]\\nhooks = false\\n\" >\"$C/.codex/config.toml\"; }\n"
+        },
+        {
+            "id": "h-projoff-nopin",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай h-projoff-nopin: какие хуки записали вызов на одном exec_command (журнал каждого хука — свой файл)",
+            "cliVersion": "0.163.0",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/h-projoff-nopin/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "note": "проектный features.hooks=false без --enable hooks: не позван никто",
+            "hooksCalled": [],
+            "caseScript": ". \"$D/common-h.sh\"\nARGS=(\"${BASE[@]}\" --dangerously-bypass-hook-trust -c \"$(hookreg \"$OUT/hook.jsonl\")\"); pre() { mkdir -p \"$C/.codex\"; printf \"[features]\\nhooks = false\\n\" >\"$C/.codex/config.toml\"; }\n"
+        },
+        {
+            "id": "h-projtoml-untrusted",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай h-projtoml-untrusted: какие хуки записали вызов на одном exec_command (журнал каждого хука — свой файл)",
+            "cliVersion": "0.163.0",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/h-projtoml-untrusted/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\] -c projects=\\{\\\"/path/to/stand/work/consumer\\\"=\\{trust_level=\\\"untrusted\\\"\\}\\}",
+            "note": "проект объявлен untrusted через -c: проектный хук не позван, наш — да",
+            "hooksCalled": ["hook"],
+            "caseScript": ". \"$D/common-h.sh\"\nARGS=(\"${BASE[@]}\" \"${HOOK[@]}\" -c \"projects={\\\"$C\\\"={trust_level=\\\"untrusted\\\"}}\"); pre() { mkdir -p \"$C/.codex\"; CT projtoml >\"$C/.codex/config.toml\"; }\n"
+        },
+        {
+            "id": "h-projjson-untrusted",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай h-projjson-untrusted: какие хуки записали вызов на одном exec_command (журнал каждого хука — свой файл)",
+            "cliVersion": "0.163.0",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/h-projjson-untrusted/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\] -c projects=\\{\\\"/path/to/stand/work/consumer\\\"=\\{trust_level=\\\"untrusted\\\"\\}\\}",
+            "note": "то же для .codex/hooks.json",
+            "hooksCalled": ["hook"],
+            "caseScript": ". \"$D/common-h.sh\"\n# Проектный файл хуков Codex при проекте, объявленном недоверенным переопределением -c.\nARGS=(\"${BASE[@]}\" \"${HOOK[@]}\" -c \"projects={\\\"$C\\\"={trust_level=\\\"untrusted\\\"}}\"); pre() { mkdir -p \"$C/.codex\"; CJ projjson >\"$C/.codex/hooks.json\"; }\n"
+        },
+        {
+            "id": "u-sub",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай u-sub: какие хуки записали вызов на одном exec_command (журнал каждого хука — свой файл)",
+            "cliVersion": "0.163.0",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/u-sub/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\] -c projects=\\{\\\"/path/to/stand/work/consumer\\\"=\\{trust_level=\\\"untrusted\\\"\\}\\}",
+            "note": "untrusted через -c, хук в sub/.codex: не позван",
+            "hooksCalled": ["hook"],
+            "caseScript": ". \"$D/common-h.sh\"\nARGS=(\"${BASE[@]}\" \"${HOOK[@]}\" -c \"projects={\\\"$C\\\"={trust_level=\\\"untrusted\\\"}}\"); LOOPSUB=1; pre() { mkdir -p \"$C/sub/.codex\"; CT subtoml >\"$C/sub/.codex/config.toml\"; touch \"$C/sub/.keep\"; }\n"
+        },
+        {
+            "id": "u-off",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай u-off: какие хуки записали вызов на одном exec_command (журнал каждого хука — свой файл)",
+            "cliVersion": "0.163.0",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/u-off/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\] -c projects=\\{\\\"/path/to/stand/work/consumer\\\"=\\{trust_level=\\\"untrusted\\\"\\}\\}",
+            "note": "untrusted через -c, проектный features.hooks=false без --enable hooks: наш позван",
+            "hooksCalled": ["hook"],
+            "caseScript": ". \"$D/common-h.sh\"\nARGS=(\"${BASE[@]}\" --dangerously-bypass-hook-trust -c \"$(hookreg \"$OUT/hook.jsonl\")\" -c \"projects={\\\"$C\\\"={trust_level=\\\"untrusted\\\"}}\"); pre() { mkdir -p \"$C/.codex\"; printf '[features]\\nhooks = false\\n' >\"$C/.codex/config.toml\"; }\n"
+        },
+        {
+            "id": "u-loopkey",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай u-loopkey: какие хуки записали вызов на одном exec_command (журнал каждого хука — свой файл)",
+            "cliVersion": "0.163.0",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/u-loopkey/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\] -c projects=\\{\\\"/path/to/stand/work/loop\\\"=\\{trust_level=\\\"untrusted\\\"\\}\\}",
+            "note": "untrusted через -c ключом пути linked worktree (не главного репо): проектный хук не позван",
+            "hooksCalled": ["hook"],
+            "caseScript": ". \"$D/common-h.sh\"\nARGS=(\"${BASE[@]}\" \"${HOOK[@]}\" -c \"projects={\\\"$LOOP\\\"={trust_level=\\\"untrusted\\\"}}\"); pre() { mkdir -p \"$C/.codex\"; CT projtoml >\"$C/.codex/config.toml\"; }\n"
+        },
+        {
+            "id": "h-projtoml-notrust",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай h-projtoml-notrust: какие хуки записали вызов на одном exec_command (журнал каждого хука — свой файл)",
+            "cliVersion": "0.163.0",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --enable hooks -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/h-projtoml-notrust/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "note": "проектный хук без флага доверия хукам: не позван никто",
+            "hooksCalled": [],
+            "caseScript": ". \"$D/common-h.sh\"\nARGS=(\"${BASE[@]}\" --enable hooks -c \"$(hookreg \"$OUT/hook.jsonl\")\"); pre() { mkdir -p \"$C/.codex\"; CT projtoml >\"$C/.codex/config.toml\"; }\n"
+        },
+        {
+            "id": "h-projjson-notrust",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай h-projjson-notrust: какие хуки записали вызов на одном exec_command (журнал каждого хука — свой файл)",
+            "cliVersion": "0.163.0",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --enable hooks -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/h-projjson-notrust/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "note": "то же для .codex/hooks.json",
+            "hooksCalled": [],
+            "caseScript": ". \"$D/common-h.sh\"\n# Проектный файл хуков Codex без флага обхода доверия хукам.\nARGS=(\"${BASE[@]}\" --enable hooks -c \"$(hookreg \"$OUT/hook.jsonl\")\"); pre() { mkdir -p \"$C/.codex\"; CJ projjson >\"$C/.codex/hooks.json\"; }\n"
+        },
+        {
+            "id": "h-usertoml",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай h-usertoml: какие хуки записали вызов на одном exec_command (журнал каждого хука — свой файл)",
+            "cliVersion": "0.163.0",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/h-usertoml/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "note": "хук в config.toml дома без --ignore-user-config: позваны оба",
+            "hooksCalled": ["hook", "usertoml"],
+            "caseScript": ". \"$D/common-h.sh\"\nARGS=(\"${BASE[@]}\" \"${HOOK[@]}\"); pre() { CT usertoml >\"$CODEX_HOME/config.toml\"; }\n"
+        },
+        {
+            "id": "h-userjson",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай h-userjson: какие хуки записали вызов на одном exec_command (журнал каждого хука — свой файл)",
+            "cliVersion": "0.163.0",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/h-userjson/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "note": "хук в hooks.json дома без --ignore-user-config: позваны оба",
+            "hooksCalled": ["hook", "userjson"],
+            "caseScript": ". \"$D/common-h.sh\"\n# Файл хуков в доме Codex (CODEX_HOME стенда) рядом с нашим -c.\nARGS=(\"${BASE[@]}\" \"${HOOK[@]}\"); pre() { CJ userjson >\"$CODEX_HOME/hooks.json\"; }\n"
+        },
+        {
+            "id": "L-proj",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай L-proj: какие хуки записали вызов на одном exec_command (журнал каждого хука — свой файл)",
+            "cliVersion": "0.163.0",
+            "argv": "codex exec --ignore-user-config -s danger-full-access --skip-git-repo-check --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/L-proj/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "note": "argv петли: проектные хуки (оба файла) не позваны, наш — да",
+            "hooksCalled": ["hook"],
+            "caseScript": ". \"$D/common-h.sh\"\n# argv петли (buildCodexArgs + регистрация guard), провайдер — фиктивный стенда.\n# Проектные слои: хуки файлом Codex и в config.toml, MCP-сервер.\nARGS=(--ignore-user-config -s danger-full-access --skip-git-repo-check \"${HOOK[@]}\")\npre() {\n  mkdir -p \"$C/.codex\"\n  CJ projjson >\"$C/.codex/hooks.json\"\n  CT projtoml >\"$C/.codex/config.toml\"\n  printf '[mcp_servers.projmcp]\\ncommand = \"node\"\\nargs = [\"/path/to/canon/provision/stand/fake-mcp.mts\", \"%s\"]\\n' \"$OUT/projmcp.jsonl\" >>\"$C/.codex/config.toml\"\n}\n"
+        },
+        {
+            "id": "L-proj-pretrusted",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай L-proj-pretrusted: какие хуки записали вызов на одном exec_command (журнал каждого хука — свой файл)",
+            "cliVersion": "0.163.0",
+            "argv": "codex exec --ignore-user-config -s danger-full-access --skip-git-repo-check --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/L-proj-pretrusted/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "note": "argv петли при записанном доверии: проектные хуки не позваны",
+            "hooksCalled": ["hook"],
+            "caseScript": ". \"$D/common-h.sh\"\n# То же, но доверие проекту уже записано в конфиге дома Codex.\nARGS=(--ignore-user-config -s danger-full-access --skip-git-repo-check \"${HOOK[@]}\")\npre() {\n  printf '[projects.\"%s\"]\\ntrust_level = \"trusted\"\\n' \"$C\" >\"$CODEX_HOME/config.toml\"\n  mkdir -p \"$C/.codex\"\n  CJ projjson >\"$C/.codex/hooks.json\"\n  CT projtoml >\"$C/.codex/config.toml\"\n}\n"
+        },
+        {
+            "id": "L-off",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай L-off: какие хуки записали вызов на одном exec_command (журнал каждого хука — свой файл)",
+            "cliVersion": "0.163.0",
+            "argv": "codex exec --ignore-user-config -s danger-full-access --skip-git-repo-check --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/L-off/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "note": "argv петли без --enable hooks, проектный features.hooks=false: наш позван",
+            "hooksCalled": ["hook"],
+            "caseScript": ". \"$D/common-h.sh\"\nARGS=(--ignore-user-config -s danger-full-access --skip-git-repo-check --dangerously-bypass-hook-trust -c \"$(hookreg \"$OUT/hook.jsonl\")\"); pre() { mkdir -p \"$C/.codex\"; printf \"[features]\\nhooks = false\\n\" >\"$C/.codex/config.toml\"; }\n"
+        },
+        {
+            "id": "L-off-pretrusted",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай L-off-pretrusted: какие хуки записали вызов на одном exec_command (журнал каждого хука — свой файл)",
+            "cliVersion": "0.163.0",
+            "argv": "codex exec --ignore-user-config -s danger-full-access --skip-git-repo-check --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/L-off-pretrusted/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "note": "то же при записанном доверии: наш позван",
+            "hooksCalled": ["hook"],
+            "caseScript": ". \"$D/common-h.sh\"\nARGS=(--ignore-user-config -s danger-full-access --skip-git-repo-check --dangerously-bypass-hook-trust -c \"$(hookreg \"$OUT/hook.jsonl\")\"); pre() { printf \"[projects.\\\"%s\\\"]\\ntrust_level = \\\"trusted\\\"\\n\" \"$C\" >\"$CODEX_HOME/config.toml\"; mkdir -p \"$C/.codex\"; printf \"[features]\\nhooks = false\\n\" >\"$C/.codex/config.toml\"; }\n"
+        },
+        {
+            "id": "L-home",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026; случай L-home: какие хуки записали вызов на одном exec_command (журнал каждого хука — свой файл)",
+            "cliVersion": "0.163.0",
+            "argv": "codex exec --ignore-user-config -s danger-full-access --skip-git-repo-check --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/L-home/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "note": "argv петли: hooks.json ДОМА позван, хук из config.toml дома — нет",
+            "hooksCalled": ["hook", "userjson"],
+            "caseScript": ". \"$D/common-h.sh\"\n# Хуки дома Codex (файлом и в config.toml) под --ignore-user-config.\nARGS=(--ignore-user-config -s danger-full-access --skip-git-repo-check \"${HOOK[@]}\")\npre() { CJ userjson >\"$CODEX_HOME/hooks.json\"; CT usertoml >\"$CODEX_HOME/config.toml\"; }\n"
+        },
+        {
+            "id": "S-anc",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026, карточка #195; случай S-anc: какие хуки записали вызов на одном exec_command (журнал каждого хука — свой файл)",
+            "cliVersion": "0.163.0",
+            "argv": "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/S-anc/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "note": "доверенный проект, хуки в .codex/ каталога НАД корнем репозитория (config.toml и файлом): не позван ни один из них, наш — да",
+            "hooksCalled": ["hook"],
+            "caseScript": ". \"$D/common-h.sh\"\n# Слой .codex/ в ПРЕДКЕ корня репозитория (каталог над work/consumer), проект доверен,\n# конфиг дома читается: зовёт ли Codex хук из него.\nHJ=\"hooks\"\".json\"\nARGS=(\"${BASE[@]}\" \"${HOOK[@]}\")\npre() { mkdir -p \"$S/work/.codex\"; CT anctoml >\"$S/work/.codex/config.toml\"; CJ ancjson >\"$S/work/.codex/$HJ\"; }\n"
+        }
+    ],
+    "loopChannels": [
+        {
+            "id": "L-tty-cm",
+            "title": "argv петли с --disable unified_exec_tty, code mode: exec_command tty=true для bash, python3 -i и node -i отвергнут — процесса для write_stdin нет",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026, карточка #190; случай L-tty-cm: журнал хука, ответ CLI модели (вывод инструмента) из журнала фиктивного провайдера и git status дерева после прогона",
+            "cliVersion": "0.163.0",
+            "model": "gpt-6-astra",
+            "mode": "code-mode",
+            "argv": "codex exec --ignore-user-config -s danger-full-access --skip-git-repo-check --disable unified_exec_tty --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/L-tty-cm/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "call": [
+                "{\"type\": \"custom_tool_call\", \"name\": \"exec\", \"call_id\": \"call-1\", \"input\": \"for (const cmd of [\\\"bash --noprofile --norc\\\", \\\"python3 -i\\\", \\\"node -i\\\"]) { try { const a = await tools.exec_command({cmd, tty: true, yield_time_ms: 500}); text(cmd + \\\" OPEN \\\" + JSON.stringify(a)); text(JSON.stringify(await tools.write_stdin({session_id: a.session_id, chars: \\\"touch ralph-stand-forbidden-tty\\\\n\\\", yield_time_ms: 500}))); } catch (e) { text(cmd + \\\" ERR \\\" + e); } }\"}"
+            ],
+            "hookStdin": [
+                "{\"session_id\":\"01a182b8-a173-7181-8ca6-2aa7a2bb4397\",\"turn_id\":\"01a182b8-a196-7003-bdc0-ecf8f0dcf0c5\",\"transcript_path\":\"/path/to/stand-home/.codex/sessions/2026/10/28/rollout-2026-10-28T13-35-00-01a182b8-a173-7181-8ca6-2aa7a2bb4397.jsonl\",\"cwd\":\"/path/to/stand/work/loop\",\"hook_event_name\":\"PreToolUse\",\"model\":\"gpt-6-astra\",\"permission_mode\":\"bypassPermissions\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"bash --noprofile --norc\"},\"tool_use_id\":\"exec-42a4b541-3be7-442b-85a7-e8c9ca18a520\"}",
+                "{\"session_id\":\"01a182b8-a173-7181-8ca6-2aa7a2bb4397\",\"turn_id\":\"01a182b8-a196-7003-bdc0-ecf8f0dcf0c5\",\"transcript_path\":\"/path/to/stand-home/.codex/sessions/2026/10/28/rollout-2026-10-28T13-35-00-01a182b8-a173-7181-8ca6-2aa7a2bb4397.jsonl\",\"cwd\":\"/path/to/stand/work/loop\",\"hook_event_name\":\"PreToolUse\",\"model\":\"gpt-6-astra\",\"permission_mode\":\"bypassPermissions\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"python3 -i\"},\"tool_use_id\":\"exec-284541b2-fec9-453e-8268-507ba7bd3c4b\"}",
+                "{\"session_id\":\"01a182b8-a173-7181-8ca6-2aa7a2bb4397\",\"turn_id\":\"01a182b8-a196-7003-bdc0-ecf8f0dcf0c5\",\"transcript_path\":\"/path/to/stand-home/.codex/sessions/2026/10/28/rollout-2026-10-28T13-35-00-01a182b8-a173-7181-8ca6-2aa7a2bb4397.jsonl\",\"cwd\":\"/path/to/stand/work/loop\",\"hook_event_name\":\"PreToolUse\",\"model\":\"gpt-6-astra\",\"permission_mode\":\"bypassPermissions\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"node -i\"},\"tool_use_id\":\"exec-90fc4f1a-8cbb-4987-ae6d-711b02fa00b9\"}"
+            ],
+            "cliToolOutput": [
+                "[{\"type\": \"input_text\", \"text\": \"Script completed\\nWall time 0.2 seconds\\nOutput:\\n\"}, {\"type\": \"input_text\", \"text\": \"bash --noprofile --norc ERR TTY execution is disabled by config; omit `tty` or set it to false.\"}, {\"type\": \"input_text\", \"text\": \"python3 -i ERR TTY execution is disabled by config; omit `tty` or set it to false.\"}, {\"type\": \"input_text\", \"text\": \"node -i ERR TTY execution is disabled by config; omit `tty` or set it to false.\"}]"
+            ],
+            "loopStatus": [],
+            "caseScript": "# argv петли: buildCodexArgs (-s danger-full-access, --ignore-user-config) + регистрация guard с --disable unified_exec_tty\nARGS=(--ignore-user-config -s danger-full-access --skip-git-repo-check --disable unified_exec_tty \"${HOOK[@]}\")\npost() { ( cd \"$LOOP\" && ls -1 ) >\"$OUT/loop-files.txt\"; }\nMODEL=gpt-6-astra\nSTEPS=$(js 'for (const cmd of [\"bash --noprofile --norc\", \"python3 -i\", \"node -i\"]) { try { const a = await tools.exec_command({cmd, tty: true, yield_time_ms: 500}); text(cmd + \" OPEN \" + JSON.stringify(a)); text(JSON.stringify(await tools.write_stdin({session_id: a.session_id, chars: \"touch ralph-stand-forbidden-tty\\n\", yield_time_ms: 500}))); } catch (e) { text(cmd + \" ERR \" + e); } }')\n"
+        },
+        {
+            "id": "L-tty-dx",
+            "title": "argv петли с --disable unified_exec_tty, прямой вызов: exec_command tty=true отвергнут, write_stdin без процесса",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026, карточка #190; случай L-tty-dx: журнал хука, ответ CLI модели (вывод инструмента) из журнала фиктивного провайдера и git status дерева после прогона",
+            "cliVersion": "0.163.0",
+            "model": "gpt-5.5",
+            "mode": "direct",
+            "argv": "codex exec --ignore-user-config -s danger-full-access --skip-git-repo-check --disable unified_exec_tty --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/L-tty-dx/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "call": [
+                "{\"type\": \"function_call\", \"name\": \"exec_command\", \"call_id\": \"call-1\", \"arguments\": \"{\\\"cmd\\\":\\\"bash --noprofile --norc\\\",\\\"tty\\\":true,\\\"yield_time_ms\\\":500}\"}",
+                "{\"type\": \"function_call\", \"name\": \"write_stdin\", \"call_id\": \"call-2\", \"arguments\": \"{\\\"session_id\\\":__SID__,\\\"chars\\\":\\\"touch ralph-stand-forbidden-tty\\\\n\\\",\\\"yield_time_ms\\\":500}\"}"
+            ],
+            "hookStdin": [
+                "{\"session_id\":\"01a182b8-a74d-7072-90bb-a0ec9ab8a172\",\"turn_id\":\"01a182b8-a76c-70f2-96fc-43cce16cbccf\",\"transcript_path\":\"/path/to/stand-home/.codex/sessions/2026/10/28/rollout-2026-10-28T13-35-01-01a182b8-a74d-7072-90bb-a0ec9ab8a172.jsonl\",\"cwd\":\"/path/to/stand/work/loop\",\"hook_event_name\":\"PreToolUse\",\"model\":\"gpt-5.5\",\"permission_mode\":\"bypassPermissions\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"bash --noprofile --norc\"},\"tool_use_id\":\"call-1\"}"
+            ],
+            "cliToolOutput": [
+                "\"TTY execution is disabled by config; omit `tty` or set it to false.\"",
+                "\"failed to parse function arguments: expected value at line 1 column 15\""
+            ],
+            "loopStatus": [],
+            "caseScript": "# argv петли: buildCodexArgs (-s danger-full-access, --ignore-user-config) + регистрация guard с --disable unified_exec_tty\nARGS=(--ignore-user-config -s danger-full-access --skip-git-repo-check --disable unified_exec_tty \"${HOOK[@]}\")\npost() { ( cd \"$LOOP\" && ls -1 ) >\"$OUT/loop-files.txt\"; }\nMODEL=gpt-5.5\nSTEPS='[[{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"call-1\",\"arguments\":\"{\\\"cmd\\\":\\\"bash --noprofile --norc\\\",\\\"tty\\\":true,\\\"yield_time_ms\\\":500}\"}],[{\"type\":\"function_call\",\"name\":\"write_stdin\",\"call_id\":\"call-2\",\"arguments\":\"{\\\"session_id\\\":__SID__,\\\"chars\\\":\\\"touch ralph-stand-forbidden-tty\\\\n\\\",\\\"yield_time_ms\\\":500}\"}],[{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"m3\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}]]'\n"
+        },
+        {
+            "id": "L-repl-cm",
+            "title": "argv петли с --disable unified_exec_tty, code mode: write_stdin с запрещённым вводом в живые bash, python3 -i и node -i — stdin закрыт, эффекта нет; тот же ввод в команде exec_command судит хук и исполняет",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026, карточка #190; случай L-repl-cm: журнал хука, ответ CLI модели (вывод инструмента) из журнала фиктивного провайдера и git status дерева после прогона",
+            "cliVersion": "0.163.0",
+            "model": "gpt-6-astra",
+            "mode": "code-mode",
+            "argv": "codex exec --ignore-user-config -s danger-full-access --skip-git-repo-check --disable unified_exec_tty --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/L-repl-cm/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "call": [
+                "{\"type\": \"custom_tool_call\", \"name\": \"exec\", \"call_id\": \"call-1\", \"input\": \"const inputs = {\\\"bash --noprofile --norc\\\": \\\"touch ralph-stand-forbidden-sh\\\\n\\\", \\\"python3 -i\\\": \\\"open(\\\\\\\"ralph-stand-forbidden-py\\\\\\\",\\\\\\\"w\\\\\\\")\\\\n\\\", \\\"node -i\\\": \\\"require(\\\\\\\"fs\\\\\\\").writeFileSync(\\\\\\\"ralph-stand-forbidden-js\\\\\\\",\\\\\\\"\\\\\\\")\\\\n\\\"}; for (const [cmd, chars] of Object.entries(inputs)) { try { const a = await tools.exec_command({cmd: \\\"sleep 1; \\\" + cmd, yield_time_ms: 250}); text(cmd + \\\" OPEN \\\" + JSON.stringify(a)); text(cmd + \\\" IN \\\" + JSON.stringify(await tools.write_stdin({session_id: a.session_id, chars, yield_time_ms: 250}))); text(cmd + \\\" WAIT \\\" + JSON.stringify(await tools.write_stdin({session_id: a.session_id, chars: \\\"\\\", yield_time_ms: 3000}))); } catch (e) { text(cmd + \\\" ERR \\\" + e); } } for (const cmd of [\\\"printf %s\\\\\\\\\\\\\\\\n \\\\\\\"touch ralph-stand-allowed-sh\\\\\\\" | bash\\\", \\\"printf %s\\\\\\\\\\\\\\\\n \\\\\\\"open(\\\\\\\\\\\\\\\"ralph-stand-allowed-py\\\\\\\\\\\\\\\",\\\\\\\\\\\\\\\"w\\\\\\\\\\\\\\\")\\\\\\\" | python3\\\", \\\"echo ok\\\"]) { try { text(cmd + \\\" RUN \\\" + JSON.stringify(await tools.exec_command({cmd, yield_time_ms: 3000}))); } catch (e) { text(cmd + \\\" ERR \\\" + e); } }\"}"
+            ],
+            "hookStdin": [
+                "{\"session_id\":\"01a182b8-ad5a-7091-9107-949940746037\",\"turn_id\":\"01a182b8-ad77-79e2-b650-56a24577c8ab\",\"transcript_path\":\"/path/to/stand-home/.codex/sessions/2026/10/28/rollout-2026-10-28T13-35-03-01a182b8-ad5a-7091-9107-949940746037.jsonl\",\"cwd\":\"/path/to/stand/work/loop\",\"hook_event_name\":\"PreToolUse\",\"model\":\"gpt-6-astra\",\"permission_mode\":\"bypassPermissions\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"sleep 1; bash --noprofile --norc\"},\"tool_use_id\":\"exec-cc73c439-bdb9-4ea6-b12d-6822d8e1511b\"}",
+                "{\"session_id\":\"01a182b8-ad5a-7091-9107-949940746037\",\"turn_id\":\"01a182b8-ad77-79e2-b650-56a24577c8ab\",\"transcript_path\":\"/path/to/stand-home/.codex/sessions/2026/10/28/rollout-2026-10-28T13-35-03-01a182b8-ad5a-7091-9107-949940746037.jsonl\",\"cwd\":\"/path/to/stand/work/loop\",\"hook_event_name\":\"PreToolUse\",\"model\":\"gpt-6-astra\",\"permission_mode\":\"bypassPermissions\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"sleep 1; python3 -i\"},\"tool_use_id\":\"exec-a1995f2d-d5fa-4055-8082-26fdbaafd793\"}",
+                "{\"session_id\":\"01a182b8-ad5a-7091-9107-949940746037\",\"turn_id\":\"01a182b8-ad77-79e2-b650-56a24577c8ab\",\"transcript_path\":\"/path/to/stand-home/.codex/sessions/2026/10/28/rollout-2026-10-28T13-35-03-01a182b8-ad5a-7091-9107-949940746037.jsonl\",\"cwd\":\"/path/to/stand/work/loop\",\"hook_event_name\":\"PreToolUse\",\"model\":\"gpt-6-astra\",\"permission_mode\":\"bypassPermissions\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"sleep 1; node -i\"},\"tool_use_id\":\"exec-423c2a81-0df8-418c-9648-abaa7ae44891\"}",
+                "{\"session_id\":\"01a182b8-ad5a-7091-9107-949940746037\",\"turn_id\":\"01a182b8-ad77-79e2-b650-56a24577c8ab\",\"transcript_path\":\"/path/to/stand-home/.codex/sessions/2026/10/28/rollout-2026-10-28T13-35-03-01a182b8-ad5a-7091-9107-949940746037.jsonl\",\"cwd\":\"/path/to/stand/work/loop\",\"hook_event_name\":\"PreToolUse\",\"model\":\"gpt-6-astra\",\"permission_mode\":\"bypassPermissions\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"printf %s\\\\\\\\n \\\"touch ralph-stand-allowed-sh\\\" | bash\"},\"tool_use_id\":\"exec-db534219-01bc-4f28-80ff-4a866650919b\"}",
+                "{\"session_id\":\"01a182b8-ad5a-7091-9107-949940746037\",\"turn_id\":\"01a182b8-ad77-79e2-b650-56a24577c8ab\",\"transcript_path\":\"/path/to/stand-home/.codex/sessions/2026/10/28/rollout-2026-10-28T13-35-03-01a182b8-ad5a-7091-9107-949940746037.jsonl\",\"cwd\":\"/path/to/stand/work/loop\",\"hook_event_name\":\"PreToolUse\",\"model\":\"gpt-6-astra\",\"permission_mode\":\"bypassPermissions\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"printf %s\\\\\\\\n \\\"open(\\\\\\\"ralph-stand-allowed-py\\\\\\\",\\\\\\\"w\\\\\\\")\\\" | python3\"},\"tool_use_id\":\"exec-17a9771d-d1f5-4242-8431-0150d6165cdc\"}",
+                "{\"session_id\":\"01a182b8-ad5a-7091-9107-949940746037\",\"turn_id\":\"01a182b8-ad77-79e2-b650-56a24577c8ab\",\"transcript_path\":\"/path/to/stand-home/.codex/sessions/2026/10/28/rollout-2026-10-28T13-35-03-01a182b8-ad5a-7091-9107-949940746037.jsonl\",\"cwd\":\"/path/to/stand/work/loop\",\"hook_event_name\":\"PreToolUse\",\"model\":\"gpt-6-astra\",\"permission_mode\":\"bypassPermissions\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"echo ok\"},\"tool_use_id\":\"exec-4a03b202-e87d-46b5-a098-97dfc91fe635\"}"
+            ],
+            "cliToolOutput": [
+                "[{\"type\": \"input_text\", \"text\": \"Script completed\\nWall time 1.8 seconds\\nOutput:\\n\"}, {\"type\": \"input_text\", \"text\": \"bash --noprofile --norc OPEN {\\\"chunk_id\\\":\\\"790592\\\",\\\"wall_time_seconds\\\":0.250546478,\\\"session_id\\\":87593,\\\"original_token_count\\\":0,\\\"output\\\":\\\"\\\"}\"}, {\"type\": \"input_text\", \"text\": \"bash --noprofile --norc ERR write_stdin failed: stdin is closed for this session; rerun exec_command with tty=true to keep stdin open\"}, {\"type\": \"input_text\", \"text\": \"python3 -i OPEN {\\\"chunk_id\\\":\\\"906029\\\",\\\"wall_time_seconds\\\":0.250771431,\\\"session_id\\\":64872,\\\"original_token_count\\\":0,\\\"output\\\":\\\"\\\"}\"}, {\"type\": \"input_text\", \"text\": \"python3 -i ERR write_stdin failed: stdin is closed for this session; rerun exec_command with tty=true to keep stdin open\"}, {\"type\": \"input_text\", \"text\": \"node -i OPEN {\\\"chunk_id\\\":\\\"19e41b\\\",\\\"wall_time_seconds\\\":0.251632171,\\\"session_id\\\":14028,\\\"original_token_count\\\":0,\\\"output\\\":\\\"\\\"}\"}, {\"type\": \"input_text\", \"text\": \"node -i ERR write_stdin failed: stdin is closed for this session; rerun exec_command with tty=true to keep stdin open\"}, {\"type\": \"input_text\", \"text\": \"printf %s\\\\\\\\n \\\"touch ralph-stand-allowed-sh\\\" | bash RUN {\\\"chunk_id\\\":\\\"507d49\\\",\\\"wall_time_seconds\\\":0.00000668,\\\"exit_code\\\":0,\\\"original_token_count\\\":0,\\\"output\\\":\\\"\\\"}\"}, {\"type\": \"input_text\", \"text\": \"printf %s\\\\\\\\n \\\"open(\\\\\\\"ralph-stand-allowed-py\\\\\\\",\\\\\\\"w\\\\\\\")\\\" | python3 RUN {\\\"chunk_id\\\":\\\"8029ef\\\",\\\"wall_time_seconds\\\":0.000008985,\\\"exit_code\\\":0,\\\"original_token_count\\\":0,\\\"output\\\":\\\"\\\"}\"}, {\"type\": \"input_text\", \"text\": \"echo ok RUN {\\\"chunk_id\\\":\\\"7b7589\\\",\\\"wall_time_seconds\\\":0.000010496,\\\"exit_code\\\":0,\\\"original_token_count\\\":1,\\\"output\\\":\\\"ok\\\\n\\\"}\"}]"
+            ],
+            "loopStatus": ["?? ralph-stand-allowed-py", "?? ralph-stand-allowed-sh"],
+            "caseScript": "# argv петли: buildCodexArgs (-s danger-full-access, --ignore-user-config) + регистрация guard с --disable unified_exec_tty\nARGS=(--ignore-user-config -s danger-full-access --skip-git-repo-check --disable unified_exec_tty \"${HOOK[@]}\")\npost() { ( cd \"$LOOP\" && ls -1 ) >\"$OUT/loop-files.txt\"; }\nMODEL=gpt-6-astra\nSTEPS=$(js 'const inputs = {\"bash --noprofile --norc\": \"touch ralph-stand-forbidden-sh\\n\", \"python3 -i\": \"open(\\\"ralph-stand-forbidden-py\\\",\\\"w\\\")\\n\", \"node -i\": \"require(\\\"fs\\\").writeFileSync(\\\"ralph-stand-forbidden-js\\\",\\\"\\\")\\n\"}; for (const [cmd, chars] of Object.entries(inputs)) { try { const a = await tools.exec_command({cmd: \"sleep 1; \" + cmd, yield_time_ms: 250}); text(cmd + \" OPEN \" + JSON.stringify(a)); text(cmd + \" IN \" + JSON.stringify(await tools.write_stdin({session_id: a.session_id, chars, yield_time_ms: 250}))); text(cmd + \" WAIT \" + JSON.stringify(await tools.write_stdin({session_id: a.session_id, chars: \"\", yield_time_ms: 3000}))); } catch (e) { text(cmd + \" ERR \" + e); } } for (const cmd of [\"printf %s\\\\\\\\n \\\"touch ralph-stand-allowed-sh\\\" | bash\", \"printf %s\\\\\\\\n \\\"open(\\\\\\\"ralph-stand-allowed-py\\\\\\\",\\\\\\\"w\\\\\\\")\\\" | python3\", \"echo ok\"]) { try { text(cmd + \" RUN \" + JSON.stringify(await tools.exec_command({cmd, yield_time_ms: 3000}))); } catch (e) { text(cmd + \" ERR \" + e); } }')\n"
+        },
+        {
+            "id": "L-exec-js",
+            "title": "argv петли, code mode: сам exec (JavaScript) хук не получает, но среды для эффекта у него нет — ни require, ни process, ни fetch, импорт отвергнут; наружу только tools.*",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026, карточка #190; случай L-exec-js: журнал хука, ответ CLI модели (вывод инструмента) из журнала фиктивного провайдера и git status дерева после прогона",
+            "cliVersion": "0.163.0",
+            "model": "gpt-6-astra",
+            "mode": "code-mode",
+            "argv": "codex exec --ignore-user-config -s danger-full-access --skip-git-repo-check --disable unified_exec_tty --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/L-exec-js/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "call": [
+                "{\"type\": \"custom_tool_call\", \"name\": \"exec\", \"call_id\": \"call-1\", \"input\": \"const probes = {require: () => typeof require, process: () => typeof process, Deno: () => typeof Deno, Bun: () => typeof Bun, fetch: () => typeof fetch, WebSocket: () => typeof WebSocket, importFs: async () => Object.keys(await import(\\\"node:fs\\\")).length, importFsBare: async () => Object.keys(await import(\\\"fs\\\")).length, dynamicFunction: () => typeof (new Function(\\\"return this\\\"))().process, globals: () => Object.getOwnPropertyNames(globalThis).join(\\\",\\\")}; for (const [k, f] of Object.entries(probes)) { try { text(k + \\\" = \\\" + String(await f())); } catch (e) { text(k + \\\" ERR \\\" + e); } }\"}"
+            ],
+            "hookStdin": [],
+            "cliToolOutput": [
+                "[{\"type\": \"input_text\", \"text\": \"Script completed\\nWall time 0.0 seconds\\nOutput:\\n\"}, {\"type\": \"input_text\", \"text\": \"require = undefined\"}, {\"type\": \"input_text\", \"text\": \"process = undefined\"}, {\"type\": \"input_text\", \"text\": \"Deno = undefined\"}, {\"type\": \"input_text\", \"text\": \"Bun = undefined\"}, {\"type\": \"input_text\", \"text\": \"fetch = undefined\"}, {\"type\": \"input_text\", \"text\": \"WebSocket = undefined\"}, {\"type\": \"input_text\", \"text\": \"importFs ERR unsupported import in exec\"}, {\"type\": \"input_text\", \"text\": \"importFsBare ERR unsupported import in exec\"}, {\"type\": \"input_text\", \"text\": \"dynamicFunction = undefined\"}, {\"type\": \"input_text\", \"text\": \"globals = Object,Function,Array,Number,parseFloat,parseInt,Infinity,NaN,undefined,Boolean,String,Symbol,Date,Promise,RegExp,Error,AggregateError,EvalError,RangeError,ReferenceError,SyntaxError,TypeError,URIError,globalThis,JSON,Math,Intl,ArrayBuffer,Uint8Array,Int8Array,Uint16Array,Int16Array,Uint32Array,Int32Array,BigUint64Array,BigInt64Array,Uint8ClampedArray,Float32Array,Float64Array,DataView,Map,BigInt,Set,Iterator,WeakMap,WeakSet,Proxy,Reflect,FinalizationRegistry,WeakRef,decodeURI,decodeURIComponent,encodeURI,encodeURIComponent,escape,unescape,eval,isFinite,isNaN,SuppressedError,DisposableStack,AsyncDisposableStack,Float16Array,tools,ALL_TOOLS,clearTimeout,setTimeout,text,image,audio,generatedImage,store,load,notify,yield_control,exit,as_settled,stream_settled\"}]"
+            ],
+            "loopStatus": [],
+            "caseScript": "# argv петли: buildCodexArgs (-s danger-full-access, --ignore-user-config) + регистрация guard с --disable unified_exec_tty\nARGS=(--ignore-user-config -s danger-full-access --skip-git-repo-check --disable unified_exec_tty \"${HOOK[@]}\")\npost() { ( cd \"$LOOP\" && ls -1 ) >\"$OUT/loop-files.txt\"; }\nMODEL=gpt-6-astra\nSTEPS=$(js 'const probes = {require: () => typeof require, process: () => typeof process, Deno: () => typeof Deno, Bun: () => typeof Bun, fetch: () => typeof fetch, WebSocket: () => typeof WebSocket, importFs: async () => Object.keys(await import(\"node:fs\")).length, importFsBare: async () => Object.keys(await import(\"fs\")).length, dynamicFunction: () => typeof (new Function(\"return this\"))().process, globals: () => Object.getOwnPropertyNames(globalThis).join(\",\")}; for (const [k, f] of Object.entries(probes)) { try { text(k + \" = \" + String(await f())); } catch (e) { text(k + \" ERR \" + e); } }')\n"
+        },
+        {
+            "id": "L-repl-dx",
+            "title": "argv петли с --disable unified_exec_tty, прямой вызов: write_stdin в живой python3 -i — stdin закрыт; ввод в команде исполнен после хука",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026, карточка #190; случай L-repl-dx: журнал хука, ответ CLI модели (вывод инструмента) из журнала фиктивного провайдера и git status дерева после прогона",
+            "cliVersion": "0.163.0",
+            "model": "gpt-5.5",
+            "mode": "direct",
+            "argv": "codex exec --ignore-user-config -s danger-full-access --skip-git-repo-check --disable unified_exec_tty --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/L-repl-dx/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\]",
+            "call": [
+                "{\"type\": \"function_call\", \"name\": \"exec_command\", \"call_id\": \"call-1\", \"arguments\": \"{\\\"cmd\\\":\\\"sleep 1; python3 -i\\\",\\\"yield_time_ms\\\":250}\"}",
+                "{\"type\": \"function_call\", \"name\": \"write_stdin\", \"call_id\": \"call-2\", \"arguments\": \"{\\\"session_id\\\":__SID__,\\\"chars\\\":\\\"open(\\\\\\\"ralph-stand-forbidden-py\\\\\\\",\\\\\\\"w\\\\\\\")\\\\n\\\",\\\"yield_time_ms\\\":250}\"}",
+                "{\"type\": \"function_call\", \"name\": \"exec_command\", \"call_id\": \"call-3\", \"arguments\": \"{\\\"cmd\\\":\\\"printf %s\\\\\\\\\\\\\\\\n \\\\\\\"open(\\\\\\\\\\\\\\\"ralph-stand-allowed-py\\\\\\\\\\\\\\\",\\\\\\\\\\\\\\\"w\\\\\\\\\\\\\\\")\\\\\\\" | python3\\\",\\\"yield_time_ms\\\":3000}\"}"
+            ],
+            "hookStdin": [
+                "{\"session_id\":\"01a182b8-b8af-7fa1-b0b9-68825acac870\",\"turn_id\":\"01a182b8-b8cb-7923-84af-54dd43a959f0\",\"transcript_path\":\"/path/to/stand-home/.codex/sessions/2026/10/28/rollout-2026-10-28T13-35-06-01a182b8-b8af-7fa1-b0b9-68825acac870.jsonl\",\"cwd\":\"/path/to/stand/work/loop\",\"hook_event_name\":\"PreToolUse\",\"model\":\"gpt-5.5\",\"permission_mode\":\"bypassPermissions\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"sleep 1; python3 -i\"},\"tool_use_id\":\"call-1\"}",
+                "{\"session_id\":\"01a182b8-b8af-7fa1-b0b9-68825acac870\",\"turn_id\":\"01a182b8-b8cb-7923-84af-54dd43a959f0\",\"transcript_path\":\"/path/to/stand-home/.codex/sessions/2026/10/28/rollout-2026-10-28T13-35-06-01a182b8-b8af-7fa1-b0b9-68825acac870.jsonl\",\"cwd\":\"/path/to/stand/work/loop\",\"hook_event_name\":\"PreToolUse\",\"model\":\"gpt-5.5\",\"permission_mode\":\"bypassPermissions\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"printf %s\\\\\\\\n \\\"open(\\\\\\\"ralph-stand-allowed-py\\\\\\\",\\\\\\\"w\\\\\\\")\\\" | python3\"},\"tool_use_id\":\"call-3\"}"
+            ],
+            "cliToolOutput": [
+                "\"Chunk ID: a74d4a\\nWall time: 0.2516 seconds\\nProcess running with session ID 6047\\nOriginal token count: 0\\nOutput:\\n\"",
+                "\"write_stdin failed: stdin is closed for this session; rerun exec_command with tty=true to keep stdin open\"",
+                "\"Chunk ID: 700b3b\\nWall time: 0.0000 seconds\\nProcess exited with code 0\\nOriginal token count: 0\\nOutput:\\n\""
+            ],
+            "loopStatus": ["?? ralph-stand-allowed-py"],
+            "caseScript": "# argv петли: buildCodexArgs (-s danger-full-access, --ignore-user-config) + регистрация guard с --disable unified_exec_tty\nARGS=(--ignore-user-config -s danger-full-access --skip-git-repo-check --disable unified_exec_tty \"${HOOK[@]}\")\npost() { ( cd \"$LOOP\" && ls -1 ) >\"$OUT/loop-files.txt\"; }\nMODEL=gpt-5.5\nSTEPS='[[{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"call-1\",\"arguments\":\"{\\\"cmd\\\":\\\"sleep 1; python3 -i\\\",\\\"yield_time_ms\\\":250}\"}],[{\"type\":\"function_call\",\"name\":\"write_stdin\",\"call_id\":\"call-2\",\"arguments\":\"{\\\"session_id\\\":__SID__,\\\"chars\\\":\\\"open(\\\\\\\"ralph-stand-forbidden-py\\\\\\\",\\\\\\\"w\\\\\\\")\\\\n\\\",\\\"yield_time_ms\\\":250}\"}],[{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"call-3\",\"arguments\":\"{\\\"cmd\\\":\\\"printf %s\\\\\\\\\\\\\\\\n \\\\\\\"open(\\\\\\\\\\\\\\\"ralph-stand-allowed-py\\\\\\\\\\\\\\\",\\\\\\\\\\\\\\\"w\\\\\\\\\\\\\\\")\\\\\\\" | python3\\\",\\\"yield_time_ms\\\":3000}\"}],[{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"m4\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}]]'\n"
+        }
+    ],
+    "sessionHome": [
+        {
+            "id": "S-own",
+            "title": "дом сессии раннера + проект недоверен: наш хук судит, хуки дома человека и проекта молчат, MCP проекта не поднят",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026, карточка #195; случай S-own",
+            "cliVersion": "0.163.0",
+            "model": "gpt-5.5",
+            "mode": "direct",
+            "argv": "codex exec --ignore-user-config -s danger-full-access --skip-git-repo-check --enable hooks --dangerously-bypass-hook-trust -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"node\\ /path/to/stand-scripts/hook.cjs\\ /path/to/stand/journal/S-own/hook.jsonl\\\"\\,timeout=10\\}\\]\\}\\] -c projects=\\{\\\"/path/to/stand/work/consumer\\\"=\\{trust_level=\\\"untrusted\\\"\\}\\,\\\"/path/to/stand/work/loop\\\"=\\{trust_level=\\\"untrusted\\\"\\}\\}",
+            "calls": [
+                "echo ralph-stand-forbidden > forbidden.txt",
+                "echo ralph-stand-allowed > allowed.txt"
+            ],
+            "note": "CODEX_HOME — свой каталог (config.toml только с комментарием); дом человека — CODEX_HOME стенда с хуком в config.toml и файлом хуков; в проекте хуки файлом и в config.toml и MCP-сервер; проект недоверен -c projects ключами главного репозитория и worktree",
+            "hooksCalled": ["hook"],
+            "hookCommands": [
+                "echo ralph-stand-forbidden > forbidden.txt",
+                "echo ralph-stand-allowed > allowed.txt"
+            ],
+            "cliToolOutput": [
+                "Command blocked by PreToolUse hook: blocked by stand hook. Command: echo ralph-stand-forbidden > forbidden.txt",
+                "Chunk ID: f74687\nWall time: 0.0000 seconds\nProcess exited with code 0\nOriginal token count: 0\nOutput:\n"
+            ],
+            "loopStatus": ["?? allowed.txt"],
+            "mcpJournal": false,
+            "humanHomeSameBytes": true,
+            "sessionConfigAfter": "# ralph: дом сессии\n",
+            "caseScript": ". \"$D/common-h.sh\"\n# Свой дом сессии (CODEX_HOME в каталоге состояния раннера) + проект объявлен недоверенным.\n# Дом «человека» (CODEX_HOME стенда) несёт хуки в config.toml и файлом хуков; проект — хуки\n# файлом и в config.toml, MCP-сервер. Запрещённый вызов — маркер, разрешённый — эффект в дереве.\nSTEPS=$(python3 \"$D/steps3.py\" \"echo ralph-stand-forbidden > forbidden.txt\" \"echo ralph-stand-allowed > allowed.txt\")\nSH=\"$S/session-home\"\nHJ=\"hooks\"\".json\"\nARGS=(--ignore-user-config -s danger-full-access --skip-git-repo-check \"${HOOK[@]}\" -c \"projects={\\\"$C\\\"={trust_level=\\\"untrusted\\\"},\\\"$LOOP\\\"={trust_level=\\\"untrusted\\\"}}\")\nHUMAN=\"$CODEX_HOME\"\npre() {\n  CT usertoml >\"$HUMAN/config.toml\"; CJ userjson >\"$HUMAN/$HJ\"\n  mkdir -p \"$C/.codex\"\n  CJ projjson >\"$C/.codex/$HJ\"\n  CT projtoml >\"$C/.codex/config.toml\"\n  printf '[mcp_servers.projmcp]\\ncommand = \"node\"\\nargs = [\"/path/to/canon/provision/stand/fake-mcp.mts\", \"%s\"]\\n' \"$OUT/projmcp.jsonl\" >>\"$C/.codex/config.toml\"\n  mkdir -p \"$SH\"; printf '# ralph: дом сессии\\n' >\"$SH/config.toml\"\n  sha256sum \"$HUMAN/config.toml\" \"$HUMAN/$HJ\" >\"$OUT/human.before.sha\"\n  export CODEX_HOME=\"$SH\"\n}\npost() {\n  sha256sum \"$HUMAN/config.toml\" \"$HUMAN/$HJ\" >\"$OUT/human.after.sha\"\n  cp \"$SH/config.toml\" \"$OUT/session-config.after.toml\"; ls -la \"$SH\" >\"$OUT/session-home.txt\"; ls -la \"$HUMAN\" >\"$OUT/human-home.txt\"\n}\n"
+        },
+        {
+            "id": "S-guard",
+            "title": "то же с guard канона (совместимый вход 16b): чтение env-файла — блок кодом secret-env, разрешённая запись исполнена, проектный хук с маркером не позван",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026, карточка #195; случай S-guard",
+            "cliVersion": "0.163.0",
+            "model": "gpt-5.5",
+            "mode": "direct",
+            "argv": "codex exec --ignore-user-config -s danger-full-access --skip-git-repo-check --dangerously-bypass-hook-trust --enable hooks --disable unified_exec_tty -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"export\\ CLAUDE_PROJECT_DIR=\\'/path/to/stand/work/loop\\'\\ RALPH_GUARD_INPUT=compat-16b\\;\\ node\\ /path/to/canon/.claude/hooks/guard.cjs\\\"\\,timeout=30\\}\\]\\}\\] -c projects=\\{\\\"/path/to/stand/work/consumer\\\"=\\{trust_level=\\\"untrusted\\\"\\}\\,\\\"/path/to/stand/work/loop\\\"=\\{trust_level=\\\"untrusted\\\"\\}\\}",
+            "calls": ["cat .env", "echo ralph-stand-allowed > allowed.txt"],
+            "note": "регистрация guard как у codexGuardArgs (доверие и включение хуков, --disable unified_exec_tty); env-файл закоммичен в проект, его содержимое модели не ушло",
+            "hooksCalled": [],
+            "hookStderr": [
+                "hook: PreToolUse",
+                "2026-10-28T13:48:47.754930Z ERROR codex_core::tools::router: error=Command blocked by PreToolUse hook: Команда заблокирована: чтение/копирование .env файлов запрещено (секреты).",
+                "ralph-reason-code: secret-env. Command: cat .env",
+                "hook: PreToolUse Blocked",
+                "hook: PreToolUse",
+                "hook: PreToolUse Completed"
+            ],
+            "cliToolOutput": [
+                "Command blocked by PreToolUse hook: Команда заблокирована: чтение/копирование .env файлов запрещено (секреты).\nralph-reason-code: secret-env. Command: cat .env",
+                "Chunk ID: 0dbf02\nWall time: 0.0000 seconds\nProcess exited with code 0\nOriginal token count: 0\nOutput:\n"
+            ],
+            "loopStatus": ["?? allowed.txt"],
+            "secretInProvider": false,
+            "sessionConfigAfter": "# ralph: дом сессии\n",
+            "caseScript": ". \"$D/common-h.sh\"\n# argv сессии петли со сборщиком #195: guard канона (совместимый вход 16b) регистрацией в -c,\n# --disable unified_exec_tty, --ignore-user-config, свой дом сессии, проект недоверен\n# ключами главного репозитория и worktree. Проектный хук с маркером — в .codex/config.toml.\nSTEPS=$(python3 \"$D/steps3.py\" \"cat .env\" \"echo ralph-stand-allowed > allowed.txt\")\nSH=\"$S/session-home\"\nHUMAN=\"$CODEX_HOME\"\nGUARD=\"export CLAUDE_PROJECT_DIR='$LOOP' RALPH_GUARD_INPUT=compat-16b; node /path/to/canon/.claude/hooks/guard.cjs\"\nARGS=(--ignore-user-config -s danger-full-access --skip-git-repo-check\n  --dangerously-bypass-hook-trust --enable hooks --disable unified_exec_tty\n  -c \"hooks.PreToolUse=[{matcher=\\\".*\\\",hooks=[{type=\\\"command\\\",command=$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' \"$GUARD\"),timeout=30}]}]\"\n  -c \"projects={\\\"$C\\\"={trust_level=\\\"untrusted\\\"},\\\"$LOOP\\\"={trust_level=\\\"untrusted\\\"}}\")\npre() {\n  printf 'SECRET=1\\n' >\"$C/.env\"\n  mkdir -p \"$C/.codex\"\n  CT projtoml >\"$C/.codex/config.toml\"\n  mkdir -p \"$SH\"; printf '# ralph: дом сессии\\n' >\"$SH/config.toml\"\n  export CODEX_HOME=\"$SH\"\n}\npost() { cp \"$SH/config.toml\" \"$OUT/session-config.after.toml\"; }\n"
+        },
+        {
+            "id": "S-guard-nostderr",
+            "title": "хук выходит кодом 2 без stderr — Codex считает его упавшим и исполняет вызов",
+            "source": "codex-cli 0.163.0 (x86_64-unknown-linux-musl), изолированный стенд живых проб (provision/stand/stand.mts exec), 28.10.2026, карточка #195; случай S-guard-nostderr",
+            "cliVersion": "0.163.0",
+            "model": "gpt-5.5",
+            "mode": "direct",
+            "argv": "codex exec --ignore-user-config -s danger-full-access --skip-git-repo-check --dangerously-bypass-hook-trust --enable hooks --disable unified_exec_tty -c hooks.PreToolUse=\\[\\{matcher=\\\".\\*\\\"\\,hooks=\\[\\{type=\\\"command\\\"\\,command=\\\"export\\ CLAUDE_PROJECT_DIR=\\'/path/to/stand/work/loop\\'\\ RALPH_GUARD_INPUT=compat-16b\\;\\ node\\ /path/to/canon/.claude/hooks/guard.cjs\\ 2\\>\\>/path/to/stand/journal/S-guard/guard.stderr\\\"\\,timeout=30\\}\\]\\}\\] -c projects=\\{\\\"/path/to/stand/work/consumer\\\"=\\{trust_level=\\\"untrusted\\\"\\}\\,\\\"/path/to/stand/work/loop\\\"=\\{trust_level=\\\"untrusted\\\"\\}\\}",
+            "calls": ["cat .env", "echo ralph-stand-allowed > allowed.txt"],
+            "note": "первый прогон S-guard: stderr guard ушёл в файл журнала — блок кодом 2 без текста причины CLI не засчитал",
+            "hookStderr": [
+                "hook: PreToolUse",
+                "hook: PreToolUse Failed",
+                "hook: PreToolUse",
+                "hook: PreToolUse Completed"
+            ],
+            "cliToolOutput": [
+                "Chunk ID: 519749\nWall time: 0.0000 seconds\nProcess exited with code 0\nOriginal token count: 3\nOutput:\nSECRET=1\n",
+                "Chunk ID: 46bb7e\nWall time: 0.0000 seconds\nProcess exited with code 0\nOriginal token count: 0\nOutput:\n"
+            ],
+            "secretInProvider": true,
+            "caseScript": ". \"$D/common-h.sh\"\n# argv сессии петли со сборщиком #195: guard канона (совместимый вход 16b) регистрацией в -c,\n# --disable unified_exec_tty, --ignore-user-config, свой дом сессии, проект недоверен\n# ключами главного репозитория и worktree. Проектный хук с маркером — в .codex/config.toml.\nSTEPS=$(python3 \"$D/steps3.py\" \"cat .env\" \"echo ralph-stand-allowed > allowed.txt\")\nSH=\"$S/session-home\"\nHUMAN=\"$CODEX_HOME\"\nGUARD=\"export CLAUDE_PROJECT_DIR='$LOOP' RALPH_GUARD_INPUT=compat-16b; node /path/to/canon/.claude/hooks/guard.cjs 2>>$OUT/guard.stderr\"\nARGS=(--ignore-user-config -s danger-full-access --skip-git-repo-check\n  --dangerously-bypass-hook-trust --enable hooks --disable unified_exec_tty\n  -c \"hooks.PreToolUse=[{matcher=\\\".*\\\",hooks=[{type=\\\"command\\\",command=$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' \"$GUARD\"),timeout=30}]}]\"\n  -c \"projects={\\\"$C\\\"={trust_level=\\\"untrusted\\\"},\\\"$LOOP\\\"={trust_level=\\\"untrusted\\\"}}\")\npre() {\n  printf 'SECRET=1\\n' >\"$C/.env\"\n  mkdir -p \"$C/.codex\"\n  CT projtoml >\"$C/.codex/config.toml\"\n  mkdir -p \"$SH\"; printf '# ralph: дом сессии\\n' >\"$SH/config.toml\"\n  export CODEX_HOME=\"$SH\"\n}\npost() { cp \"$SH/config.toml\" \"$OUT/session-config.after.toml\"; }\n"
+        }
+    ]
+}

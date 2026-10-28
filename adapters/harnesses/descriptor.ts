@@ -26,7 +26,11 @@ import { isAbsolute } from 'node:path';
 
 export const HARNESS_DESCRIPTOR_SCHEMA_VERSION = 1;
 
-/** Операции, в которые `toolMap` отображает инструмент; `unknown` отображением не бывает. */
+/**
+ * Операции, в которые `toolMap` отображает инструмент; `unknown` отображением не бывает.
+ * `patch` — не операция события, а класс входа: текст патча, который нормализатор разбирает
+ * общим разбором (`patch.ts`) в `write`/`delete`/`move` — guard патча не видит (#189).
+ */
 export const MAPPED_OPERATIONS = [
     'exec',
     'read',
@@ -34,6 +38,7 @@ export const MAPPED_OPERATIONS = [
     'delete',
     'move',
     'search',
+    'patch',
     'mcp',
     'fetch',
     'agent',
@@ -42,7 +47,7 @@ export const MAPPED_OPERATIONS = [
 ] as const;
 
 /**
- * Роли полей входа, которые нормализатор переносит в операцию. `baseDir` ролью не бывает: его
+ * Роли полей входа, которые нормализатор переносит в операцию (`patch` — поле с текстом патча). `baseDir` ролью не бывает: его
  * берёт нормализатор из конверта события (`cwd` у Claude Code), и роль, которую схема
  * принимала, а нормализатор не исполнял, обещала бы пакету пути от другой базы (ревью 16c).
  */
@@ -54,6 +59,7 @@ export const ARG_ROLES = [
     'contentPattern',
     'pathGlob',
     'url',
+    'patch',
 ] as const;
 
 /** Канал исполнения: перехвачен хуком или доказанно выключен — третьего нет. */

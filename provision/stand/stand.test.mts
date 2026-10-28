@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import {
     ESCAPE_PROBE_SOURCE,
     HUMAN_CLI_HOMES,
+    cliBinary,
     configSurfaces,
     escapeTargets,
     extraReadOnly,
@@ -137,6 +138,72 @@ describe('раскладка и окружение стенда', () => {
         expect(extraReadOnly([join(d, 'link')])).toEqual([join(d, 'bin', 'cli')]);
         expect(extraReadOnly([join(d, 'bin', 'cli'), join(d, 'bin')])).toEqual([join(d, 'bin')]);
         expect(extraReadOnly(['/usr/bin', join(d, 'bin', 'key')])).toEqual([join(d, 'bin', 'key')]);
+    });
+
+    it('бинарь CLI: файл — файлом; Codex — каталогом релиза с code-mode host и на PATH (#231)', () => {
+        const d = tmp('ralph-bin.');
+        mkdirSync(join(d, 'release', 'bin'), { recursive: true });
+        mkdirSync(join(d, 'local'));
+        writeFileSync(join(d, 'release', 'bin', 'codex'), '');
+        writeFileSync(join(d, 'release', 'bin', 'codex-code-mode-host'), '');
+        writeFileSync(join(d, 'release', 'bin', 'claude'), '');
+        symlinkSync(join(d, 'release', 'bin', 'codex'), join(d, 'local', 'codex'));
+        symlinkSync(join(d, 'release', 'bin', 'claude'), join(d, 'local', 'claude'));
+        const rel = join(d, 'release', 'bin');
+        expect(cliBinary('codex', join(d, 'local', 'codex'))).toEqual({ ro: rel, pathDir: rel });
+        expect(cliBinary('claude', join(d, 'local', 'claude'))).toEqual({
+            ro: join(rel, 'claude'),
+            pathDir: null,
+        });
+        // От противного: без host внутри code mode отказывает закрыто, и проба падала бы до
+        // хука — монтировать каталог без него значило бы открыть соседей ни за что.
+        rmSync(join(rel, 'codex-code-mode-host'));
+        expect(() => cliBinary('codex', join(d, 'local', 'codex'))).toThrow(/codex-code-mode-host/);
+    });
+
+    it('install-stand.sh везёт бинарь CLI в стенд только через --cli-bin (#231)', () => {
+        const sh = readFileSync(join(import.meta.dirname, '..', 'install-stand.sh'), 'utf-8');
+        // Вызов exec — до ` -- `: строки продолжения склеены, чтобы флаги следующей строки
+        // остались при своём вызове.
+        const calls = [...sh.replace(/\\\n\s*/g, ' ').matchAll(/stand\.mts" exec (.*?) -- /g)].map(
+            (m) => m[1],
+        );
+        expect(calls.length).toBeGreaterThanOrEqual(2);
+        for (const c of calls) {
+            expect(c).toMatch(/--cli-bin "\$\(?(bin|command -v "\$BIN"\))"/);
+            expect(c).not.toMatch(/--ro "\$(bin|\(command)/);
+        }
+    });
+
+    it('разбор exec: --cli-bin кладёт бинарь на чтение по правилу CLI, каталог Codex — на PATH', () => {
+        const d = tmp('ralph-bin.');
+        writeFileSync(join(d, 'codex'), '');
+        writeFileSync(join(d, 'codex-code-mode-host'), '');
+        const a = parseExecArgs([
+            '--stand',
+            '/s',
+            '--cli',
+            'codex',
+            '--cli-bin',
+            join(d, 'codex'),
+            '--',
+            'x',
+        ]);
+        expect(a).toMatchObject({ ro: [d], pathDirs: [d] });
+        expect(parseExecArgs(['--stand', '/s', '--cli', 'codex', '--', 'x']).pathDirs).toEqual([]);
+        // Правило берётся по CLI, а не по порядку флагов: --cli-bin раньше --cli — то же.
+        expect(
+            parseExecArgs([
+                '--cli-bin',
+                join(d, 'codex'),
+                '--stand',
+                '/s',
+                '--cli',
+                'codex',
+                '--',
+                'x',
+            ]).ro,
+        ).toEqual([d]);
     });
 
     it('раскладка — только на чистое место: каталог прошлого прогона отвергнут, симлинк не пройден', () => {

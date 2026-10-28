@@ -60,6 +60,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { guardSideEffect } from '../shared/side-effect-guard.ts';
 import {
+    CODEX_HARNESS,
     codexArgsProblems,
     CORE_SHA_ENV,
     GUARD_ADAPTER_ENV,
@@ -67,12 +68,15 @@ import {
     HOOK_COMMAND_ONLY_ENV,
     HOOKS_DATA_ENV,
     guardHooksOf,
+    guardInputOf,
+    harnessLayerProblems,
     kimiTomlProblems,
     opencodePluginProblems,
     probeProblems,
     runHook,
     sessionContextProblems,
     runOpencodePlugin,
+    type TLayersFn,
     type TRunHookFn,
     type TRunPluginFn,
 } from './guard-probe.ts';
@@ -87,6 +91,12 @@ import {
     type HarnessRegistry,
 } from '../adapters/harness-registry.ts';
 import { KIMI_HOME_LINKS, kimiSessionConfig } from '../adapters/kimi-native.ts';
+import {
+    CODEX_HOME_LINKS,
+    CODEX_SESSION_CONFIG,
+    codexProjectKeys,
+    codexUntrustArgs,
+} from '../adapters/codex-home.ts';
 import {
     OPENCODE_BIN,
     OPENCODE_GUARD_PLUGIN_FILE,
@@ -541,7 +551,9 @@ export type TPreparedCodexGuard = { ok: true; args: string[] } | { ok: false; re
  * сессия Claude Code: при раскладке корней — собранные (хуки из установки ядра, контур и
  * хуки человека), без неё — `.claude/settings.json` дерева сессии. Codex этих настроек сам не
  * читает: без регистрации в argv его сессия шла бы без барьера, о чём до карточки и
- * говорил отказ пробы старта. Проба идёт на ТОМ argv, который уйдёт в CLI.
+ * говорил отказ пробы старта. Проба идёт на ТОМ argv, который уйдёт в CLI. Судит регистрацию
+ * событие нормализатора пакета Codex (#232), а не совместимый вход 16b: тот `apply_patch` не
+ * судил, и запись данных контура патчем проходила.
  */
 export function prepareCodexGuardArgs(
     {
@@ -554,7 +566,10 @@ export function prepareCodexGuardArgs(
     {
         readFileFn = (p) => fs.readFileSync(p, 'utf-8'),
         runHookFn = runHook,
-    }: Pick<TSessionSettingsDeps, 'readFileFn' | 'runHookFn'> = {},
+        registry = HARNESS_REGISTRY,
+    }: Pick<TSessionSettingsDeps, 'readFileFn' | 'runHookFn'> & {
+        registry?: HarnessRegistry;
+    } = {},
 ): TPreparedCodexGuard {
     let settings: unknown;
     try {
@@ -567,8 +582,11 @@ export function prepareCodexGuardArgs(
                 'Без них сессия Codex шла бы без барьера — старт отменён.',
         };
     }
-    const args = codexGuardArgs(guardHooksOf(settings, sessionTree));
-    const problems = codexArgsProblems(args, sessionTree, { runHookFn });
+    // Судит регистрацию событие нормализатора Codex (#232): путь — в каталоге исполняемого ядра,
+    // как у пути Claude Code в собранных настройках (`guardAdapterValue`).
+    const input = guardInputOf(registry, CODEX_HARNESS, roots?.productRoot);
+    const args = codexGuardArgs(guardHooksOf(settings, sessionTree, input));
+    const problems = codexArgsProblems(args, sessionTree, { runHookFn, registry });
     if (problems.length > 0) {
         return {
             ok: false,
@@ -578,6 +596,162 @@ export function prepareCodexGuardArgs(
         };
     }
     return { ok: true, args };
+}
+
+/** Работа с ссылками входа в доме CLI сессии — общая у Kimi Code и Codex. */
+type THomeLinkDeps = {
+    existsFn: (p: string) => boolean;
+    entryKindFn: (p: string) => 'missing' | 'link' | 'other';
+    unlinkFn: (p: string) => void;
+    linkFn: (target: string, link: string) => void;
+};
+
+/**
+ * Ссылки дома сессии на вход человека. Ссылка снимается ВСЕГДА и ставится заново, только если
+ * цель есть: ссылка на пропавший у человека файл иначе висела бы с прошлой сессии. Настоящий
+ * файл или каталог на месте ссылки (CLI создал его сам, пока ссылки не было) раннер не удаляет —
+ * там может лежать вход, — а называет: отказ строкой, `null` — ссылки на месте.
+ */
+function linkHomeEntries(
+    {
+        cli,
+        home,
+        sourceHome,
+        names,
+    }: { cli: string; home: string; sourceHome: string; names: readonly string[] },
+    { existsFn, entryKindFn, unlinkFn, linkFn }: THomeLinkDeps,
+): string | null {
+    for (const name of names) {
+        const target = path.join(sourceHome, name);
+        const link = path.join(home, name);
+        const kind = entryKindFn(link);
+        if (kind === 'other') {
+            return (
+                `В доме ${cli} сессии ${link} — настоящий файл или каталог, а не ссылка на ` +
+                `${target}: его создал CLI, пока ссылки не было, и вход человека сессия за ним ` +
+                'не увидит. Перенеси нужное в дом человека и удали его — раннер вход не удаляет.'
+            );
+        }
+        if (kind === 'link') unlinkFn(link);
+        if (existsFn(target)) linkFn(target, link);
+    }
+    return null;
+}
+
+const defaultEntryKind = (p: string): 'missing' | 'link' | 'other' => {
+    try {
+        return fs.lstatSync(p).isSymbolicLink() ? 'link' : 'other';
+    } catch {
+        return 'missing';
+    }
+};
+
+/** Исход подготовки сессии Codex: argv барьера и недоверия, дом для `CODEX_HOME`. */
+export type TPreparedCodexSession =
+    { ok: true; args: string[]; home: string; keys: string[] } | { ok: false; reason: string };
+
+export type TCodexSessionDeps = Pick<
+    TSessionSettingsDeps,
+    'readFileFn' | 'writeFileFn' | 'runHookFn'
+> &
+    Partial<THomeLinkDeps> & {
+        mkdirFn?: (p: string) => void;
+        layersFn?: TLayersFn;
+        registry?: HarnessRegistry;
+    };
+
+/**
+ * Сессия Codex перед КАЖДЫМ спавном (#195): регистрация барьера с пробой
+ * (`prepareCodexGuardArgs`), отказ на исполняемых слоях `.codex/` в дереве и предках, недоверие
+ * проекту в argv и свой дом CLI в каталоге состояния (`adapters/codex-home.ts`): `config.toml`
+ * без доверия, хуков и MCP и вход человека ссылкой. Дом человека не читается и не пишется —
+ * только цель ссылки входа. Всё до записи: не прошедшая сессия ничего не кладёт.
+ */
+export function prepareCodexSession(
+    {
+        roots,
+        sessionTree,
+        home,
+        sourceHome,
+        env,
+    }: {
+        roots: TGuardRoots;
+        sessionTree: string;
+        home: string;
+        sourceHome: string | null;
+        env: NodeJS.ProcessEnv;
+    },
+    {
+        readFileFn = (p) => fs.readFileSync(p, 'utf-8'),
+        writeFileFn = (p, text) => writeFileAtomic(p, text),
+        runHookFn = runHook,
+        existsFn = (p) => fs.existsSync(p),
+        entryKindFn = defaultEntryKind,
+        unlinkFn = (p) => {
+            guardSideEffect(`prepareCodexSession:unlink(${p})`, 'Подмени unlinkFn в тесте.');
+            fs.unlinkSync(p);
+        },
+        mkdirFn = (p) => {
+            guardSideEffect(`prepareCodexSession:mkdir(${p})`, 'Подмени mkdirFn в тесте.');
+            fs.mkdirSync(p, { recursive: true, mode: 0o700 });
+        },
+        linkFn = (target, link) => {
+            guardSideEffect(`prepareCodexSession:symlink(${link})`, 'Подмени linkFn в тесте.');
+            fs.symlinkSync(target, link);
+        },
+        layersFn,
+        registry = HARNESS_REGISTRY,
+    }: TCodexSessionDeps = {},
+): TPreparedCodexSession {
+    const why = (error: unknown) => (error instanceof Error ? error.message : String(error));
+    // Вход guard, проба регистрации и слои судятся одним реестром: подменённый в тесте, он
+    // проверяет тот же путь, что пройдёт сессия.
+    const guard = prepareCodexGuardArgs(
+        { roots, sessionTree },
+        { readFileFn, runHookFn, registry },
+    );
+    if (!guard.ok) return guard;
+    const layers = harnessLayerProblems(CODEX_HARNESS, sessionTree, env, {
+        registry,
+        ...(layersFn ? { layersFn } : {}),
+    });
+    if (layers.length > 0) {
+        return {
+            ok: false,
+            reason:
+                'Исполняемые слои конфига Codex в дереве сессии или его предках — сессия не запущена:\n' +
+                layers.map((p) => `  - ${p}`).join('\n'),
+        };
+    }
+    let keys: string[];
+    try {
+        keys = codexProjectKeys(sessionTree, readFileFn);
+    } catch (error) {
+        return {
+            ok: false,
+            reason: `Недоверие проекту Codex не собрано: ${why(error)}. Без него хуки и MCP дерева исполнились бы.`,
+        };
+    }
+    if (sourceHome !== null && path.resolve(sourceHome) === path.resolve(home)) {
+        return {
+            ok: false,
+            reason: `Дом сессии Codex ${home} совпал с домом человека — доверие легло бы в его конфиг.`,
+        };
+    }
+    try {
+        mkdirFn(home);
+        writeFileFn(path.join(home, 'config.toml'), CODEX_SESSION_CONFIG);
+        if (sourceHome !== null) {
+            const refused = linkHomeEntries(
+                { cli: 'Codex', home, sourceHome, names: CODEX_HOME_LINKS },
+                { existsFn, entryKindFn, unlinkFn, linkFn },
+            );
+            if (refused) return { ok: false, reason: refused };
+        }
+    } catch (error) {
+        return { ok: false, reason: `Дом Codex сессии не собран в ${home} (${why(error)}).` };
+    }
+    return { ok: true, args: [...guard.args, ...codexUntrustArgs(keys)], home, keys };
 }
 
 /** Исход подготовки дома Kimi Code: каталог для `KIMI_CODE_HOME` либо причина отказа. */
@@ -623,13 +797,7 @@ export function prepareKimiNativeHome(
         writeFileFn = (p, text) => writeFileAtomic(p, text),
         runHookFn = runHook,
         existsFn = (p) => fs.existsSync(p),
-        entryKindFn = (p) => {
-            try {
-                return fs.lstatSync(p).isSymbolicLink() ? 'link' : 'other';
-            } catch {
-                return 'missing';
-            }
-        },
+        entryKindFn = defaultEntryKind,
         unlinkFn = (p) => {
             guardSideEffect(`prepareKimiNativeHome:unlink(${p})`, 'Подмени unlinkFn в тесте.');
             fs.unlinkSync(p);
@@ -680,22 +848,11 @@ export function prepareKimiNativeHome(
     try {
         mkdirFn(home);
         writeFileFn(path.join(home, 'config.toml'), toml);
-        for (const name of KIMI_HOME_LINKS) {
-            const target = path.join(sourceHome, name);
-            const link = path.join(home, name);
-            const kind = entryKindFn(link);
-            if (kind === 'other') {
-                return {
-                    ok: false,
-                    reason:
-                        `В доме Kimi Code сессии ${link} — настоящий файл или каталог, а не ссылка на ` +
-                        `${target}: его создал CLI, пока ссылки не было, и вход человека сессия за ним ` +
-                        'не увидит. Перенеси нужное в дом человека и удали его — раннер вход не удаляет.',
-                };
-            }
-            if (kind === 'link') unlinkFn(link);
-            if (existsFn(target)) linkFn(target, link);
-        }
+        const refused = linkHomeEntries(
+            { cli: 'Kimi Code', home, sourceHome, names: KIMI_HOME_LINKS },
+            { existsFn, entryKindFn, unlinkFn, linkFn },
+        );
+        if (refused) return { ok: false, reason: refused };
     } catch (error) {
         return { ok: false, reason: `Дом Kimi Code сессии не собран в ${home} (${why(error)}).` };
     }

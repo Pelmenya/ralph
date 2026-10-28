@@ -293,6 +293,7 @@ import {
     kimiSourceHome,
     kimiStreamText,
 } from '../adapters/kimi-native.ts';
+import { codexHumanHome, codexIsolationProblems, codexSessionEnv } from '../adapters/codex-home.ts';
 // #121: OpenCode — экспериментальный третий харнесс: argv, конфиг эксперимента, модель, текст.
 import {
     OPENCODE_BIN,
@@ -377,12 +378,13 @@ import { updateConsumerTree } from './consumer-tree.ts';
 import { ensureGuardHolds } from './guard-probe.ts';
 import {
     buildSessionSettings,
-    prepareCodexGuardArgs,
+    prepareCodexSession,
     prepareKimiNativeHome,
     prepareOpencodeSession,
     prepareSessionSettings,
     readHumanSettings,
     resolveCoreSha,
+    type TCodexSessionDeps,
     coreShaPolicy,
     describeSessionSettingsStart,
     doctorStartChecks,
@@ -2456,13 +2458,16 @@ export function createOrchestrator(env: OrchestratorEnv) {
     }
 
     // #119: дерево сессий для регистрации барьера не-Claude харнессов. Ставит `main()` рядом
-    // с пробой старта. До этого `null`, и сборка регистрации (`codexGuardArgsFor`,
+    // с пробой старта. До этого `null`, и сборка регистрации (`codexSessionFor`,
     // `kimiNativeHomeFor`, `opencodeConfigDirFor`) — стоп `guard-probe`, а не сессия без
     // барьера (ревью Фазы 16b): что дерево ставится раньше любого спавна, держал бы только
     // порядок кода, и новый путь спавна до этой точки пустил бы Codex, Kimi Code или OpenCode
     // мимо барьера без строки в логе. Claude без `--settings` хотя бы читает settings дерева,
     // эти CLI — ничего. Юнит-тесты фабрики передают дерево явно.
     let codexGuardTree: string | null = null;
+
+    /** Собранная сессия Codex: argv барьера и недоверия, дом CLI, ключи недоверия. */
+    type TCodexSession = { args: string[]; home: string; keys: string[] };
 
     function noGuardTree(harness: string, stop: TGuardStopDeps): never {
         return stopOnGuardProbe(
@@ -2542,21 +2547,40 @@ export function createOrchestrator(env: OrchestratorEnv) {
         return stopOnGuardProbe(prepared.reason, stop);
     }
 
-    // #119: барьер сессии Codex. `codex exec` настроек Claude Code не читает, поэтому
+    // #119, #195: сессия Codex. `codex exec` настроек Claude Code не читает, поэтому
     // регистрация хуков едет в его argv (`-c hooks.PreToolUse=…` с флагами доверия и
-    // включения), собирается и пробуется перед КАЖДОЙ сессией — то же правило и тот же стоп,
-    // что у `sessionSettingsArgs`. Проба не прошла — сессия не стартует.
-    function codexGuardArgsFor(
-        deps: Pick<TSessionSettingsDeps, 'readFileFn' | 'runHookFn'> = {},
+    // включения), рядом — недоверие проекту (`-c projects=…`), а дом CLI у сессии свой, в
+    // каталоге состояния (`prepareCodexSession`): дом человека Codex переписывал доверием и вёз из
+    // него хуки. Собирается и пробуется перед КАЖДОЙ сессией — то же правило и тот же стоп, что
+    // у `sessionSettingsArgs`; слои `.codex/` в дереве и предках — тоже стоп. Проба не прошла —
+    // сессия не стартует.
+    function codexSessionFor(
+        deps: TCodexSessionDeps = {},
         {
             tree = codexGuardTree,
             roots = sessionSettingsRoots,
+            sourceHome = codexHumanHome(process.env),
+            env = process.env,
             ...stop
-        }: { tree?: string | null; roots?: typeof sessionSettingsRoots } & TGuardStopDeps = {},
-    ): string[] {
+        }: {
+            tree?: string | null;
+            roots?: typeof sessionSettingsRoots;
+            sourceHome?: string | null;
+            env?: NodeJS.ProcessEnv;
+        } & TGuardStopDeps = {},
+    ): TCodexSession {
         if (tree === null) return noGuardTree('Codex', stop);
-        const prepared = prepareCodexGuardArgs({ roots, sessionTree: tree }, deps);
-        if (prepared.ok) return prepared.args;
+        const prepared = prepareCodexSession(
+            {
+                roots,
+                sessionTree: tree,
+                home: path.join(path.resolve(RUNTIME.codexSession), 'home'),
+                sourceHome,
+                env,
+            },
+            deps,
+        );
+        if (prepared.ok) return { args: prepared.args, home: prepared.home, keys: prepared.keys };
         return stopOnGuardProbe(prepared.reason, stop);
     }
 
@@ -2754,7 +2778,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // maxTurns у Codex аналога не имеет (это Claude-бюджет ходов) — в argv не тащим (research,
     // риск #3: чужой CLI на неизвестный флаг упал бы). fallback-model — тоже Claude-only, нет.
     //
-    // #119: `guardArgs` — регистрация барьера (`codexGuardArgsFor`), перед хвостом `-- -`.
+    // #119: `guardArgs` — регистрация барьера и недоверие проекту (`codexSessionFor`), перед
+    // хвостом `-- -`.
     function buildCodexArgs({
         model,
         sandboxMode,
@@ -3214,7 +3239,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
         spawnFn: typeof spawnSync = spawnSync,
         readFileFn: (path: string, encoding: 'utf8') => string = fs.readFileSync,
         cliVersionFn: (runtime: string) => CliVersion = (rt) => sessionCliVersion(rt),
-        guardArgsFn: () => string[] = () => codexGuardArgsFor(),
+        sessionFn: () => TCodexSession = () => codexSessionFor(),
+        stop: TGuardStopDeps = {},
     ): RunResult {
         if (toolless) return toollessRefusal('openai');
         // Провайдер-гейт: чужую (не-openai) модель к codex `-m` не пускаем — резолвер тогда
@@ -3234,13 +3260,14 @@ export function createOrchestrator(env: OrchestratorEnv) {
             `▶ openai (codex exec) "${prompt.slice(0, 80)}…" -m ${resolvedModel} -s ${sandboxMode}`,
         );
         if (DRY) return { code: 0, output: '' };
-        // Барьер — после проверки DRY, как `--settings` у Claude: сухой прогон ничего не
+        // Барьер и дом — после проверки DRY, как `--settings` у Claude: сухой прогон ничего не
         // пишет и пробу прошёл на старте.
+        const session = sessionFn();
         const cmdArgs = buildCodexArgs({
             model: resolvedModel,
             sandboxMode,
             authMode,
-            guardArgs: guardArgsFn(),
+            guardArgs: session.args,
         });
         const timeout = config.claudeTimeoutMs || 2 * 60 * 60 * 1000;
         // token не-null при !DRY только в режиме apiKey (requireToken выше); при подписке он
@@ -3248,8 +3275,27 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // Секрет — только в env процесса, НЕ в argv (иначе виден в /proc/*/cmdline).
         // Контекст сессии петли (#184) — тем же env, что у остальных харнессов: хук моста Codex
         // наследует окружение CLI.
-        const openaiEnv = buildOpenAISpawnEnv(token, process.env, tokenEnv);
+        // #195: окружение CLI раннера (`CODEX_*`, адрес провайдера) сессии не достаётся, дом —
+        // собранный. Сверка — на ТОМ argv и env, что уйдут в CLI, а не на намерении сборщика.
+        const openaiEnv = codexSessionEnv(
+            buildOpenAISpawnEnv(token, process.env, tokenEnv),
+            session.home,
+        );
         const env = withSkillGuard(openaiEnv);
+        const isolation = codexIsolationProblems({
+            argv: cmdArgs,
+            env,
+            home: session.home,
+            humanHome: codexHumanHome(process.env),
+            keys: session.keys,
+        });
+        if (isolation.length > 0) {
+            return stopOnGuardProbe(
+                'Сессия Codex собрана не изолированной от конфига человека и дерева — не запущена:\n' +
+                    isolation.map((p) => `  - ${p}`).join('\n'),
+                stop,
+            );
+        }
         // Порядок важен: канал входа проверяется ДО спавна сессии — иначе платный запрос уже
         // ушёл бы, и «стоп» опоздал ровно на одну оплаченную итерацию.
         // Проверяются ОБА режима (ревью Codex, 4-й проход): при `apiKey` кешированный
@@ -12692,7 +12738,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // не меняет (исполняются только хуки, не сами вызовы), а ответ «барьер держит ли»
         // dry обязан давать тот же, что живой запуск.
         // Рантайм кодера тоже в пробе (#119): у каждого достижимого харнесса — своя
-        // регистрация барьера (Codex — argv, `codexGuardArgsFor`; Kimi Code — дом CLI,
+        // регистрация барьера (Codex — argv и дом CLI, `codexSessionFor`; Kimi Code — дом CLI,
         // `kimiNativeHomeFor`, #120), и харнесс без доказанного guard не стартует.
         //
         // Задача 101: при заданной раскладке корней проба идёт на settings, который раннер
@@ -12877,7 +12923,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         setConfigForTests,
         reloadPhasesFromConfig,
         sessionSettingsArgs,
-        codexGuardArgsFor,
+        codexSessionFor,
         kimiNativeHomeFor,
         opencodeConfigDirFor,
         withSkillGuard,

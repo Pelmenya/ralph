@@ -135,9 +135,16 @@ export function harnessPackageProblems(raw: unknown, name: string): string[] {
     for (const flag of ['setsProjectDirEnv', 'skillBarrier'] as const) {
         if (typeof raw[flag] !== 'boolean') problems.push(`${PACKAGE_MODULE}: ${flag} не boolean`);
     }
+    if (raw.guardInput !== 'event' && raw.guardInput !== 'compat-16b') {
+        problems.push(`${PACKAGE_MODULE}: guardInput не event и не compat-16b`);
+    }
     const limit = raw.guardLimit;
     if (limit !== null && (typeof limit !== 'string' || limit.trim() === '')) {
         problems.push(`${PACKAGE_MODULE}: guardLimit не null и не непустая строка`);
+    }
+    const layers = raw.projectLayers;
+    if (layers !== null && (!isRecord(layers) || typeof layers.homes !== 'function')) {
+        problems.push(`${PACKAGE_MODULE}: projectLayers не null и не объект с функцией homes`);
     }
     const plugin = raw.plugin;
     if (plugin !== null) {
