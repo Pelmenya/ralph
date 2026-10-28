@@ -42,6 +42,24 @@ export const LIVE_PROBE_CLI_KEY_ENV: Readonly<Record<string, string>> = {
 };
 
 /**
+ * Маршрут пробы к провайдеру, отличному от умолчания CLI (`liveProbe.baseUrl`/`keyAs`/`model`):
+ * под какими именами CLI внутри стенда берёт адрес, ключ-токен (Bearer, а не ключ API) и модель.
+ * Провайдер-посредник принимает токен, а не ключ API, и не знает алиаса `haiku`, которым стенд
+ * зовёт модель по умолчанию; поэтому модель едет и своей переменной стенда, и переменной,
+ * которой CLI разрешает алиас фоновых вызовов. CLI без строки здесь — отказ пробы с маршрутом,
+ * а не прогон к провайдеру по умолчанию.
+ */
+export const LIVE_PROBE_CLI_ROUTE: Readonly<
+    Record<string, { authTokenEnv: string; baseUrlEnv: string; modelEnvs: readonly string[] }>
+> = {
+    claude: {
+        authTokenEnv: 'ANTHROPIC_AUTH_TOKEN',
+        baseUrlEnv: 'ANTHROPIC_BASE_URL',
+        modelEnvs: ['STAND_CLAUDE_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL'],
+    },
+};
+
+/**
  * Переменные ключей ПЕТЛИ: ни одна из них не едет в процесс стенда, и ключ пробы с любой из
  * них совпадать не вправе — иначе «отдельный ключ с ограниченной квотой» был бы ключом петли
  * под другим именем, и код ветки внутри стенда увидел бы его.

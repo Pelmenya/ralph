@@ -19,7 +19,11 @@
  *     её проверяет. Установки нет или она внутри дерева работы — отказ, а не дерево ветки.
  *     Из ветки берётся только ПРОВЕРЯЕМОЕ — хуки и пакеты харнессов (`STAND_SUBJECT_ROOT`);
  *   - выход — только к провайдеру модели: белый список держит прокси стенда
- *     (`provision/stand/egress.mts`), раннер лишних адресов (`--allow`) не добавляет;
+ *     (`provision/stand/egress.mts`). Раннер добавляет к нему (`--allow`) ровно один адрес —
+ *     хост `liveProbe.baseUrl`, и только из локального конфига человека: ветка его не задаёт,
+ *     а стенд, проверяющий список, — из установки. Нужен он провайдеру-посреднику: рабочий
+ *     аккаунт человека под живую пробу не отдаётся, а ключ API у `api.anthropic.com` бывает
+ *     только рабочий;
  *   - значение ключа вычищается из всего, что уходит в карточку и лог, а его след в выводе
  *     означает FAIL пробы: ключ, напечатанный изнутри, уже вне стенда.
  *
@@ -36,7 +40,11 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join, relative, isAbsolute } from 'node:path';
 
-import { LIVE_PROBE_CLI_KEY_ENV, LOOP_KEY_ENVS } from '../adapters/live-probe-cases.ts';
+import {
+    LIVE_PROBE_CLI_KEY_ENV,
+    LIVE_PROBE_CLI_ROUTE,
+    LOOP_KEY_ENVS,
+} from '../adapters/live-probe-cases.ts';
 import { guardSideEffect } from '../shared/side-effect-guard.ts';
 
 export type TLiveProbeVerdict = 'PASS' | 'FAIL' | 'INCONCLUSIVE' | 'REFUSED';
@@ -58,10 +66,18 @@ export type TLiveProbeConfig = {
     upstreamProxyEnv?: string;
     /** Срок пробы целиком, мс. */
     timeoutMs?: number;
+    /** Адрес провайдера-посредника (`https://хост[:порт]`); нет — провайдер по умолчанию CLI. */
+    baseUrl?: string;
+    /** Под каким видом ключ уходит CLI: ключ API (умолчание) или токен Bearer посредника. */
+    keyAs?: 'api-key' | 'auth-token';
+    /** Модель сессии стенда; нужна посреднику, не знающему алиасов CLI. */
+    model?: string;
 };
 
 const ENV_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
-const SECTION_KEYS = ['keyEnv', 'upstreamProxyEnv', 'timeoutMs'];
+const SECTION_KEYS = ['keyEnv', 'upstreamProxyEnv', 'timeoutMs', 'baseUrl', 'keyAs', 'model'];
+const KEY_AS = ['api-key', 'auth-token'];
+const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/;
 export const LIVE_PROBE_TIMEOUT_MS = 15 * 60_000;
 /**
  * Потолок срока пробы из конфига. Раннер ждёт стенд синхронно, и строка старта пробы несёт
@@ -111,11 +127,48 @@ export function resolveLiveProbeConfig(raw: unknown): TLiveProbeConfig | null {
             `liveProbe.timeoutMs: не больше ${String(LIVE_PROBE_MAX_TIMEOUT_MS)} — дольше раннер ` +
                 'молчит в логе за порогом тишины deadman',
         );
+    const baseUrl = o['baseUrl'];
+    if (baseUrl !== undefined) baseUrlAddress(baseUrl);
+    const keyAs = o['keyAs'];
+    if (keyAs !== undefined && !KEY_AS.includes(keyAs as string))
+        throw new Error(`liveProbe.keyAs: ожидалось ${KEY_AS.join(' или ')}`);
+    const model = o['model'];
+    if (model !== undefined && (typeof model !== 'string' || !MODEL_RE.test(model)))
+        throw new Error('liveProbe.model: ожидалось имя модели без пробелов');
     return {
         keyEnv,
         ...(upstreamProxyEnv ? { upstreamProxyEnv } : {}),
         ...(t !== undefined ? { timeoutMs: t as number } : {}),
+        ...(baseUrl !== undefined ? { baseUrl: baseUrl as string } : {}),
+        ...(keyAs !== undefined ? { keyAs: keyAs as 'api-key' | 'auth-token' } : {}),
+        ...(model !== undefined ? { model: model as string } : {}),
     };
+}
+
+/**
+ * `host:port` для белого списка выхода из `liveProbe.baseUrl`. Принимается только начало адреса
+ * по https: путь, запрос и креды в адресе — отказ, а не «возьмём хост». Адрес с кредами уехал бы
+ * в env стенда, где его видит код ветки, а http выпустил бы ключ открытым текстом мимо TLS.
+ * Сам адрес в текст отказа не попадает: отказ уходит в публичный комментарий карточки, а в
+ * неразобранной строке могли быть креды. Хост — только та форма, которую пропустит прокси
+ * выхода (`egress.mts`): IPv6 и порт 0 конфиг принял бы, а проба упала бы уже в стенде.
+ */
+export function baseUrlAddress(raw: unknown): string {
+    const bad = (why: string) => new Error(`liveProbe.baseUrl: ${why}`);
+    if (typeof raw !== 'string') throw bad('ожидалась строка');
+    let u: URL;
+    try {
+        u = new URL(raw);
+    } catch {
+        throw bad('не разбирается как адрес');
+    }
+    if (u.protocol !== 'https:') throw bad('только https');
+    if (u.username !== '' || u.password !== '') throw bad('креды в адресе запрещены');
+    if (u.pathname !== '/' || u.search !== '' || u.hash !== '')
+        throw bad('только https://хост[:порт], без пути и запроса');
+    if (!/^[a-z0-9.-]+$/.test(u.hostname)) throw bad('хост — только имя или IPv4');
+    if (u.port === '0') throw bad('порт 0');
+    return `${u.hostname}:${u.port || '443'}`;
 }
 
 /**
@@ -312,8 +365,20 @@ export function runLiveProbe({
             `ключ пробы из ${config.keyEnv} совпадает с ключом петли (${same.join(', ')}) — ` +
                 'нужен отдельный ключ с ограниченной квотой',
         );
-    const cliKeyEnv = LIVE_PROBE_CLI_KEY_ENV[cli];
+    const route = LIVE_PROBE_CLI_ROUTE[cli];
+    const viaRoute =
+        config.baseUrl !== undefined || config.keyAs === 'auth-token' || config.model !== undefined;
+    if (viaRoute && route === undefined)
+        return refused(`маршрута к провайдеру из liveProbe для CLI ${cli} нет`);
+    const cliKeyEnv =
+        config.keyAs === 'auth-token' ? route?.authTokenEnv : LIVE_PROBE_CLI_KEY_ENV[cli];
     if (cliKeyEnv === undefined) return refused(`маршрута ключа пробы для CLI ${cli} нет`);
+    // Переменные маршрута — значения конфига человека, не ключ: едут в стенд именами `--pass-env`.
+    const routeEnv: Record<string, string> = {};
+    if (route !== undefined && config.baseUrl !== undefined)
+        routeEnv[route.baseUrlEnv] = config.baseUrl;
+    if (route !== undefined && config.model !== undefined)
+        for (const n of route.modelEnvs) routeEnv[n] = config.model;
     if (productRoot === null || executionRoot === null)
         return refused(
             'стенд берётся только из установки ядра, а раскладки корней (roots) нет — ' +
@@ -347,6 +412,8 @@ export function runLiveProbe({
         cliKeyEnv,
         '--pass-env',
         'IS_SANDBOX',
+        ...Object.keys(routeEnv).flatMap((n) => ['--pass-env', n]),
+        ...(config.baseUrl !== undefined ? ['--allow', baseUrlAddress(config.baseUrl)] : []),
         ...(proxy !== undefined ? ['--upstream-proxy-env', 'RALPH_PROBE_UPSTREAM'] : []),
     ];
     const standEnv: Record<string, string> = {
@@ -359,6 +426,7 @@ export function runLiveProbe({
         STAND_SUBJECT_ROOT: executionRoot,
         STAND_ISOLATE_ARGS: isolateArgs.join(' '),
         IS_SANDBOX: '1',
+        ...routeEnv,
         [cliKeyEnv]: key,
         ...(proxy !== undefined ? { RALPH_PROBE_UPSTREAM: proxy } : {}),
     };

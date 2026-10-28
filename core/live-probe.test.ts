@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import {
+    baseUrlAddress,
     formatLiveProbeComment,
     judgeStandOutput,
     KEY_PLACEHOLDER,
@@ -72,6 +73,37 @@ describe('resolveLiveProbeConfig', () => {
         ).toEqual({ keyEnv: 'RALPH_PROBE_KEY', upstreamProxyEnv: 'HTTPS_PROXY', timeoutMs: 1000 });
     });
 
+    it('маршрут к посреднику разбирается', () => {
+        expect(
+            resolveLiveProbeConfig({
+                keyEnv: 'RALPH_PROBE_KEY',
+                baseUrl: 'https://provider.example.com',
+                keyAs: 'auth-token',
+                model: 'vendor/model-1.5',
+            }),
+        ).toEqual({
+            keyEnv: 'RALPH_PROBE_KEY',
+            baseUrl: 'https://provider.example.com',
+            keyAs: 'auth-token',
+            model: 'vendor/model-1.5',
+        });
+    });
+
+    it('неразобранный адрес в текст отказа не попадает — там могли быть креды', () => {
+        const secret = ['cred', '0123456789abcdef'].join('-');
+        expect(() => baseUrlAddress(`https://u:${secret}@bad host`)).toThrow(
+            expect.objectContaining({ message: expect.not.stringContaining(secret) }),
+        );
+    });
+
+    it.each([
+        ['https://provider.example.com', 'provider.example.com:443'],
+        ['https://provider.example.com/', 'provider.example.com:443'],
+        ['https://provider.example.com:8443', 'provider.example.com:8443'],
+    ])('адрес выхода из %s — %s', (url, addr) => {
+        expect(baseUrlAddress(url)).toBe(addr);
+    });
+
     it.each([
         [[], /объект/],
         [{}, /keyEnv/],
@@ -80,6 +112,16 @@ describe('resolveLiveProbeConfig', () => {
         [{ keyEnv: 'X', keyenv: 'Y' }, /незнакомые ключи keyenv/],
         [{ keyEnv: 'X', timeoutMs: -1 }, /timeoutMs/],
         [{ keyEnv: 'X', upstreamProxyEnv: 5 }, /upstreamProxyEnv/],
+        [{ keyEnv: 'X', baseUrl: 'http://provider.example.com' }, /только https/],
+        [{ keyEnv: 'X', baseUrl: 'https://provider.example.com/v1' }, /без пути/],
+        [{ keyEnv: 'X', baseUrl: 'https://provider.example.com/?k=1' }, /без пути/],
+        [{ keyEnv: 'X', baseUrl: 'https://u:p@provider.example.com' }, /креды/],
+        [{ keyEnv: 'X', baseUrl: 'provider.example.com' }, /не разбирается/],
+        [{ keyEnv: 'X', baseUrl: 'https://[2001:db8::1]' }, /IPv4/],
+        [{ keyEnv: 'X', baseUrl: 'https://provider.example.com:0' }, /порт 0/],
+        [{ keyEnv: 'X', baseUrl: 443 }, /строка/],
+        [{ keyEnv: 'X', keyAs: 'bearer' }, /keyAs/],
+        [{ keyEnv: 'X', model: 'a b' }, /model/],
     ])('битая секция %j — отказ', (raw, re) => {
         expect(() => resolveLiveProbeConfig(raw)).toThrow(re);
     });
@@ -212,6 +254,72 @@ describe('runLiveProbe: запуск стенда', () => {
         expect(Object.values(call.env)).not.toContain('forge-token');
         expect(call.env.RALPH_PROBE_KEY).toBeUndefined();
         expect(removed).toEqual(['/tmp/rp-x1']);
+    });
+
+    it('маршрут к посреднику: хост в --allow, токен под своим именем, адрес и модель — pass-env', () => {
+        const { calls, spawnFn } = fakeSpawn('RESULT claude unknown-tool PASS — ok\n');
+        const r = runLiveProbe(
+            base({
+                config: {
+                    ...CONFIG,
+                    baseUrl: 'https://provider.example.com',
+                    keyAs: 'auth-token',
+                    model: 'vendor/model-1',
+                },
+                spawnFn,
+            }),
+        );
+        expect(r.verdict).toBe('PASS');
+        const [call] = calls;
+        expect(call.env).toMatchObject({
+            ANTHROPIC_AUTH_TOKEN: KEY,
+            ANTHROPIC_BASE_URL: 'https://provider.example.com',
+            STAND_CLAUDE_MODEL: 'vendor/model-1',
+            ANTHROPIC_DEFAULT_HAIKU_MODEL: 'vendor/model-1',
+        });
+        // Ключ API рядом с токеном дал бы CLI второй путь к провайдеру по умолчанию.
+        expect(call.env.ANTHROPIC_API_KEY).toBeUndefined();
+        expect(call.env.STAND_ISOLATE_ARGS.split(' ')).toEqual([
+            '--pass-env',
+            'ANTHROPIC_AUTH_TOKEN',
+            '--pass-env',
+            'IS_SANDBOX',
+            '--pass-env',
+            'ANTHROPIC_BASE_URL',
+            '--pass-env',
+            'STAND_CLAUDE_MODEL',
+            '--pass-env',
+            'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+            '--allow',
+            'provider.example.com:443',
+        ]);
+    });
+
+    it('без baseUrl лишнего адреса выхода нет', () => {
+        const { calls, spawnFn } = fakeSpawn('RESULT claude unknown-tool PASS — ok\n');
+        runLiveProbe(base({ spawnFn }));
+        expect(calls[0].env.STAND_ISOLATE_ARGS).not.toContain('--allow');
+        expect(calls[0].env.ANTHROPIC_BASE_URL).toBeUndefined();
+    });
+
+    it('маршрут для CLI без строки маршрута — отказ, а не провайдер по умолчанию', () => {
+        const { calls, spawnFn } = fakeSpawn('');
+        const r = runLiveProbe(
+            base({
+                cli: 'codex',
+                config: { ...CONFIG, baseUrl: 'https://p.example.com' },
+                spawnFn,
+            }),
+        );
+        expect(r).toMatchObject({ verdict: 'REFUSED', reason: expect.stringMatching(/маршрута/) });
+        expect(calls).toEqual([]);
+    });
+
+    it('токен посредника в выводе — FAIL, как ключ API', () => {
+        const { spawnFn } = fakeSpawn(`leak ${KEY}\nRESULT claude unknown-tool PASS — ok\n`);
+        const r = runLiveProbe(base({ config: { ...CONFIG, keyAs: 'auth-token' }, spawnFn }));
+        expect(r.verdict).toBe('FAIL');
+        expect(r.tail).not.toContain(KEY);
     });
 
     it('короткий корень каталога стенда — предел пути unix-сокета', () => {
