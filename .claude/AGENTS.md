@@ -11,25 +11,27 @@
 ядро приходит к нему каталогом или подмодулем. Общие правила репозитория — в
 [корне канона](../AGENTS.md).
 
-| Путь                            | Что это                                                                       |
-| ------------------------------- | ----------------------------------------------------------------------------- |
-| `settings.json`                 | проводка хуков: какой зовётся на каком событии и инструменте                  |
-| `hooks/guard.cjs`               | PreToolUse-барьер: секреты, деструктивное, MCP вне allowlist, службы хоста    |
-| `hooks/guard-rules.cjs`         | правила барьера; `guard.cjs` только грузит их и держит fail-closed            |
-| `hooks/guard-shell.cjs`         | политика над вызовами оболочки: удаление, сброс дерева, манифест, адреса      |
-| `hooks/shell-calls.cjs`         | разбор команды оболочки в список вызовов (`sh -c`, подстановки, heredoc)      |
-| `hooks/guard-host-services.cjs` | systemctl, docker, Caddy — запрещено любое изменение состояния                |
-| `hooks/guard-process-kill.cjs`  | `kill` — только свой процесс и только по литеральному pid                     |
-| `hooks/guard-wiring.ts`         | сверка проводки: guard подключён и накрывает Bash, файловые инструменты, MCP  |
-| `hooks/skill-barrier.cjs`       | правка теста в сессии петли — только после вызова `Skill(vitest)`             |
-| `hooks/core-revision.cjs`       | контракт запуска `RALPH_CORE_SHA`: петля заявлена, хук сверен с ревизией ядра |
-| `hooks/consumer-data.cjs`       | разбор данных потребителя для хуков: MCP-контур и таблица скиллов             |
-| `hooks/load-context.cjs`        | SessionStart: подгружает `local/HANDOFF.md`                                   |
-| `hooks/sync-docs.cjs`           | PostToolUse: пересобирает `AGENTS.md` после правки `CLAUDE.md`                |
-| `skills/vitest/`                | скилл vitest (сгенерирован в antfu/skills), правится только регенерацией      |
-| `local/HANDOFF.md`              | передача между сессиями; локальный, под `.gitignore`                          |
-| `ralph/ralph.project.md`        | проектная половина промпта петли на каноне (конфиг рядом — локальный)         |
-| `ralph/hooks.json`              | данные канона как потребителя для хуков: MCP-мутации цикла, таблица скиллов   |
+| Путь                                                  | Что это                                                                                      |
+| ----------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `settings.json`                                       | проводка хуков: какой зовётся на каком событии и инструменте                                 |
+| `hooks/guard.cjs`                                     | PreToolUse-барьер: секреты, деструктивное, MCP вне allowlist, службы хоста                   |
+| `hooks/guard-rules.cjs`                               | правила барьера; `guard.cjs` только грузит их и держит fail-closed                           |
+| `hooks/guard-shell.cjs`                               | политика над вызовами оболочки: удаление, сброс дерева, манифест, адреса                     |
+| `hooks/shell-calls.cjs`                               | разбор команды оболочки в список вызовов (`sh -c`, подстановки, heredoc)                     |
+| `hooks/guard-host-services.cjs`                       | systemctl, docker, Caddy — запрещено любое изменение состояния                               |
+| `hooks/guard-process-kill.cjs`                        | `kill` — только свой процесс и только по литеральному pid                                    |
+| `hooks/guard-wiring.ts`                               | сверка проводки: guard подключён и накрывает Bash, файловые инструменты, MCP                 |
+| `hooks/skill-barrier.cjs`                             | правка теста в сессии петли — только после вызова `Skill(vitest)`                            |
+| `hooks/core-revision.cjs`                             | контракт запуска `RALPH_CORE_SHA`: петля заявлена, хук сверен с ревизией ядра                |
+| `hooks/consumer-data.cjs`                             | разбор данных потребителя для хуков: MCP-контур и таблица скиллов                            |
+| `hooks/load-context.cjs`                              | SessionStart: подгружает `local/HANDOFF.md`                                                  |
+| `hooks/sync-docs.cjs`                                 | PostToolUse: пересобирает `AGENTS.md` после правки `CLAUDE.md`                               |
+| `skills/vitest/`                                      | скилл vitest (сгенерирован в antfu/skills), правится только регенерацией                     |
+| `skills/prd/`, `skills/plan-phase/`, `skills/issues/` | цепочка планирования: раздел PRD → фазы до 5 карточек → вехи, карточки, строка конфига петли |
+| `skills/git-commit/`                                  | коммит по конвенции: сообщение проверяет `commit-msg.mts` до `git commit -F`                 |
+| `local/HANDOFF.md`                                    | передача между сессиями; локальный, под `.gitignore`                                         |
+| `ralph/ralph.project.md`                              | проектная половина промпта петли на каноне (конфиг рядом — локальный)                        |
+| `ralph/hooks.json`                                    | данные канона как потребителя для хуков: MCP-мутации цикла, таблица скиллов                  |
 
 ## Местные правила
 
