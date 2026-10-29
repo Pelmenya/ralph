@@ -46,19 +46,26 @@ function gatewayProfile(env, baseUrlEnv) {
     };
 }
 
-function kimiProfile(env) {
-    // 1M — вариант Kimi для тарифов Pro и выше; на Plus окно k3.1-pro только 256K, и модель
-    // с окном задаются переменными (README). Claude Code принимает у AUTO_COMPACT_WINDOW
-    // не более десятичного миллиона: 1048576 уже даёт warning при старте.
-    const model = env.CLAUDE_KIMI_MODEL || 'k3.1-pro[1m]';
+function kimiProfile(env, currentEnv = {}) {
+    // Основной кодер и дорогой expert разведены по алиасам Claude Code: иначе любая фоновая
+    // задача расходует квоту флагмана. Оба дефолта держат 1M, поэтому compact остаётся общим.
+    // Claude Code принимает у AUTO_COMPACT_WINDOW не более десятичного миллиона: 1048576
+    // уже даёт warning при старте.
+    const model = env.CLAUDE_KIMI_MODEL || 'kimi-for-coding';
+    const expertModel = env.CLAUDE_KIMI_EXPERT_MODEL || 'k3.1-pro[1m]';
     const contextTokens = env.CLAUDE_KIMI_CONTEXT_TOKENS || '1000000';
     const effort = env.CLAUDE_KIMI_EFFORT_LEVEL || 'high';
+    const baseUrl = env.CLAUDE_KIMI_BASE_URL || 'https://api.kimi.ai/coding/';
+    const storedKey =
+        currentEnv.ANTHROPIC_BASE_URL === baseUrl ? currentEnv.ANTHROPIC_API_KEY : undefined;
+    const apiKey = env.KIMI_CODE_API_KEY?.trim() || storedKey?.trim();
+    if (!apiKey) throw new Error('env KIMI_CODE_API_KEY not set');
     return {
-        ANTHROPIC_BASE_URL: env.CLAUDE_KIMI_BASE_URL || 'https://api.kimi.ai/coding/',
-        ANTHROPIC_API_KEY: requiredEnv(env, 'KIMI_CODE_API_KEY'),
+        ANTHROPIC_BASE_URL: baseUrl,
+        ANTHROPIC_API_KEY: apiKey,
         ANTHROPIC_MODEL: model,
-        ANTHROPIC_DEFAULT_FABLE_MODEL: model,
-        ANTHROPIC_DEFAULT_OPUS_MODEL: model,
+        ANTHROPIC_DEFAULT_FABLE_MODEL: expertModel,
+        ANTHROPIC_DEFAULT_OPUS_MODEL: expertModel,
         ANTHROPIC_DEFAULT_SONNET_MODEL: model,
         ANTHROPIC_DEFAULT_HAIKU_MODEL: model,
         CLAUDE_CODE_SUBAGENT_MODEL: model,
@@ -167,7 +174,7 @@ export function main(options = {}) {
         const nextEnv = Object.fromEntries(
             Object.entries(cfg.env ?? {}).filter(([key]) => !MANAGED_VARS.includes(key)),
         );
-        const profileEnv = PROFILES[name](processEnv);
+        const profileEnv = PROFILES[name](processEnv, cfg.env);
         if (profileEnv) Object.assign(nextEnv, profileEnv);
 
         if (Object.keys(nextEnv).length > 0) cfg.env = nextEnv;

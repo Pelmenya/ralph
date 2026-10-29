@@ -39,12 +39,12 @@ describe('switch-claude helper', () => {
             KEEP_ME: 'yes',
             ANTHROPIC_BASE_URL: 'https://api.kimi.ai/coding/',
             ANTHROPIC_API_KEY: 'test-kimi-key',
-            ANTHROPIC_MODEL: 'k3.1-pro[1m]',
+            ANTHROPIC_MODEL: 'kimi-for-coding',
             ANTHROPIC_DEFAULT_FABLE_MODEL: 'k3.1-pro[1m]',
             ANTHROPIC_DEFAULT_OPUS_MODEL: 'k3.1-pro[1m]',
-            ANTHROPIC_DEFAULT_SONNET_MODEL: 'k3.1-pro[1m]',
-            ANTHROPIC_DEFAULT_HAIKU_MODEL: 'k3.1-pro[1m]',
-            CLAUDE_CODE_SUBAGENT_MODEL: 'k3.1-pro[1m]',
+            ANTHROPIC_DEFAULT_SONNET_MODEL: 'kimi-for-coding',
+            ANTHROPIC_DEFAULT_HAIKU_MODEL: 'kimi-for-coding',
+            CLAUDE_CODE_SUBAGENT_MODEL: 'kimi-for-coding',
             CLAUDE_CODE_EFFORT_LEVEL: 'high',
             CLAUDE_CODE_AUTO_COMPACT_WINDOW: '1000000',
             CLAUDE_CODE_MAX_CONTEXT_TOKENS: '1000000',
@@ -53,6 +53,59 @@ describe('switch-claude helper', () => {
         expect(
             statSync(join(home, '.claude', 'settings.json.channel-switch.bak')).mode & 0o777,
         ).toBe(0o600);
+    });
+
+    it('профиль kimi позволяет независимо переопределить основной и expert-маршруты', () => {
+        const home = homeWith();
+        const result = run(home, ['kimi'], {
+            KIMI_CODE_API_KEY: 'test-kimi-key',
+            CLAUDE_KIMI_MODEL: 'main-model',
+            CLAUDE_KIMI_EXPERT_MODEL: 'expert-model',
+        });
+
+        expect(result.status, result.stderr).toBe(0);
+        expect(settings(home).env).toMatchObject({
+            ANTHROPIC_MODEL: 'main-model',
+            ANTHROPIC_DEFAULT_FABLE_MODEL: 'expert-model',
+            ANTHROPIC_DEFAULT_OPUS_MODEL: 'expert-model',
+            ANTHROPIC_DEFAULT_SONNET_MODEL: 'main-model',
+            ANTHROPIC_DEFAULT_HAIKU_MODEL: 'main-model',
+            CLAUDE_CODE_SUBAGENT_MODEL: 'main-model',
+        });
+    });
+
+    it('повторное переключение kimi использует ключ активного Kimi endpoint', () => {
+        const home = homeWith({
+            env: {
+                ANTHROPIC_BASE_URL: 'https://api.kimi.ai/coding/',
+                ANTHROPIC_API_KEY: 'stored-kimi-key',
+                ANTHROPIC_MODEL: 'old-model',
+            },
+        });
+        const result = run(home, ['kimi']);
+
+        expect(result.status, result.stderr).toBe(0);
+        expect(settings(home).env).toMatchObject({
+            ANTHROPIC_API_KEY: 'stored-kimi-key',
+            ANTHROPIC_MODEL: 'kimi-for-coding',
+            ANTHROPIC_DEFAULT_OPUS_MODEL: 'k3.1-pro[1m]',
+        });
+    });
+
+    it('не переносит сохранённый API key с чужого endpoint в профиль kimi', () => {
+        const home = homeWith({
+            env: {
+                ANTHROPIC_BASE_URL: 'https://gateway.example.com',
+                ANTHROPIC_API_KEY: 'other-provider-key',
+            },
+        });
+        const file = join(home, '.claude', 'settings.json');
+        const before = readFileSync(file, 'utf8');
+        const result = run(home, ['kimi']);
+
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain('KIMI_CODE_API_KEY');
+        expect(readFileSync(file, 'utf8')).toBe(before);
     });
 
     it('kimi → cheap → official чистит переменные прошлого канала, но не чужие', () => {
