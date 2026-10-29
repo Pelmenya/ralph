@@ -59,14 +59,23 @@ echo
 node ~/switch-claude.mjs kimi
 ```
 
-По умолчанию используется overseas endpoint `https://api.kimi.ai/coding/`, модель
-`k3.1-pro[1m]`, thinking effort `high` и окно 1M — схема из
-[официального руководства Kimi для Claude Code](https://www.kimi.com/code/docs/en/third-party-tools/claude-code.html).
-Окно 1M у `k3.1-pro` есть только с тарифа Pro; на Plus доступно 256K, и
-модель с окном задаются локально (так же `CLAUDE_KIMI_BASE_URL` меняет endpoint):
+При повторном выборе уже активного Kimi-канала helper сохраняет его текущий API key, поэтому
+экспортировать ключ заново не нужно. С другого endpoint ключ намеренно не переносится.
+
+По умолчанию используется overseas endpoint `https://api.kimi.ai/coding/`. Основной кодер,
+sonnet/haiku-задачи и субагенты идут через K2.8 Preview (`kimi-for-coding`), а expert-маршрут
+opus/fable — через K3.1 Pro с окном 1M (`k3.1-pro[1m]`). Thinking effort — `high`, общее окно
+контекста — 1M. Идентификаторы и переменные соответствуют
+[официальной конфигурации моделей Kimi](https://www.kimi.com/code/docs/en/kimi-code/models.html)
+и [руководству для Claude Code](https://www.kimi.com/code/docs/en/third-party-tools/claude-code.html).
+
+Обе модели можно переопределить независимо. `CLAUDE_KIMI_MODEL` задаёт основной маршрут,
+`CLAUDE_KIMI_EXPERT_MODEL` — opus/fable; `CLAUDE_KIMI_BASE_URL` меняет endpoint. Например,
+конфигурация K3.1 Pro 256K для обоих маршрутов:
 
 ```bash
 export CLAUDE_KIMI_MODEL='k3.1-pro'
+export CLAUDE_KIMI_EXPERT_MODEL='k3.1-pro'
 export CLAUDE_KIMI_CONTEXT_TOKENS='262144'
 node ~/switch-claude.mjs kimi
 ```
