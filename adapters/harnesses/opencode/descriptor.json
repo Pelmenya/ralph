@@ -60,6 +60,22 @@
     ],
     "forbiddenEnv": ["OPENCODE_PURE", "OPENCODE_CONFIG_CONTENT", "OPENCODE_PERMISSION"],
     "mcpNames": {},
+    "mcpArgs": {
+        "path": [
+            "path",
+            "paths",
+            "file",
+            "files",
+            "filePath",
+            "file_path",
+            "filename",
+            "dir",
+            "directory",
+            "cwd",
+            "destination"
+        ],
+        "url": ["url", "urls", "uri", "href", "endpoint"]
+    },
     "probeInputs": {
         "write": { "content": "ralph-probe\n" },
         "edit": { "oldString": "ralph-probe", "newString": "ralph-probe" },
@@ -76,5 +92,30 @@
         "source": "заглушка: доказательства загрузки скилла нет — вызов skill только доставляет инструкции, транскрипта плагин хуку не отдаёт (SKILL_BARRIER_LIMIT); поставщик — Фаза 16e"
     },
     "rules": ["AGENTS.md", "CLAUDE.md"],
-    "inventorySource": "стенд 1.19.4 (adapters/harnesses/__fixtures__/opencode-1.19.4-stand.json): toolMap и allowedFields — перечень инструментов и полей, который CLI в режиме run отдал модели в запросе к провайдеру стенда (раздел inventory: модель gpt- получает apply_patch вместо edit и write), плюс description у bash — его модель шлёт, и CLI передал его плагину (стенд bash-workdir). Конверт — аргументы tool.execute.before. Встроенные вне режима run (list, question, lsp, multiedit, websearch, codesearch) здесь не описаны и блокируются как незнакомые; сверка с инвентарём машиной — Фаза 16f"
+    "inventorySource": "стенд 1.19.4 (adapters/harnesses/__fixtures__/opencode-1.19.4-stand.json): toolMap и allowedFields — перечень инструментов и полей, который CLI в режиме run отдал модели в запросе к провайдеру стенда (раздел inventory: модель gpt- получает apply_patch вместо edit и write), плюс description у bash — его модель шлёт, и CLI передал его плагину (стенд bash-workdir). Конверт — аргументы tool.execute.before. Встроенные вне режима run (list, question, lsp, multiedit, websearch, codesearch) здесь не описаны и блокируются как незнакомые; сверка с инвентарём машиной — Фаза 16f",
+    "registrationSchema": null,
+    "protectedSurfaces": {
+        "tree": [".opencode/", "opencode.json", "opencode.jsonc"],
+        "homes": [
+            {
+                "env": "XDG_CONFIG_HOME",
+                "sub": "opencode",
+                "default": ".config/opencode",
+                "exempt": []
+            },
+            {
+                "env": "OPENCODE_CONFIG_DIR",
+                "sub": "",
+                "default": null,
+                "exempt": []
+            },
+            {
+                "env": null,
+                "sub": "",
+                "default": ".opencode",
+                "exempt": []
+            }
+        ],
+        "absolute": []
+    }
 }

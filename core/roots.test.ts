@@ -478,6 +478,7 @@ describe('переезд состояния в runtimeDir (канон, зада�
         const { runtimePathsIn } = await import('./runtime-paths.ts');
         expect(Object.keys(runtimePathsIn('/path/to/runtime')).sort()).toEqual([
             'activations',
+            'claudeSession',
             'codexSession',
             'dryEvents',
             'dryHeartbeat',

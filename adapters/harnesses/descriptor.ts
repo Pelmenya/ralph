@@ -17,8 +17,8 @@
  *     у каждого инструмента `toolMap` есть перечень. Разъехавшиеся таблицы дают
  *     нормализатор, который берёт путь из поля, о котором барьер не знает.
  *
- * Пустыми законно быть `configSurfaces`, `forbiddenEnv`, `mcpNames` и `rules`: у
- * харнесса может не быть проектных слоёв конфига, переменных-выключателей или MCP. Пустой
+ * Пустыми законно быть `configSurfaces`, `forbiddenEnv`, `mcpNames`, списки `mcpArgs` и
+ * `rules`: у харнесса может не быть проектных слоёв конфига, переменных-выключателей или MCP. Пустой
  * `toolMap` или перечень конверта — нет: пакет, не знающий ни одного инструмента, ничего
  * не нормализует.
  */
@@ -80,6 +80,12 @@ export type HarnessDescriptor = {
     configSurfaces: string[];
     forbiddenEnv: string[];
     mcpNames: Record<string, { server: string; tool: string }>;
+    /**
+     * Какие параметры MCP-вызова — пути и адреса (#193): имена полей входа, значения под
+     * которыми нормализатор судит записью (`path`) и выходом в сеть (`url`) — `mcpDerived`.
+     * Пустые списки законны: строки без пробелов и адреса целиком разбор находит и без имён.
+     */
+    mcpArgs: { path: string[]; url: string[] };
     skillEvidence: { source: string };
     /**
      * Файлы правил дерева в порядке, в котором их ищет CLI; где правила отдаёт раннер (OpenCode
@@ -95,6 +101,56 @@ export type HarnessDescriptor = {
      * валидатор ловит как незнакомое поле.
      */
     probeInputs?: Record<string, Record<string, unknown>>;
+    /**
+     * Схема, по которой CLI принимает запись регистрации барьера (#199, принцип 5 контракта):
+     * ключи записи, обязательные из них, допустимые значения и целые диапазоны. CLI, сверяющий
+     * запись строго, отбрасывает невалидную секцию ЦЕЛИКОМ (Kimi Code 2.3.2 — предупреждением в
+     * stderr), и сессия шла бы без барьера, хотя наш разбор хуки видел. Поэтому проба судит
+     * регистрацию этой схемой, а не своим разбором. `null` — CLI запись схемой не сверяет или
+     * схема не снята: регистрацию судит обратное чтение пакета, и это сказано полем.
+     */
+    registrationSchema: RegistrationSchema | null;
+    /**
+     * Поверхности конфига, которые guard в сессии петли не даёт писать (#199): всё, что CLI
+     * читает как настройки, хуки, плагины и MCP. Правка такой поверхности меняет барьер или
+     * серверы следующей сессии — раньше ship человека. Перечень у каждого CLI свой, общий барьер
+     * его не знает: раннер объединяет перечни реестра в контексте сессии
+     * (`core/session-context.ts`), и новый CLI привозит свои поверхности данными.
+     */
+    protectedSurfaces: ProtectedSurfaces;
+};
+
+/**
+ * `tree` — шаблоны пути от любого каталога (`*` внутри сегмента, `/` в конце — каталог
+ * целиком): поверхность дерева, в котором идёт сессия, и в его подкаталогах. `homes` — дома CLI:
+ * каталог из переменной `env` (с подкаталогом `sub`) И `default` от `HOME` — оба, потому что
+ * переменная сессии (`XDG_CONFIG_HOME` у OpenCode) не отменяет конфиг человека по умолчанию. Дом
+ * защищён целиком, кроме `exempt` — имён первого уровня (история, сессии, кэш), которые CLI пишет
+ * сам и которые ничего не исполняют: перечень исключений, а не защищаемых, чтобы новый каталог
+ * конфига в следующей версии CLI оказался защищён, а не открыт. Дом бывает и файлом рядом с
+ * каталогом (`~/.claude.json`): защищён сам путь. `absolute` — системные пути, которые CLI читает
+ * при любых источниках настроек (managed-настройки в `/etc`), — путь и всё внутри.
+ */
+export type ProtectedSurfaces = {
+    tree: string[];
+    homes: ProtectedHome[];
+    absolute: string[];
+};
+
+export type ProtectedHome = {
+    env: string | null;
+    sub: string;
+    default: string | null;
+    exempt: string[];
+};
+
+export type RegistrationSchema = {
+    /** Откуда снята схема: версия CLI и место в нём. */
+    evidence: string;
+    keys: string[];
+    required: string[];
+    enums: Record<string, string[]>;
+    intRanges: Record<string, [number, number]>;
 };
 
 const FIELDS: ReadonlyArray<keyof HarnessDescriptor> = [
@@ -109,9 +165,12 @@ const FIELDS: ReadonlyArray<keyof HarnessDescriptor> = [
     'configSurfaces',
     'forbiddenEnv',
     'mcpNames',
+    'mcpArgs',
     'skillEvidence',
     'rules',
     'inventorySource',
+    'registrationSchema',
+    'protectedSurfaces',
 ];
 
 /** Необязательные поля описания: отсутствие — не отказ, незнакомое — отказ. */
@@ -254,10 +313,143 @@ function mcpNamesProblems(v: unknown): string[] {
     return problems;
 }
 
+function mcpArgsProblems(v: unknown): string[] {
+    if (!isRecord(v)) return ['mcpArgs: не объект'];
+    const problems = unknownKeys(v, ['path', 'url'], 'mcpArgs');
+    problems.push(
+        ...stringListProblems(v.path, 'mcpArgs.path', true),
+        ...stringListProblems(v.url, 'mcpArgs.url', true),
+    );
+    if (problems.length > 0) return problems;
+    // Поле и путь, и адрес: какая роль победит, решал бы порядок проверок в разборе.
+    const paths = new Set((v.path as string[]).map((k) => k.toLowerCase()));
+    for (const key of v.url as string[]) {
+        if (paths.has(key.toLowerCase())) problems.push(`mcpArgs: поле ${key} и путь, и адрес`);
+    }
+    return problems;
+}
+
 function skillEvidenceProblems(v: unknown): string[] {
     if (!isRecord(v)) return ['skillEvidence: не объект'];
     const problems = unknownKeys(v, ['source'], 'skillEvidence');
     if (!isText(v.source)) problems.push('skillEvidence.source: не непустая строка');
+    return problems;
+}
+
+/** Относительный путь без выхода вверх и без пустых сегментов: шаблон поверхности, путь в доме. */
+const isRelativeTail = (v: unknown): v is string =>
+    isText(v) &&
+    !isAbsolute(v) &&
+    !v.includes('\\') &&
+    v
+        .replace(/\/$/, '')
+        .split('/')
+        .every((segment) => segment !== '' && segment !== '.' && segment !== '..');
+
+/**
+ * Абсолютный путь без `.`, `..` и обратной косой: системная поверхность. Срезается ОДИН ведущий
+ * `/`, как в разборе контекста хуком (`session-context.cjs`): `//etc/x` описание иначе принимало
+ * бы, а контекст каждой сессии с ним был бы битым.
+ */
+const isAbsoluteClean = (v: string): boolean =>
+    isAbsolute(v) && !v.includes('\\') && isRelativeTail(v.slice(1));
+
+function protectedSurfacesProblems(v: unknown): string[] {
+    const at = 'protectedSurfaces';
+    if (!isRecord(v)) return [`${at}: не объект`];
+    const problems = unknownKeys(v, ['tree', 'homes', 'absolute'], at);
+    problems.push(...stringListProblems(v.absolute, `${at}.absolute`, true));
+    if (Array.isArray(v.absolute)) {
+        v.absolute.forEach((p, i) => {
+            if (isText(p) && !isAbsoluteClean(p)) {
+                problems.push(`${at}.absolute[${i}]: не абсолютный путь без . и ..`);
+            }
+        });
+    }
+    problems.push(...stringListProblems(v.tree, `${at}.tree`, false));
+    if (Array.isArray(v.tree)) {
+        v.tree.forEach((pattern, i) => {
+            if (isText(pattern) && !isRelativeTail(pattern)) {
+                problems.push(`${at}.tree[${i}]: не относительный шаблон без ..`);
+            }
+        });
+    }
+    if (!Array.isArray(v.homes)) return [...problems, `${at}.homes: не массив`];
+    v.homes.forEach((home, i) => {
+        const where = `${at}.homes[${i}]`;
+        if (!isRecord(home)) {
+            problems.push(`${where}: не объект`);
+            return;
+        }
+        const keys = ['env', 'sub', 'default', 'exempt'];
+        problems.push(...unknownKeys(home, keys, where));
+        for (const key of keys) {
+            if (!Object.hasOwn(home, key)) problems.push(`${where}.${key}: нет обязательного поля`);
+        }
+        if (home.env !== null && !(isText(home.env) && /^[A-Za-z_]\w*$/.test(home.env))) {
+            problems.push(`${where}.env: не имя переменной и не null`);
+        }
+        if (home.sub !== '' && !isRelativeTail(home.sub)) {
+            problems.push(`${where}.sub: не относительный путь и не пустая строка`);
+        }
+        if (home.default !== null && !isRelativeTail(home.default)) {
+            problems.push(`${where}.default: не путь от HOME и не null`);
+        }
+        // Дом, которого нельзя найти ни переменной, ни от HOME, не защищает ничего — и выглядит
+        // защитой.
+        if (home.env === null && home.default === null) {
+            problems.push(`${where}: нет ни env, ни default — дом не находится`);
+        }
+        problems.push(...stringListProblems(home.exempt, `${where}.exempt`, true));
+        if (Array.isArray(home.exempt)) {
+            home.exempt.forEach((name, j) => {
+                if (isText(name) && (/[\\/]/.test(name) || name === '.' || name === '..')) {
+                    problems.push(`${where}.exempt[${j}]: не имя первого уровня`);
+                }
+            });
+        }
+    });
+    return problems;
+}
+
+function registrationSchemaProblems(v: unknown): string[] {
+    if (v === null) return [];
+    const at = 'registrationSchema';
+    if (!isRecord(v)) return [`${at}: не объект и не null`];
+    const problems = unknownKeys(v, ['evidence', 'keys', 'required', 'enums', 'intRanges'], at);
+    for (const key of ['evidence', 'keys', 'required', 'enums', 'intRanges']) {
+        if (!Object.hasOwn(v, key)) problems.push(`${at}.${key}: нет обязательного поля`);
+    }
+    if (problems.length > 0) return problems;
+    if (!isText(v.evidence)) problems.push(`${at}.evidence: нет доказательства`);
+    problems.push(
+        ...stringListProblems(v.keys, `${at}.keys`, false),
+        ...stringListProblems(v.required, `${at}.required`, true),
+    );
+    const keys = Array.isArray(v.keys) ? (v.keys as unknown[]) : [];
+    const named = (key: string, where: string) => {
+        if (!keys.includes(key)) problems.push(`${at}.${where}: ключа ${key} нет в keys`);
+    };
+    if (Array.isArray(v.required)) for (const key of v.required) named(String(key), 'required');
+    if (!isRecord(v.enums)) problems.push(`${at}.enums: не объект`);
+    else {
+        for (const [key, values] of Object.entries(v.enums)) {
+            named(key, `enums.${key}`);
+            problems.push(...stringListProblems(values, `${at}.enums.${key}`, false));
+        }
+    }
+    if (!isRecord(v.intRanges)) problems.push(`${at}.intRanges: не объект`);
+    else {
+        for (const [key, range] of Object.entries(v.intRanges)) {
+            named(key, `intRanges.${key}`);
+            const ok =
+                Array.isArray(range) &&
+                range.length === 2 &&
+                range.every((n) => Number.isInteger(n)) &&
+                range[0] <= range[1];
+            if (!ok) problems.push(`${at}.intRanges.${key}: не пара целых [min, max]`);
+        }
+    }
     return problems;
 }
 
@@ -299,9 +491,12 @@ export function harnessDescriptorProblems(raw: unknown): string[] {
         ...stringListProblems(raw.configSurfaces, 'configSurfaces', true),
         ...stringListProblems(raw.forbiddenEnv, 'forbiddenEnv', true),
         ...mcpNamesProblems(raw.mcpNames),
+        ...mcpArgsProblems(raw.mcpArgs),
         ...skillEvidenceProblems(raw.skillEvidence),
         ...stringListProblems(raw.rules, 'rules', true),
         ...probeInputsProblems(raw.probeInputs, tools, raw.allowedFields),
+        ...registrationSchemaProblems(raw.registrationSchema),
+        ...protectedSurfacesProblems(raw.protectedSurfaces),
     );
     return problems;
 }

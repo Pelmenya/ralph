@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { kimiHooksToml } from '../../harness-guard.ts';
+import { HOOK_CRASH_PASSES, kimiHooksToml } from '../../harness-guard.ts';
 import { ownDescriptor, parseHarnessDescriptor } from '../descriptor.ts';
 import { ADAPTER_PROTOCOL_VERSION } from '../protocol.ts';
 import { main } from './normalize.ts';
@@ -48,7 +48,7 @@ describe('регистрация барьера Kimi Code', () => {
         expect(harnessPackage.guardInput).toBe('event');
         expect(harnessPackage.setsProjectDirEnv).toBe(false);
         expect(harnessPackage.skillBarrier).toBe(false);
-        expect(harnessPackage.guardLimit).toBeNull();
+        expect(harnessPackage.guardLimit).toBe(`kimi-code: ${HOOK_CRASH_PASSES}`);
     });
 
     // #196: проектные слои держит недоверие каталогу; поверхностей отказа нет — и домов тоже.
@@ -67,12 +67,17 @@ describe('регистрация барьера Kimi Code', () => {
         expect(loop.map((p) => [p.toolName, p.expect])).toEqual([
             ['Write', 'blocked'],
             ['Bash', 'blocked'],
+            ['Write', 'blocked'],
             ['Write', 'allowed'],
         ]);
         expect(loop[1].toolInput).toMatchObject({ cwd: '.claude' });
-        for (const p of loop.filter((x) => x.expect === 'blocked')) {
-            expect(p).toMatchObject({ reasonCode: 'contour-data' });
-        }
+        for (const p of loop.slice(0, 2)) expect(p).toMatchObject({ reasonCode: 'contour-data' });
+        // #199: запись поверхности конфига своего CLI — из перечня описания.
+        expect(loop[2]).toMatchObject({
+            reasonCode: 'config-surface',
+            toolInput: { path: '.kimi-code/mcp.json' },
+        });
+        expect(descriptorRaw().protectedSurfaces.tree).toContain('.kimi-code/');
     });
 });
 

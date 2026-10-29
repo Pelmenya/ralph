@@ -19,6 +19,8 @@ export type TSkillVerdict = {
 export type TSkillRules = { files: TSkillRule[]; commands: TSkillRule[] };
 
 export declare const NO_RULES: TSkillRules;
+/** Плагин раннера со скиллами дерева человека (#194): `ralph:<скилл>`. */
+export declare const SESSION_SKILL_PLUGIN: string;
 
 export declare function targetsOf(toolName: string, toolInput: unknown): string[];
 export declare function requiredSkills(

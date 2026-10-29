@@ -149,7 +149,7 @@ export function planRuntimeMigration(
     existsFn: (p: string) => boolean,
     opts: { runnerDir?: string | null } = {},
 ): TMigrationPlan {
-    // Из описи исключены пять ключей, и все — осознанно (первые два — ревью Codex, !23):
+    // Из описи исключены шесть ключей, и все — осознанно (первые два — ревью Codex, !23):
     //   • `sessions` — АРХИВ логов прошлых сессий, а не состояние, от которого зависит
     //     продолжение фазы. Старые логи остаются на месте, новые пишутся в `runtimeDir`;
     //   • `lock` — файл ЖИВОГО процесса. Переезд идёт под локом, взятым уже в новой
@@ -162,7 +162,9 @@ export function planRuntimeMigration(
     //   • `opencodeSession` (#121) — тоже каталог, пересобираемый перед каждой сессией
     //     (плагин барьера и настройки сессии): состояния в нём нет.
     //   • `codexSession` (#195) — дом CLI Codex со ссылкой на вход человека, пересобирается
-    //     перед каждой сессией, как `kimiNative`.
+    //     перед каждой сессией, как `kimiNative`;
+    //   • `claudeSession` (#194) — MCP-конфиг и плагин скиллов сессии Claude Code, тоже
+    //     собираются заново перед каждой сессией.
     // Здесь — КЛЮЧИ описи, а не имена рантаймов: ключ, совпавший с именем рантайма, сменил бы
     // смысл вместе с ним, и переезд начал бы копировать каталог сессии молча.
     const SKIP: ReadonlySet<string> = new Set([
@@ -171,6 +173,7 @@ export function planRuntimeMigration(
         'kimiNative',
         'opencodeSession',
         'codexSession',
+        'claudeSession',
     ]);
     const names = Object.entries(runtimePathsIn(''))
         .filter(([key]) => !SKIP.has(key))

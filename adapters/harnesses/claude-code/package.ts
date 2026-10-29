@@ -18,6 +18,7 @@
  */
 import {
     HARNESS_PROBES,
+    HOOK_CRASH_PASSES,
     harnessHookPayload,
     harnessMatcherCovers,
     type HarnessProbe,
@@ -101,9 +102,13 @@ export const harnessPackage: HarnessPackage = {
     // Транскрипт с вызовом `Skill` хук получает только здесь (`SKILL_BARRIER_LIMIT`).
     skillBarrier: true,
     // Регистрация — сами настройки сессии, и всё, что барьер держит, проба видит.
-    guardLimit: null,
+    // Отказ механизма перехвата CLI считает пропуском — объявленное ограничение (#199).
+    guardLimit: `claude-code: ${HOOK_CRASH_PASSES}`,
     // Барьер — команды хуков, их исполняет проба сама.
     plugin: null,
-    // Сборщика конфига у пакета ещё нет (Фазы 16d2, 16d3): слои дерева не отвергаются.
+    // Слои дерева (`configSurfaces`) не отвергаются, а выключены (#194): сессия раннера идёт без
+    // источников настроек и со строгим MCP-конфигом (`core/session-settings.ts`), поэтому
+    // `.claude/settings*.json` и `.mcp.json` дерева CLI не читает, и отвергать их нечего — на
+    // каноне они и есть проводка человека.
     projectLayers: null,
 };

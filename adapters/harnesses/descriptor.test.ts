@@ -266,6 +266,23 @@ describe('описание пакета харнесса: поля и перек
             (d: any) => (d.mcpNames.mcp__fs__read.effect = 'read'),
             'mcpNames.mcp__fs__read: незнакомое поле effect',
         ],
+        ['mcpArgs не объект', (d: any) => (d.mcpArgs = []), 'mcpArgs: не объект'],
+        [
+            'mcpArgs: незнакомое поле',
+            (d: any) => (d.mcpArgs.paths = []),
+            'mcpArgs: незнакомое поле paths',
+        ],
+        ['mcpArgs без адресов', (d: any) => delete d.mcpArgs.url, 'mcpArgs.url: не массив'],
+        [
+            'mcpArgs: пустое имя поля пути',
+            (d: any) => d.mcpArgs.path.push(''),
+            'mcpArgs.path[1]: не непустая строка',
+        ],
+        [
+            'mcpArgs: поле и путь, и адрес — без регистра',
+            (d: any) => d.mcpArgs.url.push('PATH'),
+            'mcpArgs: поле PATH и путь, и адрес',
+        ],
         [
             'skillEvidence не объект',
             (d: any) => (d.skillEvidence = 'none'),
@@ -285,6 +302,203 @@ describe('описание пакета харнесса: поля и перек
         expect(with_(patch)).toContain(problem);
     });
 
+    // #199: схема регистрации — признак принятия записи самим CLI.
+    describe('registrationSchema', () => {
+        const SCHEMA = () => ({
+            evidence: 'CLI 1.0, схема секции',
+            keys: ['event', 'command', 'timeout'],
+            required: ['event', 'command'],
+            enums: { event: ['PreToolUse'] },
+            intRanges: { timeout: [1, 600] },
+        });
+        const withSchema = (patch: (r: Record<string, any>) => void) =>
+            with_((d) => {
+                d.registrationSchema = SCHEMA();
+                patch(d.registrationSchema);
+            });
+
+        it('null и полная схема — приняты', () => {
+            expect(with_((d) => (d.registrationSchema = null))).toEqual([]);
+            expect(withSchema(() => {})).toEqual([]);
+        });
+
+        it.each([
+            [
+                'не объект',
+                (r: any) => Object.assign(r, { keys: 'x' }),
+                'registrationSchema.keys: не массив',
+            ],
+            ['пустые ключи', (r: any) => (r.keys = []), 'registrationSchema.keys: пустой список'],
+            [
+                'нет доказательства',
+                (r: any) => (r.evidence = ''),
+                'registrationSchema.evidence: нет доказательства',
+            ],
+            [
+                'обязательный вне ключей',
+                (r: any) => r.required.push('x'),
+                'registrationSchema.required: ключа x нет в keys',
+            ],
+            [
+                'перечень вне ключей',
+                (r: any) => (r.enums.y = ['a']),
+                'registrationSchema.enums.y: ключа y нет в keys',
+            ],
+            [
+                'пустой перечень',
+                (r: any) => (r.enums.event = []),
+                'registrationSchema.enums.event: пустой список',
+            ],
+            [
+                'перевёрнутый диапазон',
+                (r: any) => (r.intRanges.timeout = [5, 1]),
+                'registrationSchema.intRanges.timeout: не пара целых [min, max]',
+            ],
+            [
+                'дробный диапазон',
+                (r: any) => (r.intRanges.timeout = [1.5, 2]),
+                'registrationSchema.intRanges.timeout: не пара целых [min, max]',
+            ],
+            [
+                'незнакомое поле',
+                (r: any) => (r.strict = true),
+                'registrationSchema: незнакомое поле strict',
+            ],
+            [
+                'нет поля',
+                (r: any) => delete r.intRanges,
+                'registrationSchema.intRanges: нет обязательного поля',
+            ],
+        ])('%s — отказ', (_name, patch, problem) => {
+            expect(withSchema(patch)).toContain(problem);
+        });
+
+        it('не объект и не null — отказ', () => {
+            expect(with_((d) => (d.registrationSchema = []))).toContain(
+                'registrationSchema: не объект и не null',
+            );
+        });
+    });
+
+    // #199: поверхности конфига, которые guard в сессии петли не даёт писать.
+    describe('protectedSurfaces', () => {
+        const homeOf = (d: Record<string, any>) => d.protectedSurfaces.homes[0];
+
+        it.each([
+            ['не объект', (d: any) => (d.protectedSurfaces = []), 'protectedSurfaces: не объект'],
+            [
+                'пустой tree',
+                (d: any) => (d.protectedSurfaces.tree = []),
+                'protectedSurfaces.tree: пустой список',
+            ],
+            [
+                'абсолютный шаблон',
+                (d: any) => (d.protectedSurfaces.tree = ['/etc/x']),
+                'protectedSurfaces.tree[0]: не относительный шаблон без ..',
+            ],
+            [
+                'выход вверх',
+                (d: any) => (d.protectedSurfaces.tree = ['../x']),
+                'protectedSurfaces.tree[0]: не относительный шаблон без ..',
+            ],
+            [
+                'незнакомое поле',
+                (d: any) => (d.protectedSurfaces.extra = 1),
+                'protectedSurfaces: незнакомое поле extra',
+            ],
+            [
+                'homes не массив',
+                (d: any) => (d.protectedSurfaces.homes = {}),
+                'protectedSurfaces.homes: не массив',
+            ],
+            [
+                'дом не объект',
+                (d: any) => (d.protectedSurfaces.homes = ['x']),
+                'protectedSurfaces.homes[0]: не объект',
+            ],
+            [
+                'нет поля дома',
+                (d: any) => delete homeOf(d).exempt,
+                'protectedSurfaces.homes[0].exempt: нет обязательного поля',
+            ],
+            [
+                'env не имя',
+                (d: any) => (homeOf(d).env = 'A-B'),
+                'protectedSurfaces.homes[0].env: не имя переменной и не null',
+            ],
+            [
+                'sub абсолютный',
+                (d: any) => (homeOf(d).sub = '/x'),
+                'protectedSurfaces.homes[0].sub: не относительный путь и не пустая строка',
+            ],
+            [
+                'default с ..',
+                (d: any) => (homeOf(d).default = '../x'),
+                'protectedSurfaces.homes[0].default: не путь от HOME и не null',
+            ],
+            [
+                'дом не находится',
+                (d: any) => Object.assign(homeOf(d), { env: null, default: null }),
+                'protectedSurfaces.homes[0]: нет ни env, ни default — дом не находится',
+            ],
+            [
+                'исключение с путём',
+                (d: any) => (homeOf(d).exempt = ['a/b']),
+                'protectedSurfaces.homes[0].exempt[0]: не имя первого уровня',
+            ],
+            [
+                'исключение `..`',
+                (d: any) => (homeOf(d).exempt = ['ok', '..']),
+                'protectedSurfaces.homes[0].exempt[1]: не имя первого уровня',
+            ],
+            [
+                'исключение `.`',
+                (d: any) => (homeOf(d).exempt = ['.']),
+                'protectedSurfaces.homes[0].exempt[0]: не имя первого уровня',
+            ],
+            [
+                'absolute не массив',
+                (d: any) => (d.protectedSurfaces.absolute = '/etc/x'),
+                'protectedSurfaces.absolute: не массив',
+            ],
+            [
+                'absolute относительный',
+                (d: any) => (d.protectedSurfaces.absolute = ['etc/x']),
+                'protectedSurfaces.absolute[0]: не абсолютный путь без . и ..',
+            ],
+            [
+                // Разбор контекста хуком срезает один слэш: `//etc` там битый, и здесь тоже.
+                'absolute с двумя ведущими слэшами',
+                (d: any) => (d.protectedSurfaces.absolute = ['//etc/x']),
+                'protectedSurfaces.absolute[0]: не абсолютный путь без . и ..',
+            ],
+            [
+                'absolute с ..',
+                (d: any) => (d.protectedSurfaces.absolute = ['/etc/../root']),
+                'protectedSurfaces.absolute[0]: не абсолютный путь без . и ..',
+            ],
+            [
+                'absolute — корень',
+                (d: any) => (d.protectedSurfaces.absolute = ['/']),
+                'protectedSurfaces.absolute[0]: не абсолютный путь без . и ..',
+            ],
+        ])('%s — отказ', (_name, patch, problem) => {
+            expect(with_(patch)).toContain(problem);
+        });
+
+        it('дом без переменной и дом без default — приняты; homes пустой — тоже', () => {
+            expect(
+                with_((d) =>
+                    d.protectedSurfaces.homes.push(
+                        { env: null, sub: '', default: '.x', exempt: [] },
+                        { env: 'X_DIR', sub: 'x', default: null, exempt: [] },
+                    ),
+                ),
+            ).toEqual([]);
+            expect(with_((d) => (d.protectedSurfaces.homes = []))).toEqual([]);
+        });
+    });
+
     it('законно пустые списки принимаются', () => {
         expect(
             with_((d) => {
@@ -292,6 +506,7 @@ describe('описание пакета харнесса: поля и перек
                 d.forbiddenEnv = [];
                 d.rules = [];
                 d.mcpNames = {};
+                d.mcpArgs = { path: [], url: [] };
             }),
         ).toEqual([]);
     });

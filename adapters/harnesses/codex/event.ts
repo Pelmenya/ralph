@@ -18,11 +18,12 @@
  * `write_stdin`), и своей карточки в плане у него до ревью фазы 16d не было — заведена
  * отдельной. Пришедшее поле `workdir` — незнакомое, как любое поле вне `allowedFields`.
  *
- * MCP здесь только нормализуется (`effect: 'unknown'`); допуск — политика контура у guard.
+ * MCP здесь только нормализуется (`effect: 'unknown'`); допуск — политика контура у guard, а
+ * параметры вызова — операции `derived` общего разбора (`mcpDerived`, #193).
  * Поля `mcp_server` у Codex нет, граница сервера — единственный разделитель `__`.
  */
 import type { HarnessDescriptor } from '../descriptor.ts';
-import { isRecord, mcpEvent, roleReader, unknownOp } from '../event-roles.ts';
+import { isRecord, mcpDerived, mcpEvent, roleReader, unknownOp } from '../event-roles.ts';
 import { MCP_PREFIX, mcpParts } from '../mcp-name.ts';
 import { patchOperations, patchesInCommand } from '../patch.ts';
 import type { ToolEvent, ToolOperation } from '../protocol.ts';
@@ -62,7 +63,7 @@ export function normalizeCodexEvent(d: HarnessDescriptor, raw: unknown): ToolEve
     if (tool.startsWith(MCP_PREFIX)) {
         const mcp = mcpParts(tool, undefined);
         if ('why' in mcp) return unknownOp(mcp.why);
-        return mcpEvent(mcp.server, mcp.tool);
+        return mcpEvent(mcp.server, mcp.tool, mcpDerived(d, input, raw.cwd));
     }
     if (!Object.hasOwn(d.toolMap, tool)) {
         return unknownOp(`инструмент ${tool} вне описания`, 'tool');

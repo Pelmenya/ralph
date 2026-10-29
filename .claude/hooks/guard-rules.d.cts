@@ -32,6 +32,13 @@ export type TGuardDecideOptions = {
     ) => { comm: string; ppid: number; cwd: string; cmdline: string } | null;
     selfPid?: number;
     sessionCwd?: string;
+    /** Поверхности конфига харнессов из контекста сессии (#199); нет — правило молчит. */
+    surfaces?: TGuardSurfaces | null;
+    /** Окружение, от которого находятся дома CLI; по умолчанию — окружение хука. */
+    processEnv?: Record<string, string | undefined>;
+    /** База относительных путей совместимого входа — `cwd` конверта хука. */
+    baseDir?: string;
+    fsApi?: TGuardFs;
 };
 
 export declare function decide(
@@ -92,9 +99,17 @@ export type TGuardFs = {
     readlinkSync?: (p: string) => string;
 };
 
+/** Поверхности конфига харнессов из контекста сессии (#199). */
+export type TGuardSurfaces = {
+    tree: string[];
+    homes: { env: string | null; sub: string; default: string | null; exempt: string[] }[];
+    /** Системные пути (managed-настройки); разбор контекста их требует, правило терпит отсутствие. */
+    absolute?: string[];
+};
+
 export declare function decideEvent(
     event: TGuardEvent,
-    options?: TGuardDecideOptions & { fsApi?: TGuardFs },
+    options?: TGuardDecideOptions,
 ): TGuardDecision;
 
 export declare function globMayMatchEnv(glob: string): boolean;

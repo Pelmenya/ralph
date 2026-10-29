@@ -39,6 +39,7 @@
 // их обратно. Исполняет хуки и плагин проба ядра.
 
 import { REASON_LINE_PREFIX, type BarrierReasonCode } from './barrier-reason.ts';
+import type { RegistrationSchema } from './harnesses/descriptor.ts';
 
 /** Харнесс — CLI, который ведёт сессию. Ключи — те же, что `harness` у `RUNTIME_IDENTITIES`. */
 export type Harness = 'claude-code' | 'codex' | 'kimi-code' | 'opencode';
@@ -226,6 +227,42 @@ const OPENCODE_SAFE_PROBES: readonly HarnessProbe[] = [
     },
 ];
 
+/**
+ * Запись поверхности конфига харнесса в сессии петли (#199): по одной у каждого пакета — его
+ * собственная поверхность, инструментом записи его CLI. Перечень guard получает контекстом сессии
+ * (`protectedSurfaces`), и хук, до которого он не дошёл, пропустил бы запись — проба это ловит.
+ * Разрешённая пара той же формы у каждого пакета уже есть (безобидная запись или патч). У Claude
+ * Code проба идёт с контекстом сессии в `core/guard-probe.ts` (`CONFIG_SURFACE_PROBES`), рядом
+ * с субагентом и отложенным ходом.
+ */
+const surfaceWrite = (
+    toolName: string,
+    toolInput: Record<string, unknown>,
+    surface: string,
+): HarnessProbe => ({
+    what: `запись поверхности конфига ${surface} в сессии петли`,
+    toolName,
+    toolInput,
+    loop: true,
+    expect: 'blocked',
+    reasonCode: 'config-surface',
+});
+const CODEX_SURFACE_PATCH = surfaceWrite(
+    'apply_patch',
+    { command: patchText('.codex/config.toml', '+[features]') },
+    '.codex/config.toml',
+);
+const KIMI_SURFACE_WRITE = surfaceWrite(
+    'Write',
+    { path: '.kimi-code/mcp.json', content: '{}' },
+    '.kimi-code/mcp.json',
+);
+const OPENCODE_SURFACE_WRITE = surfaceWrite(
+    'write',
+    { filePath: 'opencode.json', content: '{}' },
+    'opencode.json',
+);
+
 /** Проба оболочки: с кодом причины — запрещённая, без него — безобидная. */
 const shell = (toolName: string, p: ShellProbe): HarnessProbe => {
     const base = { what: p.what, toolName, toolInput: { command: p.command } };
@@ -276,6 +313,7 @@ export const HARNESS_PROBES: Record<Harness, readonly HarnessProbe[]> = {
         shell('Bash', SED),
         MCP_DELETE,
         CODEX_CONTOUR_PATCH,
+        CODEX_SURFACE_PATCH,
         shell('Bash', SAFE),
         CODEX_SAFE_PATCH,
     ],
@@ -302,6 +340,7 @@ export const HARNESS_PROBES: Record<Harness, readonly HarnessProbe[]> = {
         MCP_DELETE,
         KIMI_CONTOUR_WRITE,
         KIMI_CONTOUR_BASH_CWD,
+        KIMI_SURFACE_WRITE,
         shell('Bash', SAFE),
         KIMI_SAFE_WRITE,
     ],
@@ -389,6 +428,7 @@ export const HARNESS_PROBES: Record<Harness, readonly HarnessProbe[]> = {
             reasonCode: 'unknown-tool',
         },
         ...OPENCODE_LOOP_PROBES,
+        OPENCODE_SURFACE_WRITE,
         shell('bash', SAFE),
         ...OPENCODE_SAFE_PROBES,
     ],
@@ -480,10 +520,22 @@ export function opencodeEvent(probe: HarnessProbe): {
  * (`buildCodexArgs`) и недоверие проекту в argv — `.codex/` недоверенного проекта Codex 0.163 не
  * исполняет (стенд `S-own`, `S-guard`), а слой в дереве или предке preflight отвергает.
  */
+/**
+ * Отказ механизма перехвата (#199, принцип 5 контракта): у Claude Code, Codex и Kimi Code хук,
+ * который упал, завис или не запустился, CLI считает пропуском, и вызов исполняется (стенд
+ * Фазы 11, `crash`; `S-guard-nostderr`). Барьер fail-closed изнутри — любой свой сбой он кончает
+ * двойкой с кодом неисправности, — но процесс хука, убитый снаружи, ничего не скажет. Это
+ * объявленное ограничение пакета, его держит песочница (Фаза 16e); у OpenCode механизм наш
+ * (плагин), и там такой отказ — блок `hook-failed`.
+ */
+export const HOOK_CRASH_PASSES =
+    'упавший, зависший или не запустившийся хук CLI считает пропуском, и вызов исполняется: ' +
+    'guard кончает свой сбой двойкой, а процесс, убитый снаружи, держит песочница (Фаза 16e)';
+
 export const CODEX_GUARD_LIMIT =
     'codex: ввод в процесс write_stdin хук не зовёт — канал выключен --disable unified_exec_tty; ' +
     'серверы MCP и хуки проекта закрыты своим домом сессии и недоверием проекту, слой .codex/ в ' +
-    'дереве — отказ старта';
+    `дереве — отказ старта; ${HOOK_CRASH_PASSES}`;
 
 /**
  * Что не держат регистрации всех харнессов, кроме Claude Code, — строка старта (ревью Фазы
@@ -545,7 +597,7 @@ export function codexGuardArgs(hooks: readonly GuardHook[]): string[] {
  * `:`, строки копируются как есть. Разбирается только то подмножество, которое пишет
  * `codexGuardArgs`; всё прочее — отказ разбора, а не догадка.
  */
-function tomlInlineToJson(text: string): unknown {
+export function tomlInlineToJson(text: string): unknown {
     let out = '';
     for (let i = 0; i < text.length;) {
         const ch = text[i];
@@ -638,7 +690,7 @@ export function codexGuardFromArgs(argv: readonly string[]): {
 }
 
 /** Значения переопределений конфига в argv: `-c X`, `-cX`, `--config X`, `--config=X`. */
-function codexConfigOverrides(argv: readonly string[]): string[] {
+export function codexConfigOverrides(argv: readonly string[]): string[] {
     const out: string[] = [];
     argv.forEach((a, i) => {
         if (a === '-c' || a === '--config') {
@@ -741,13 +793,25 @@ function tomlScalar(raw: string): string | number | null {
  * первым сегментом `hooks`, не узнанный как `[[hooks]]`, — тоже отказ, а не чужая таблица:
  * точное сравнение строки теряло `[[hooks]] # …` и `[[ hooks ]]`, которые CLI позовёт. Ключ
  * `hooks` на верхнем уровне — отказ: дописанные `[[hooks]]` дали бы повторный ключ.
+ *
+ * `schema` — схема регистрации из описания пакета (`registrationSchema`, #199). Kimi Code
+ * сверяет секцию `hooks` строгой схемой и при ОДНОЙ невалидной записи отбрасывает секцию
+ * целиком — и чужой хук человека с лишним ключом снимал бы барьер, который наш разбор видел.
+ * Поэтому со схемой каждая таблица `[[hooks]]`, а не только `PreToolUse`, обязана ей
+ * соответствовать: ключ вне схемы, нет обязательного, значение вне перечня или диапазона —
+ * отказ с причиной. Ключи вне `intRanges` схема считает строками, как у CLI.
  */
-export function kimiHooksFromToml(text: string): { hooks: GuardHook[]; problems: string[] } {
+export function kimiHooksFromToml(
+    text: string,
+    schema: RegistrationSchema | null = null,
+): { hooks: GuardHook[]; problems: string[] } {
     const hooks: GuardHook[] = [];
     const problems: string[] = [];
     let cur: Record<string, string | number> | null = null;
+    let curLine = 0;
     let topLevel = true;
     const flush = () => {
+        if (cur && schema) problems.push(...registrationEntryProblems(cur, curLine, schema));
         if (!cur || cur.event !== 'PreToolUse') return;
         if (typeof cur.command !== 'string' || cur.command.trim() === '') return;
         hooks.push({
@@ -767,6 +831,7 @@ export function kimiHooksFromToml(text: string): { hooks: GuardHook[]; problems:
             topLevel = false;
             // `[[hooks]] # барьер` и `[[ hooks ]]` — тот же заголовок для TOML и для CLI.
             cur = HOOKS_HEADER.test(t) ? {} : null;
+            curLine = n + 1;
             if (!cur && HOOKS_LIKE_HEADER.test(t)) {
                 problems.push(
                     `config.toml, строка ${n + 1}: заголовок «${t}» про hooks не разобран`,
@@ -797,6 +862,46 @@ export function kimiHooksFromToml(text: string): { hooks: GuardHook[]; problems:
     });
     flush();
     return { hooks, problems };
+}
+
+/** Запись `[[hooks]]` против схемы регистрации; строка — номер заголовка таблицы. */
+function registrationEntryProblems(
+    entry: Record<string, string | number>,
+    line: number,
+    schema: RegistrationSchema,
+): string[] {
+    const at = `config.toml, [[hooks]] строки ${line}`;
+    const drop = 'CLI отбросил бы секцию hooks целиком, и барьер не был бы позван';
+    const out: string[] = [];
+    for (const [key, value] of Object.entries(entry)) {
+        if (!schema.keys.includes(key)) {
+            out.push(`${at}: ключ «${key}» вне схемы (${schema.keys.join(', ')}) — ${drop}`);
+            continue;
+        }
+        const range = schema.intRanges[key];
+        if (range) {
+            if (
+                !Number.isInteger(value) ||
+                (value as number) < range[0] ||
+                (value as number) > range[1]
+            ) {
+                out.push(
+                    `${at}: ${key} = ${JSON.stringify(value)} — не целое ${range[0]}..${range[1]} — ${drop}`,
+                );
+            }
+        } else if (typeof value !== 'string') {
+            out.push(`${at}: ${key} = ${JSON.stringify(value)} — не строка — ${drop}`);
+        } else if (schema.enums[key] && !schema.enums[key].includes(value)) {
+            out.push(`${at}: ${key} = «${value}» вне перечня CLI — ${drop}`);
+        }
+    }
+    for (const key of schema.required) {
+        const value = entry[key];
+        if (value === undefined || value === '') {
+            out.push(`${at}: нет обязательного ${key} — ${drop}`);
+        }
+    }
+    return out;
 }
 
 // ── OpenCode: плагин ─────────────────────────────────────────────────────────────────

@@ -498,8 +498,11 @@ describe('ensureGuardHolds — старт отменяется до первой
         expect(c.logged[0]).toContain('claude-code, codex');
         // Ревью Фазы 16b: предел Codex старт говорит вслух. С #232 патч судится событием, и
         // строка о нём больше не говорит — остаются каналы, закрытые не хуком.
-        expect(c.logged[1]).toMatch(/^⚠ codex: ввод в процесс write_stdin хук не зовёт/);
-        expect(c.logged[1]).not.toContain('apply_patch');
+        // #199: отказ механизма перехвата — объявленный предел у каждого CLI с хуком-командой.
+        expect(c.logged[1]).toMatch(/^⚠ claude-code: упавший, зависший .* считает пропуском/);
+        expect(c.logged[2]).toMatch(/^⚠ codex: ввод в процесс write_stdin хук не зовёт/);
+        expect(c.logged[2]).toMatch(/считает пропуском/);
+        expect(c.logged[2]).not.toContain('apply_patch');
     });
 
     // #195: исполняемые слои конфига Codex — отказ старта с путём и секциями, своим текстом:

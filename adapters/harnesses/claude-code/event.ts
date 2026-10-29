@@ -35,10 +35,18 @@
  * по полю конверта `mcp_server`, а без него — по единственному разделителю `__`: ленивое
  * разбиение отдавало `mcp__sync__get__CreateReport` серверу `sync` с инструментом
  * `get__CreateReport`, а несколько возможных границ без имени сервера — `unknown`. Разбор имени
- * общий с Codex — `../mcp-name.ts`.
+ * общий с Codex — `../mcp-name.ts`. Параметры вызова — операции `derived` общим разбором
+ * (`mcpDerived`, #193): путь секрета в аргументе разрешённого инструмента судится как чтение.
  */
 import type { HarnessDescriptor } from '../descriptor.ts';
-import { isRecord, mcpEvent, roleReader, searchOperation, unknownOp } from '../event-roles.ts';
+import {
+    isRecord,
+    mcpDerived,
+    mcpEvent,
+    roleReader,
+    searchOperation,
+    unknownOp,
+} from '../event-roles.ts';
 import { MCP_PREFIX, mcpParts } from '../mcp-name.ts';
 import type { ToolEvent, ToolOperation } from '../protocol.ts';
 
@@ -102,7 +110,7 @@ export function normalizeClaudeEvent(d: HarnessDescriptor, raw: unknown): ToolEv
     if (tool.startsWith(MCP_PREFIX)) {
         const mcp = mcpParts(tool, raw.mcp_server);
         if ('why' in mcp) return unknownOp(mcp.why);
-        return mcpEvent(mcp.server, mcp.tool);
+        return mcpEvent(mcp.server, mcp.tool, mcpDerived(d, input, raw.cwd));
     }
     if (!Object.hasOwn(d.toolMap, tool)) {
         return unknownOp(`инструмент ${tool} вне описания`, 'tool');

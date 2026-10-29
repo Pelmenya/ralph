@@ -34,20 +34,39 @@
 // Затем отрицательная проба (`guard-probe.ts`) на СОБРАННОМ файле: запрещённое обязано
 // быть заблокировано, безобидное — пропущено. Не прошла — сессия не стартует.
 //
-// Чего это НЕ обещает, сказано вслух. Claude Code по-прежнему читает и проектные настройки
-// дерева сессии и складывает их хуки с нашими: хук из дерева сессии может заблокировать
-// больше, но не может снять наш — блокирует любой код 2. Отказаться от проектных настроек
-// (`--setting-sources user`) стенд умеет, но вместе с ними CLI теряет и то, что берёт из
-// проекта помимо хуков; это решение отдельной задачи, а не попутное. Хук потребителя,
-// названный через `${CLAUDE_PROJECT_DIR}`, исполняет код дерева сессии — так он написан
-// потребителем, и переписывать чужие команды раннер не берётся. Отсюда и удвоение: когда
-// дерево сессии — worktree того же репозитория (канон, обычно и потребитель), такой хук
-// приходит и из собранного файла, и из проектных настроек дерева сессии, и на каждом вызове
-// инструмента может стартовать дважды — лишний node на guard и на прочие хуки потребителя.
-// Корректность это не ломает: оба экземпляра исполняют один код и блокируют одинаково.
-// Записи, совпавшие с настройками дерева сессии, намеренно не выбрасываются: решать по
-// дереву, которое правит PR, какие хуки человека снять из собранного файла, — значит снова
-// дать правимому коду голос в настройках сессии, ради чего модуль и заведён.
+// Исполняемые слои дерева сессии не исполняются (#194). До карточки Claude Code читал и
+// проектные настройки дерева сессии: хуки PR складывались с нашими и исполнялись, серверы
+// `.mcp.json` в режиме `-p` одобрялись сами. Теперь (бинарь 2.1.312, условия — в
+// `docs/install-stand.md`):
+//   • источники настроек сняты (`--setting-sources ''`): ни пользовательских, ни проектных,
+//     ни локальных хуков, плагинов и команд; читаются только `--settings` и managed-настройки.
+//     Снять одни хуки, оставив источник, можно только managed-ключом `allowManagedHooksOnly`, а
+//     конфиг хоста петля не правит;
+//   • MCP — строгий конфиг раннера (`--strict-mcp-config --mcp-config`) из `.mcp.json` дерева
+//     человека: `.mcp.json` дерева сессии, `~/.claude.json` и MCP плагинов отброшены;
+//   • без проектного источника CLI теряет `CLAUDE.md` и скиллы `.claude/skills` — раннер
+//     отдаёт их сам и из дерева человека: правила — `--append-system-prompt-file`, скиллы —
+//     плагином в каталоге сессии (`ralph:<скилл>`, его узнаёт барьер скиллов);
+//   • хук человека, названный через `${CLAUDE_PROJECT_DIR}`, привязан к дереву человека
+//     (`anchorHookEntry`): CLI подставил бы дерево сессии, и правленый в ветке хук исполнился бы
+//     следующей сессией. Прежнее удвоение (тот же хук из собранного файла и из проектных
+//     настроек worktree) ушло вместе с проектным источником.
+// Пределы названы. `CLAUDE.md` вложенных каталогов CLI сам больше не подгружает — их читает
+// модель, как велит корневой. Импорты `@path` в `CLAUDE.md` CLI раскрывает только у файла из
+// проектного источника, а флаг отдаёт файл текстом: строку `@docs/x.md` модель видит буквально и
+// сама файл не получает. Раннер импорты не раскрывает — правило, которое должно дойти до сессии,
+// пишется в `CLAUDE.md` текстом или ссылкой, которую модель прочтёт. Относительная команда хука человека и относительный путь в
+// `args` его MCP-сервера идут от cwd сессии: разбирать чужую строку оболочки раннер не берётся.
+// MCP человека, заведённый только в `~/.claude.json`, сессия не получает — источник MCP раннера
+// один, `.mcp.json` дерева человека.
+//
+// Итоговый MCP сверяется с доверенным у всех харнессов (#198). Allowlist контура судит сервер
+// по имени, а одноимённый сервер с другой командой мог объявить слой, который CLI сливает мимо
+// раннера, — глобальный каталог конфига OpenCode, дом CLI, argv. Поэтому после записи каждый
+// сборщик читает обратно ВСЁ, откуда CLI этой сессии возьмёт MCP, и сверяет каждый сервер с
+// `.mcp.json` дерева человека по команде, адресу и хешу записи (`adapters/mcp-trust.ts`). Без
+// раскладки корней доверенного нет, и любой сервер — отказ. Расхождение и нечитаемый итог —
+// отказ старта с именем сервера и источника, а не сессия на чужом сервере.
 //
 // Файл settings лежит в каталоге состояния: сессия, умеющая писать куда угодно на хосте,
 // может его поправить, но перед следующей сессией он собирается заново, а проба гоняется на
@@ -108,9 +127,19 @@ import {
 } from '../adapters/opencode.ts';
 import {
     opencodeSessionConfig,
+    opencodeSessionConfigLayers,
     opencodeSessionEnv,
     opencodeSessionXdg,
 } from '../adapters/opencode-home.ts';
+import {
+    codexArgvMcpServers,
+    codexTomlMcpServers,
+    jsonMcpServers,
+    mcpServersOf,
+    mcpTrustProblems,
+    opencodeMcpServers,
+    type TMcpServers,
+} from '../adapters/mcp-trust.ts';
 import { stripGitContext } from './consumer-tree.ts';
 import { writeFileAtomic } from './roots.ts';
 
@@ -295,8 +324,9 @@ export function describeSessionSettingsStart(
     }
     const contract = roots.coreSha ? `${CORE_SHA_ENV}=${roots.coreSha}` : 'без контракта ревизии';
     return (
-        `🧷 Settings сессии: хуки из ядра ${roots.productRoot} (${contract}), контур из ` +
-        `${roots.humanRoot}; собирается и проходит пробу перед каждой сессией`
+        `🧷 Settings сессии: хуки из ядра ${roots.productRoot} (${contract}), контур, MCP, ` +
+        `скиллы и правила из ${roots.humanRoot}; источники настроек дерева сессии сняты; ` +
+        'собирается и проходит пробу перед каждой сессией'
     );
 }
 
@@ -412,9 +442,46 @@ export function readHumanSettings(
     return raw;
 }
 
+// `${CLAUDE_PROJECT_DIR}` и `$CLAUDE_PROJECT_DIR` — CLI подставляет их сам, деревом сессии.
+const PROJECT_DIR_REF = /\$\{CLAUDE_PROJECT_DIR\}|\$CLAUDE_PROJECT_DIR(?![A-Za-z0-9_])/g;
+// Путь, который встаёт в команду как есть — и в двойных кавычках, и без них.
+const PLAIN_PATH_RE = /^\/[A-Za-z0-9._/@+-]*$/;
+
+/**
+ * Хук человека, названный через `${CLAUDE_PROJECT_DIR}`, — файлом ДЕРЕВА ЧЕЛОВЕКА (#194).
+ * CLI подставляет в команду дерево сессии, а это дерево правит PR: правленый в ветке фазы
+ * `.claude/hooks/*.cjs` исполнялся бы следующей же сессией, хотя запись о хуке взята из
+ * доверенного дерева. Переменная окружения хука остаётся деревом сессии — хук по-прежнему
+ * работает с ним (так `sync-docs.cjs` пересобирает копию доков там, где правили источник), но
+ * его код — из дерева, которое не правится сессией. Путь, требующий экранирования, в команду
+ * вставлять нельзя (кавычки команды писал потребитель) — отказ, а не тихое дерево сессии.
+ * Относительная команда (`node .claude/hooks/x.cjs`) остаётся от cwd сессии — это предел:
+ * разбирать чужую строку оболочки раннер не берётся.
+ */
+function anchorHookEntry(entry: unknown, humanRoot: string): unknown {
+    if (!isPlainObject(entry) || !Array.isArray(entry.hooks)) return entry;
+    return {
+        ...entry,
+        hooks: entry.hooks.map((hook) => {
+            if (!isPlainObject(hook) || typeof hook.command !== 'string') return hook;
+            if (!hook.command.match(PROJECT_DIR_REF)) return hook;
+            if (!PLAIN_PATH_RE.test(humanRoot)) {
+                throw new Error(
+                    `хук человека «${hook.command}» назван через CLAUDE_PROJECT_DIR, а путь ` +
+                        `дерева человека ${humanRoot} требует экранирования — привязать хук к ` +
+                        'нему нельзя, а дерево сессии исполнило бы код, который правит PR',
+                );
+            }
+            return { ...hook, command: hook.command.replace(PROJECT_DIR_REF, () => humanRoot) };
+        }),
+    };
+}
+
 /**
  * Собранный settings сессии. Чистая функция: тот же вход — тот же объект. Списки хуков
- * потребителя копируются, а не делятся: правка собранного не трогает прочитанного.
+ * потребителя копируются, а не делятся: правка собранного не трогает прочитанного. Хуки
+ * человека, названные через `${CLAUDE_PROJECT_DIR}`, привязаны к его дереву
+ * (`anchorHookEntry`); путь, который привязать нельзя, — исключение.
  */
 export function buildSessionSettings({
     productRoot,
@@ -430,7 +497,9 @@ export function buildSessionSettings({
     const humanHooks = isPlainObject(humanSettings.hooks) ? humanSettings.hooks : {};
     const hooks: Record<string, unknown[]> = {};
     for (const [event, entries] of Object.entries(humanHooks)) {
-        hooks[event] = Array.isArray(entries) ? [...entries] : [];
+        hooks[event] = Array.isArray(entries)
+            ? entries.map((entry) => anchorHookEntry(entry, humanRoot))
+            : [];
     }
     hooks.PreToolUse = [
         ...(hooks.PreToolUse ?? []),
@@ -454,18 +523,221 @@ export function buildSessionSettings({
     return { ...humanSettings, hooks, disableAllHooks: false };
 }
 
+/**
+ * Имя плагина, которым раннер отдаёт сессии скиллы дерева человека (#194). CLI зовёт скилл
+ * плагина `<имя>:<папка>`, и барьер скиллов узнаёт этот префикс (`SESSION_SKILL_PLUGIN` в
+ * `skill-barrier.cjs`, совпадение сверяет тест).
+ */
+export const SESSION_SKILL_PLUGIN = 'ralph';
+
+/**
+ * Источники настроек сессии Claude Code — ни одного (#194). Проверено по бинарю 2.1.312:
+ * пользовательский, проектный и локальный источники несут хуки (`hooks`), команды
+ * (`statusLine`, `apiKeyHelper`), плагины (`enabledPlugins`), а проектный ещё и одобряет
+ * серверы `.mcp.json` в режиме `-p` сам; снять одни хуки, оставив источник, можно только
+ * managed-настройками хоста (`allowManagedHooksOnly`), а их петля не правит. Командная строка
+ * (`--settings`) и managed-настройки читаются при любом списке. Вместе с проектным источником
+ * CLI теряет `CLAUDE.md` и скиллы `.claude/skills` — их раннер отдаёт сам, из дерева человека
+ * (`claudeSessionArgs`). Пустой список — `''` отдельным элементом argv, как `--tools ''`.
+ */
+export const CLAUDE_SESSION_SOURCES_ARGS: readonly string[] = ['--setting-sources', ''];
+
+const MCP_REL = '.mcp.json';
+const SKILLS_REL = path.join('.claude', 'skills');
+const INSTRUCTIONS_FILE = 'CLAUDE.md';
+
+/**
+ * MCP-конфиг сессии из `.mcp.json` дерева человека (#194). Файла нет — ни одного сервера.
+ * Битый файл или запись не той формы — исключение: «серверов нет» по нечитаемому файлу сняло
+ * бы MCP-чтения контура молча. Сервер с относительной командой — тоже отказ: CLI порождает
+ * его от cwd сессии, то есть кодом дерева, которое правит PR. Относительный путь в `args`
+ * (`node scripts/server.js`) так не распознать — это предел, названный в доке пакета.
+ */
+export function readHumanMcpConfig(
+    humanRoot: string,
+    readFileFn: (p: string) => string = (p) => fs.readFileSync(p, 'utf-8'),
+): { mcpServers: Record<string, unknown> } {
+    const file = path.join(humanRoot, MCP_REL);
+    let text: string;
+    try {
+        text = readFileFn(file);
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return { mcpServers: {} };
+        throw new Error(
+            `${file} не прочитан (${error instanceof Error ? error.message : String(error)})`,
+        );
+    }
+    let raw: unknown;
+    try {
+        raw = JSON.parse(text);
+    } catch (error) {
+        throw new Error(
+            `${file} — не JSON (${error instanceof Error ? error.message : String(error)})`,
+        );
+    }
+    if (!isPlainObject(raw)) throw new Error(`${file} — не объект`);
+    const servers = raw.mcpServers ?? {};
+    if (!isPlainObject(servers)) throw new Error(`${file}: mcpServers — не объект`);
+    for (const [name, server] of Object.entries(servers)) {
+        if (!isPlainObject(server)) throw new Error(`${file}: mcpServers.${name} — не объект`);
+        const cmd = server.command;
+        if (typeof cmd === 'string' && cmd.includes('/') && !path.isAbsolute(cmd)) {
+            throw new Error(
+                `${file}: mcpServers.${name}.command «${cmd}» — относительный путь: CLI порождает ` +
+                    'сервер от каталога сессии, то есть кодом дерева, которое правит PR',
+            );
+        }
+    }
+    return { mcpServers: { ...servers } };
+}
+
+/**
+ * Доверенные серверы MCP (#198): `.mcp.json` дерева человека — то, что прошло ревью. Без раскладки
+ * корней дерева человека нет, и доверенных серверов нет: раннер своих не отдаёт.
+ */
+export function trustedMcpServers(
+    roots: { humanRoot: string } | null,
+    readFileFn: (p: string) => string,
+): TMcpServers {
+    if (!roots) return {};
+    return mcpServersOf(
+        readHumanMcpConfig(roots.humanRoot, readFileFn),
+        path.join(roots.humanRoot, MCP_REL),
+    );
+}
+
+/** Один источник итогового MCP сессии: где CLI его возьмёт и как его разобрать. */
+export type TMcpSource = {
+    file: string;
+    parse: (text: string, where: string) => TMcpServers;
+    /** Файла может не быть (слой, который CLI читает, если он есть). Без флага нет файла — отказ. */
+    optional?: boolean;
+};
+
+/**
+ * Итоговый MCP сессии против доверенного (#198): каждый источник читается обратно — то, что
+ * возьмёт CLI, а не то, что раннер собирался записать. Отказ — причина строкой, `null` — сошлось.
+ */
+export function sessionMcpRefusal(
+    cli: string,
+    {
+        roots,
+        sources,
+        extra = {},
+        extraSource = '',
+    }: {
+        roots: { humanRoot: string } | null;
+        sources: readonly TMcpSource[];
+        /** Серверы не из файла (argv Codex). */
+        extra?: TMcpServers;
+        extraSource?: string;
+    },
+    readFileFn: (p: string) => string,
+): string | null {
+    const why = (error: unknown) => (error instanceof Error ? error.message : String(error));
+    const problems: string[] = [];
+    let trusted: TMcpServers;
+    try {
+        trusted = trustedMcpServers(roots, readFileFn);
+    } catch (error) {
+        return `Доверенный MCP-конфиг для сессии ${cli} не прочитан: ${why(error)} — старт отменён.`;
+    }
+    problems.push(...mcpTrustProblems(extra, trusted, extraSource));
+    for (const source of sources) {
+        let text: string;
+        try {
+            text = readFileFn(source.file);
+        } catch (error) {
+            if (source.optional && (error as NodeJS.ErrnoException)?.code === 'ENOENT') continue;
+            problems.push(`${source.file}: итоговый MCP-конфиг не прочитан (${why(error)})`);
+            continue;
+        }
+        try {
+            problems.push(
+                ...mcpTrustProblems(source.parse(text, source.file), trusted, source.file),
+            );
+        } catch (error) {
+            problems.push(`${why(error)} — итоговый MCP-конфиг не разобран`);
+        }
+    }
+    if (problems.length === 0) return null;
+    return (
+        `Итоговый MCP-конфиг сессии ${cli} разошёлся с доверенным (.mcp.json дерева человека) — ` +
+        'сессия не запущена:\n' +
+        problems.map((p) => `  - ${p}`).join('\n')
+    );
+}
+
+/** Что собрано для сессии Claude Code: из этого `claudeSessionArgs` строит argv. */
+export type TClaudeSession = {
+    /** Собранный settings (`--settings`). */
+    settings: string;
+    /** Строгий MCP-конфиг раннера (`--mcp-config`). */
+    mcpConfig: string;
+    /** Плагин скиллов дерева человека; `null` — скиллов у человека нет. */
+    pluginDir: string | null;
+    /** `CLAUDE.md` дерева человека; `null` — файла нет. */
+    instructions: string | null;
+};
+
+/**
+ * Аргументы сессии Claude Code из собранного (#194). Источники настроек сняты; MCP — только
+ * конфиг раннера (`--strict-mcp-config` отбрасывает `.mcp.json` дерева, `~/.claude.json` и MCP
+ * плагинов); скиллы — плагином, правила — `CLAUDE.md` дерева человека. Сессия без инструментов
+ * (`toolless`, #217) не получает ни серверов, ни скиллов: её `--strict-mcp-config` без
+ * `--mcp-config` уже стоит в argv, и второй конфиг вернул бы ей серверы.
+ */
+export function claudeSessionArgs(
+    session: TClaudeSession,
+    { toolless = false }: { toolless?: boolean } = {},
+): string[] {
+    const args = ['--settings', session.settings, ...CLAUDE_SESSION_SOURCES_ARGS];
+    if (session.instructions !== null) {
+        args.push('--append-system-prompt-file', session.instructions);
+    }
+    if (toolless) return args;
+    args.push('--strict-mcp-config', '--mcp-config', session.mcpConfig);
+    if (session.pluginDir !== null) args.push('--plugin-dir', session.pluginDir);
+    return args;
+}
+
+/** Копия каталога скиллов в плагин; `false` — источника нет. Боевая — побочка. */
+export type TSyncSkillsFn = (src: string, dst: string) => boolean;
+
+const syncSkills: TSyncSkillsFn = (src, dst) => {
+    guardSideEffect(`копия скиллов ${src} → ${dst}`, 'Подмени syncSkillsFn в тесте.');
+    fs.rmSync(dst, { recursive: true, force: true });
+    if (!fs.existsSync(src)) return false;
+    // Копия, а не ссылка: загрузчик плагина отвергает симлинк на файл скилла, а ссылка на
+    // каталог человека делала бы плагин окном в его дерево.
+    fs.cpSync(src, dst, { recursive: true, dereference: true });
+    return true;
+};
+
+/** Запись файла сессии: каталог сессии и плагина создаются по пути. Боевая — побочка. */
+function writeSessionFile(p: string, text: string): void {
+    guardSideEffect(`запись ${p}`, 'Подмени writeFileFn в тесте.');
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    writeFileAtomic(p, text);
+}
+
 export type TSessionSettingsDeps = {
     readFileFn?: (p: string) => string;
     writeFileFn?: (p: string, text: string) => void;
     runHookFn?: TRunHookFn;
+    syncSkillsFn?: TSyncSkillsFn;
+    existsFn?: (p: string) => boolean;
 };
 
-export type TPreparedSettings = { ok: true; path: string } | { ok: false; reason: string };
+export type TPreparedSettings =
+    { ok: true; path: string; session: TClaudeSession } | { ok: false; reason: string };
 
 /**
  * Сборка, запись и проба перед сессией. Отказ — причина строкой, а не исключение: стоп с
  * ней делает вызывающий. Проба идёт на собранном объекте ДО записи: файл, не прошедший
- * пробу, не должен лечь туда, откуда его возьмёт следующая сессия.
+ * пробу, не должен лечь туда, откуда его возьмёт следующая сессия. Рядом, в каталоге сессии
+ * (`sessionDir`), — MCP-конфиг и плагин скиллов (#194): они пишутся после пробы, и отказ
+ * любого из них — отказ сессии, а не сессия без MCP-контура или скиллов.
  */
 export function prepareSessionSettings(
     {
@@ -474,6 +746,7 @@ export function prepareSessionSettings(
         coreSha,
         sessionTree,
         outPath,
+        sessionDir,
         sessionContext,
     }: {
         productRoot: string;
@@ -481,27 +754,34 @@ export function prepareSessionSettings(
         coreSha: string;
         sessionTree: string;
         outPath: string;
+        /** Каталог сессии Claude Code в состоянии экземпляра: MCP-конфиг и плагин скиллов. */
+        sessionDir: string;
         /** Контекст сессии (#184), который раннер даст ей в окружение: его обязан получить каждый guard. */
         sessionContext: string;
     },
     {
         readFileFn = (p) => fs.readFileSync(p, 'utf-8'),
-        writeFileFn = (p, text) => writeFileAtomic(p, text),
+        writeFileFn = writeSessionFile,
         runHookFn = runHook,
+        syncSkillsFn = syncSkills,
+        existsFn = (p) => fs.existsSync(p),
     }: TSessionSettingsDeps = {},
 ): TPreparedSettings {
-    let humanSettings: Record<string, unknown>;
+    let settings: Record<string, unknown>;
+    let mcp: { mcpServers: Record<string, unknown> };
     try {
-        humanSettings = readHumanSettings(humanRoot, readFileFn);
+        const humanSettings = readHumanSettings(humanRoot, readFileFn);
+        settings = buildSessionSettings({ productRoot, humanRoot, coreSha, humanSettings });
+        mcp = readHumanMcpConfig(humanRoot, readFileFn);
     } catch (error) {
         return {
             ok: false,
             reason:
                 `Settings сессии не собран: ${error instanceof Error ? error.message : String(error)}. ` +
-                'Без настроек дерева человека сессия потеряла бы хуки потребителя — старт отменён.',
+                'Без настроек дерева человека сессия потеряла бы хуки и MCP-контур потребителя — ' +
+                'старт отменён.',
         };
     }
-    const settings = buildSessionSettings({ productRoot, humanRoot, coreSha, humanSettings });
     const problems = [
         ...probeProblems(settings, sessionTree, { runHookFn }),
         ...sessionContextProblems(settings, sessionTree, sessionContext, { runHookFn }),
@@ -524,7 +804,45 @@ export function prepareSessionSettings(
             reason: `Settings сессии не записан в ${outPath} (${error instanceof Error ? error.message : String(error)}).`,
         };
     }
-    return { ok: true, path: outPath };
+    const mcpConfig = path.join(sessionDir, 'mcp.json');
+    const plugin = path.join(sessionDir, 'plugin');
+    let pluginDir: string | null;
+    try {
+        writeFileFn(mcpConfig, `${JSON.stringify(mcp, null, 2)}\n`);
+        const copied = syncSkillsFn(path.join(humanRoot, SKILLS_REL), path.join(plugin, 'skills'));
+        if (copied) {
+            writeFileFn(
+                path.join(plugin, '.claude-plugin', 'plugin.json'),
+                `${JSON.stringify({ name: SESSION_SKILL_PLUGIN, description: 'Скиллы дерева человека для сессии петли' }, null, 2)}\n`,
+            );
+        }
+        pluginDir = copied ? plugin : null;
+    } catch (error) {
+        return {
+            ok: false,
+            reason:
+                `Каталог сессии ${sessionDir} не собран (${error instanceof Error ? error.message : String(error)}): ` +
+                'без него сессия шла бы без MCP-контура раннера или без скиллов.',
+        };
+    }
+    // #198: `--strict-mcp-config` оставляет CLI один источник — этот файл, и он читается обратно.
+    const mcpRefused = sessionMcpRefusal(
+        'Claude Code',
+        { roots: { humanRoot }, sources: [{ file: mcpConfig, parse: jsonMcpServers }] },
+        readFileFn,
+    );
+    if (mcpRefused) return { ok: false, reason: mcpRefused };
+    const instructionsPath = path.join(humanRoot, INSTRUCTIONS_FILE);
+    return {
+        ok: true,
+        path: outPath,
+        session: {
+            settings: outPath,
+            mcpConfig,
+            pluginDir,
+            instructions: existsFn(instructionsPath) ? instructionsPath : null,
+        },
+    };
 }
 
 type TGuardRoots = { productRoot: string; humanRoot: string; coreSha: string } | null;
@@ -757,7 +1075,30 @@ export function prepareCodexSession(
     } catch (error) {
         return { ok: false, reason: `Дом Codex сессии не собран в ${home} (${why(error)}).` };
     }
-    return { ok: true, args: [...guard.args, ...codexUntrustArgs(keys)], home, keys };
+    const args = [...guard.args, ...codexUntrustArgs(keys)];
+    // #198: MCP Codex — переопределения argv и `config.toml` дома. Под `--ignore-user-config`
+    // файл CLI не читает, но сверяется и он: флаг снимает чужая версия сборки, а не сессия.
+    let argvServers: TMcpServers;
+    try {
+        argvServers = codexArgvMcpServers(args);
+    } catch (error) {
+        return {
+            ok: false,
+            reason: `MCP в argv Codex не разобран: ${why(error)} — старт отменён.`,
+        };
+    }
+    const mcpRefused = sessionMcpRefusal(
+        'Codex',
+        {
+            roots,
+            sources: [{ file: path.join(home, 'config.toml'), parse: codexTomlMcpServers }],
+            extra: argvServers,
+            extraSource: 'argv codex exec',
+        },
+        readFileFn,
+    );
+    if (mcpRefused) return { ok: false, reason: mcpRefused };
+    return { ok: true, args, home, keys };
 }
 
 /** Исход подготовки дома Kimi Code: каталог для `KIMI_CODE_HOME` либо причина отказа. */
@@ -874,6 +1215,13 @@ export function prepareKimiNativeHome(
     } catch (error) {
         return { ok: false, reason: `Дом Kimi Code сессии не собран в ${home} (${why(error)}).` };
     }
+    // #198: MCP Kimi Code — `mcp.json` дома (проектные серверы держит недоверие каталогу).
+    const mcpRefused = sessionMcpRefusal(
+        'Kimi Code',
+        { roots, sources: [{ file: path.join(home, 'mcp.json'), parse: jsonMcpServers }] },
+        readFileFn,
+    );
+    if (mcpRefused) return { ok: false, reason: mcpRefused };
     return { ok: true, home };
 }
 
@@ -1043,6 +1391,24 @@ export function prepareOpencodeSession(
             reason: `Каталог сессии OpenCode не собран в ${configDir} (${why(error)}).`,
         };
     }
+    // #198: MCP OpenCode — настройки сессии и всё, что CLI сливает с ними без флага
+    // (`opencodeSessionConfigLayers`): файл, оставленный там прошлой сессией, поднял бы её сервер.
+    const mcpRefused = sessionMcpRefusal(
+        'OpenCode',
+        {
+            roots,
+            sources: [
+                { file: path.join(configDir, 'opencode.json'), parse: opencodeMcpServers },
+                ...opencodeSessionConfigLayers(configDir).map((file): TMcpSource => ({
+                    file,
+                    parse: opencodeMcpServers,
+                    optional: true,
+                })),
+            ],
+        },
+        readFileFn,
+    );
+    if (mcpRefused) return { ok: false, reason: mcpRefused };
     const expected = expectedOpencodeSkills(sessionTree, listDirFn, isFileFn);
     const skills = opencodeSkillProblems(
         listSkillsFn(opencodeSessionEnv(baseEnv, { configDir, cwd: sessionTree }), sessionTree),

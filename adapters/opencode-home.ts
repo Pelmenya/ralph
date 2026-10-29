@@ -81,6 +81,20 @@ export const OPENCODE_HOME_LAYERS: readonly string[] = [
     'opencode.jsonc',
 ];
 
+/**
+ * Файлы конфига, которые CLI сливает в сессию с каталогом `configDir` помимо `OPENCODE_CONFIG`:
+ * `opencode.jsonc` того же каталога и глобальный каталог сессии (`<XDG_CONFIG_HOME>/opencode`).
+ * Глобальный раннер не чистит — CLI создаёт его сам, — поэтому их MCP сверяется с доверенным
+ * перед каждой сессией (#198).
+ */
+export function opencodeSessionConfigLayers(configDir: string): string[] {
+    const xdg = path.join(opencodeSessionXdg(configDir), 'opencode');
+    return [
+        path.join(configDir, 'opencode.jsonc'),
+        ...['config.json', 'opencode.json', 'opencode.jsonc'].map((f) => path.join(xdg, f)),
+    ];
+}
+
 /** `XDG_CONFIG_HOME` сессии для каталога сессии `configDir`. */
 export function opencodeSessionXdg(configDir: string): string {
     return path.join(path.dirname(configDir), OPENCODE_SESSION_XDG_DIR);

@@ -14,6 +14,12 @@
 // котором он сам ставит ветку фазы и запускает CLI. Контекст без обоих корней — отказ
 // preflight, а не контекст «как получилось»: хук, получивший половину, решал бы по ней.
 //
+// Поверхности конфига харнессов (`protectedSurfaces`, #199) едут тем же контекстом: перечень у
+// каждого пакета свой, общий барьер пакетов не читает, а раннер объединяет перечни реестра
+// (`protectedSurfacesOf`). Guard по нему не даёт сессии петли писать настройки, хуки, плагины и
+// MCP любого CLI — правка такой поверхности меняла бы барьер или серверы следующей сессии
+// раньше ship человека.
+//
 // Разбор на стороне хука — `.claude/hooks/session-context.cjs`; равенство формы держит тест.
 // Решает guard пока по одному `loop`: забор данных контура узнаёт путь шаблоном, а не
 // относительно `roots.execution`. Остальные поля сверяются по форме — битый контекст блокирует, —
@@ -23,6 +29,11 @@
 
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
+import {
+    HARNESS_REGISTRY,
+    protectedSurfacesOf,
+    type ProtectedSurfaces,
+} from '../adapters/harness-registry.ts';
 
 /** Переменная контекста в окружении сессии (читает `session-context.cjs`). */
 export const SESSION_CONTEXT_ENV = 'RALPH_SESSION_CONTEXT';
@@ -34,6 +45,8 @@ export type TSessionContext = {
     /** Ревизия ядра контракта `RALPH_CORE_SHA`; пусто — ядро без контракта. */
     coreRevision: string;
     roots: { consumer: string; execution: string };
+    /** Поверхности конфига всех принятых пакетов: их guard в сессии петли не даёт писать. */
+    protectedSurfaces: ProtectedSurfaces;
 };
 
 export type TSessionContextBuild =
@@ -48,11 +61,13 @@ export function loopSessionContext({
     sessionTree,
     coreSha,
     sessionIdFn = randomUUID,
+    surfacesFn = () => protectedSurfacesOf(HARNESS_REGISTRY),
 }: {
     humanRoot: string | null;
     sessionTree: string | null;
     coreSha: string;
     sessionIdFn?: () => string;
+    surfacesFn?: () => ProtectedSurfaces;
 }): TSessionContextBuild {
     const consumer = humanRoot ?? sessionTree;
     const missing = [
@@ -69,11 +84,23 @@ export function loopSessionContext({
                 'обоих корней решал бы по половине контекста — сессия не стартует.',
         };
     }
+    let protectedSurfaces: ProtectedSurfaces;
+    try {
+        protectedSurfaces = surfacesFn();
+    } catch (error) {
+        return {
+            ok: false,
+            reason:
+                `Контекст сессии не собран: ${error instanceof Error ? error.message : String(error)}. ` +
+                'Без перечня guard не защитил бы конфиг харнессов — сессия не стартует.',
+        };
+    }
     const context: TSessionContext = {
         sessionId: sessionIdFn(),
         loop: true,
         coreRevision: coreSha,
         roots: { consumer: consumer as string, execution: sessionTree as string },
+        protectedSurfaces,
     };
     return { ok: true, context, value: JSON.stringify(context) };
 }

@@ -220,6 +220,23 @@ describe('загруженные скиллы читаются из вызово
         ];
         expect([...loadedSkills(lines)]).toEqual(['vitest']);
     });
+
+    // #194: проектный источник настроек у сессии петли снят, скиллы дерева человека едут
+    // плагином раннера, и CLI зовёт их `ralph:<папка>`. Засчитывается ровно этот префикс:
+    // скилл чужого плагина с тем же именем папки — не скилл проекта.
+    it('скилл плагина раннера засчитывается своим именем, чужого плагина — нет', () => {
+        expect(hook.SESSION_SKILL_PLUGIN).toBe('ralph');
+        expect([...loadedSkills([skillCall('ralph:vitest')])]).toEqual(['vitest']);
+        expect([...loadedSkills([skillCall('/ralph:vitest')])]).toEqual(['vitest']);
+        expect([...loadedSkills([skillCall('other:vitest')])]).toEqual(['other:vitest']);
+        const verdict = decide({
+            toolName: 'Edit',
+            toolInput: { file_path: 'core/x.test.ts' },
+            transcriptLines: [skillCall('other:vitest')],
+            env: LOOP_ENV,
+        });
+        expect(verdict.blocked).toBe(true);
+    });
 });
 
 describe('вердикт', () => {

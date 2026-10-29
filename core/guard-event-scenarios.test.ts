@@ -119,6 +119,50 @@ function claudeVerdict(
 const allowed: Verdict = { status: 'allowed' };
 const blocked = (code: string): Verdict => ({ status: 'blocked', code });
 
+// #194: на каноне дерево человека — тот же репозиторий, и его `.claude/settings.json` несёт
+// guard, барьер скиллов и хуки доков через `${CLAUDE_PROJECT_DIR}`. Сборка привязывает их к
+// дереву человека; петля обязана пройти и с ними — регистрация складывается с раннерской.
+describe.skipIf(!coreIsRepoRoot())(
+    'сценарии петли с настройками канона как дерева человека',
+    () => {
+        const human = JSON.parse(
+            readFileSync(path.join(CANON_ROOT, '.claude', 'settings.json'), 'utf-8'),
+        );
+        const settings = buildSessionSettings({
+            productRoot: CANON_ROOT,
+            humanRoot: CANON_ROOT,
+            coreSha: '',
+            humanSettings: human,
+        });
+
+        it('хуки человека названы его деревом, а не переменной дерева сессии', () => {
+            expect(JSON.stringify(settings)).not.toContain('CLAUDE_PROJECT_DIR');
+        });
+
+        it.each([
+            [
+                'правка кода',
+                'Edit',
+                { file_path: 'core/gate.ts', old_string: 'a', new_string: 'b' },
+            ],
+            ['MCP-чтение из контура', 'mcp__sourcecraft__GetIssue', { issue_slug: '1' }],
+            ['git commit', 'Bash', { command: 'git commit -qm "feat: x (#1)"' }],
+        ])('%s (%s) — проходит', (_what, tool, input) => {
+            expect(claudeVerdict(settings, tool, input)).toEqual(allowed);
+        });
+
+        it('правка теста — после скилла плагина раннера; без него — блок', () => {
+            const edit = { file_path: 'core/gate.test.ts', old_string: 'a', new_string: 'b' };
+            expect(claudeVerdict(settings, 'Edit', edit, transcript('ralph:vitest'))).toEqual(
+                allowed,
+            );
+            expect(claudeVerdict(settings, 'Edit', edit, transcript(null))).toEqual(
+                blocked('skill-required'),
+            );
+        });
+    },
+);
+
 describe.skipIf(!coreIsRepoRoot())('сценарии текущей петли проходят guard на событии', () => {
     const settings = sessionSettings(humanTree());
 
@@ -149,6 +193,17 @@ describe.skipIf(!coreIsRepoRoot())('сценарии текущей петли �
         const edit = { file_path: 'core/gate.test.ts', old_string: 'a', new_string: 'b' };
         expect(claudeVerdict(settings, 'Edit', edit, transcript('vitest'))).toEqual(allowed);
         expect(claudeVerdict(settings, 'Edit', edit, transcript(null))).toEqual(
+            blocked('skill-required'),
+        );
+    });
+
+    // #194: проектный источник настроек у сессии снят, скиллы дерева человека едут плагином
+    // раннера, и CLI зовёт их `ralph:<папка>`.
+    it('скилл плагина раннера: загрузка проходит, правка теста после неё — тоже', () => {
+        const edit = { file_path: 'core/gate.test.ts', old_string: 'a', new_string: 'b' };
+        expect(claudeVerdict(settings, 'Skill', { skill: 'ralph:vitest' })).toEqual(allowed);
+        expect(claudeVerdict(settings, 'Edit', edit, transcript('ralph:vitest'))).toEqual(allowed);
+        expect(claudeVerdict(settings, 'Edit', edit, transcript('other:vitest'))).toEqual(
             blocked('skill-required'),
         );
     });

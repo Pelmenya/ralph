@@ -29,11 +29,19 @@
  * (стенд `mcp`: `stand_stand_write`). `_` законен в обеих частях, и граница сервера по имени не
  * восстанавливается: сервер `foo_list` с инструментом `drop` выглядел бы чтением `list…`. Поэтому
  * имя вне `toolMap` — MCP только через перевод `mcpNames` описания, иначе `unknown` вида `tool`:
- * блок, а не догадка о сервере.
+ * блок, а не догадка о сервере. Параметры переведённого вызова — операции `derived` общего
+ * разбора (`mcpDerived`, #193).
  */
 import path from 'node:path';
 import type { HarnessDescriptor } from '../descriptor.ts';
-import { isRecord, roleReader, searchOperation, translatedMcp, unknownOp } from '../event-roles.ts';
+import {
+    isRecord,
+    mcpDerived,
+    roleReader,
+    searchOperation,
+    translatedMcp,
+    unknownOp,
+} from '../event-roles.ts';
 import { patchOperations } from '../patch.ts';
 import type { ToolEvent, ToolOperation } from '../protocol.ts';
 
@@ -91,9 +99,14 @@ function operations(
     }
 }
 
-function mcpOperation(d: HarnessDescriptor, tool: string): ToolEvent {
+function mcpOperation(
+    d: HarnessDescriptor,
+    tool: string,
+    args: Record<string, unknown>,
+    baseDir: string,
+): ToolEvent {
     return (
-        translatedMcp(d, tool) ??
+        translatedMcp(d, tool, mcpDerived(d, args, baseDir)) ??
         unknownOp(
             `инструмент ${tool} вне описания: встроенного с таким именем нет, а MCP-имя OpenCode ` +
                 '(<сервер>_<инструмент>) без перевода в mcpNames границы сервера не называет',
@@ -124,7 +137,7 @@ export function normalizeOpencodeEvent(d: HarnessDescriptor, raw: unknown): Tool
     const sessionId =
         typeof event.sessionID === 'string' && event.sessionID ? event.sessionID : 'unknown';
 
-    if (!Object.hasOwn(d.toolMap, tool)) return mcpOperation(d, tool);
+    if (!Object.hasOwn(d.toolMap, tool)) return mcpOperation(d, tool, args, raw.cwd);
     const allowed = d.allowedFields.tools[tool] ?? [];
     const strayArgs = Object.keys(args).filter((k) => !allowed.includes(k));
     if (strayArgs.length > 0) {

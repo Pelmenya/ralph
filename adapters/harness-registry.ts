@@ -32,9 +32,13 @@ import {
     parseHarnessDescriptor,
     type HarnessDescriptor,
     type MAPPED_OPERATIONS,
+    type ProtectedSurfaces,
 } from './harnesses/descriptor.ts';
 import { HARNESS_INTERFACE_VERSION, type HarnessPackage } from './harness-package.ts';
 import { BARRIER_REASON_CODES, isBarrierReasonCode } from './barrier-reason.ts';
+
+/** Форма перечня поверхностей — для ядра, которое пакеты по пути не импортирует. */
+export type { ProtectedSurfaces };
 
 /** Каталог пакетов — рядом с модулем, а не от места запуска. */
 export const HARNESSES_DIR = path.join(import.meta.dirname, 'harnesses');
@@ -287,6 +291,30 @@ export function loopDeniedTools(registry: HarnessRegistry, harness: string): str
     return Object.entries(selected.harness.descriptor.toolMap)
         .filter(([, op]) => LOOP_DENIED_OPERATIONS.includes(op))
         .map(([tool]) => tool);
+}
+
+/**
+ * Поверхности конфига, которые guard не даёт писать в сессии петли (#199), — объединение
+ * `protectedSurfaces` ВСЕХ принятых пакетов, а не одного выбранного: сессия Claude Code, правящая
+ * `.codex/`, меняет барьер следующей сессии Codex того же дерева. Пакет, отвергнутый реестром,
+ * перечня не даёт — его описание не прочитано; сессию в него не пускает проба старта. Пустой
+ * реестр — бросок: контекст без единой поверхности выглядел бы защитой.
+ */
+export function protectedSurfacesOf(registry: HarnessRegistry): ProtectedSurfaces {
+    if (registry.packages.size === 0) {
+        throw new Error('поверхности конфига: в реестре нет ни одного принятого пакета');
+    }
+    const tree = new Set<string>();
+    const homes = new Map<string, ProtectedSurfaces['homes'][number]>();
+    const absolute = new Set<string>();
+    for (const { descriptor } of registry.packages.values()) {
+        for (const pattern of descriptor.protectedSurfaces.tree) tree.add(pattern);
+        for (const home of descriptor.protectedSurfaces.homes) {
+            homes.set(JSON.stringify(home), home);
+        }
+        for (const p of descriptor.protectedSurfaces.absolute) absolute.add(p);
+    }
+    return { tree: [...tree], homes: [...homes.values()], absolute: [...absolute] };
 }
 
 /** Реестр процесса: пакеты грузятся один раз, при первом импорте модуля. */

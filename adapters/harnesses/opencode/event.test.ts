@@ -6,6 +6,7 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { parseHarnessDescriptor, type HarnessDescriptor } from '../descriptor.ts';
 import { OPENCODE_HOOK_FIELDS, normalizeOpencodeEvent } from './event.ts';
+import { kitScriptProblems } from '../stand-scrub.ts';
 
 const DIR = import.meta.dirname;
 const descriptor = parseHarnessDescriptor(
@@ -30,6 +31,8 @@ const FX = JSON.parse(
     readFileSync(path.join(DIR, '..', '__fixtures__', 'opencode-1.19.4-stand.json'), 'utf-8'),
 ) as {
     cliVersion: string;
+    kit: Record<string, unknown> & { 'drive.sh': string };
+    sessionHomeKit: Record<string, unknown>;
     events: StandEvent[];
     inventory: {
         models: Record<string, Record<string, { properties: string[]; required: string[] }>>;
@@ -62,6 +65,14 @@ const synthetic = (tool: string, args: unknown, extra: Record<string, unknown> =
 });
 
 describe('фикстура стенда', () => {
+    it('набор воспроизведения цел: вход с шебангом, без подстановки между символами (#235)', () => {
+        expect(kitScriptProblems(FX.kit)).toEqual([]);
+        expect(kitScriptProblems(FX.sessionHomeKit)).toEqual([]);
+        expect(FX.kit['drive.sh']).toMatch(/^#!\/usr\/bin\/env bash\n/);
+        const text = JSON.stringify(FX.kit);
+        expect(text).not.toMatch(/(?<![\w.-])\/(root|home|tmp|usr\/lib)\//);
+    });
+
     it('версия описания совпадает со стендом; каждое событие дошло до плагина ровно раз', () => {
         expect(descriptor.cliVersion).toBe(FX.cliVersion);
         for (const e of FX.events) {
@@ -193,7 +204,16 @@ describe('нормализация событий стенда', () => {
             mcpNames: { stand_stand_write: { server: 'stand', tool: 'stand_write' } },
         };
         expect(ops(stand('mcp'), translated)).toEqual([
-            { op: 'mcp', server: 'stand', tool: 'stand_write', effect: 'unknown', derived: [] },
+            {
+                op: 'mcp',
+                server: 'stand',
+                tool: 'stand_write',
+                effect: 'unknown',
+                derived: [
+                    { op: 'read', path: 'k', baseDir: LOOP },
+                    { op: 'read', path: 'ralph-stand-forbidden', baseDir: LOOP },
+                ],
+            },
         ]);
     });
 });

@@ -189,6 +189,18 @@ describe('выбор харнесса — реестром', () => {
         ]);
     });
 
+    // #199: Kimi Code отбрасывает секцию hooks с лишним ключом целиком — старт отменён.
+    it('Kimi Code: регистрация с лишним ключом — отказ пробы с причиной, хуки зелёные', () => {
+        const toml =
+            '[[hooks]]\nevent = "PreToolUse"\nmatcher = ""\ncommand = "node g.cjs"\n' +
+            'timeout = 10\nretries = 2\n';
+        const problems = kimiTomlProblems(toml, '/x', { runHookFn: goodGuard });
+        expect(problems).toEqual([expect.stringMatching(/ключ «retries» вне схемы/)]);
+        expect(
+            kimiTomlProblems(toml.replace('retries = 2\n', ''), '/x', { runHookFn: goodGuard }),
+        ).toEqual([]);
+    });
+
     // #190: argv Codex без флага, закрывающего ввод в процесс, — отказ старта с причиной,
     // даже если хуки на месте и пробу проходят.
     it('Codex: argv без --disable unified_exec_tty — отказ пробы с причиной write_stdin', () => {

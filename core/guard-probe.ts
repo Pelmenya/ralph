@@ -63,6 +63,7 @@ import {
     HARNESS_REGISTRY,
     SESSION_SETTINGS_HARNESS,
     normalizerPathIn,
+    protectedSurfacesOf,
     selectHarness,
     type HarnessRegistry,
 } from '../adapters/harness-registry.ts';
@@ -227,7 +228,8 @@ function probeHookList(
 
 /**
  * Контекст петли для пробы правила сессии петли (`HarnessProbe.loop`, #232): та же форма, что
- * раннер кладёт в env сессии (`loopSessionContext`), с деревом пробы обоими корнями. Ревизии нет:
+ * раннер кладёт в env сессии (`loopSessionContext`), с деревом пробы обоими корнями и теми же
+ * поверхностями конфига реестра (#199). Ревизии нет:
  * хук с контрактом петлю узнаёт и без контекста, а хуку дерева контракт не положен.
  */
 function probeLoopContext(projectDir: string): string {
@@ -236,6 +238,7 @@ function probeLoopContext(projectDir: string): string {
         loop: true,
         coreRevision: '',
         roots: { consumer: projectDir, execution: projectDir },
+        protectedSurfaces: protectedSurfacesOf(HARNESS_REGISTRY),
     });
 }
 
@@ -367,8 +370,9 @@ const CONTOUR_WRITE: TGuardProbe = {
  */
 const DELEGATION_CODE = 'loop-delegation';
 // Шаг миграции для раскладки без `roots` (докблок `sessionContextProblems`): там guard сессии —
-// копия хуков дерева, и старая копия правила `loop-delegation` не знает.
-export const DELEGATION_MIGRATION_HINT =
+// копия хуков дерева, и старая копия не знает правила, которое проба требует с контекстом петли:
+// `loop-delegation` (#225), `config-surface` (#199) и следующих. Текст общий для всех таких проб.
+export const GUARD_COPY_MIGRATION_HINT =
     'если guard — копия хуков в дереве (раскладка без roots), она старше ядра: обнови ' +
     '.claude/hooks из ядра той же ревизии';
 export const DELEGATION_PROBES: readonly TGuardProbe[] = [
@@ -389,6 +393,22 @@ export const DELEGATION_PROBES: readonly TGuardProbe[] = [
 ];
 
 /**
+ * Запись поверхности конфига Claude Code — запрещённое ТОЛЬКО в сессии петли и только с перечнем
+ * поверхностей в контексте (#199). Проба идёт здесь, а не в составе пакета: перечень guard
+ * получает тем же контекстом, что забор данных контура, и хватает одной регистрации, назвавшей
+ * правило, — как у субагента. У Codex, Kimi Code и OpenCode такая проба — в составе их пакета.
+ */
+export const CONFIG_SURFACE_PROBES: readonly TGuardProbe[] = [
+    {
+        what: 'запись поверхности конфига .claude/settings.local.json в сессии петли',
+        toolName: 'Write',
+        toolInput: { file_path: '.claude/settings.local.json', content: '{}' },
+        expect: 'blocked',
+        reasonCode: 'config-surface',
+    },
+];
+
+/**
  * Каждая регистрация guard'а в настройках сессии обязана получить контекст сессии (#184):
  * проба подаёт КАЖДОЙ правку данных контура с тем окружением, которое раннер даст сессии, и
  * ждёт от каждой блок кодом `contour-data`. Регистрация, до которой контекст не дошёл, сочла
@@ -399,13 +419,14 @@ export const DELEGATION_PROBES: readonly TGuardProbe[] = [
  * хук установки несёт `RALPH_CORE_SHA` литералом в команде, петлю узнаёт по нему и блок дал бы
  * и без контекста; контекст ему не нужен, и снять контракт из окружения проба не может.
  *
- * Тем же контекстом проба подаёт субагента и отложенный ход (`DELEGATION_PROBES`, #225). Здесь
+ * Тем же контекстом проба подаёт субагента и отложенный ход (`DELEGATION_PROBES`, #225) и запись
+ * поверхности конфига (`CONFIG_SURFACE_PROBES`, #199). Здесь
  * хватает одной регистрации, назвавшей правило: CLI складывает хуки, и блок одного блокирует
  * вызов. С `roots` эта регистрация — канонический хук установки, и копия хуков дерева старше
  * ядра старт не роняет. Без `roots` регистрация одна — копия хуков в дереве потребителя, и пока
  * она старше #225, проба падает и петля не стартует. Это шаг миграции, а не дефект пробы:
  * ослабить её строкой `⚠` значило бы пустить сессию, в которой второй слой запрета не стоит
- * вовсе. Строка отказа называет шаг (`DELEGATION_MIGRATION_HINT`).
+ * вовсе. Строка отказа называет шаг (`GUARD_COPY_MIGRATION_HINT`).
  */
 export function sessionContextProblems(
     settings: unknown,
@@ -445,7 +466,7 @@ export function sessionContextProblems(
                 `или не держит забор (${got}; ждали ${CONTOUR_CODE})`,
         ];
     });
-    const delegation = DELEGATION_PROBES.flatMap((probe) => {
+    const delegation = [...DELEGATION_PROBES, ...CONFIG_SURFACE_PROBES].flatMap((probe) => {
         const covering = pkg
             .guardRegistration(settings)
             .hooks.filter(
@@ -468,7 +489,7 @@ export function sessionContextProblems(
                 env: contextEnv,
             }),
         }));
-        return verdictProblems(probe, runs).map((p) => `${p} — ${DELEGATION_MIGRATION_HINT}`);
+        return verdictProblems(probe, runs).map((p) => `${p} — ${GUARD_COPY_MIGRATION_HINT}`);
     });
     return [...contour, ...delegation];
 }
@@ -693,9 +714,13 @@ export function kimiTomlProblems(
         registry = HARNESS_REGISTRY,
     }: { runHookFn?: TRunHookFn; registry?: HarnessRegistry } = {},
 ): string[] {
+    // Схема регистрации — из описания пакета (#199): CLI отбрасывает секцию hooks, не
+    // прошедшую её, целиком, и разбор без неё видел хуки, которых CLI не позовёт.
+    const schema =
+        registry.packages.get(KIMI_NATIVE_RUNTIME_HARNESS)?.descriptor.registrationSchema ?? null;
     return readBackProblems(
         KIMI_NATIVE_RUNTIME_HARNESS,
-        kimiHooksFromToml(toml),
+        kimiHooksFromToml(toml, schema),
         projectDir,
         runHookFn,
         registry,
@@ -1048,9 +1073,8 @@ export function ensureGuardHolds(
         const limit = registry.packages.get(h)?.pkg.guardLimit;
         if (limit) logFn(`⚠ ${limit}`);
     }
-    // Харнесс настроек сессии без сборщика конфига — вне списка: его слои дерева
-    // (`.claude/settings.json`) раннер пока сам и читает (#194), строка шла бы на каждом старте
-    // каждого потребителя и ничего не сообщала бы. Остальные названы.
+    // Харнесс настроек сессии — вне списка: его слои дерева (`.claude/settings*.json`,
+    // `.mcp.json`) выключены флагами сессии раннера, а не отвергаются (#194). Остальные названы.
     const noLayers = others.filter((h) => registry.packages.get(h)?.pkg.projectLayers === null);
     if (noLayers.length > 0) logFn(`⚠ ${noLayers.join(', ')}: ${PROJECT_LAYERS_LIMIT}`);
     const noSkillBarrier = harnesses.filter((h) => !registry.packages.get(h)?.pkg.skillBarrier);

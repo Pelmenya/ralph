@@ -366,7 +366,7 @@ function shellCalls(command, depth = 0) {
         nested.push(...substitutionsOf(segment));
         // `find … -exec rm -rf {} +` — команда, которую запустит find, а не его аргументы.
         // Действий с командой у `find` бывает несколько — каждое своим вызовом.
-        if (call.name === 'find') {
+        if (basenameOf(call.name) === 'find') {
             const argv = call.args.map(({ value }) => value);
             for (let at = 0; at < argv.length; at += 1) {
                 if (!FIND_EXEC_ACTIONS.has(argv[at])) continue;

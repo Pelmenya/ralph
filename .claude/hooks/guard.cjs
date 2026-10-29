@@ -326,7 +326,12 @@ async function main() {
 
     let verdict;
     try {
-        const options = { contour, loop: isLoopSession() };
+        // Поверхности конфига (#199) — из контекста сессии: перечень объединяет раннер по реестру
+        // пакетов, хук его не знает. Нет перечня — правило `config-surface` не действует.
+        const surfaces = (session.context && session.context.protectedSurfaces) || null;
+        // База относительных путей совместимого входа — `cwd` конверта, как у события.
+        const baseDir = typeof input.cwd === 'string' ? input.cwd : undefined;
+        const options = { contour, loop: isLoopSession(), surfaces, baseDir };
         verdict = withSealedExit(() =>
             event === null ? decide(toolName, toolInput, options) : decideEvent(event, options),
         );

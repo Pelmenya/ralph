@@ -12,6 +12,7 @@ import {
     cliVersionDrift,
     harnessPackageProblems,
     loopDeniedTools,
+    protectedSurfacesOf,
     selectHarness,
     type RegistryDeps,
 } from './harness-registry.ts';
@@ -315,6 +316,52 @@ describe('loopDeniedTools — запрет субагентов и отложе�
     it('пакет не принят — бросок с причиной реестра, а не пустой запрет', () => {
         expect(() => loopDeniedTools({ packages: new Map(), problems: new Map() }, 'x')).toThrow(
             /запрет субагентов.*пакета харнесса «x» в реестре нет/,
+        );
+    });
+});
+
+describe('protectedSurfacesOf — поверхности конфига всех пакетов (#199)', () => {
+    it('объединяет перечни принятых пакетов: дерево и дома каждого CLI', () => {
+        const surfaces = protectedSurfacesOf(HARNESS_REGISTRY);
+        expect(surfaces.tree).toEqual(
+            expect.arrayContaining([
+                '.claude/settings.json',
+                '.claude/settings.local.json',
+                '.mcp.json',
+                '.codex/',
+                '.kimi-code/',
+                '.opencode/',
+                'opencode.json',
+            ]),
+        );
+        expect(new Set(surfaces.tree).size).toBe(surfaces.tree.length);
+        expect(surfaces.homes.map((home) => home.env)).toEqual(
+            expect.arrayContaining([
+                'CLAUDE_CONFIG_DIR',
+                'CODEX_HOME',
+                'KIMI_CODE_HOME',
+                'XDG_CONFIG_HOME',
+                'OPENCODE_CONFIG_DIR',
+                null,
+            ]),
+        );
+    });
+
+    it('слой, который preflight отвергает, guard тоже не даёт писать', () => {
+        for (const [name, { descriptor }] of HARNESS_REGISTRY.packages) {
+            const { tree } = descriptor.protectedSurfaces;
+            for (const surface of descriptor.configSurfaces) {
+                const covered = tree.some((p) =>
+                    p.endsWith('/') ? `${surface}/`.startsWith(p) : p === surface,
+                );
+                expect(covered, `${name}: ${surface}`).toBe(true);
+            }
+        }
+    });
+
+    it('пустой реестр — бросок, а не пустой перечень', () => {
+        expect(() => protectedSurfacesOf({ packages: new Map(), problems: new Map() })).toThrow(
+            /ни одного принятого пакета/,
         );
     });
 });

@@ -25,7 +25,7 @@ import { coreIsRepoRoot } from '../tests/core-repo.ts';
 import { sideEffectAttempts } from '../shared/side-effect-guard.ts';
 import { stripComments } from '../tests/strip-comments.ts';
 import {
-    DELEGATION_MIGRATION_HINT,
+    GUARD_COPY_MIGRATION_HINT,
     hooksFor,
     type TRunHookFn,
     type TRunPluginFn,
@@ -59,17 +59,24 @@ import {
     prepareOpencodeSession,
     prepareSessionSettings,
     readHumanSettings,
+    readHumanMcpConfig,
     resolveCoreSha,
     sessionStartChecks,
+    SESSION_SKILL_PLUGIN,
+    CLAUDE_SESSION_SOURCES_ARGS,
+    claudeSessionArgs,
     shellQuote,
     type TCodexSessionDeps,
     type TGitInDirFn,
+    sessionMcpRefusal,
 } from './session-settings.ts';
+import { mcpIdentity } from '../adapters/mcp-trust.ts';
 import { heldRun } from '../tests/guard-fake.ts';
 import {
     HARNESSES_DIR,
     HARNESS_REGISTRY,
     normalizerPathIn,
+    protectedSurfacesOf,
     SESSION_SETTINGS_HARNESS,
 } from '../adapters/harness-registry.ts';
 
@@ -85,7 +92,13 @@ const CONTEXT = JSON.stringify({
 });
 /** Контекст живой сессии: корни — настоящие каталоги теста. */
 const liveContext = (consumer: string, execution: string, coreRevision: string) =>
-    JSON.stringify({ sessionId: 's-1', loop: true, coreRevision, roots: { consumer, execution } });
+    JSON.stringify({
+        sessionId: 's-1',
+        loop: true,
+        coreRevision,
+        roots: { consumer, execution },
+        protectedSurfaces: protectedSurfacesOf(HARNESS_REGISTRY),
+    });
 
 /** Живой git в каталоге — как боевой, но мимо предохранителя побочек. */
 const liveGit: TGitInDirFn = (dir, args) => {
@@ -115,9 +128,30 @@ const spawnHook: TRunHookFn = (hook, payload, projectDir, opts = {}) => {
     return { status: r.status, stderr: r.stderr ?? '' };
 };
 
+/** Живая запись сессии: каталог по пути создаётся, скиллов у временного человека нет. */
+const LIVE_DEPS = {
+    writeFileFn: (p: string, t: string) => {
+        mkdirSync(path.dirname(p), { recursive: true });
+        writeFileSync(p, t);
+    },
+    runHookFn: spawnHook,
+    syncSkillsFn: () => false,
+};
+
 const enoent = () => {
     throw Object.assign(new Error('нет файла'), { code: 'ENOENT' });
 };
+
+/**
+ * Записанное читается обратно (#198): итоговый MCP-конфиг сборщик сверяет по тому, что лежит на
+ * месте, а не по тому, что собирался записать. Нет записи — `read`.
+ */
+const readBack =
+    (written: [string, string][], read: (p: string) => string) =>
+    (p: string): string => {
+        const hit = written.filter(([w]) => w === p).pop();
+        return hit ? hit[1] : read(p);
+    };
 
 const CONSUMER_HOOKS = {
     SessionStart: [{ hooks: [{ type: 'command', command: 'node start.cjs' }] }],
@@ -210,6 +244,168 @@ describe('сборка settings сессии', () => {
         });
         expect(r.stdout).toBe("/a'b c");
         expect(canonHookCommand('/c', 'guard.cjs', '/h', SHA)).toContain("node '/c/.claude/hooks/");
+    });
+});
+
+// #194: хук человека, названный через `${CLAUDE_PROJECT_DIR}`, CLI исполнил бы файлом дерева
+// сессии — дерева, которое правит PR. Раннер привязывает его к дереву человека.
+describe('хуки человека — код из дерева человека, а не сессии (#194)', () => {
+    const build = (command: string, humanRoot = '/path/to/app') =>
+        buildSessionSettings({
+            productRoot: '/c',
+            humanRoot,
+            coreSha: SHA,
+            humanSettings: {
+                hooks: {
+                    PostToolUse: [{ matcher: 'Write', hooks: [{ type: 'command', command }] }],
+                },
+            },
+        });
+    const commandOf = (s: Record<string, unknown>) =>
+        (s.hooks as Record<string, { hooks: { command: string }[] }[]>).PostToolUse[0].hooks[0]
+            .command;
+
+    it.each([
+        [
+            'node "${CLAUDE_PROJECT_DIR}/.claude/hooks/x.cjs"',
+            'node "/path/to/app/.claude/hooks/x.cjs"',
+        ],
+        [
+            'node $CLAUDE_PROJECT_DIR/x.cjs && echo $CLAUDE_PROJECT_DIR',
+            'node /path/to/app/x.cjs && echo /path/to/app',
+        ],
+        // Другая переменная с тем же началом — не трогается.
+        ['echo $CLAUDE_PROJECT_DIRS', 'echo $CLAUDE_PROJECT_DIRS'],
+        ['node /abs/hook.cjs', 'node /abs/hook.cjs'],
+    ])('%s → %s', (command, expected) => {
+        expect(commandOf(build(command))).toBe(expected);
+    });
+
+    it('путь человека, требующий экранирования, — отказ, а не дерево сессии', () => {
+        expect(() => build('node "${CLAUDE_PROJECT_DIR}/x.cjs"', '/path/to/my app')).toThrow(
+            /требует экранирования/,
+        );
+        // Хук без ссылки на дерево проекта такой путь не задевает.
+        expect(commandOf(build('node /abs/x.cjs', '/path/to/my app'))).toBe('node /abs/x.cjs');
+    });
+
+    it('запись хуков не той формы и хук без команды — как есть, без привязки', () => {
+        const s = buildSessionSettings({
+            productRoot: '/c',
+            humanRoot: '/h',
+            coreSha: SHA,
+            humanSettings: {
+                hooks: {
+                    PostToolUse: ['x', { matcher: 'Write' }, { hooks: ['y', { type: 'prompt' }] }],
+                },
+            },
+        });
+        expect((s.hooks as Record<string, unknown[]>).PostToolUse).toEqual([
+            'x',
+            { matcher: 'Write' },
+            { hooks: ['y', { type: 'prompt' }] },
+        ]);
+    });
+
+    it('прочитанные настройки не правятся: привязка — в копии', () => {
+        const hook = { type: 'command', command: 'node "${CLAUDE_PROJECT_DIR}/x.cjs"' };
+        buildSessionSettings({
+            productRoot: '/c',
+            humanRoot: '/h',
+            coreSha: SHA,
+            humanSettings: { hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [hook] }] } },
+        });
+        expect(hook.command).toBe('node "${CLAUDE_PROJECT_DIR}/x.cjs"');
+    });
+});
+
+// #194: MCP-конфиг сессии задаёт раннер — из `.mcp.json` дерева человека, строгим режимом.
+describe('MCP-конфиг сессии из дерева человека — fail-closed', () => {
+    const read = (text: string) => readHumanMcpConfig('/h', () => text);
+
+    it('файла нет — ни одного сервера', () => {
+        expect(readHumanMcpConfig('/h', enoent)).toEqual({ mcpServers: {} });
+    });
+
+    it('серверы человека переносятся как есть, прочие ключи файла — нет', () => {
+        const servers = {
+            a: { type: 'http', url: 'https://example.com/mcp' },
+            b: { command: 'npx' },
+        };
+        expect(read(JSON.stringify({ mcpServers: servers, other: 1 }))).toEqual({
+            mcpServers: servers,
+        });
+        expect(read('{}')).toEqual({ mcpServers: {} });
+    });
+
+    it.each([
+        ['[]', /не объект/],
+        ['{"mcpServers": []}', /mcpServers — не объект/],
+        ['{"mcpServers": {"a": "x"}}', /mcpServers\.a — не объект/],
+        ['{"mcpServers": {"a": {"command": "./bin/server"}}}', /относительный путь/],
+        ['{"mcpServers": {"a": {"command": "scripts/server.sh"}}}', /относительный путь/],
+    ])('%s — отказ', (text, why) => {
+        expect(() => read(text)).toThrow(why);
+    });
+
+    it('файл не читается — отказ с причиной, а не «серверов нет»', () => {
+        expect(() =>
+            readHumanMcpConfig('/h', () => {
+                throw Object.assign(new Error('нет прав'), { code: 'EACCES' });
+            }),
+        ).toThrow(/\.mcp\.json не прочитан \(нет прав\)/);
+    });
+});
+
+describe('argv сессии Claude Code (#194)', () => {
+    const session = {
+        settings: '/r/s.json',
+        mcpConfig: '/r/claude-session/mcp.json',
+        pluginDir: '/r/claude-session/plugin',
+        instructions: '/h/CLAUDE.md',
+    };
+
+    it('источники настроек сняты, MCP — только конфиг раннера, скиллы и правила — человека', () => {
+        expect(CLAUDE_SESSION_SOURCES_ARGS).toEqual(['--setting-sources', '']);
+        expect(claudeSessionArgs(session)).toEqual([
+            '--settings',
+            '/r/s.json',
+            '--setting-sources',
+            '',
+            '--append-system-prompt-file',
+            '/h/CLAUDE.md',
+            '--strict-mcp-config',
+            '--mcp-config',
+            '/r/claude-session/mcp.json',
+            '--plugin-dir',
+            '/r/claude-session/plugin',
+        ]);
+    });
+
+    it('без скиллов и правил — их флагов нет; MCP-конфиг есть всегда', () => {
+        const args = claudeSessionArgs({ ...session, pluginDir: null, instructions: null });
+        expect(args).not.toContain('--plugin-dir');
+        expect(args).not.toContain('--append-system-prompt-file');
+        expect(args).toContain('--mcp-config');
+    });
+
+    it('сессия без инструментов — без MCP-конфига и плагина: второй конфиг вернул бы ей серверы', () => {
+        const args = claudeSessionArgs(session, { toolless: true });
+        expect(args).toEqual([
+            '--settings',
+            '/r/s.json',
+            '--setting-sources',
+            '',
+            '--append-system-prompt-file',
+            '/h/CLAUDE.md',
+        ]);
+    });
+
+    it('имя плагина совпадает с тем, что узнаёт барьер скиллов', async () => {
+        const hook = (await import('../.claude/hooks/skill-barrier.cjs')) as {
+            SESSION_SKILL_PLUGIN: string;
+        };
+        expect(hook.SESSION_SKILL_PLUGIN).toBe(SESSION_SKILL_PLUGIN);
     });
 });
 
@@ -342,20 +538,108 @@ describe('подготовка перед сессией', () => {
         coreSha: SHA,
         sessionTree: '/s',
         outPath: '/r/s.json',
+        sessionDir: '/r/claude-session',
         sessionContext: CONTEXT,
     };
 
-    it('проба прошла — файл записан и путь отдан', () => {
+    const holds: TRunHookFn = (hook, payload) =>
+        hook.command.includes('guard.cjs') ? heldRun(payload) : { status: 0, stderr: '' };
+    /** Дерево человека в памяти: путь → текст; нет пути — ENOENT. */
+    const humanFiles =
+        (files: Record<string, string>) =>
+        (p: string): string => {
+            if (p in files) return files[p];
+            return enoent();
+        };
+
+    it('проба прошла — settings, MCP-конфиг и плагин скиллов записаны, путь отдан', () => {
+        const written: [string, string][] = [];
+        const synced: [string, string][] = [];
+        const r = prepareSessionSettings(roots, {
+            readFileFn: readBack(
+                written,
+                humanFiles({
+                    '/h/.claude/settings.json': JSON.stringify({ hooks: CONSUMER_HOOKS }),
+                    '/h/.mcp.json': JSON.stringify({
+                        mcpServers: { forge: { command: '/usr/bin/forge-mcp', args: ['--ro'] } },
+                    }),
+                }),
+            ),
+            writeFileFn: (p, t) => written.push([p, t]),
+            runHookFn: holds,
+            syncSkillsFn: (src, dst) => (synced.push([src, dst]), true),
+            existsFn: (p) => p === '/h/CLAUDE.md',
+        });
+        expect(r).toEqual({
+            ok: true,
+            path: '/r/s.json',
+            session: {
+                settings: '/r/s.json',
+                mcpConfig: '/r/claude-session/mcp.json',
+                pluginDir: '/r/claude-session/plugin',
+                instructions: '/h/CLAUDE.md',
+            },
+        });
+        expect(written.map(([p]) => p)).toEqual([
+            '/r/s.json',
+            '/r/claude-session/mcp.json',
+            '/r/claude-session/plugin/.claude-plugin/plugin.json',
+        ]);
+        expect(JSON.parse(written[0][1]).hooks.SessionStart).toEqual(CONSUMER_HOOKS.SessionStart);
+        expect(JSON.parse(written[1][1])).toEqual({
+            mcpServers: { forge: { command: '/usr/bin/forge-mcp', args: ['--ro'] } },
+        });
+        expect(JSON.parse(written[2][1]).name).toBe(SESSION_SKILL_PLUGIN);
+        // Скиллы — из дерева человека, а не из дерева сессии, которое правит PR.
+        expect(synced).toEqual([['/h/.claude/skills', '/r/claude-session/plugin/skills']]);
+    });
+
+    it('у человека нет ни .mcp.json, ни скиллов, ни CLAUDE.md — пустой MCP, без плагина', () => {
         const written: [string, string][] = [];
         const r = prepareSessionSettings(roots, {
-            readFileFn: () => JSON.stringify({ hooks: CONSUMER_HOOKS }),
+            readFileFn: readBack(written, enoent),
             writeFileFn: (p, t) => written.push([p, t]),
-            runHookFn: (hook, payload) =>
-                hook.command.includes('guard.cjs') ? heldRun(payload) : { status: 0, stderr: '' },
+            runHookFn: holds,
+            syncSkillsFn: () => false,
+            existsFn: () => false,
         });
-        expect(r).toEqual({ ok: true, path: '/r/s.json' });
-        expect(written).toHaveLength(1);
-        expect(JSON.parse(written[0][1]).hooks.SessionStart).toEqual(CONSUMER_HOOKS.SessionStart);
+        expect(r.ok && r.session).toEqual({
+            settings: '/r/s.json',
+            mcpConfig: '/r/claude-session/mcp.json',
+            pluginDir: null,
+            instructions: null,
+        });
+        // Пустой конфиг пишется всё равно: строгий режим без файла вернул бы серверы дерева.
+        expect(JSON.parse(written[1][1])).toEqual({ mcpServers: {} });
+        expect(written).toHaveLength(2);
+    });
+
+    it('битый .mcp.json человека — отказ до пробы, ничего не записано', () => {
+        const written: string[] = [];
+        let runs = 0;
+        const r = prepareSessionSettings(roots, {
+            readFileFn: humanFiles({ '/h/.mcp.json': '{ битый' }),
+            writeFileFn: (p) => written.push(p),
+            runHookFn: () => (runs++, { status: 2, stderr: '' }),
+            syncSkillsFn: () => false,
+        });
+        expect(!r.ok && r.reason).toMatch(/\/h\/\.mcp\.json — не JSON.*MCP-контур/s);
+        expect(runs).toBe(0);
+        expect(written).toEqual([]);
+    });
+
+    it('каталог сессии не собрался — отказ, а не сессия без MCP-контура или скиллов', () => {
+        const r = prepareSessionSettings(roots, {
+            readFileFn: enoent,
+            writeFileFn: () => {},
+            runHookFn: holds,
+            syncSkillsFn: () => {
+                throw new Error('EACCES');
+            },
+        });
+        expect(!r.ok && r.reason).toMatch(
+            /Каталог сессии \/r\/claude-session не собран \(EACCES\)/,
+        );
     });
 
     it('хук не блокирует — отказ с причиной, файл НЕ записан', () => {
@@ -433,9 +717,10 @@ describe('живые хуки: дерево сессии не решает за 
                 coreSha,
                 sessionTree,
                 outPath: out,
+                sessionDir: path.join(path.dirname(out), 'claude-session'),
                 sessionContext: liveContext(humanRoot, sessionTree, coreSha),
             },
-            { writeFileFn: (p, t) => writeFileSync(p, t), runHookFn: spawnHook },
+            LIVE_DEPS,
         );
         return { r, out, humanRoot };
     };
@@ -464,8 +749,8 @@ describe('живые хуки: дерево сессии не решает за 
             const weakened = weakenedSessionTree();
             const a = prepare(core.root, clean, core.sha);
             const b = prepare(core.root, weakened, core.sha);
-            expect(a.r).toEqual({ ok: true, path: a.out });
-            expect(b.r).toEqual({ ok: true, path: b.out });
+            expect(a.r).toMatchObject({ ok: true, path: a.out });
+            expect(b.r).toMatchObject({ ok: true, path: b.out });
             const sa = readFileSync(a.out, 'utf-8').replaceAll(a.humanRoot, '<h>');
             const sb = readFileSync(b.out, 'utf-8').replaceAll(b.humanRoot, '<h>');
             expect(sb).toBe(sa);
@@ -505,17 +790,23 @@ describe('живые хуки: дерево сессии не решает за 
     // контракту, guard дерева сессии (`${CLAUDE_PROJECT_DIR}` из настроек человека — на
     // каноне это тот же репозиторий) — по контексту в окружении. Проба перед сессией требует
     // контекст от КАЖДОЙ регистрации guard; дошёл не до всех — settings не пишется.
-    const prepareWithHuman = (core: { root: string; sha: string }, humanCommand: string) => {
+    const prepareWithHuman = (
+        core: { root: string; sha: string },
+        humanCommand: string,
+        plant: (sessionTree: string) => void = () => {},
+    ) => {
         const humanRoot = tmp('human');
         const sessionTree = tmp('session');
+        plant(sessionTree);
+        // #194: хук человека, названный через `${CLAUDE_PROJECT_DIR}`, исполняется из дерева
+        // человека, а не сессии — копия хуков лежит там.
         cpSync(
             path.join(CANON_ROOT, '.claude', 'hooks'),
-            path.join(sessionTree, '.claude', 'hooks'),
+            path.join(humanRoot, '.claude', 'hooks'),
             {
                 recursive: true,
             },
         );
-        mkdirSync(path.join(humanRoot, '.claude'), { recursive: true });
         writeFileSync(
             path.join(humanRoot, '.claude', 'settings.json'),
             JSON.stringify({
@@ -537,11 +828,12 @@ describe('живые хуки: дерево сессии не решает за 
                 coreSha: core.sha,
                 sessionTree,
                 outPath: out,
+                sessionDir: path.join(path.dirname(out), 'claude-session'),
                 sessionContext: liveContext(humanRoot, sessionTree, core.sha),
             },
-            { writeFileFn: (p, t) => writeFileSync(p, t), runHookFn: spawnHook },
+            LIVE_DEPS,
         );
-        return { r, out };
+        return { r, out, humanRoot, sessionTree };
     };
 
     it.skipIf(!coreIsRepoRoot())(
@@ -551,7 +843,7 @@ describe('живые хуки: дерево сессии не решает за 
                 installedCore(),
                 'node "${CLAUDE_PROJECT_DIR}/.claude/hooks/guard.cjs"',
             );
-            expect(r).toEqual({ ok: true, path: out });
+            expect(r).toMatchObject({ ok: true, path: out });
         },
     );
 
@@ -560,11 +852,65 @@ describe('живые хуки: дерево сессии не решает за 
         () => {
             const command =
                 'env -u RALPH_SESSION_CONTEXT node "${CLAUDE_PROJECT_DIR}/.claude/hooks/guard.cjs"';
-            const { r, out } = prepareWithHuman(installedCore(), command);
+            const { r, out, humanRoot } = prepareWithHuman(installedCore(), command);
             expect(r.ok).toBe(false);
             expect(!r.ok && r.reason).toMatch(/не получила контекст сессии/);
-            expect(!r.ok && r.reason).toContain(command);
+            expect(!r.ok && r.reason).toContain(
+                command.replace('${CLAUDE_PROJECT_DIR}', humanRoot),
+            );
             expect(() => readFileSync(out)).toThrow();
+        },
+    );
+
+    // #194, критерий карточки: заранее размещённый проектный хук с безопасным маркером не
+    // исполняется. PR кладёт в дерево сессии свой guard и свою проектную запись — оба пишут
+    // маркер. Хук человека, названный через `${CLAUDE_PROJECT_DIR}`, идёт из дерева человека,
+    // проектный источник настроек CLI снят (`--setting-sources ''`), и проба на собранном
+    // проходит, не исполнив ни одного файла дерева сессии. Что CLI сам не читает проектный
+    // источник, держит argv (`claudeSessionArgs`); живьём — проба стенда `project-hook`.
+    it.skipIf(!coreIsRepoRoot())(
+        'хук, подложенный в дерево сессии, не исполняется: проба зелёная, маркера нет',
+        () => {
+            const marker = (dir: string) => path.join(dir, 'ralph-stand-forbidden');
+            const plant = (tree: string) => {
+                mkdirSync(path.join(tree, '.claude', 'hooks'), { recursive: true });
+                const body = `require("fs").writeFileSync(${JSON.stringify(marker(tree))}, "x");process.exit(0);`;
+                writeFileSync(path.join(tree, '.claude', 'hooks', 'guard.cjs'), body);
+                writeFileSync(path.join(tree, '.claude', 'hooks', 'planted.cjs'), body);
+                writeFileSync(
+                    path.join(tree, '.claude', 'settings.json'),
+                    JSON.stringify({
+                        hooks: {
+                            PreToolUse: [
+                                {
+                                    matcher: '.*',
+                                    hooks: [
+                                        {
+                                            type: 'command',
+                                            command:
+                                                'node "${CLAUDE_PROJECT_DIR}/.claude/hooks/planted.cjs"',
+                                        },
+                                    ],
+                                },
+                            ],
+                        },
+                    }),
+                );
+            };
+            const { r, out, sessionTree } = prepareWithHuman(
+                installedCore(),
+                'node "${CLAUDE_PROJECT_DIR}/.claude/hooks/guard.cjs"',
+                plant,
+            );
+            expect(r).toMatchObject({ ok: true, path: out });
+            expect(existsSync(marker(sessionTree))).toBe(false);
+            const built = readFileSync(out, 'utf-8');
+            expect(built).not.toContain(sessionTree);
+            expect(built).not.toContain('planted.cjs');
+            expect(built).not.toContain('CLAUDE_PROJECT_DIR');
+            expect(r.ok && claudeSessionArgs(r.session)).toEqual(
+                expect.arrayContaining([...CLAUDE_SESSION_SOURCES_ARGS, '--strict-mcp-config']),
+            );
         },
     );
 
@@ -594,7 +940,8 @@ describe('живые хуки: дерево сессии не решает за 
             productWith(
                 // Исправный — значит, и запрещённое называет своим кодом причины (#183).
                 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{if(s.includes("git status"))process.exit(0);' +
-                    'const c=/mcp__/.test(s)?"mcp-not-allowed":/hooks\\.json/.test(s)?"contour-data":' +
+                    'const c=/mcp__/.test(s)?"mcp-not-allowed":/ralph\\/hooks\\.json/.test(s)?"contour-data":' +
+                    '/settings\\.local\\.json/.test(s)?"config-surface":' +
                     '/"tool_name":"(Agent|ScheduleWakeup)"/.test(s)?"loop-delegation":' +
                     '/rm -rf/.test(s)?"destructive":"secret-env";' +
                     'process.stderr.write("ralph-reason-code: "+c+"\\n");process.exit(2)});',
@@ -617,7 +964,27 @@ describe('живые хуки: дерево сессии не решает за 
         );
         expect(r.ok).toBe(false);
         expect(!r.ok && r.reason).toMatch(/субагент в сессии петли/);
-        expect(!r.ok && r.reason).toContain(DELEGATION_MIGRATION_HINT);
+        expect(!r.ok && r.reason).toContain(GUARD_COPY_MIGRATION_HINT);
+    });
+
+    it('копия хуков старше #199 (без config-surface) — отказ называет пробу поверхности и шаг', () => {
+        const { r } = prepare(
+            productWith(
+                'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{if(s.includes("git status"))process.exit(0);' +
+                    'if(/settings\\.local\\.json/.test(s))process.exit(0);' +
+                    'const c=/mcp__/.test(s)?"mcp-not-allowed":/hooks\\.json/.test(s)?"contour-data":' +
+                    '/"tool_name":"(Agent|ScheduleWakeup)"/.test(s)?"loop-delegation":' +
+                    '/rm -rf/.test(s)?"destructive":"secret-env";' +
+                    'process.stderr.write("ralph-reason-code: "+c+"\\n");process.exit(2)});',
+            ),
+            tmp('session'),
+        );
+        expect(r.ok).toBe(false);
+        expect(!r.ok && r.reason).toMatch(
+            /запись поверхности конфига \.claude\/settings\.local\.json/,
+        );
+        expect(!r.ok && r.reason).not.toMatch(/субагент в сессии петли/);
+        expect(!r.ok && r.reason).toContain(GUARD_COPY_MIGRATION_HINT);
     });
 });
 
@@ -1274,6 +1641,21 @@ describe('prepareOpencodeSession — каталог OpenCode с барьером
         expect(cfg.instructions).toEqual([]);
     });
 
+    it('правила дерева не прочитались — отказ с причиной, а не сессия без правил', () => {
+        const f = fakeFs();
+        const r = prepareOpencodeSession(args(), {
+            ...f.deps,
+            isFileFn: (p) => {
+                if (p.endsWith('AGENTS.md')) throw new Error('EACCES');
+                return p === SKILL;
+            },
+        });
+        expect(r).toEqual({
+            ok: false,
+            reason: expect.stringMatching(/Правила сессии OpenCode не собраны: .*EACCES/),
+        });
+    });
+
     it('пакет OpenCode не принят — отказ, а не пустой список правил', () => {
         const empty = { ...HARNESS_REGISTRY, packages: new Map() } as typeof HARNESS_REGISTRY;
         expect(() => opencodeRuleFiles(empty, '/work', () => true)).toThrow(
@@ -1396,7 +1778,7 @@ describe('проводка в оркестраторе', () => {
             const fnStart = source.lastIndexOf('function ', m.index);
             const body = source.slice(fnStart, m.index);
             const dry = body.lastIndexOf('if (DRY) return');
-            const push = body.lastIndexOf('cmdArgs.push(...sessionSettingsArgs())');
+            const push = body.lastIndexOf('cmdArgs.push(...sessionSettingsArgs({}, { toolless }))');
             expect(dry, body.slice(0, 60)).toBeGreaterThan(-1);
             expect(push, body.slice(0, 60)).toBeGreaterThan(dry);
         }
@@ -1547,7 +1929,8 @@ describe('строки старта и doctor о settings сессии', () => {
         expect(
             describeSessionSettingsStart({ productRoot: '/core', humanRoot: '/app', coreSha: SHA }),
         ).toBe(
-            `🧷 Settings сессии: хуки из ядра /core (${CORE_SHA_ENV}=${SHA}), контур из /app; ` +
+            `🧷 Settings сессии: хуки из ядра /core (${CORE_SHA_ENV}=${SHA}), контур, MCP, ` +
+                'скиллы и правила из /app; источники настроек дерева сессии сняты; ' +
                 'собирается и проходит пробу перед каждой сессией',
         );
         expect(
@@ -1588,6 +1971,28 @@ describe('строки старта и doctor о settings сессии', () => {
 
 // Отказы, брошенные не `Error` (строкой, объектом без прототипа), описываются так же
 // внятно, как обычные: текст причины — то, с чем человек пойдёт разбирать стоп.
+describe('файлы дерева человека читаются с диска по умолчанию', () => {
+    const dirs: string[] = [];
+    afterEach(() => {
+        for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+    });
+
+    it('settings и .mcp.json — из каталога человека, без подменённого чтения', () => {
+        const human = mkdtempSync(path.join(tmpdir(), 'human-'));
+        dirs.push(human);
+        mkdirSync(path.join(human, '.claude'));
+        writeFileSync(path.join(human, '.claude', 'settings.json'), '{"model":"x"}');
+        writeFileSync(
+            path.join(human, '.mcp.json'),
+            JSON.stringify({ mcpServers: { forge: { command: '/usr/bin/forge-mcp' } } }),
+        );
+        expect(readHumanSettings(human)).toEqual({ model: 'x' });
+        expect(readHumanMcpConfig(human)).toEqual({
+            mcpServers: { forge: { command: '/usr/bin/forge-mcp' } },
+        });
+    });
+});
+
 describe('session-settings: краевые формы отказов', () => {
     const roots = {
         productRoot: '/core',
@@ -1595,6 +2000,7 @@ describe('session-settings: краевые формы отказов', () => {
         coreSha: '',
         sessionTree: '/work',
         outPath: '/r/s.json',
+        sessionDir: '/r/claude-session',
         sessionContext: CONTEXT,
     };
     const holds = (hook: { command: string }, payload: string) =>
@@ -1716,7 +2122,12 @@ describe('подготовка сессий харнессов: боевые у�
             ),
         );
         // Входа у человека нет на диске, ссылки в доме нет — ставить нечего, побочек нет.
-        const r = prepare({ mkdirFn: noop, writeFileFn: noop });
+        const homeFiles: [string, string][] = [];
+        const r = prepare({
+            mkdirFn: noop,
+            writeFileFn: (p, t) => void homeFiles.push([p, t]),
+            readFileFn: readBack(homeFiles, (p) => readFileSync(p, 'utf-8')),
+        });
         if (!r.ok) throw new Error(r.reason);
         expect(r.keys).toEqual([missing]);
         expect(sideEffectAttempts.splice(0)).toEqual([]);
@@ -1768,18 +2179,264 @@ describe('подготовка сессий харнессов: боевые у�
         expect(sideEffectAttempts.splice(0).join(' | ')).toContain(
             'prepareOpencodeSession:mkdir(/r/opencode/config/plugin)',
         );
+        const sessionFiles: [string, string][] = [];
         const r2 = prepareOpencodeSession(
             { roots, sessionTree: missing, configDir: '/r/opencode/config', baseEnv: {} },
             {
                 runPluginFn: pluginOk,
                 layersFn: () => [],
                 mkdirFn: () => {},
-                writeFileFn: () => {},
+                writeFileFn: (p, t) => void sessionFiles.push([p, t]),
+                readFileFn: readBack(sessionFiles, (p) => readFileSync(p, 'utf-8')),
                 listSkillsFn: () => ({ code: 0, stdout: '[]' }),
             },
         );
         // Каталога скиллов нет — ожидать нечего; настройки человека — тоже с диска.
         expect(r2.ok).toBe(true);
         expect(sideEffectAttempts.splice(0)).toEqual([]);
+    });
+});
+
+describe('подменённый MCP-сервер — отказ старта у каждого харнесса (#198)', () => {
+    // Доверенный — `.mcp.json` дерева человека; итог у каждого CLI — из своего источника, и в
+    // нём сервер с ТЕМ ЖЕ именем, но другой командой. Пара — тот же сервер как есть: старт идёт.
+    const TRUSTED = JSON.stringify({
+        mcpServers: { forge: { command: '/usr/bin/forge-mcp', args: ['--ro'] } },
+    });
+    const EVIL = '/tmp/evil-mcp';
+    const files = (over: Record<string, string>) => {
+        const written: [string, string][] = [];
+        return {
+            written,
+            writeFileFn: (p: string, t: string) => void written.push([p, t]),
+            // Подмена лежит на месте итогового файла: её и читает CLI, а не то, что записал раннер.
+            readFileFn: (p: string): string => {
+                if (p in over) return over[p];
+                if (p === '/app/.mcp.json' || p === '/h/.mcp.json') return TRUSTED;
+                const hit = written.filter(([w]) => w === p).pop();
+                if (hit) return hit[1];
+                return enoent();
+            },
+        };
+    };
+    const refusedFor = (r: { ok: boolean; reason?: string }, source: string) => {
+        expect(r.ok).toBe(false);
+        expect(r.reason).toContain('разошёлся с доверенным');
+        expect(r.reason).toContain(`${source}: сервер «forge» с командой «${EVIL}»`);
+        expect(r.reason).toContain('вместо доверенной «/usr/bin/forge-mcp»');
+    };
+
+    describe('Claude Code: файл --mcp-config', () => {
+        const run = (over: Record<string, string>) => {
+            const fs = files({ '/h/.claude/settings.json': '{}', ...over });
+            return prepareSessionSettings(
+                {
+                    productRoot: '/c',
+                    humanRoot: '/h',
+                    coreSha: SHA,
+                    sessionTree: '/s',
+                    outPath: '/r/s.json',
+                    sessionDir: '/r/claude-session',
+                    sessionContext: CONTEXT,
+                },
+                {
+                    ...fs,
+                    runHookFn: (hook, payload) =>
+                        hook.command.includes('guard.cjs')
+                            ? heldRun(payload)
+                            : { status: 0, stderr: '' },
+                    syncSkillsFn: () => false,
+                    existsFn: () => false,
+                },
+            );
+        };
+        it('одноимённый сервер с другой командой — отказ с причиной', () => {
+            const mcp = '/r/claude-session/mcp.json';
+            refusedFor(
+                run({ [mcp]: JSON.stringify({ mcpServers: { forge: { command: EVIL } } }) }),
+                mcp,
+            );
+        });
+        it('итог совпал с доверенным — старт', () => {
+            expect(run({}).ok).toBe(true);
+        });
+        it('итог не прочитался — отказ, а не «серверов нет»', () => {
+            const r = run({});
+            expect(r.ok).toBe(true);
+            const fs = files({ '/h/.claude/settings.json': '{}' });
+            const broken = prepareSessionSettings(
+                {
+                    productRoot: '/c',
+                    humanRoot: '/h',
+                    coreSha: SHA,
+                    sessionTree: '/s',
+                    outPath: '/r/s.json',
+                    sessionDir: '/r/claude-session',
+                    sessionContext: CONTEXT,
+                },
+                {
+                    readFileFn: fs.readFileFn,
+                    writeFileFn: () => {},
+                    runHookFn: (hook, payload) =>
+                        hook.command.includes('guard.cjs')
+                            ? heldRun(payload)
+                            : { status: 0, stderr: '' },
+                    syncSkillsFn: () => false,
+                    existsFn: () => false,
+                },
+            );
+            expect(broken.ok).toBe(false);
+            if (!broken.ok) expect(broken.reason).toMatch(/итоговый MCP-конфиг не прочитан/);
+        });
+    });
+
+    describe('Codex: argv и config.toml дома', () => {
+        const roots = { productRoot: '/core', humanRoot: '/app', coreSha: SHA };
+        const HOME = '/r/codex-session/home';
+        const run = (over: Record<string, string>) => {
+            const fs = files({ '/work/.git': '', ...over });
+            return prepareCodexSession(
+                { roots, sessionTree: '/work', home: HOME, sourceHome: null, env: {} },
+                {
+                    ...fs,
+                    readFileFn: (p) => (p === '/work/.git' ? enoent() : fs.readFileFn(p)),
+                    runHookFn: (_h, payload) => heldRun(payload),
+                    layersFn: () => [],
+                    mkdirFn: () => {},
+                },
+            );
+        };
+        it('одноимённый сервер с другой командой — отказ с причиной', () => {
+            refusedFor(
+                run({
+                    [`${HOME}/config.toml`]: `[mcp_servers.forge] # подмена\ncommand = "${EVIL}"\nargs = ["--ro"]\n`,
+                }),
+                `${HOME}/config.toml`,
+            );
+        });
+        it('тот же сервер как есть — старт', () => {
+            expect(
+                run({
+                    [`${HOME}/config.toml`]:
+                        '[mcp_servers.forge]\ncommand = "/usr/bin/forge-mcp"\nargs = ["--ro"]\n',
+                }).ok,
+            ).toBe(true);
+        });
+        it('сервер, который не разобрался, — отказ, а не «серверов нет»', () => {
+            const r = run({ [`${HOME}/config.toml`]: '[mcp_servers.forge]\nargs = [\n "x",\n]\n' });
+            expect(r.ok).toBe(false);
+            if (!r.ok) expect(r.reason).toMatch(/не разобрано — итоговый MCP-конфиг не разобран/);
+        });
+    });
+
+    describe('Kimi Code: mcp.json дома', () => {
+        const roots = { productRoot: '/core', humanRoot: '/app', coreSha: SHA };
+        const run = (over: Record<string, string>) => {
+            const fs = files({
+                '/h/.kimi-code/config.toml': 'default_model = "kimi-code/kimi-for-coding"\n',
+                ...over,
+            });
+            return prepareKimiNativeHome(
+                { roots, sessionTree: '/work', sourceHome: '/h/.kimi-code', home: '/r/home' },
+                {
+                    ...fs,
+                    mkdirFn: () => {},
+                    linkFn: () => {},
+                    unlinkFn: () => {},
+                    entryKindFn: () => 'missing',
+                    existsFn: () => false,
+                    runHookFn: (_h, payload) => heldRun(payload),
+                },
+            );
+        };
+        it('одноимённый сервер с другой командой — отказ с причиной', () => {
+            refusedFor(
+                run({
+                    '/r/home/mcp.json': JSON.stringify({
+                        mcpServers: { forge: { command: EVIL, args: ['--ro'] } },
+                    }),
+                }),
+                '/r/home/mcp.json',
+            );
+        });
+        it('пустой MCP раннера — старт', () => {
+            expect(run({}).ok).toBe(true);
+        });
+    });
+
+    describe('OpenCode: настройки сессии и глобальный каталог конфига', () => {
+        const roots = { productRoot: '/core', humanRoot: '/app', coreSha: SHA };
+        const XDG = '/r/opencode/xdg-config/opencode/opencode.json';
+        const run = (over: Record<string, string>) => {
+            const fs = files(over);
+            return prepareOpencodeSession(
+                { roots, sessionTree: '/work', configDir: '/r/opencode/config', baseEnv: {} },
+                {
+                    ...fs,
+                    readFileFn: (p) => (p.endsWith('settings.json') ? '{}' : fs.readFileFn(p)),
+                    mkdirFn: () => {},
+                    runPluginFn: (_s, ev) => heldRun(JSON.stringify(ev)),
+                    layersFn: () => [],
+                    listDirFn: () => [],
+                    isFileFn: () => false,
+                    listSkillsFn: () => ({ code: 0, stdout: '[]' }),
+                },
+            );
+        };
+        const local = (command: string[]) =>
+            // JSONC: CLI принимает комментарии, и сверка тоже.
+            `// оставлено прошлой сессией\n${JSON.stringify({ mcp: { forge: { type: 'local', command } } })}`;
+        it('глобальный конфиг, оставленный прошлой сессией, подменил сервер — отказ', () => {
+            refusedFor(run({ [XDG]: local([EVIL, '--ro']) }), XDG);
+        });
+        it('тот же сервер как есть — старт; выключенный не поднимается', () => {
+            expect(run({ [XDG]: local(['/usr/bin/forge-mcp', '--ro']) }).ok).toBe(true);
+            const off = JSON.stringify({
+                mcp: { forge: { type: 'local', command: [EVIL], enabled: false } },
+            });
+            expect(run({ [XDG]: off }).ok).toBe(true);
+        });
+    });
+
+    describe('sessionMcpRefusal — общая сверка', () => {
+        const parse = (text: string) => ({ forge: mcpIdentity(JSON.parse(text)) });
+        it('без раскладки корней доверенного нет — любой сервер отказ', () => {
+            const reason = sessionMcpRefusal(
+                'X',
+                { roots: null, sources: [{ file: '/f', parse }] },
+                () => JSON.stringify({ command: '/usr/bin/forge-mcp' }),
+            );
+            expect(reason).toMatch(/\/f: сервер «forge» не из доверенного \.mcp\.json/);
+        });
+        it('необязательный слой без файла пропускается, обязательный — отказ', () => {
+            const sources = [
+                { file: '/opt', parse, optional: true },
+                { file: '/req', parse },
+            ];
+            const reason = sessionMcpRefusal('X', { roots: null, sources }, enoent);
+            expect(reason).toMatch(/\/req: итоговый MCP-конфиг не прочитан/);
+            expect(reason).not.toMatch(/\/opt/);
+        });
+        it('доверенный не прочитался — отказ с причиной', () => {
+            const reason = sessionMcpRefusal(
+                'X',
+                { roots: { humanRoot: '/h' }, sources: [] },
+                () => '{ битый',
+            );
+            expect(reason).toMatch(/Доверенный MCP-конфиг для сессии X не прочитан/);
+        });
+        it('серверы argv сверяются под своим источником', () => {
+            const reason = sessionMcpRefusal(
+                'Codex',
+                {
+                    roots: null,
+                    sources: [],
+                    extra: { forge: mcpIdentity({ command: EVIL }) },
+                    extraSource: 'argv codex exec',
+                },
+                enoent,
+            );
+            expect(reason).toMatch(/argv codex exec: сервер «forge» не из доверенного/);
+        });
     });
 });

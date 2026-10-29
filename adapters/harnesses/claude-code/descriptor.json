@@ -160,6 +160,22 @@
     "configSurfaces": [".claude/settings.json", ".claude/settings.local.json", ".mcp.json"],
     "forbiddenEnv": [],
     "mcpNames": {},
+    "mcpArgs": {
+        "path": [
+            "path",
+            "paths",
+            "file",
+            "files",
+            "filePath",
+            "file_path",
+            "filename",
+            "dir",
+            "directory",
+            "cwd",
+            "destination"
+        ],
+        "url": ["url", "urls", "uri", "href", "endpoint"]
+    },
     "skillEvidence": {
         "source": "транскрипт сессии: вызов Skill в JSONL (.claude/hooks/skill-barrier.cjs)"
     },
@@ -228,5 +244,44 @@
             "findings": []
         }
     },
-    "inventorySource": "CLI 2.1.312: конверт PreToolUse — схема входа хука в бинаре (поля общего входа, tool_use_id, mcp_server); инструменты и поля — схемы инструментов, которые CLI отдаёт модели, и вызовы в транскриптах сессий петли (adapters/harnesses/__fixtures__/claude-code-loop.json). Grep, Glob, MultiEdit, Task и TodoWrite — из прежних версий CLI, в 2.1.312 модели не отдаются. Сверка с инвентарём CLI машиной — Фаза 16f"
+    "inventorySource": "CLI 2.1.312: конверт PreToolUse — схема входа хука в бинаре (поля общего входа, tool_use_id, mcp_server); инструменты и поля — схемы инструментов, которые CLI отдаёт модели, и вызовы в транскриптах сессий петли (adapters/harnesses/__fixtures__/claude-code-loop.json). Grep, Glob, MultiEdit, Task и TodoWrite — из прежних версий CLI, в 2.1.312 модели не отдаются. Сверка с инвентарём CLI машиной — Фаза 16f",
+    "registrationSchema": null,
+    "protectedSurfaces": {
+        "tree": [".claude/settings.json", ".claude/settings.local.json", ".mcp.json"],
+        "homes": [
+            {
+                "env": "CLAUDE_CONFIG_DIR",
+                "sub": "",
+                "default": ".claude",
+                "exempt": [
+                    "projects",
+                    "todos",
+                    "plans",
+                    "sessions",
+                    "session-env",
+                    "shell-snapshots",
+                    "file-history",
+                    "paste-cache",
+                    "history.jsonl",
+                    "cache",
+                    "statsig",
+                    "telemetry",
+                    "debug",
+                    "logs",
+                    "ide",
+                    "feedback",
+                    "backups",
+                    "jobs",
+                    "stats-cache.json"
+                ]
+            },
+            {
+                "env": "CLAUDE_CONFIG_DIR",
+                "sub": ".claude.json",
+                "default": ".claude.json",
+                "exempt": []
+            }
+        ],
+        "absolute": ["/etc/claude-code"]
+    }
 }

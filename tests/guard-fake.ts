@@ -24,6 +24,14 @@ export function probeReasonCode(text: string): BarrierReasonCode {
     if (/\.claude\/ralph\/hooks\.json|"(?:cwd|workdir)":"\.claude"/.test(text)) {
         return 'contour-data';
     }
+    // Поверхность конфига харнесса (#199) — тоже только в сессии петли, с перечнем в контексте.
+    if (
+        /\.claude\/settings\.local\.json|\.codex\/config\.toml|\.kimi-code\/|opencode\.json/.test(
+            text,
+        )
+    ) {
+        return 'config-surface';
+    }
     // Субагент и отложенный ход (#225) — тоже только в сессии петли, как контур выше.
     if (/"tool_name":"(?:Agent|ScheduleWakeup)"|"tool":"task"/.test(text)) return 'loop-delegation';
     if (/rm -rf/.test(text)) return 'destructive';

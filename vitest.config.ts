@@ -53,7 +53,7 @@ export default defineConfig({
             reporter: ['text-summary', 'json-summary'],
             reportsDirectory: './node_modules/.coverage',
             thresholds: {
-                'core/**': { lines: 94.25, statements: 93.52, functions: 92.11, branches: 90.53 },
+                'core/**': { lines: 94.25, statements: 93.52, functions: 92.2, branches: 90.56 },
                 'runtime/**': {
                     lines: 80.82,
                     statements: 80.33,
@@ -62,10 +62,10 @@ export default defineConfig({
                 },
                 'shared/**': { lines: 100, statements: 100, functions: 100, branches: 94.11 },
                 'adapters/**': {
-                    lines: 99.51,
-                    statements: 99.25,
-                    functions: 99.12,
-                    branches: 95.81,
+                    lines: 99.57,
+                    statements: 99.27,
+                    functions: 99.2,
+                    branches: 96.02,
                 },
             },
         },

@@ -34,6 +34,7 @@ export type TRuntimePaths = {
     kimiNative: string;
     opencodeSession: string;
     codexSession: string;
+    claudeSession: string;
     activations: string;
 };
 
@@ -78,6 +79,11 @@ export function runtimePathsIn(runtimeDir: string): TRuntimePaths {
         // конфиг без доверия, хуков и MCP и ссылка на вход человека. Пересобирается перед каждой
         // сессией, как дом `kimi-native`.
         codexSession: path.join(runtimeDir, 'codex-session'),
+        // #194: КАТАЛОГ сессии Claude Code — строгий MCP-конфиг раннера (`mcp.json`) и плагин
+        // скиллов (`plugin/`), собранные из дерева человека: проектный источник настроек у
+        // сессии выключен, и скиллы `.claude/skills` CLI без него не грузит. Пересобирается
+        // перед каждой сессией, как дом `kimi-native`.
+        claudeSession: path.join(runtimeDir, 'claude-session'),
         // #38: журнал активации ревизий ядра — какая исполнялась, когда, с какой снята.
         activations: path.join(runtimeDir, 'ralph.activations.jsonl'),
     };

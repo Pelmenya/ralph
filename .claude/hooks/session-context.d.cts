@@ -4,6 +4,11 @@ export type TSessionContext = {
     loop: boolean;
     coreRevision: string;
     roots: { consumer: string; execution: string };
+    /** Необязательно до раннера с #199; форма — `ProtectedSurfaces` описания пакета. */
+    protectedSurfaces?: {
+        tree: string[];
+        homes: { env: string | null; sub: string; default: string | null; exempt: string[] }[];
+    };
 };
 
 export type TSessionContextRead =

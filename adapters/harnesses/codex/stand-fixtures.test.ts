@@ -8,6 +8,7 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { CODEX_DISABLE_TTY } from '../../harness-guard.ts';
 import { parseHarnessDescriptor } from '../descriptor.ts';
+import { kitScriptProblems } from '../stand-scrub.ts';
 
 const DIR = import.meta.dirname;
 const FX = JSON.parse(
@@ -48,6 +49,10 @@ describe('фикстура стенда — сырая, у каждой запи
                 expect(e.caseScript, e.id).toEqual(expect.any(String));
             }
         }
+    });
+
+    it('набор воспроизведения цел: вход с шебангом, без подстановки между символами', () => {
+        expect(kitScriptProblems(FX.kit)).toEqual([]);
     });
 
     it('без путей машины: только абстрактные корни', () => {

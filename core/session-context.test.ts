@@ -18,6 +18,7 @@ import {
     sessionContextProblems,
     type TRunHookFn,
 } from './guard-probe.ts';
+import { HARNESS_REGISTRY, protectedSurfacesOf } from '../adapters/harness-registry.ts';
 import { loopSessionContext, SESSION_CONTEXT_ENV } from './session-context.ts';
 
 const CANON = path.resolve(import.meta.dirname, '..');
@@ -54,6 +55,7 @@ describe('loopSessionContext — контекст, который раннер �
                 loop: true,
                 coreRevision: SHA,
                 roots: { consumer: '/path/to/app', execution: '/path/to/app-ralph' },
+                protectedSurfaces: protectedSurfacesOf(HARNESS_REGISTRY),
             },
             value: expect.any(String),
         });
@@ -89,6 +91,19 @@ describe('loopSessionContext — контекст, который раннер �
         const built = loopSessionContext({ humanRoot, sessionTree, coreSha: '' });
         expect(built.ok).toBe(false);
         expect(!built.ok && built.reason).toMatch(why);
+    });
+
+    it('перечень поверхностей не собрался — отказ preflight, а не контекст без защиты', () => {
+        const built = loopSessionContext({
+            humanRoot: null,
+            sessionTree: '/a',
+            coreSha: '',
+            surfacesFn: () => {
+                throw new Error('в реестре нет ни одного принятого пакета');
+            },
+        });
+        expect(built.ok).toBe(false);
+        expect(!built.ok && built.reason).toMatch(/ни одного принятого пакета.*не стартует/);
     });
 
     it('sessionId у каждой сборки свой', () => {
@@ -458,5 +473,84 @@ describe('preflight: субагент и отложенный ход в конт
         expect(fails).toHaveLength(1);
         expect(fails[0]).toMatch(/claude-code: субагент в сессии петли/);
         expect(fails[0]).toMatch(/claude-code: отложенный ход в сессии петли/);
+    });
+});
+
+// #199: поверхности конфига — необязательное поле, пока раннер установки его не присылает;
+// присланное разбирается строго.
+describe('parseSessionContext — protectedSurfaces', () => {
+    const BASE = {
+        sessionId: 's',
+        loop: true,
+        coreRevision: '',
+        roots: { consumer: '/a', execution: '/a' },
+    };
+    const SURFACES = {
+        tree: ['.codex/'],
+        homes: [{ env: 'CODEX_HOME', sub: '', default: '.codex', exempt: ['sessions'] }],
+        absolute: ['/etc/codex'],
+    };
+    const parse = (extra: Record<string, unknown>) =>
+        parseSessionContext(JSON.stringify({ ...BASE, ...extra }));
+
+    it('без поля — контекст прежней формы, без поверхностей', () => {
+        expect(parse({})).toEqual({ context: BASE, error: null });
+    });
+
+    it('с полем — перечень в контексте', () => {
+        expect(parse({ protectedSurfaces: SURFACES }).context?.protectedSurfaces).toEqual(SURFACES);
+    });
+
+    it.each([
+        ['не объект', [], /protectedSurfaces — не объект/],
+        ['лишний ключ', { ...SURFACES, x: 1 }, /незнакомые x/],
+        ['пустой tree', { ...SURFACES, tree: [] }, /tree — не непустой список/],
+        ['абсолютный шаблон', { ...SURFACES, tree: ['/etc'] }, /tree — не непустой список/],
+        ['выход вверх', { ...SURFACES, tree: ['a/../b'] }, /tree — не непустой список/],
+        ['homes не список', { ...SURFACES, homes: {} }, /homes — не список/],
+        ['дом не объект', { ...SURFACES, homes: [1] }, /homes\[0\] — не объект/],
+        [
+            'нет ключа дома',
+            { ...SURFACES, homes: [{ env: null, sub: '', default: '.x' }] },
+            /нет exempt/,
+        ],
+        [
+            'env не имя',
+            { ...SURFACES, homes: [{ env: 'A B', sub: '', default: '.x', exempt: [] }] },
+            /env — не имя переменной/,
+        ],
+        [
+            'sub абсолютный',
+            { ...SURFACES, homes: [{ env: 'A', sub: '/x', default: '.x', exempt: [] }] },
+            /sub — не относительный путь/,
+        ],
+        [
+            'default абсолютный',
+            { ...SURFACES, homes: [{ env: 'A', sub: '', default: '/x', exempt: [] }] },
+            /default — не путь от HOME/,
+        ],
+        [
+            'дом не находится',
+            { ...SURFACES, homes: [{ env: null, sub: '', default: null, exempt: [] }] },
+            /дом не находится/,
+        ],
+        [
+            'исключение с путём',
+            { ...SURFACES, homes: [{ env: 'A', sub: '', default: '.x', exempt: ['a/b'] }] },
+            /exempt — не список имён/,
+        ],
+        [
+            'исключение `..`',
+            { ...SURFACES, homes: [{ env: 'A', sub: '', default: '.x', exempt: ['..'] }] },
+            /exempt — не список имён/,
+        ],
+        ['нет absolute', { tree: SURFACES.tree, homes: SURFACES.homes }, /нет absolute/],
+        ['absolute относительный', { ...SURFACES, absolute: ['etc'] }, /absolute — не список/],
+        ['absolute с ..', { ...SURFACES, absolute: ['/a/../b'] }, /absolute — не список/],
+        ['absolute — корень', { ...SURFACES, absolute: ['/'] }, /absolute — не список/],
+    ])('%s — битый контекст, а не «поверхностей нет»', (_what, value, why) => {
+        const read = parse({ protectedSurfaces: value });
+        expect(read.context).toBeNull();
+        expect(read.error).toMatch(why);
     });
 });

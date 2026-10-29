@@ -50,9 +50,48 @@
     "configSurfaces": [".codex/config.toml", ".codex/hooks.json"],
     "forbiddenEnv": [],
     "mcpNames": {},
+    "mcpArgs": {
+        "path": [
+            "path",
+            "paths",
+            "file",
+            "files",
+            "filePath",
+            "file_path",
+            "filename",
+            "dir",
+            "directory",
+            "cwd",
+            "destination"
+        ],
+        "url": ["url", "urls", "uri", "href", "endpoint"]
+    },
     "skillEvidence": {
         "source": "заглушка: доказательства загрузки скилла нет — транскрипт rollout без вызова Skill (SKILL_BARRIER_LIMIT); поставщик — Фаза 16e"
     },
     "rules": ["AGENTS.md"],
-    "inventorySource": "стенд 0.163.0 (adapters/harnesses/__fixtures__/codex-0.163.0-stand.json): хук зовётся на exec_command (Bash, вход — command), apply_patch (патч в command) и MCP (mcp__<сервер>__<инструмент>, без поля mcp_server); toolMap и allowedFields — ровно эти события (#189). Перечень инструментов CLI по моделям и флагам — раздел inventory; сверка с инвентарём машиной — Фаза 16f"
+    "inventorySource": "стенд 0.163.0 (adapters/harnesses/__fixtures__/codex-0.163.0-stand.json): хук зовётся на exec_command (Bash, вход — command), apply_patch (патч в command) и MCP (mcp__<сервер>__<инструмент>, без поля mcp_server); toolMap и allowedFields — ровно эти события (#189). Перечень инструментов CLI по моделям и флагам — раздел inventory; сверка с инвентарём машиной — Фаза 16f",
+    "registrationSchema": null,
+    "protectedSurfaces": {
+        "tree": [".codex/"],
+        "homes": [
+            {
+                "env": "CODEX_HOME",
+                "sub": "",
+                "default": ".codex",
+                "exempt": [
+                    "sessions",
+                    "archived_sessions",
+                    "history.jsonl",
+                    "session_index.jsonl",
+                    "log",
+                    "cache",
+                    "shell_snapshots",
+                    "generated_images",
+                    "models_cache.json"
+                ]
+            }
+        ],
+        "absolute": ["/etc/codex"]
+    }
 }

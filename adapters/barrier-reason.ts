@@ -91,10 +91,10 @@ export const BARRIER_REASON_CODES = {
     },
     'config-surface': {
         class: 'rule',
-        emitter: 'reserved',
+        emitter: 'guard',
         meaning:
-            'запись поверхности конфига харнесса: перечень у пакета, политика в контексте ' +
-            'сессии — после #186',
+            'запись поверхности конфига харнесса из сессии петли: перечень у пакета, ' +
+            'объединение — в контексте сессии (#199)',
     },
     'capability-unjudged': {
         class: 'rule',

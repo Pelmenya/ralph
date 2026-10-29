@@ -947,6 +947,12 @@ function decide(toolName, toolInput, options = {}) {
         };
     }
 
+    const surfaces = surfacesOf(options);
+    if (surfaces && inLoop()) {
+        const surface = compatSurfaceWrite(toolName, input, surfaces, options);
+        if (surface) return surfaceBlock(surface);
+    }
+
     // Все файловые инструменты, а не три: `MultiEdit` и `NotebookEdit` пишут файл тем же
     // путём, а `Grep` с `output_mode: content` ЧИТАЕТ его содержимое (ревью Kimi) — для
     // секрета это тот же Read. `glob` у Grep — тоже адрес файла: `glob: ".env"`.
@@ -1550,6 +1556,395 @@ function judgeSearch(op, fsApi) {
     return secretPath(`${found} (поиск по корню ${op.root} ${how})`);
 }
 
+// --- Поверхности конфига харнессов (#199) ----------------------------------------------
+//
+// Настройки, хуки, плагины и MCP любого CLI — то, что решает, с каким барьером и какими
+// серверами пойдёт СЛЕДУЮЩАЯ сессия. Сессия петли, правящая `.claude/settings.json`, `.codex/`
+// или `opencode.json`, меняла бы их раньше ship человека, а в доме CLI (`~/.claude`, `CODEX_HOME`,
+// `<XDG_CONFIG_HOME>/opencode`, каталог плагина барьера OpenCode) — ещё и мимо ревью вовсе.
+// Перечень у каждого пакета свой (`protectedSurfaces` описания), раннер объединяет перечни
+// реестра в контексте сессии, и правило знает только его форму: новый CLI привозит свои
+// поверхности данными. Контекста с перечнем нет (раннер установки до #199) — правило молчит,
+// и это сказано в докблоке `session-context.cjs`. Кроме шаблонов дерева и домов перечень знает
+// файлы рядом с домом (`~/.claude.json` — дом-файл) и системные пути (`absolute`: managed-настройки
+// `/etc/claude-code`, `/etc/codex`), которые CLI читают при любых источниках настроек.
+//
+// Что правило НЕ судит, сказано здесь. Чтение не защищается: конфиг читает и человек, и сессия.
+// Вызов оболочки судится по аргументам и целям перенаправления от каталога вызова: `cd` внутри
+// той же строки разбор не отслеживает (`cd .codex && tee config.toml`), путь, собранный по
+// частям, не виден. Код, запущенный не интерпретатором по имени, судится по словам пути в его
+// тексте (`PLAIN_ARG_RE`): имя, собранное выражением (`'.m'+'cp.json'`), не видно. Совместимый вход 16b (`decide`) несёт правило для инструментов записи и
+// оболочки (`compatSurfaceWrite`): без раскладки `roots` guard сессии — копия хуков в дереве, и
+// судит она этим входом. Запись, которой нет в аргументах, держит песочница (Фаза 16e), а не хук.
+
+/** Сегменты пути без пустых и `.`. */
+const segmentsOf = (p) => p.split(/[\\/]+/).filter((x) => x !== '' && x !== '.');
+
+/**
+ * Шаблон дерева против пути: последовательность сегментов шаблона где угодно в пути. Шаблон
+ * каталога (`/` в конце) накрывает каталог и всё внутри, шаблон файла — только сам файл. `ancestor`
+ * — перенос или удаление: путь, внутри которого лежит поверхность, уносит её, не называя.
+ */
+function treePatternHits(pattern, segments, ancestor) {
+    const dir = pattern.endsWith('/');
+    const parts = segmentsOf(pattern);
+    const res = parts.map((part) => segmentRegExp(part));
+    for (let i = 0; i < segments.length; i++) {
+        let k = 0;
+        while (k < parts.length && i + k < segments.length) {
+            const re = res[k];
+            if (re === null ? segments[i + k] !== parts[k] : !re.test(segments[i + k])) break;
+            k++;
+        }
+        if (k === parts.length && (dir || i + k === segments.length)) return true;
+        // Путь кончился внутри шаблона: это предок поверхности.
+        if (ancestor && k > 0 && i + k === segments.length) return true;
+    }
+    return false;
+}
+
+/**
+ * Каталоги дома CLI по описанию: из переменной окружения И путь по умолчанию от `HOME`. Дом из
+ * переменной не отменяет прежний: раннер сам ставит `XDG_CONFIG_HOME` сессии OpenCode в каталог
+ * состояния, а глобальный конфиг человека `~/.config/opencode` грузит его интерактивный CLI.
+ */
+function homeDirsOf(home, vars) {
+    const dirs = [];
+    if (home.env !== null && vars[home.env]) dirs.push(path.join(vars[home.env], home.sub));
+    if (home.default !== null && vars.HOME) dirs.push(path.join(vars.HOME, home.default));
+    return dirs;
+}
+
+/** `rel` от корня — внутри корня или он сам: `..cache` — имя внутри, а не выход вверх. */
+const isInside = (rel) =>
+    rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+
+/**
+ * Перечень поверхностей, приготовленный к суду: корни домов и системных путей — строкой и
+ * настоящим путём. От цели они не зависят, поэтому разрешаются один раз на решение, а не на
+ * каждый аргумент каждого вызова.
+ */
+function surfaceIndexOf(surfaces, vars, fsApi) {
+    const roots = [];
+    const add = (dir, exempt, label) => {
+        for (const root of new Set([path.resolve(dir), physicalPath(dir, '/', fsApi)])) {
+            roots.push({ root, exempt, label });
+        }
+    };
+    for (const home of surfaces.homes) {
+        for (const dir of homeDirsOf(home, vars)) add(dir, home.exempt, 'дом CLI');
+    }
+    for (const abs of surfaces.absolute || []) add(abs, [], 'системный конфиг CLI');
+    return { tree: surfaces.tree, roots };
+}
+
+/**
+ * Поверхность, которую задевает путь операции, строкой или null. Путь судится лексически от
+ * `baseDir` и настоящим (`physicalPath`), корни — тоже обеими формами. `ancestor` — перенос и
+ * удаление: каталог, содержащий корень или поверхность дерева.
+ */
+function surfaceOf(target, baseDir, index, fsApi, ancestor) {
+    const forms = new Set([path.resolve(baseDir, target), physicalPath(target, baseDir, fsApi)]);
+    // Шаблоны дерева судят путь НИЖЕ исключения дома: история и кэш законно лежат под каталогом,
+    // который снаружи дома был бы поверхностью дерева (`~/.codex/sessions` — внутри `.codex/`), а
+    // `~/.claude/projects/w/.claude/settings.json` под исключением — снова поверхность дерева.
+    // Исключение снимает только свой дом: остальные корни судят путь как обычно.
+    const treeForms = [...forms].map((form) => ({ form, segments: segmentsOf(form) }));
+    for (const entry of treeForms) {
+        for (const { root, exempt, label } of index.roots) {
+            const rel = path.relative(root, entry.form);
+            if (isInside(rel)) {
+                const first = rel.split(path.sep)[0];
+                if (rel !== '' && exempt.includes(first)) {
+                    const below = segmentsOf(path.relative(path.join(root, first), entry.form));
+                    if (below.length < entry.segments.length) entry.segments = below;
+                    continue;
+                }
+                return `${entry.form} — ${label} ${root}`;
+            }
+            if (ancestor && isInside(path.relative(entry.form, root))) {
+                return `${entry.form} — содержит ${label} ${root}`;
+            }
+        }
+    }
+    for (const { form, segments } of treeForms) {
+        const pattern = index.tree.find((p) => treePatternHits(p, segments, ancestor));
+        if (pattern) return `${form} — поверхность ${pattern}`;
+    }
+    return null;
+}
+
+const surfaceBlock = (what) =>
+    blockedBy(
+        'config-surface',
+        `Запись поверхности конфига харнесса (${what}) из сессии петли заблокирована: настройки, ` +
+            'хуки, плагины и MCP решают, с каким барьером и серверами пойдёт следующая сессия, ' +
+            'и правка действовала бы раньше ship человека. Нужна правка — оставь намерение с ' +
+            'обоснованием, файл правит человек.',
+    );
+
+/** Перечень поверхностей из контекста сессии; нет его — правило не действует. */
+const surfacesOf = (options) => {
+    const s = options.surfaces;
+    return s && Array.isArray(s.tree) && Array.isArray(s.homes) ? s : null;
+};
+
+// Команды, которые пишут только перенаправлением: их аргументы — текст, а не адрес записи.
+const TEXT_COMMANDS = new Set(['echo', 'printf', 'true', 'false', ':', 'test', '[']);
+// Перенаправление в файл с целью в том же токене или следующем: `>x`, `2>>x`, `&>x`, `>|x`.
+const REDIRECT_RE = /(?:^|[^<>])(?:\d|&)?>>?\|?(.*)$/;
+// Слова пути в тексте программы интерпретатора: `fs.writeFileSync('.mcp.json')`.
+const PATHLIKE_RE = /[~\w./-]*[/.][~\w./-]*/g;
+// Аргумент из одних символов пути. Остальное — текст программы (`npx tsx -e "…"`, `awk '{…}'`,
+// `pnpm exec node -e …`), и в нём ищутся слова пути, как у интерпретатора: перечень
+// интерпретаторов по имени отстаёт от того, чем петля на самом деле запускает код.
+const PLAIN_ARG_RE = /^[~\w./@+:,%=-]*$/;
+// Удаляющие команды: каталог-предок поверхности у них уносит её, не называя.
+const SURFACE_REMOVERS = new Set(['rm', 'rmdir', 'unlink']);
+// Копирующие и переносящие: назначение пишется, а у `mv` ещё и источник уходит.
+const SURFACE_COPIERS = new Set(['mv', 'cp', 'install', 'ln', 'rsync']);
+// Опции копирующих с отдельным значением: значение — не путь вызова. Короткие — буквой: у GNU
+// `getopt` значение берётся хвостом связки (`-m644`) или следующим словом (`-Dm 644`).
+const COPIER_VALUE_CHARS = new Set(['m', 'o', 'g', 'S']);
+const COPIER_VALUE_LONG = ['--mode', '--owner', '--group', '--suffix'];
+// `rsync`, удаляющий в назначении или источнике: предок там опасен так же, как у `rm`.
+const RSYNC_REMOVES_RE = /^--(?:delete|del$|remove-source-files)/;
+// Короткие опции `rsync`, включающие рекурсию: `-r`, `-a` и их связки (`-av`). Сам `rsync` всегда
+// судится рекурсивным; набор нужен разбору coreutils ниже.
+const RECURSIVE_CHARS = new Set(['r', 'R', 'a']);
+// Действия `find`, пишущие в файл по имени.
+const FIND_FILE_ACTIONS = new Set(['-fprint', '-fprint0', '-fprintf', '-fls']);
+
+/** `~/x` → от `HOME`: оболочка раскроет его до вызова. */
+const expandHome = (p, vars) =>
+    p === '~' || p.startsWith('~/') ? path.join(vars.HOME || '/', p.slice(1)) : p;
+
+/** Цель записи без признака предка. */
+const plainTarget = (raw) => ({ raw, ancestor: false });
+
+/**
+ * Длинная опция GNU `getopt_long` с сокращением: `--no-t` — это `--no-target-directory`, `--t=DIR` —
+ * `--target-directory=DIR`. Сравнение только с полным именем обходилось сокращением: `cp -r --no-t
+ * evil ~` писал `~/.claude`, а правило судило запись `~/evil`. Порог `min` — кратчайший префикс,
+ * однозначный у всех четырёх утилит; короче он неоднозначен, и `getopt` отвергает вызов сам.
+ */
+function longOpt(arg, full, min) {
+    const eq = arg.indexOf('=');
+    const name = eq === -1 ? arg : arg.slice(0, eq);
+    if (name.length < min || !full.startsWith(name)) return null;
+    return { value: eq === -1 ? null : arg.slice(eq + 1) };
+}
+
+/**
+ * Опции копирующей утилиты coreutils (`cp`, `mv`, `install`, `ln`) так, как их читает GNU
+ * `getopt`: связка коротких (`-rt DIR`, `-t~`), сокращение длинных, `--` в конце опций. Признак по
+ * целому слову пропускал `cp -rt ~ x/.claude`: связка с `t` не узнавалась, и назначением считался
+ * последний аргумент.
+ */
+function parseCoreutilsCopier(args) {
+    const positional = [];
+    let dest = null;
+    let noTarget = false;
+    let recursive = false;
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+        if (arg === '--') {
+            positional.push(...args.slice(i + 1));
+            break;
+        }
+        if (arg.startsWith('--')) {
+            let m;
+            if (longOpt(arg, '--no-target-directory', '--no-t'.length)) noTarget = true;
+            else if ((m = longOpt(arg, '--target-directory', '--t'.length))) {
+                dest = m.value ?? args[++i] ?? null;
+            } else if (longOpt(arg, '--recursive', '--rec'.length)) recursive = true;
+            else if (longOpt(arg, '--archive', '--ar'.length)) recursive = true;
+            else if (!arg.includes('=') && COPIER_VALUE_LONG.some((o) => longOpt(arg, o, 4))) i++;
+            continue;
+        }
+        if (arg.length < 2 || !arg.startsWith('-')) {
+            positional.push(arg);
+            continue;
+        }
+        for (let j = 1; j < arg.length; j++) {
+            const ch = arg[j];
+            if (ch === 'T') noTarget = true;
+            else if (RECURSIVE_CHARS.has(ch)) recursive = true;
+            else if (ch === 't' || COPIER_VALUE_CHARS.has(ch)) {
+                const value = j + 1 < arg.length ? arg.slice(j + 1) : (args[++i] ?? null);
+                if (ch === 't') dest = value;
+                break;
+            }
+        }
+    }
+    return { positional, dest, noTarget, recursive };
+}
+
+/**
+ * Опции `rsync`: у него нет ни `-t`, ни `-T` coreutils (`-t` — времена, `-T` — временный
+ * каталог), и назначение — всегда последний позиционный аргумент. Значение `-T DIR` попадает в
+ * источники: это лишняя проверенная запись, а не пропущенная.
+ */
+const parseRsync = (args) => ({
+    positional: args.filter((a) => !a.startsWith('-')),
+    dest: null,
+    noTarget: false,
+    recursive: true,
+});
+
+/**
+ * Пути, которые пишет копирующая команда: назначение и `назначение/имя источника` — `cp -r
+ * x/.claude ~/` пишет `~/.claude`, не называя его. Источник с неизвестным именем (`.`, хвост `/`,
+ * шаблон, `-T`) кладёт в назначение неизвестно что, и назначение тогда судится как предок. Источники
+ * `mv` и удаляющего `rsync` уходят — они предки; у остальных их только читают.
+ */
+function copierTargets(name, args, isDirAt) {
+    const parsed = name === 'rsync' ? parseRsync(args) : parseCoreutilsCopier(args);
+    const { positional, noTarget, recursive } = parsed;
+    let dest = parsed.dest;
+    let intoDir = dest !== null;
+    if (dest === null) {
+        intoDir = positional.length !== 2;
+        dest = positional.length > 1 ? positional.pop() : '.';
+    }
+    // Источник ложится ВНУТРЬ назначения, только если оно каталог: так его называет вызов
+    // (`-t`, хвост `/`, несколько источников) или файловая система.
+    // `-T` (`--no-target-directory`) кладёт СОДЕРЖИМОЕ источника прямо в назначение, даже если
+    // оно каталог: `cp -rT evil ~` пишет `~/.claude`, не называя его.
+    intoDir = !noTarget && (intoDir || /[\\/]$/.test(dest) || isDirAt(dest));
+    const removes =
+        name === 'mv' || (name === 'rsync' && args.some((a) => RSYNC_REMOVES_RE.test(a)));
+    // Рекурсивная копия кладёт каталог с неизвестным содержимым: путь, который он получает,
+    // судится как предок — `cp -r evil ~/.config` создаёт `~/.config/opencode`, не называя его.
+    const out = [{ raw: dest, ancestor: removes || (recursive && !intoDir) }];
+    for (const src of positional) {
+        if (removes) out.push({ raw: src, ancestor: true });
+        if (!intoDir) continue;
+        const tail = path.basename(src);
+        const unknown =
+            /[\\/]$/.test(src) || tail === '.' || tail === '..' || GLOB_CHARS_RE.test(tail);
+        if (unknown) out.push({ raw: dest, ancestor: true });
+        else out.push({ raw: path.join(dest, tail), ancestor: recursive });
+    }
+    return out;
+}
+
+/** Позиционные аргументы предками: удаление уносит каталог вместе с поверхностью. */
+const ancestorTargets = (args) =>
+    args.filter((arg) => !arg.startsWith('-')).map((raw) => ({ raw, ancestor: true }));
+
+/**
+ * Адреса записи одного вызова оболочки — `{raw, ancestor}`. Цели перенаправлений — у любого
+ * вызова; у читающих и текстовых команд и у git с безопасной подкомандой — только они; у
+ * интерпретатора — слова пути в тексте программы; у удаляющих — аргументы предками; у копирующих
+ * — назначение (`copierTargets`); у `find` — корни предками, только если действие удаляет или
+ * исполняет; у остальных — аргументы, значения `--опция=…` и слова пути в аргументах-тексте.
+ * Предок опасен только там, где путь уходит: `find ~ -name x` читает, `cp x ~/` пишет в дом
+ * другой файл.
+ */
+function shellWriteTargets(call, isDirAt) {
+    const args = argValues(call);
+    const targets = [];
+    for (let i = 0; i < args.length; i++) {
+        const m = REDIRECT_RE.exec(args[i]);
+        if (!m) continue;
+        if (m[1] !== '') targets.push(plainTarget(m[1]));
+        else if (i + 1 < args.length) targets.push(plainTarget(args[i + 1]));
+    }
+    const name = basenameOf(call.name);
+    const words = (arg) => (arg.match(PATHLIKE_RE) || []).map(plainTarget);
+    if (DATA_READERS.has(name) || TEXT_COMMANDS.has(name)) return targets;
+    if (name === 'git' && gitLeavesDataAlone(args)) return targets;
+    if (INTERPRETERS_RE.test(name)) return [...targets, ...args.flatMap(words)];
+    if (SURFACE_REMOVERS.has(name)) return [...targets, ...ancestorTargets(args)];
+    if (SURFACE_COPIERS.has(name)) return [...targets, ...copierTargets(name, args, isDirAt)];
+    if (name === 'find') {
+        if (findReplacesPaths(args)) return [...targets, ...ancestorTargets(args)];
+        args.forEach((arg, i) => {
+            if (FIND_FILE_ACTIONS.has(arg) && i + 1 < args.length) {
+                targets.push(plainTarget(args[i + 1]));
+            }
+        });
+        return targets;
+    }
+    for (const arg of args) {
+        if (!arg.startsWith('-')) targets.push(plainTarget(arg));
+        else if (arg.indexOf('=') > 0) targets.push(plainTarget(arg.slice(arg.indexOf('=') + 1)));
+        if (!PLAIN_ARG_RE.test(arg)) targets.push(...words(arg));
+    }
+    return targets;
+}
+
+/** Вызов оболочки, пишущий поверхность конфига, — строкой или null. */
+function shellWritesSurface(calls, baseDir, index, vars, fsApi) {
+    const isDirAt = (p) => isDirectory(path.resolve(baseDir, expandHome(p, vars)), fsApi);
+    for (const call of calls) {
+        for (const { raw, ancestor } of shellWriteTargets(call, isDirAt)) {
+            if (raw === '' || /^[<>&|]+$/.test(raw)) continue;
+            const hit = surfaceOf(expandHome(raw, vars), baseDir, index, fsApi, ancestor);
+            if (hit) return `${call.name}: ${hit}`;
+        }
+    }
+    return null;
+}
+
+/**
+ * Поверхность конфига на совместимом входе 16b: пути инструментов записи Claude Code и команда
+ * оболочки. База относительных путей — `cwd` конверта хука (`options.baseDir`).
+ */
+function compatSurfaceWrite(toolName, input, surfaces, options) {
+    const vars = options.processEnv || process.env;
+    const fsApi = options.fsApi || fs;
+    const baseDir = options.baseDir || '/';
+    if (WRITE_TOOLS.has(toolName)) {
+        const paths = [input.file_path, input.notebook_path, input.path];
+        if (Array.isArray(input.edits)) {
+            for (const edit of input.edits) if (edit) paths.push(edit.file_path);
+        }
+        const named = paths.filter((p) => typeof p === 'string');
+        if (named.length === 0) return null;
+        const index = surfaceIndexOf(surfaces, vars, fsApi);
+        for (const p of named) {
+            const hit = surfaceOf(expandHome(p, vars), baseDir, index, fsApi, false);
+            if (hit) return hit;
+        }
+        return null;
+    }
+    if (toolName === 'Bash' && typeof input.command === 'string') {
+        const index = surfaceIndexOf(surfaces, vars, fsApi);
+        return shellWritesSurface(shellCalls(input.command), baseDir, index, vars, fsApi);
+    }
+    return null;
+}
+
+/** Перечень поверхностей решения, приготовленный один раз (`surfaceIndexOf`); нет — null. */
+function surfaceIndexIn(ctx) {
+    if (ctx.surfaceIndex === undefined) {
+        const surfaces = surfacesOf(ctx.options);
+        ctx.surfaceIndex = surfaces && surfaceIndexOf(surfaces, ctx.vars, ctx.fsApi);
+    }
+    return ctx.surfaceIndex;
+}
+
+/**
+ * Запись, перенос или удаление поверхности конфига в сессии петли (#199). У переноса судятся обе
+ * стороны: источник уходит, назначение появляется — `mv evil.toml .codex/config.toml` пишет
+ * поверхность так же, как `Write`.
+ */
+function judgeSurfaceWrite(op, ctx) {
+    if (op.op === 'read' || !ctx.inLoop()) return null;
+    const index = surfaceIndexIn(ctx);
+    if (!index) return null;
+    const removes = op.op === 'move' || op.op === 'delete';
+    const sides = [op.path, ...(op.op === 'move' ? [op.destination] : [])];
+    for (const side of sides) {
+        const target = expandHome(side, ctx.vars);
+        const hit = surfaceOf(target, op.baseDir, index, ctx.fsApi, removes && side === op.path);
+        if (hit) return surfaceBlock(hit);
+    }
+    return null;
+}
+
 /**
  * Решение по одной операции события или null. `nested` — операция из `derived` MCP-вызова:
  * сетевой эффект параметров там блокируется и вне петли — до политики сети его не судит никто.
@@ -1565,13 +1960,17 @@ function judgeOperation(op, ctx, nested) {
                 (ctx.inLoop() ? moverTouchesData(calls, op.baseDir, ctx.fsApi) : null);
             if (writes === GIT_EXEC_INPUT && ctx.inLoop()) return gitExecBlock();
             if (writes && ctx.inLoop()) return contourBlock(writes);
+            const index = ctx.inLoop() ? surfaceIndexIn(ctx) : null;
+            const surface =
+                index && shellWritesSurface(calls, op.baseDir, index, ctx.vars, ctx.fsApi);
+            if (surface) return surfaceBlock(surface);
             return judgeShell(op.command, ctx.options);
         }
         case 'read':
         case 'write':
         case 'delete':
         case 'move':
-            return judgeFileOperation(op, ctx.inLoop, ctx.fsApi);
+            return judgeFileOperation(op, ctx.inLoop, ctx.fsApi) || judgeSurfaceWrite(op, ctx);
         case 'search':
             return judgeSearch(op, ctx.fsApi);
         case 'mcp': {
@@ -1604,15 +2003,18 @@ function judgeOperation(op, ctx, nested) {
  * `options` — как у `decide`: `contour`, `loop` и подмена окружения правила про kill; плюс
  * `fsApi` — чтение файловой системы для разрешения путей и обхода корня поиска (тесты).
  *
- * Чего правило на событии пока НЕ судит, сказано вслух. Поверхности конфига харнесса
- * (`config-surface`): их перечень у каждого пакета свой, общий барьер пакетов не читает, и
- * правило ждёт политики в контексте сессии. `fetch`, `agent` и `defer` блокируются только в
- * сессии петли — в сессии человека сеть, субагенты и отложенный ход остаются.
+ * `surfaces` — поверхности конфига харнессов из контекста сессии (#199); `processEnv` —
+ * окружение, от которого находятся дома CLI (по умолчанию окружение хука: его дал CLI сессии).
+ *
+ * Чего правило на событии НЕ судит, сказано вслух: поверхности конфига — только в сессии петли и
+ * только при перечне в контексте; `fetch`, `agent` и `defer` блокируются только в сессии петли —
+ * в сессии человека сеть, субагенты и отложенный ход остаются.
  */
 function decideEvent(event, options = {}) {
     const contour = options.contour || emptyData();
     const ctx = {
         options,
+        vars: options.processEnv || process.env,
         fsApi: options.fsApi || fs,
         mcp: { toolsDeclared: false, ...contour.mcp },
         inLoop: () => inLoopOf(options),

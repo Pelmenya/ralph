@@ -22,6 +22,7 @@ import {
     opencodeHooksFromPlugin,
     type GuardHook,
 } from './harness-guard.ts';
+import { HARNESS_REGISTRY } from './harness-registry.ts';
 import { RUNTIME_IDENTITIES } from './runtime-profile.ts';
 
 type TFixture = { source: string; event: Record<string, unknown>; readEvent?: unknown };
@@ -301,6 +302,48 @@ describe('Kimi Code: регистрация в config.toml', () => {
         }
         expect(kimiHooksFromToml('[agent]\nhooks = []\n').problems).toEqual([]);
         expect(kimiHooksFromToml('hooks_dir = "/x"\n').problems).toEqual([]);
+    });
+});
+
+// #199: Kimi Code сверяет секцию hooks строгой схемой и отбрасывает её целиком — схема из
+// описания пакета, а не наш разбор, решает, позовёт ли CLI барьер.
+describe('Kimi Code: регистрация по схеме описания пакета', () => {
+    const SCHEMA = HARNESS_REGISTRY.packages.get('kimi-code')!.descriptor.registrationSchema!;
+    const GOOD = 'event = "PreToolUse"\nmatcher = ""\ncommand = "node g.cjs"\ntimeout = 10\n';
+
+    it('запись барьера по схеме — без проблем', () => {
+        expect(kimiHooksFromToml(kimiHooksToml(HOOKS), SCHEMA).problems).toEqual([]);
+        expect(kimiHooksFromToml(`[[hooks]]\n${GOOD}`, SCHEMA).problems).toEqual([]);
+    });
+
+    it('лишний ключ в любой записи — отказ с причиной, хотя хук барьера разобран', () => {
+        const human = '[[hooks]]\nevent = "Stop"\ncommand = "x"\nasync_mode = "y"\n';
+        const { hooks, problems } = kimiHooksFromToml(`${human}\n[[hooks]]\n${GOOD}`, SCHEMA);
+        expect(hooks).toHaveLength(1);
+        expect(problems).toEqual([
+            expect.stringMatching(/строки 1: ключ «async_mode» вне схемы.*целиком/),
+        ]);
+    });
+
+    it('событие вне перечня, таймаут вне диапазона, нет команды — отказ', () => {
+        const cases = [
+            ['event = "PreTool"\ncommand = "x"\n', /event = «PreTool» вне перечня/],
+            [
+                'event = "PreToolUse"\ncommand = "x"\ntimeout = 601\n',
+                /timeout = 601 — не целое 1\.\.600/,
+            ],
+            ['event = "PreToolUse"\ncommand = "x"\ntimeout = "5"\n', /timeout = "5" — не целое/],
+            ['event = "PreToolUse"\nmatcher = 5\ncommand = "x"\n', /matcher = 5 — не строка/],
+            ['event = "PreToolUse"\ncommand = ""\n', /нет обязательного command/],
+            ['matcher = ""\ncommand = "x"\n', /нет обязательного event/],
+        ] as const;
+        for (const [body, re] of cases) {
+            expect(kimiHooksFromToml(`[[hooks]]\n${body}`, SCHEMA).problems[0]).toMatch(re);
+        }
+    });
+
+    it('без схемы — прежний разбор: лишний ключ не судится', () => {
+        expect(kimiHooksFromToml(`[[hooks]]\n${GOOD}extra = "1"\n`).problems).toEqual([]);
     });
 });
 

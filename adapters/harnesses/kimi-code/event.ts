@@ -23,7 +23,8 @@
  * Роль `url` у `WebSearch` — поле `query`, то есть поисковый запрос, а не адрес: текст уходит
  * наружу тем же каналом, и в событии и в причине блока он стоит на месте адреса намеренно.
  *
- * MCP здесь только нормализуется (`effect: 'unknown'`), допуск — политика контура у guard. Имя —
+ * MCP здесь только нормализуется (`effect: 'unknown'`), допуск — политика контура у guard,
+ * параметры вызова — операции `derived` общего разбора (`mcpDerived`, #193). Имя —
  * `mcp__<сервер>__<инструмент>` с частями, где всё вне `[A-Za-z0-9_-]` заменено `_` и серии `_`
  * схлопнуты; длиннее 64 знаков CLI обрезает его и дописывает `_<хеш>` (`kimiMcpToolName`). У
  * обрезанного имени граница сервера и инструмента потеряна или указывает на обрубок (стенд
@@ -35,6 +36,7 @@ import path from 'node:path';
 import type { HarnessDescriptor } from '../descriptor.ts';
 import {
     isRecord,
+    mcpDerived,
     mcpEvent,
     roleReader,
     searchOperation,
@@ -71,8 +73,8 @@ export function kimiMcpToolName(server: string, tool: string): string {
     return `${full.slice(0, KIMI_MCP_NAME_MAX - hash.length - 1)}_${hash}`;
 }
 
-function mcpOperation(d: HarnessDescriptor, name: string): ToolEvent {
-    const translated = translatedMcp(d, name);
+function mcpOperation(d: HarnessDescriptor, name: string, derived: ToolOperation[]): ToolEvent {
+    const translated = translatedMcp(d, name, derived);
     if (translated) return translated;
     if (name.length >= KIMI_MCP_NAME_MAX) {
         return unknownOp(
@@ -82,7 +84,7 @@ function mcpOperation(d: HarnessDescriptor, name: string): ToolEvent {
     }
     const mcp = mcpParts(name, undefined);
     if ('why' in mcp) return unknownOp(mcp.why);
-    return mcpEvent(mcp.server, mcp.tool);
+    return mcpEvent(mcp.server, mcp.tool, derived);
 }
 
 function operations(
@@ -138,7 +140,9 @@ export function normalizeKimiEvent(d: HarnessDescriptor, raw: unknown): ToolEven
     if (!isRecord(input)) return unknownOp(`${tool}: tool_input не объект`);
     const sessionId = typeof raw.session_id === 'string' ? raw.session_id : '';
 
-    if (tool.startsWith(MCP_PREFIX)) return mcpOperation(d, tool);
+    if (tool.startsWith(MCP_PREFIX)) {
+        return mcpOperation(d, tool, mcpDerived(d, input, raw.cwd));
+    }
     if (!Object.hasOwn(d.toolMap, tool)) {
         return unknownOp(`инструмент ${tool} вне описания`, 'tool');
     }

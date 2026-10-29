@@ -18,6 +18,7 @@
  */
 import {
     HARNESS_PROBES,
+    HOOK_CRASH_PASSES,
     harnessHookPayload,
     harnessMatcherCovers,
     kimiHooksFromToml,
@@ -53,7 +54,8 @@ export const harnessPackage: HarnessPackage = {
     skillBarrier: false,
     // Проба покрывает оболочку (и её `cwd`), Read, Write, Grep и MCP — всё, что регистрация
     // отдаёт хуку.
-    guardLimit: null,
+    // Отказ механизма перехвата CLI считает пропуском — объявленное ограничение (#199).
+    guardLimit: `kimi-code: ${HOOK_CRASH_PASSES}`,
     // Барьер — команды хуков, их исполняет проба сама.
     plugin: null,
     // Сборщик конфига — дом сессии (#196, `kimi-home.ts`). Проектные слои Kimi Code —

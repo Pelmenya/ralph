@@ -133,6 +133,21 @@ function isLoopSession(env = process.env) {
     return env.RALPH_SKILL_GUARD === 'on';
 }
 
+/**
+ * Плагин, которым раннер отдаёт сессии петли скиллы дерева человека (#194): проектный
+ * источник настроек у сессии снят, и CLI зовёт скилл плагина `ralph:<папка>`. Префикс —
+ * ровно этот, не любой: скилл чужого плагина с тем же именем папки — не скилл проекта.
+ * Значение совпадает с `SESSION_SKILL_PLUGIN` в `core/session-settings.ts` (сверяет тест).
+ */
+const SESSION_SKILL_PLUGIN = 'ralph';
+
+/** Имя скилла без `/` и без префикса плагина раннера. */
+function skillName(raw) {
+    const name = raw.replace(/^\//, '');
+    const prefix = `${SESSION_SKILL_PLUGIN}:`;
+    return name.startsWith(prefix) ? name.slice(prefix.length) : name;
+}
+
 /** Имена скиллов, вызванных инструментом `Skill` за сессию. */
 function loadedSkills(lines) {
     const loaded = new Set();
@@ -149,7 +164,7 @@ function loadedSkills(lines) {
         for (const block of content) {
             if (block && block.type === 'tool_use' && block.name === 'Skill') {
                 const skill = block.input && block.input.skill;
-                if (typeof skill === 'string') loaded.add(skill.replace(/^\//, ''));
+                if (typeof skill === 'string') loaded.add(skillName(skill));
             }
         }
     }
@@ -202,7 +217,7 @@ function decide({
             '[skill-barrier.cjs] Правка заблокирована: до первой правки этого файла в сессии ' +
             `обязан быть вызван инструмент Skill. Не хватает:\n${list}\n` +
             "Вызови Skill с этим именем (не читай файл скилла cat'ом — это не считается) " +
-            'и повтори правку.',
+            `и повтори правку; скилл из плагина раннера засчитывается и как ${SESSION_SKILL_PLUGIN}:<имя>.`,
     };
 }
 
@@ -305,6 +320,7 @@ async function main() {
 
 module.exports = {
     NO_RULES,
+    SESSION_SKILL_PLUGIN,
     targetsOf,
     requiredSkills,
     isLoopSession,

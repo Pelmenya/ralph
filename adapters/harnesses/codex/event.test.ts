@@ -59,10 +59,13 @@ describe('сырые события стенда', () => {
         expect(ops(stand(id)[0])).toEqual([{ op: 'write', path: file, baseDir: LOOP }]);
     });
 
-    it('cm-mcp: MCP только нормализуется — эффект задаёт политика контура', () => {
+    it('cm-mcp: эффект задаёт политика контура, строки аргументов — производные чтения', () => {
+        const key = { op: 'read', path: 'k', baseDir: LOOP };
+        const value = { op: 'read', path: 'ralph-stand-forbidden', baseDir: LOOP };
+        const mcp = { op: 'mcp', server: 'stand', effect: 'unknown' };
         expect(stand('cm-mcp').map((raw) => ops(raw))).toEqual([
-            [{ op: 'mcp', server: 'stand', tool: 'stand_read', effect: 'unknown', derived: [] }],
-            [{ op: 'mcp', server: 'stand', tool: 'stand_write', effect: 'unknown', derived: [] }],
+            [{ ...mcp, tool: 'stand_read', derived: [key] }],
+            [{ ...mcp, tool: 'stand_write', derived: [key, value] }],
         ]);
     });
 });

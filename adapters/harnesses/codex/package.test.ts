@@ -67,9 +67,13 @@ describe('регистрация барьера Codex', () => {
         const patches = harnessPackage.probes.filter((p) => p.toolName === 'apply_patch');
         expect(patches.map((p) => [p.expect, p.loop])).toEqual([
             ['blocked', true],
+            ['blocked', true],
             ['allowed', true],
         ]);
-        const [contour] = patches;
+        const [contour, surface] = patches;
+        // #199: патч поверхности конфига своего CLI — слоя, который отвергает и preflight.
+        expect(surface).toMatchObject({ reasonCode: 'config-surface' });
+        expect(String(surface.toolInput.command)).toContain('*** Add File: .codex/config.toml');
         expect(contour).toMatchObject({ expect: 'blocked', reasonCode: 'contour-data' });
         const descriptor = parseHarnessDescriptor(
             JSON.parse(readFileSync(path.join(DIR, 'descriptor.json'), 'utf-8')),

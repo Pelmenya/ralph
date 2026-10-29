@@ -33,6 +33,11 @@ export const LIVE_PROBE_CASES: Readonly<Record<string, readonly string[]>> = {
         'search-glob',
         'search-deep-glob',
         'search-clean',
+        'mcp-write',
+        'mcp-env-param',
+        'mcp-read',
+        'project-hook',
+        'project-mcp',
     ],
 };
 

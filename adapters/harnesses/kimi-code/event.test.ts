@@ -32,6 +32,11 @@ const stand = (id: string) => JSON.parse(event(id).hookStdin[0]);
 const ops = (raw: unknown, d: HarnessDescriptor = descriptor) =>
     normalizeKimiEvent(d, raw).operations;
 const LOOP = '/path/to/stand/work/loop';
+/** Аргументы вызова стенда `{key: 'k', value: …}` — строки без пробелов, судятся чтением (#193). */
+const STAND_ARGS = [
+    { op: 'read', path: 'k', baseDir: LOOP },
+    { op: 'read', path: 'ralph-stand-forbidden', baseDir: LOOP },
+];
 
 const envelope = (tool_name: string, tool_input: unknown) => ({
     hook_event_name: 'PreToolUse',
@@ -144,9 +149,15 @@ describe('сырые события стенда', () => {
         expect(ops(raw)).toEqual([{ op: 'agent', parentSession: raw.session_id }]);
     });
 
-    it('mcp: только нормализуется — эффект задаёт политика контура', () => {
+    it('mcp: эффект задаёт политика контура, строки аргументов — производные чтения', () => {
         expect(ops(stand('mcp'))).toEqual([
-            { op: 'mcp', server: 'stand', tool: 'stand_write', effect: 'unknown', derived: [] },
+            {
+                op: 'mcp',
+                server: 'stand',
+                tool: 'stand_write',
+                effect: 'unknown',
+                derived: STAND_ARGS,
+            },
         ]);
     });
 });
@@ -181,7 +192,7 @@ describe('MCP-имена с хешем', () => {
             mcpNames: { [long.call.name]: { server, tool: 'stand_write' } },
         };
         expect(ops(stand('mcp-long'), d)).toEqual([
-            { op: 'mcp', server, tool: 'stand_write', effect: 'unknown', derived: [] },
+            { op: 'mcp', server, tool: 'stand_write', effect: 'unknown', derived: STAND_ARGS },
         ]);
     });
 

@@ -6,6 +6,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { KIMI_NO_AUTO_UPDATE_ENV, KIMI_SESSION_MCP, KIMI_TRUST_ENV } from '../../kimi-home.ts';
+import { kitScriptProblems } from '../stand-scrub.ts';
 
 const DIR = import.meta.dirname;
 const FX = JSON.parse(
@@ -41,6 +42,11 @@ describe('фикстура дома сессии — сырая, с источн
             expect(e.source, e.id).toMatch(/Kimi Code 2\.3\.2.*карточка #196/);
             expect(e.exit, e.id).toBe('exit=0');
         }
+    });
+
+    it('наборы воспроизведения целы: вход с шебангом, без подстановки между символами', () => {
+        expect(kitScriptProblems(FX.kit)).toEqual([]);
+        expect(kitScriptProblems(FX.sessionHomeKit)).toEqual([]);
     });
 
     it('набор воспроизведения собирает окружение сборщиком канона, без путей машины', () => {

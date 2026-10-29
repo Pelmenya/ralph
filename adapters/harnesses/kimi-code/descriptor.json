@@ -126,6 +126,22 @@
     "configSurfaces": [],
     "forbiddenEnv": [],
     "mcpNames": {},
+    "mcpArgs": {
+        "path": [
+            "path",
+            "paths",
+            "file",
+            "files",
+            "filePath",
+            "file_path",
+            "filename",
+            "dir",
+            "directory",
+            "cwd",
+            "destination"
+        ],
+        "url": ["url", "urls", "uri", "href", "endpoint"]
+    },
     "probeInputs": {
         "Write": { "content": "ralph-probe\n" },
         "Edit": { "old_string": "ralph-probe", "new_string": "ralph-probe" },
@@ -147,5 +163,47 @@
         "source": "заглушка: доказательства загрузки скилла нет — транскрипта хуку CLI не отдаёт (SKILL_BARRIER_LIMIT); поставщик — Фаза 16e"
     },
     "rules": ["AGENTS.md"],
-    "inventorySource": "стенд 2.3.2 (adapters/harnesses/__fixtures__/kimi-code-2.3.2-stand.json): toolMap и allowedFields — перечень инструментов и полей, который CLI отдал модели в запросе к провайдеру стенда (раздел inventory), плюс поля схем входа бинаря, которых стенд не предлагал (Agent: fork, model; WebSearch — только при провайдере поиска). Конверт — вход хука стенда плюс session_title, которое CLI кладёт в событие, когда у сессии есть заголовок (withSessionFacts в dist/main.mjs). Сверка с инвентарём машиной — Фаза 16f"
+    "inventorySource": "стенд 2.3.2 (adapters/harnesses/__fixtures__/kimi-code-2.3.2-stand.json): toolMap и allowedFields — перечень инструментов и полей, который CLI отдал модели в запросе к провайдеру стенда (раздел inventory), плюс поля схем входа бинаря, которых стенд не предлагал (Agent: fork, model; WebSearch — только при провайдере поиска). Конверт — вход хука стенда плюс session_title, которое CLI кладёт в событие, когда у сессии есть заголовок (withSessionFacts в dist/main.mjs). Сверка с инвентарём машиной — Фаза 16f",
+    "registrationSchema": {
+        "evidence": "Kimi Code 2.3.2 (@moonshot-ai/kimi-code, dist/main.mjs): HookDefSchema секции hooks — object({event: enum(HOOK_EVENT_TYPES), matcher: string().optional(), command: string().min(1), timeout: int().min(1).max(600).optional()}).strict(); HooksConfigSchema — array(HookDefSchema), секция не прошедшая схему отбрасывается целиком с предупреждением",
+        "keys": ["event", "matcher", "command", "timeout"],
+        "required": ["event", "command"],
+        "enums": {
+            "event": [
+                "PreToolUse",
+                "PostToolUse",
+                "PostToolUseFailure",
+                "PermissionRequest",
+                "PermissionResult",
+                "UserPromptSubmit",
+                "UserPromptQueued",
+                "TurnStarted",
+                "Stop",
+                "StopFailure",
+                "Interrupt",
+                "SessionStart",
+                "SessionEnd",
+                "SessionHeartbeat",
+                "SubagentStart",
+                "SubagentStop",
+                "TaskStarted",
+                "PreCompact",
+                "PostCompact",
+                "Notification"
+            ]
+        },
+        "intRanges": { "timeout": [1, 600] }
+    },
+    "protectedSurfaces": {
+        "tree": [".kimi-code/", ".mcp.json"],
+        "homes": [
+            {
+                "env": "KIMI_CODE_HOME",
+                "sub": "",
+                "default": ".kimi-code",
+                "exempt": ["sessions", "logs", "cache", "history.jsonl"]
+            }
+        ],
+        "absolute": []
+    }
 }

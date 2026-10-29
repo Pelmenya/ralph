@@ -389,6 +389,7 @@ import {
     prepareKimiNativeHome,
     prepareOpencodeSession,
     prepareSessionSettings,
+    claudeSessionArgs,
     readHumanSettings,
     resolveCoreSha,
     type TCodexSessionDeps,
@@ -2435,8 +2436,13 @@ export function createOrchestrator(env: OrchestratorEnv) {
         deps: TSessionSettingsDeps = {},
         {
             roots = sessionSettingsRoots,
+            toolless = false,
             ...stop
-        }: { roots?: typeof sessionSettingsRoots } & TGuardStopDeps = {},
+        }: {
+            roots?: typeof sessionSettingsRoots;
+            /** Сессия без инструментов (#217): без MCP-конфига и скиллов раннера. */
+            toolless?: boolean;
+        } & TGuardStopDeps = {},
     ): string[] {
         if (!roots) return [];
         const context = sessionContextValue({ tree: roots.sessionTree, roots, ...stop });
@@ -2453,13 +2459,16 @@ export function createOrchestrator(env: OrchestratorEnv) {
             {
                 ...roots,
                 outPath: path.resolve(RUNTIME.sessionSettings),
+                sessionDir: path.resolve(RUNTIME.claudeSession),
                 sessionContext: context,
             },
             deps,
         );
         if (prepared.ok) {
             probedSessionContext = context;
-            return ['--settings', prepared.path];
+            // #194: источники настроек дерева сняты, MCP — строгий конфиг раннера, скиллы и
+            // правила — из дерева человека (`claudeSessionArgs`).
+            return claudeSessionArgs(prepared.session, { toolless });
         }
         return stopOnGuardProbe(prepared.reason, stop);
     }
@@ -2611,7 +2620,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 (toolless ? ' (без инструментов)' : ''),
         );
         if (DRY) return { code: 0, output: '' };
-        cmdArgs.push(...sessionSettingsArgs());
+        cmdArgs.push(...sessionSettingsArgs({}, { toolless }));
         // timeout (M3): зависший claude (сетевой столл) иначе блокирует синхронный
         // loop навсегда — AFK-прогон молча стоит до утра.
         const timeout = config.claudeTimeoutMs || 2 * 60 * 60 * 1000;
@@ -2752,7 +2761,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         );
         if (DRY) return { code: 0, output: '' };
         // Тот же бинарь `claude` — те же хуки и тот же собранный settings (задача 101).
-        cmdArgs.push(...sessionSettingsArgs());
+        cmdArgs.push(...sessionSettingsArgs({}, { toolless }));
         const timeout = config.claudeTimeoutMs || 2 * 60 * 60 * 1000;
         // token гарантированно не-null при !DRY (requireToken выше). Секрет — только в env
         // процесса (buildKimiSpawnEnv), НЕ в argv (иначе виден в /proc/*/cmdline).

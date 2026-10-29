@@ -22,7 +22,21 @@
     "configSurfaces": [".sample/config.json"],
     "forbiddenEnv": ["SAMPLE_DISABLE_HOOKS"],
     "mcpNames": { "mcp__fs__read": { "server": "fs", "tool": "read" } },
+    "mcpArgs": { "path": ["path"], "url": ["url"] },
     "skillEvidence": { "source": "none" },
     "rules": ["AGENTS.md"],
-    "inventorySource": "образец: инвентаря нет"
+    "inventorySource": "образец: инвентаря нет",
+    "registrationSchema": null,
+    "protectedSurfaces": {
+        "tree": [".sample/"],
+        "homes": [
+            {
+                "env": "SAMPLE_HOME",
+                "sub": "",
+                "default": ".sample",
+                "exempt": ["history"]
+            }
+        ],
+        "absolute": []
+    }
 }
