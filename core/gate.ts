@@ -21,7 +21,7 @@
 // синтаксис — только аннотации типов, ни enum, ни namespace, ни parameter properties).
 //
 // Фабрика, а не standalone-экспорты (как в worktree.ts/tunnel-check.ts): checksGreen/
-// tryMergePhase/… НЕ чистые — им нужен контекст ralph.js (sh/shArgv/shq, ghJson,
+// tryMergePhase/… НЕ чистые — им нужен контекст ralph.js (sh/shArgv/shq, forgeJson,
 // findOpenPr, ensureClean, парковка/обновление дерева, санация env, sleep, DRY, набор
 // regex'ов). Фабрика захватывает этот контекст один раз, а возвращённые функции
 // сохраняют ПОКАЗАТЕЛЬНУЮ DI: каждая по-прежнему принимает свои коллабораторы
@@ -57,7 +57,7 @@ type ShqFn = (value: unknown) => string;
 type LogFn = (msg: string) => void;
 // fail() боевой уходит в process.exit(1); тестовый может бросить/вернуть — потому unknown.
 type FailFn = (msg: string) => unknown;
-type GhJsonFn = <T = unknown>(cmd: string, attempts?: number) => T;
+type ForgeJsonFn = <T = unknown>(cmd: string, attempts?: number) => T;
 // #55: сигнатуры примитивов форжа — гейт зависит от них, но не от их реализации.
 type MergePrFn = (
     prNumber: number,
@@ -76,7 +76,10 @@ type BuildGateEnvFn = () => NodeJS.ProcessEnv;
 
 // PR в форме, которую отдаёт findOpenPr (`gh pr list --json number,labels`).
 type Pr = { number: number; labels?: Array<{ name: string }> };
-type FindOpenPrFn = (branch: string, opts?: { ghJsonFn?: GhJsonFn; logFn?: LogFn }) => Pr | null;
+type FindOpenPrFn = (
+    branch: string,
+    opts?: { forgeJsonFn?: ForgeJsonFn; logFn?: LogFn },
+) => Pr | null;
 type EnsureCleanFn = (context: string, opts?: { shFn?: ShFn; logFn?: LogFn }) => boolean;
 type ParkFn = (opts?: { runArgvFn?: ShArgvFn; logFn?: LogFn }) => void;
 type UpdateTreeFn = (runArgvFn?: ShArgvFn) => void;
@@ -263,7 +266,7 @@ function toolFailureWhy(e: unknown): string {
 // правил код ради своей пары «тест ⊂ покрытие».
 type ResolvedGateChecks = { base: GateCheck[]; prodChecks: GateCheck[]; prodDrop: string[] };
 
-// Контекст ralph.js, захватываемый фабрикой один раз. sh/shArgv/shq/log/ghJson — те же
+// Контекст ralph.js, захватываемый фабрикой один раз. sh/shArgv/shq/log/forgeJson — те же
 // module-level коллабораторы, что использует остальной раннер. safeBranch/findOpenPr/
 // ensureClean/parkOnOriginMain/updateRunnerTreeToOriginMain/syncDepsIfLockChanged/
 // formatExcerpt — уже определённые в ralph.js помощники хореографии. buildSanitizedGateEnv
@@ -277,7 +280,7 @@ export type GateEnv = {
     shq: ShqFn;
     log: LogFn;
     fail: FailFn;
-    ghJson: GhJsonFn;
+    forgeJson: ForgeJsonFn;
     // #49: чтение головы PR — через шов форжа, как и findOpenPr. Дефолт для checksGreen
     // приходит контекстом (в composition root это GitHub-реализация), а мердж-путь
     // прокидывает сюда метод выбранного адаптера — см. tryMergePhase.
@@ -421,7 +424,7 @@ export function createGateRunner(env: GateEnv) {
         shq,
         log,
         fail,
-        ghJson,
+        forgeJson,
         prHeadSha,
         mergePr,
         phaseMerged,

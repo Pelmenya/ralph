@@ -50,8 +50,8 @@ function makeEnv(over: Partial<GateEnv> = {}): GateEnv {
             throw new Error(msg);
         },
         getConfig: () => SYNTH_GATE,
-        ghJson: () => {
-            throw new Error('ghJson не подменён в тесте');
+        forgeJson: () => {
+            throw new Error('forgeJson не подменён в тесте');
         },
         // #49: голову PR читает ШОВ форжа, а не гейт. Дефолт падает, как и остальные
         // побочки: тест, забывший подменить шов, обязан краснеть, а не идти в боевой `gh`.
@@ -417,13 +417,16 @@ describe('checksGreen — прогон шагов на голове PR (#77)', (
 
     // #49: голову PR гейт спрашивает у ШВА форжа, а не исполняет команду сам. На площадке
     // без `gh` прежний inline-вызов давал три ретрая и `not-merged` — фаза не мерджилась
-    // никогда. Тест держит именно маршрут: env.ghJson (боевой `gh`) в этом пути не зовётся.
+    // никогда. Тест держит именно маршрут: env.forgeJson (боевой `gh`) в этом пути не зовётся.
     it('#49: голова PR читается через шов, gh из гейта не зовётся', () => {
-        const ghJson = vi.fn(() => {
+        const forgeJson = vi.fn(() => {
             throw new Error('гейт не имеет права ходить в форж сам');
         });
         const g = createGateRunner(
-            makeEnv({ ghJson: ghJson as unknown as GateEnv['ghJson'], prHeadSha: () => SHA }),
+            makeEnv({
+                forgeJson: forgeJson as unknown as GateEnv['forgeJson'],
+                prHeadSha: () => SHA,
+            }),
         );
         const ok = g.checksGreen('feature/x', 7, {
             shFn: () => '',
@@ -433,7 +436,7 @@ describe('checksGreen — прогон шагов на голове PR (#77)', (
         });
         expect(ok).toBe(true);
         expect(g.getVerifiedHead()).toBe(SHA);
-        expect(ghJson).not.toHaveBeenCalled();
+        expect(forgeJson).not.toHaveBeenCalled();
     });
 
     // Fail-closed: «не смогли прочитать голову» ≠ «голова та же». Мердж отменяется, дерево

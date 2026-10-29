@@ -14,12 +14,12 @@ import type { NewPullRequest, NewReviewComment, PullRequest, ReviewComment } fro
 
 type ExecOpts = { env?: NodeJS.ProcessEnv };
 type ShArgvFn = (file: string, args: string[], opts?: ExecOpts) => string;
-type GhJsonFn = <T = unknown>(cmd: string, attempts?: number) => T;
+type ForgeJsonFn = <T = unknown>(cmd: string, attempts?: number) => T;
 type LogFn = (msg: string) => void;
 
 export type GithubPrCommandsEnv = {
     shArgv: ShArgvFn;
-    ghJson: GhJsonFn;
+    forgeJson: ForgeJsonFn;
     shq: (value: unknown) => string;
     log: LogFn;
     /** Фильтр номера PR перед argv и шелл-строкой: `--flag`-образное значение форж
@@ -35,7 +35,7 @@ export type GithubPrCommandsEnv = {
  * оркестратора и остаются зелёными без правок ассертов.
  */
 export function createGithubPrCommands(env: GithubPrCommandsEnv) {
-    const { shArgv, ghJson, shq, log, prNumberRe, sha40Re } = env;
+    const { shArgv, forgeJson, shq, log, prNumberRe, sha40Re } = env;
 
     /**
      * Годность номера PR — ОДНО правило на модуль (#72-ревью). До этого их было два:
@@ -71,12 +71,12 @@ export function createGithubPrCommands(env: GithubPrCommandsEnv) {
     // (тот же приём, что у остальных `gh api`-чтений). `--paginate` на ответе-массиве
     // конкатенирует страницы в один JSON-массив.
     //
-    // Fail-closed: ghJson бросает при сбое `gh` и невалидном JSON, ответ неожиданной формы
+    // Fail-closed: forgeJson бросает при сбое `gh` и невалидном JSON, ответ неожиданной формы
     // (не массив) — тоже отказ. Мягкое «пропустим и посчитаем как пусто» здесь означало бы
     // тихо заниженную метрику от одного транзиентного чиха.
     function prComments(
         prNumber: number,
-        { ghJsonFn = ghJson }: { ghJsonFn?: GhJsonFn } = {},
+        { forgeJsonFn = forgeJson }: { forgeJsonFn?: ForgeJsonFn } = {},
     ): ReviewComment[] {
         assertPrNumber(prNumber, 'Комментарии PR');
         const surfaces: Array<{ endpoint: string; isSummary: boolean }> = [
@@ -92,7 +92,7 @@ export function createGithubPrCommands(env: GithubPrCommandsEnv) {
         ];
         const out: ReviewComment[] = [];
         for (const { endpoint, isSummary } of surfaces) {
-            const items = ghJsonFn<unknown>(`gh api ${endpoint} --paginate`);
+            const items = forgeJsonFn<unknown>(`gh api ${endpoint} --paginate`);
             if (!Array.isArray(items)) {
                 throw new Error(
                     `gh api ${endpoint} вернул не массив — формат ответа неожиданный ` +
@@ -115,21 +115,21 @@ export function createGithubPrCommands(env: GithubPrCommandsEnv) {
     // команда `gh` внутри гейта делала мердж-путь непроходимым на любой площадке без
     // GitHub CLI (три ретрая → 'not-merged' навсегда).
     //
-    // Fail-closed по контракту шва: `ghJson` бросает на сбое `gh` и битом JSON, а ответ без
+    // Fail-closed по контракту шва: `forgeJson` бросает на сбое `gh` и битом JSON, а ответ без
     // `headRefOid` — тоже отказ. Пустая строка вместо исключения увела бы гейт в ветку
     // «голова не похожа на sha»: тот же отказ мерджа, но с неверной причиной в логе.
     // Формат sha проверяет вызывающий (sha40Re) — значение уходит в argv git-команд.
     function prHeadSha(
         prNumber: number,
-        { ghJsonFn = ghJson }: { ghJsonFn?: GhJsonFn } = {},
+        { forgeJsonFn = forgeJson }: { forgeJsonFn?: ForgeJsonFn } = {},
     ): string {
-        // Номер уходит в ШЕЛЛ-строку чтения (ghJson), поэтому фильтруется здесь, а не только
+        // Номер уходит в ШЕЛЛ-строку чтения (forgeJson), поэтому фильтруется здесь, а не только
         // у поставщика: в gate.ts это место закрывал `shq(prNumber)`, и при переезде канал
         // остался бы без замка. Оба сегодняшних поставщика номер валидируют (`prNumberRe`
         // в findOpenPr, разбор slug у площадки) — фильтр стоит одну строку и закрывает канал
         // структурно, не полагаясь на добросовестность вызывающего (инв. 7).
         assertPrNumber(prNumber, 'Голова PR');
-        const head = ghJsonFn<{ headRefOid?: unknown }>(
+        const head = forgeJsonFn<{ headRefOid?: unknown }>(
             `gh pr view ${String(prNumber)} --json headRefOid`,
         );
         const sha = String(head.headRefOid ?? '').trim();
@@ -155,8 +155,8 @@ export function createGithubPrCommands(env: GithubPrCommandsEnv) {
         input: NewReviewComment,
         {
             runArgvFn = shArgv,
-            ghJsonFn = ghJson,
-        }: { runArgvFn?: ShArgvFn; ghJsonFn?: GhJsonFn } = {},
+            forgeJsonFn = forgeJson,
+        }: { runArgvFn?: ShArgvFn; forgeJsonFn?: ForgeJsonFn } = {},
     ): void {
         const anchor = input.anchor;
         if (!anchor) {
@@ -173,7 +173,7 @@ export function createGithubPrCommands(env: GithubPrCommandsEnv) {
         let sha = '';
         let headErr = '';
         try {
-            sha = prHeadSha(prNumber, { ghJsonFn });
+            sha = prHeadSha(prNumber, { forgeJsonFn });
         } catch (e: unknown) {
             // Причину НЕСЁМ дальше, а не схлопываем: «форж недоступен» и «в ответе нет
             // headRefOid» чинятся по-разному, и до вынесения чтения в отдельную функцию
@@ -245,11 +245,11 @@ export function createGithubPrCommands(env: GithubPrCommandsEnv) {
     // форжа: PR нет, их больше одного, номер не похож на целое.
     function findOpenPr(
         branch: string,
-        { ghJsonFn = ghJson, logFn = log }: { ghJsonFn?: GhJsonFn; logFn?: LogFn } = {},
+        { forgeJsonFn = forgeJson, logFn = log }: { forgeJsonFn?: ForgeJsonFn; logFn?: LogFn } = {},
     ): PullRequest | null {
         // --base main (M5): PR из этой же ветки в ДРУГУЮ базу мерджить нельзя —
         // фаза «сдалась» бы мимо main, а следующая строилась бы без неё.
-        const prs = ghJsonFn<PullRequest[]>(
+        const prs = forgeJsonFn<PullRequest[]>(
             `gh pr list --head ${shq(branch)} --base main --state open --json number,labels`,
         );
         if (!Array.isArray(prs)) {

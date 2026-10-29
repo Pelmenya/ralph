@@ -15,12 +15,12 @@
 // Только ЧТЕНИЕ (#166). Мутаций форжа тут нет и быть не должно: пост-мердж проверка
 // СМОТРИТ на прод и main, а не трогает их — это её главное свойство, и держится оно тем,
 // что в модуле нет ни одного пишущего глагола.
-type GhJsonFn = (cmd: string, attempts?: number) => unknown;
+type ForgeJsonFn = (cmd: string, attempts?: number) => unknown;
 type ShqFn = (value: unknown) => string;
 
 export type GithubDeployCommandsEnv = {
     /** Чтения форжа с ретраями и backoff (M3) — общий коллаборатор раннера. */
-    ghJson: GhJsonFn;
+    forgeJson: ForgeJsonFn;
     /** Квотирование значения перед подстановкой в шелл-строку чтения. */
     shq: ShqFn;
 };
@@ -31,7 +31,7 @@ const RUN_LIST_LIMIT = 30;
 
 /**
  * Два read-примитива деплой-проверки для GitHub CLI. Обе функции сохраняют DI на канал
- * чтения (`ghJsonFn`) — тем же приёмом, что и остальные адаптеры ралфа: тест подменяет
+ * чтения (`forgeJsonFn`) — тем же приёмом, что и остальные адаптеры ралфа: тест подменяет
  * канал, а не перехватывает боевой `gh`.
  *
  * Форму ответа НЕ разбираем: `mergeCommit.oid` валидирует ядро (SHA40_RE), состав прогона
@@ -39,7 +39,7 @@ const RUN_LIST_LIMIT = 30;
  * иначе правило годности sha разъехалось бы по двум модулям.
  */
 export function createGithubDeployCommands(env: GithubDeployCommandsEnv) {
-    const { ghJson, shq } = env;
+    const { forgeJson, shq } = env;
 
     /** Коммит squash-мерджа PR — тот, что уехал в main и запустил deploy-workflow.
      *  Отдаёт сырое значение поля (в том числе `null`/`undefined`): «пусто» здесь —
@@ -47,22 +47,22 @@ export function createGithubDeployCommands(env: GithubDeployCommandsEnv) {
      *  ядро, а не адаптер. */
     function mergeCommitOid(
         prNumber: number,
-        { ghJsonFn = ghJson }: { ghJsonFn?: GhJsonFn } = {},
+        { forgeJsonFn = forgeJson }: { forgeJsonFn?: ForgeJsonFn } = {},
     ): unknown {
-        const view = ghJsonFn(`gh pr view ${shq(prNumber)} --json mergeCommit`) as {
+        const view = forgeJsonFn(`gh pr view ${shq(prNumber)} --json mergeCommit`) as {
             mergeCommit?: { oid?: string };
         };
         return view && view.mergeCommit && view.mergeCommit.oid;
     }
 
-    /** Последние прогоны deploy-workflow. Бросает при устойчивом сбое чтения (ghJson уже
+    /** Последние прогоны deploy-workflow. Бросает при устойчивом сбое чтения (forgeJson уже
      *  отретраил своё) — ловит и трактует отказ ядро: до таймаута ожидания впереди ещё
      *  опросы, и один чих не обязан давать ложный красный. */
     function listWorkflowRuns(
         workflow: string,
-        { ghJsonFn = ghJson }: { ghJsonFn?: GhJsonFn } = {},
+        { forgeJsonFn = forgeJson }: { forgeJsonFn?: ForgeJsonFn } = {},
     ): unknown {
-        return ghJsonFn(
+        return forgeJsonFn(
             `gh run list --workflow ${shq(workflow)} ` +
                 `--json databaseId,headSha,status,conclusion,url --limit ${String(RUN_LIST_LIMIT)}`,
         );

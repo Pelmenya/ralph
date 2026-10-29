@@ -19,7 +19,7 @@ import { shq } from '../shared/ralph-util.ts';
 // перенесены из ralph.test.js как есть и ходят через его ре-экспорт (#366).
 import ralph from '../ralph.js';
 
-// Синтетический env: побочки (ghJson/sh/shArgv/fail) по умолчанию громко падают, если
+// Синтетический env: побочки (forgeJson/sh/shArgv/fail) по умолчанию громко падают, если
 // функция под тестом дёрнет их без явного override — забытый override становится ошибкой
 // теста, а не тихим проходом через боевой gh/shell. Чистые коллабораторы (shq,
 // isPlainObject, matchRiskPaths, phaseDiffFiles, log, getConfig) — рабочие заглушки.
@@ -36,8 +36,8 @@ function makeEnv(over: Partial<ReviewEnv> = {}): ReviewEnv {
                 reviewFindingsJournal: JOURNAL_SCRIPT,
             },
         }),
-        ghJson: () => {
-            throw new Error('ghJson не подменён в тесте');
+        forgeJson: () => {
+            throw new Error('forgeJson не подменён в тесте');
         },
         sh: () => {
             throw new Error('sh не подменён в тесте');
@@ -102,16 +102,16 @@ describe('pickReviewModel — эскалация ревью (#130)', () => {
         // Ровно та регрессия, ради которой заведён #130: complexity:expert описывает
         // трудность написания, а не цену ошибки. escalateOn пуст → gh issue list вовсе не
         // зовётся, метки не смотрятся.
-        const ghJson = vi.fn(() => [{ labels: [{ name: 'complexity:expert' }] }]);
+        const forgeJson = vi.fn(() => [{ labels: [{ name: 'complexity:expert' }] }]);
         const { pickReviewModel } = createReviewModule(
-            makeEnv({ ghJson, matchRiskPaths: () => null }),
+            makeEnv({ forgeJson, matchRiskPaths: () => null }),
         );
         const model = pickReviewModel('Фаза X', 'feature/x', {
             cfg: CFG,
             files: ['src/app/page.tsx'],
         });
         expect(model).toBe('claude-opus-4-8');
-        expect(ghJson).not.toHaveBeenCalled();
+        expect(forgeJson).not.toHaveBeenCalled();
     });
 
     it('escalateOn всё ещё работает, если его осознанно заполнили', () => {
@@ -127,12 +127,12 @@ describe('pickReviewModel — эскалация ревью (#130)', () => {
         // Прежде здесь стоял прямой `gh issue list`: на площадке без `gh` он падал в
         // catch, и ревью зоны риска тихо доставалось слабой модели.
         const cfg = { review: { ...CFG.review, escalateOn: ['complexity:expert'] } };
-        const ghJson = vi.fn(() => []);
+        const forgeJson = vi.fn(() => []);
         const milestoneLabels = vi.fn(() => ['complexity:expert']);
-        const { pickReviewModel } = createReviewModule(makeEnv({ ghJson, milestoneLabels }));
+        const { pickReviewModel } = createReviewModule(makeEnv({ forgeJson, milestoneLabels }));
         pickReviewModel('Фаза X', 'feature/x', { cfg, files: ['src/app/page.tsx'] });
         expect(milestoneLabels).toHaveBeenCalledWith('Фаза X');
-        expect(ghJson).not.toHaveBeenCalled();
+        expect(forgeJson).not.toHaveBeenCalled();
     });
 
     it('#37 сбой чтения меток фазы → ЭСКАЛИРУЕМ, а не тихо ревьюим слабее', () => {
@@ -729,7 +729,7 @@ describe('pickReviewModel — отсутствующая escalated-модель 
             logFn: (m: string) => logs.push(m),
             shFn: () => '.github/workflows/deploy.yml',
             runArgvFn: () => '',
-            ghJsonFn: () => [],
+            forgeJsonFn: () => [],
         });
         expect(model).toBe('claude-opus-4-8');
         expect(model).toBeDefined();
@@ -749,7 +749,7 @@ describe('pickReviewModel — отсутствующая escalated-модель 
                 logFn: () => {},
                 shFn: () => '',
                 runArgvFn: () => '',
-                ghJsonFn: () => [],
+                forgeJsonFn: () => [],
             }),
         ).not.toThrow();
     });
@@ -772,7 +772,7 @@ describe('pickReviewModel — сбой диффа и небезопасная в
     const deps = (over = {}) => ({
         cfg: CFG,
         logFn: () => {},
-        ghJsonFn: () => [],
+        forgeJsonFn: () => [],
         shFn: () => '',
         // #252: fetch внутри phaseDiffFiles теперь мутация через argv.
         runArgvFn: () => '',

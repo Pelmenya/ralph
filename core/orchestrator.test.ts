@@ -18,7 +18,7 @@
 // DI-заглушки (SpawnFake/ChecksGreenFake/…), формы `mock.calls[i]` — но НЕ сигнатуры вызовов
 // боевого API: `runLoop`/`checksGreen`/`closeMilestone…` зовутся через `any`. Полная
 // типизация деструктуризации (`ralph as ReturnType<typeof createOrchestrator>`) покраснила
-// бы ~150 вызовов с генерик-коллабораторами (`GhJsonFn`) и частичными cfg/state-фейками —
+// бы ~150 вызовов с генерик-коллабораторами (`ForgeJsonFn`) и частичными cfg/state-фейками —
 // это отдельный трек, а не правка переноса #405.
 //
 // Файл собран при разнесении монолитного ralph.test.js по модульным тест-файлам (#366):
@@ -42,7 +42,7 @@ import fs from 'node:fs';
 // monitor-panel.mts / config-profile.test.ts, #366): дефолт ralph.js — ре-экспорт
 // runtime фабрики. Поверхность держим `any` СОЗНАТЕЛЬНО (не кастуем к
 // ReturnType<typeof createOrchestrator>): боевые DI-коллабораторы этого сьюта — генерик
-// `GhJsonFn` (`<T>(cmd)=>T`), частичные cfg/state-фейки и ClaudeOpts-заглушки, которые
+// `ForgeJsonFn` (`<T>(cmd)=>T`), частичные cfg/state-фейки и ClaudeOpts-заглушки, которые
 // #405 намеренно перенёс ДОСЛОВНО, не переписывая под строгие типы. Каст фабрики
 // покраснил бы ~150 таких вызовов разом — это отдельный крупный трек «типизация DI-моков
 // сценариев», а не правка этого переноса (см. ответ в ревью PR #409).
@@ -3610,33 +3610,33 @@ describe('выборка карточек фазы не урезается мо�
 
     it('обе выборки просят предел явно, а не полагаются на дефолт форжа', () => {
         const commands: string[] = [];
-        const ghJsonFn = ((cmd: string) => {
+        const forgeJsonFn = ((cmd: string) => {
             commands.push(cmd);
             return [];
         }) as never;
-        ralph.openIssues('M1', { ghJsonFn, failFn: () => undefined });
-        ralph.allOpenIssues('M1', { ghJsonFn });
+        ralph.openIssues('M1', { forgeJsonFn, failFn: () => undefined });
+        ralph.allOpenIssues('M1', { forgeJsonFn });
         expect(commands).toHaveLength(2);
         for (const cmd of commands) expect(cmd).toContain(`--limit ${String(LIMIT)}`);
     });
 
     it('полный список ровно в предел → отказ, а не молчаливая полнота (C2)', () => {
-        const ghJsonFn = (() => many(LIMIT)) as never;
-        expect(() => ralph.allOpenIssues('M1', { ghJsonFn })).toThrow(/предел|полным нельзя/i);
+        const forgeJsonFn = (() => many(LIMIT)) as never;
+        expect(() => ralph.allOpenIssues('M1', { forgeJsonFn })).toThrow(/предел|полным нельзя/i);
     });
 
     it('очередь ровно в предел → тот же отказ, и считается СЫРОЙ ответ, до фильтров', () => {
         // Все карточки blocked: после фильтра очередь пуста, и если бы предел проверялся
         // после отсева, урезание выглядело бы как «работы нет».
         const blocked = many(LIMIT).map((i) => ({ ...i, labels: [{ name: 'blocked' }] }));
-        const ghJsonFn = (() => blocked) as never;
+        const forgeJsonFn = (() => blocked) as never;
         const reasons: string[] = [];
         // Отказ полноты идёт МИМО failFn сбоя чтения: тот подписал бы урезанную выборку
         // диагнозом «чтение форжа упало — проверь авторизацию», а чинится она разбором
         // вехи, а не логином (копия потребителя, #72-ревью).
         expect(() =>
             ralph.openIssues('M1', {
-                ghJsonFn,
+                forgeJsonFn,
                 failFn: (msg: string) => {
                     reasons.push(msg);
                     return undefined;
@@ -3647,14 +3647,14 @@ describe('выборка карточек фазы не урезается мо�
     });
 
     it('ответ короче предела проходит — барьер не мешает обычной фазе', () => {
-        const ghJsonFn = (() => many(LIMIT - 1)) as never;
-        expect(ralph.allOpenIssues('M1', { ghJsonFn })).toHaveLength(LIMIT - 1);
+        const forgeJsonFn = (() => many(LIMIT - 1)) as never;
+        expect(ralph.allOpenIssues('M1', { forgeJsonFn })).toHaveLength(LIMIT - 1);
         // У очереди длину не сверяем: она ещё отсеивает чужих авторов по
         // `config.authorAllowlist`, и в юните этот список свой. Проверяем то, что
         // относится к барьеру, — что отказа не было вовсе.
         const reasons: string[] = [];
         ralph.openIssues('M1', {
-            ghJsonFn,
+            forgeJsonFn,
             failFn: (msg: string) => {
                 reasons.push(msg);
                 return undefined;
@@ -3664,8 +3664,8 @@ describe('выборка карточек фазы не урезается мо�
     });
 
     it('метки карточек фазы держат тот же предел — вопрос другой, граница одна', () => {
-        const ghJsonFn = (() => many(LIMIT).map(() => ({ labels: [{ name: 'x' }] }))) as never;
-        expect(() => ralph.milestoneLabels('M1', { ghJsonFn })).toThrow(/предел/i);
+        const forgeJsonFn = (() => many(LIMIT).map(() => ({ labels: [{ name: 'x' }] }))) as never;
+        expect(() => ralph.milestoneLabels('M1', { forgeJsonFn })).toThrow(/предел/i);
     });
 });
 
@@ -4741,7 +4741,7 @@ describe('runLoop — основной while-цикл: итерации коде
             // нечего»; сценарии пуша и отказа переопределяют, модуль — core/session-push.test.ts.
             pushSessionCommitsFn: () => ({ kind: 'in-sync' as const }),
             phaseMergedFn: () => false,
-            // #237: тот же безопасный дефолт — настоящий mergedPhasePr зовёт ghJson → sh,
+            // #237: тот же безопасный дефолт — настоящий mergedPhasePr зовёт forgeJson → sh,
             // и тест на пути «фаза уже смерджена» ловил бы предохранитель #138.
             mergedPhasePrFn: () => null,
             advancePhaseFn: () => {},
@@ -12499,7 +12499,7 @@ describe('ветковая хореография в worktree раннера (#7
 
         it('целый номер PR → возвращает PR как есть', () => {
             const pr = findOpenPr('feature/m1', {
-                ghJsonFn: () => [{ number: 5, labels: [] }],
+                forgeJsonFn: () => [{ number: 5, labels: [] }],
                 logFn: () => {},
             });
             expect(pr).toEqual({ number: 5, labels: [] });
@@ -12511,7 +12511,7 @@ describe('ветковая хореография в worktree раннера (#7
             // (тот самый класс, ради которого фаза перешла на argv). Fail-closed.
             const logs: string[] = [];
             const pr = findOpenPr('feature/m1', {
-                ghJsonFn: () => [{ number: '--delete-branch', labels: [] }],
+                forgeJsonFn: () => [{ number: '--delete-branch', labels: [] }],
                 logFn: (m: string) => logs.push(m),
             });
             expect(pr).toBeNull();
@@ -12520,7 +12520,7 @@ describe('ветковая хореография в worktree раннера (#7
 
         it('несколько открытых PR → null (fail-closed, разберёт человек)', () => {
             const pr = findOpenPr('feature/m1', {
-                ghJsonFn: () => [
+                forgeJsonFn: () => [
                     { number: 5, labels: [] },
                     { number: 6, labels: [] },
                 ],
@@ -12530,7 +12530,7 @@ describe('ветковая хореография в worktree раннера (#7
         });
 
         it('открытого PR нет → null', () => {
-            const pr = findOpenPr('feature/m1', { ghJsonFn: () => [], logFn: () => {} });
+            const pr = findOpenPr('feature/m1', { forgeJsonFn: () => [], logFn: () => {} });
             expect(pr).toBeNull();
         });
     });
@@ -14656,7 +14656,7 @@ describe('closeMilestoneByTitle — закрытие milestone сразу пос
         const argvCalls: Array<[string, string[]]> = [];
         const logs: string[] = [];
         closeMilestoneByTitle('Фаза X', {
-            ghJsonFn: () => [{ number: 7, title: 'Фаза X' }],
+            forgeJsonFn: () => [{ number: 7, title: 'Фаза X' }],
             runArgvFn: (file: string, args: string[]) => argvCalls.push([file, args]),
             logFn: (m: string) => logs.push(m),
         });
@@ -14670,7 +14670,7 @@ describe('closeMilestoneByTitle — закрытие milestone сразу пос
     it('milestone не найден среди открытых → не мутирует', () => {
         const runArgvFn = vi.fn();
         closeMilestoneByTitle('Фаза Y', {
-            ghJsonFn: () => [{ number: 7, title: 'Фаза X' }],
+            forgeJsonFn: () => [{ number: 7, title: 'Фаза X' }],
             runArgvFn,
             logFn: () => {},
         });
@@ -14681,7 +14681,7 @@ describe('closeMilestoneByTitle — закрытие milestone сразу пос
         const logs: string[] = [];
         expect(() =>
             closeMilestoneByTitle('Фаза X', {
-                ghJsonFn: () => {
+                forgeJsonFn: () => {
                     throw new Error('gh boom');
                 },
                 logFn: (m: string) => logs.push(m),
@@ -17091,7 +17091,7 @@ describe('applySessionRequests: намерения сессии применяе
 describe('milestoneLabels: неполная выборка — тоже неизвестность (#37)', () => {
     it('отдаёт имена меток всех карточек фазы', () => {
         const labels = ralph.milestoneLabels('M1', {
-            ghJsonFn: () => [
+            forgeJsonFn: () => [
                 { labels: [{ name: 'complexity:high' }, { name: 'area:devops' }] },
                 { labels: [] },
                 {},
@@ -17105,7 +17105,7 @@ describe('milestoneLabels: неполная выборка — тоже неиз
         // полный значило бы пропустить эскалацию молча: ровно тот класс тихой
         // деградации, ради которого метки и переехали в шов.
         const many = Array.from({ length: 200 }, () => ({ labels: [{ name: 'area:docs' }] }));
-        expect(() => ralph.milestoneLabels('M1', { ghJsonFn: () => many })).toThrow(
+        expect(() => ralph.milestoneLabels('M1', { forgeJsonFn: () => many })).toThrow(
             /лимит|предел/i,
         );
     });
@@ -17115,7 +17115,7 @@ describe('prComments: три поверхности GitHub и полная вы�
     // Тип возврата аннотирован явно: `ralph.js` — JS-entry без деклараций, и без этого
     // его ответ приезжает как any (тот же приём, что у соседних сьютов).
     const call = (impl: (cmd: string) => unknown): ReviewComment[] =>
-        ralph.prComments(42, { ghJsonFn: (cmd: string) => impl(cmd) }) as ReviewComment[];
+        ralph.prComments(42, { forgeJsonFn: (cmd: string) => impl(cmd) }) as ReviewComment[];
 
     it('спрашивает все три поверхности и помечает сводку прохода', () => {
         const cmds: string[] = [];
@@ -17155,7 +17155,7 @@ describe('prComments: три поверхности GitHub и полная вы�
     });
 
     it('НЕГАТИВНЫЙ: некорректный номер PR → отказ', () => {
-        expect(() => ralph.prComments(0, { ghJsonFn: () => [] })).toThrow(/номер/i);
+        expect(() => ralph.prComments(0, { forgeJsonFn: () => [] })).toThrow(/номер/i);
     });
 });
 
@@ -17231,7 +17231,7 @@ describe('commentOnPr: комментарий к строке требует sha
                     argv.push(a);
                     return '';
                 },
-                ghJsonFn: () => ({ headRefOid: 'a'.repeat(40) }),
+                forgeJsonFn: () => ({ headRefOid: 'a'.repeat(40) }),
             },
         );
         const flat = argv[0].join(' ');
@@ -17257,7 +17257,7 @@ describe('commentOnPr: комментарий к строке требует sha
                     argv.push(a);
                     return '';
                 },
-                ghJsonFn: () => ({ headRefOid: 'a'.repeat(40) }),
+                forgeJsonFn: () => ({ headRefOid: 'a'.repeat(40) }),
             },
         );
         const a = argv[0];
@@ -17282,7 +17282,7 @@ describe('commentOnPr: комментарий к строке требует sha
                     argv.push(a);
                     return '';
                 },
-                ghJsonFn: () => {
+                forgeJsonFn: () => {
                     throw new Error('sha не нужен для сводки');
                 },
             },
@@ -17297,7 +17297,7 @@ describe('commentOnPr: комментарий к строке требует sha
             ralph.commentOnPr(
                 42,
                 { body: 'x', anchor: { path: 'a.ts', line: 1 } },
-                { runArgvFn: () => '', ghJsonFn: () => ({ headRefOid: 'не-sha' }) },
+                { runArgvFn: () => '', forgeJsonFn: () => ({ headRefOid: 'не-sha' }) },
             ),
         ).toThrow(/sha/i);
     });

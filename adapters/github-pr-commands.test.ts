@@ -18,8 +18,8 @@ function make(over: Partial<Parameters<typeof createGithubPrCommands>[0]> = {}) 
         shArgv: () => {
             throw new Error('shArgv не подменён в тесте');
         },
-        ghJson: () => {
-            throw new Error('ghJson не подменён в тесте');
+        forgeJson: () => {
+            throw new Error('forgeJson не подменён в тесте');
         },
         shq,
         log: () => {},
@@ -33,13 +33,13 @@ function make(over: Partial<Parameters<typeof createGithubPrCommands>[0]> = {}) 
 
 describe('prComments — лента ревью со всех поверхностей форжа (#37)', () => {
     it('читает три поверхности и метит сводку прохода isSummary', () => {
-        const ghJsonFn = vi.fn((cmd: string) => {
+        const forgeJsonFn = vi.fn((cmd: string) => {
             if (cmd.includes('/issues/')) return [{ body: 'тред', user: { login: 'owner' } }];
             if (cmd.includes('/pulls/12/comments'))
                 return [{ body: '🔴 инлайн', user: { login: 'owner' } }];
             return [{ body: 'сводка', user: { login: 'owner' } }, { body: '   ' }];
         });
-        const out = make().prComments(12, { ghJsonFn } as never);
+        const out = make().prComments(12, { forgeJsonFn } as never);
         expect(out).toEqual([
             { body: 'тред', isSummary: false, author: 'owner' },
             { body: '🔴 инлайн', isSummary: false, author: 'owner' },
@@ -50,51 +50,51 @@ describe('prComments — лента ревью со всех поверхнос�
     });
 
     it('пагинация запрошена явно — иначе лента обрезалась бы молча', () => {
-        const ghJsonFn = vi.fn((_cmd: string) => [] as never);
-        make().prComments(12, { ghJsonFn });
-        for (const [cmd] of ghJsonFn.mock.calls) {
+        const forgeJsonFn = vi.fn((_cmd: string) => [] as never);
+        make().prComments(12, { forgeJsonFn });
+        for (const [cmd] of forgeJsonFn.mock.calls) {
             expect(cmd).toContain('--paginate');
         }
     });
 
     it('некорректный номер PR — отказ до похода в форж', () => {
-        const ghJsonFn = vi.fn(() => [] as never);
+        const forgeJsonFn = vi.fn(() => [] as never);
         for (const bad of [0, -1, 1.5, NaN]) {
-            expect(() => make().prComments(bad, { ghJsonFn })).toThrow(/некорректный номер/);
+            expect(() => make().prComments(bad, { forgeJsonFn })).toThrow(/некорректный номер/);
         }
-        expect(ghJsonFn).not.toHaveBeenCalled();
+        expect(forgeJsonFn).not.toHaveBeenCalled();
     });
 
     // Ноль находок при прошедшем ревью и ноль находок при недоступном форже в журнале
     // неразличимы — поэтому ответ неожиданной формы это отказ, а не пустая лента.
     it('ответ не массивом — отказ, а не тихо заниженная метрика', () => {
-        expect(() => make().prComments(12, { ghJsonFn: (() => ({ items: [] })) as never })).toThrow(
-            /не массив/,
-        );
+        expect(() =>
+            make().prComments(12, { forgeJsonFn: (() => ({ items: [] })) as never }),
+        ).toThrow(/не массив/);
     });
 });
 
 describe('prHeadSha — голова PR для гейта (#49)', () => {
     it('читает headRefOid по номеру PR', () => {
-        const ghJsonFn = vi.fn((_cmd: string) => ({ headRefOid: SHA }));
-        expect(make().prHeadSha(12, { ghJsonFn } as never)).toBe(SHA);
-        expect(ghJsonFn.mock.calls[0][0]).toContain('gh pr view 12');
+        const forgeJsonFn = vi.fn((_cmd: string) => ({ headRefOid: SHA }));
+        expect(make().prHeadSha(12, { forgeJsonFn } as never)).toBe(SHA);
+        expect(forgeJsonFn.mock.calls[0][0]).toContain('gh pr view 12');
     });
 
     // Номер уходит в ШЕЛЛ-строку чтения, поэтому фильтруется здесь, а не только у
     // поставщика: #49 показал, что при переезде кода замок теряется незаметно.
     it('номер не похож на целое — до шелл-строки не доходит', () => {
-        const ghJsonFn = vi.fn((() => ({ headRefOid: SHA })) as never);
-        expect(() => make().prHeadSha('--flag' as unknown as number, { ghJsonFn })).toThrow(
+        const forgeJsonFn = vi.fn((() => ({ headRefOid: SHA })) as never);
+        expect(() => make().prHeadSha('--flag' as unknown as number, { forgeJsonFn })).toThrow(
             /не похож на целое/,
         );
-        expect(ghJsonFn).not.toHaveBeenCalled();
+        expect(forgeJsonFn).not.toHaveBeenCalled();
     });
 
     // Пустая строка вместо исключения увела бы гейт в ветку «голова не похожа на sha»:
     // тот же отказ мерджа, но с неверной причиной в логе.
     it('в ответе нет headRefOid — отказ с честным диагнозом', () => {
-        expect(() => make().prHeadSha(12, { ghJsonFn: (() => ({})) as never })).toThrow(
+        expect(() => make().prHeadSha(12, { forgeJsonFn: (() => ({})) as never })).toThrow(
             /нет headRefOid/,
         );
     });
@@ -117,7 +117,7 @@ describe('commentOnPr — замечание ревью от имени ранн
         make().commentOnPr(
             12,
             { body: '🔴 тут', anchor: { path: 'src/a.ts', line: 42 } },
-            { runArgvFn, ghJsonFn: (() => ({ headRefOid: SHA })) as never },
+            { runArgvFn, forgeJsonFn: (() => ({ headRefOid: SHA })) as never },
         );
         expect(runArgvFn).toHaveBeenCalledWith('gh', [
             'api',
@@ -142,7 +142,7 @@ describe('commentOnPr — замечание ревью от имени ранн
         make().commentOnPr(
             12,
             { body: 'удалено зря', anchor: { path: 'src/a.ts', line: 42, side: 'LEFT' } },
-            { runArgvFn, ghJsonFn: (() => ({ headRefOid: SHA })) as never },
+            { runArgvFn, forgeJsonFn: (() => ({ headRefOid: SHA })) as never },
         );
         const args = runArgvFn.mock.calls[0][1];
         expect(args).toContain('side=LEFT');
@@ -156,7 +156,7 @@ describe('commentOnPr — замечание ревью от имени ранн
         make().commentOnPr(
             12,
             { body: 'о пропущенном', anchor: { path: 'src/a.ts' } },
-            { runArgvFn, ghJsonFn: (() => ({ headRefOid: SHA })) as never },
+            { runArgvFn, forgeJsonFn: (() => ({ headRefOid: SHA })) as never },
         );
         const args = runArgvFn.mock.calls[0][1];
         expect(args).toContain('subject_type=file');
@@ -174,7 +174,7 @@ describe('commentOnPr — замечание ревью от имени ранн
                 { body: '🔴 тут', anchor: { path: 'src/a.ts', line: 42 } },
                 {
                     runArgvFn,
-                    ghJsonFn: (() => {
+                    forgeJsonFn: (() => {
                         throw new Error('форж лёг');
                     }) as never,
                 },
@@ -188,7 +188,7 @@ describe('commentOnPr — замечание ревью от имени ранн
             make().commentOnPr(
                 12,
                 { body: 'x', anchor: { path: 'a.ts', line: 1 } },
-                { runArgvFn: () => '', ghJsonFn: (() => ({})) as never },
+                { runArgvFn: () => '', forgeJsonFn: (() => ({})) as never },
             ),
         ).toThrow(/нет headRefOid/);
     });
@@ -228,12 +228,12 @@ describe('createPr — PR фазы заводит раннер (#46)', () => {
 
 describe('findOpenPr — открытый PR ветки фазы', () => {
     it('ищет ТОЛЬКО PR в main (M5), имя ветки уходит через shq', () => {
-        const ghJsonFn = vi.fn((_cmd: string) => [{ number: 5, labels: [] }]);
-        expect(make().findOpenPr('feature/x', { ghJsonFn } as never)).toEqual({
+        const forgeJsonFn = vi.fn((_cmd: string) => [{ number: 5, labels: [] }]);
+        expect(make().findOpenPr('feature/x', { forgeJsonFn } as never)).toEqual({
             number: 5,
             labels: [],
         });
-        const cmd = ghJsonFn.mock.calls[0][0];
+        const cmd = forgeJsonFn.mock.calls[0][0];
         expect(cmd).toContain(shq('feature/x'));
         expect(cmd).toContain('--base main');
         expect(cmd).toContain('--state open');
@@ -243,20 +243,20 @@ describe('findOpenPr — открытый PR ветки фазы', () => {
     // не тем PR. Fail-closed — разберёт человек.
     it('несколько открытых PR на одну ветку — null и запись в лог', () => {
         const logFn = vi.fn();
-        const ghJsonFn = (() => [{ number: 5 }, { number: 6 }]) as never;
-        expect(make().findOpenPr('feature/x', { ghJsonFn, logFn })).toBeNull();
+        const forgeJsonFn = (() => [{ number: 5 }, { number: 6 }]) as never;
+        expect(make().findOpenPr('feature/x', { forgeJsonFn, logFn })).toBeNull();
         expect(String(logFn.mock.calls[0][0])).toContain('неоднозначно');
     });
 
     it('номер PR не похож на целое — null: в argv/шелл его не пускаем', () => {
         const logFn = vi.fn();
-        const ghJsonFn = (() => [{ number: '--flag' }]) as never;
-        expect(make().findOpenPr('feature/x', { ghJsonFn, logFn })).toBeNull();
+        const forgeJsonFn = (() => [{ number: '--flag' }]) as never;
+        expect(make().findOpenPr('feature/x', { forgeJsonFn, logFn })).toBeNull();
         expect(String(logFn.mock.calls[0][0])).toContain('не похож на целое');
     });
 
     it('открытого PR нет — null без ошибки', () => {
-        expect(make().findOpenPr('feature/x', { ghJsonFn: (() => []) as never })).toBeNull();
+        expect(make().findOpenPr('feature/x', { forgeJsonFn: (() => []) as never })).toBeNull();
     });
 
     // #127: null — ответ форжа «PR нет»; сбой, отданный тем же null, петля прочитала бы
@@ -265,7 +265,7 @@ describe('findOpenPr — открытый PR ветки фазы', () => {
         const logFn = vi.fn();
         expect(() =>
             make().findOpenPr('feature/x', {
-                ghJsonFn: (() => {
+                forgeJsonFn: (() => {
                     throw new Error('форж лёг');
                 }) as never,
                 logFn,
@@ -278,7 +278,7 @@ describe('findOpenPr — открытый PR ветки фазы', () => {
 
     it('ответ не массив — бросок: мусор от форжа не «PR нет»', () => {
         expect(() =>
-            make().findOpenPr('feature/x', { ghJsonFn: (() => ({ items: [] })) as never }),
+            make().findOpenPr('feature/x', { forgeJsonFn: (() => ({ items: [] })) as never }),
         ).toThrow(/не массив/);
     });
 });

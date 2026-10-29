@@ -428,7 +428,7 @@ describe('ядро не исполняет команд форжа (#55)', () =>
     });
 
     const ALLOWED: Array<[string, string]> = [
-        ['имя коллаборатора-чтения', 'const raw = ghJsonFn<Issue[]>(cmd);'],
+        ['имя коллаборатора-чтения', 'const raw = forgeJsonFn<Issue[]>(cmd);'],
         ['слово внутри другого слова', 'const weight = highGh + 1;'],
         ['метод шва вместо команды', 'adapters.taskSource.listReadyIssues(milestone);'],
         ['флаг с ведущим дефисом', "args.push('--gh-compat');"],

@@ -20,10 +20,10 @@
 // синтаксис — только аннотации типов, ни enum, ни namespace, ни parameter properties).
 //
 // Фабрика, а не standalone-экспорты (как в gate.ts): pickReviewModel/recordReviewFindings
-// не чистые — им нужен контекст ralph.js (config, ghJson, sh/shArgv/shq, log, fail,
+// не чистые — им нужен контекст ralph.js (config, forgeJson, sh/shArgv/shq, log, fail,
 // isPlainObject и уже определённые помощники matchRiskPaths/phaseDiffFiles). Фабрика
 // захватывает этот контекст один раз, а возвращённые функции сохраняют ПОКАЗАТЕЛЬНУЮ DI:
-// каждая по-прежнему принимает свои коллабораторы (cfg/ghJsonFn/shFn/…) параметром — ровно
+// каждая по-прежнему принимает свои коллабораторы (cfg/forgeJsonFn/shFn/…) параметром — ровно
 // так их зовут существующие тесты (review.test.ts) через ре-экспорт из ralph.js.
 //
 // getConfig, а не захваченный config: module-level `config` в ralph.js заполняется в main()
@@ -42,7 +42,7 @@ type ShFn = (cmd: string, opts?: ExecOpts) => string;
 type ShArgvFn = (file: string, args: string[], opts?: ExecOpts) => string;
 type ShqFn = (value: unknown) => string;
 type LogFn = (msg: string) => void;
-type GhJsonFn = (cmd: string, attempts?: number) => unknown;
+type ForgeJsonFn = (cmd: string, attempts?: number) => unknown;
 // fail() боевой уходит в process.exit(1); тестовый failFn может вернуть значение или
 // бросить — поэтому возврат unknown, а не never (assertKnownReviewModels пробрасывает
 // результат мягкого failFn наверх, как было в ralph.js).
@@ -93,7 +93,7 @@ type Phase = { milestone: string };
 
 export type ReviewEnv = {
     getConfig: () => ReviewCfg;
-    ghJson: GhJsonFn;
+    forgeJson: ForgeJsonFn;
     sh: ShFn;
     shArgv: ShArgvFn;
     shq: ShqFn;
@@ -126,7 +126,7 @@ export function reviewVerdict(
 export function createReviewModule(env: ReviewEnv) {
     const {
         getConfig,
-        ghJson,
+        forgeJson,
         sh,
         shArgv,
         shq,
@@ -156,7 +156,7 @@ export function createReviewModule(env: ReviewEnv) {
         branch: string,
         {
             cfg = getConfig(),
-            ghJsonFn = ghJson,
+            forgeJsonFn = forgeJson,
             shFn = sh,
             runArgvFn = shArgv,
             logFn = log,
@@ -164,7 +164,7 @@ export function createReviewModule(env: ReviewEnv) {
             files: known,
         }: {
             cfg?: ReviewCfg;
-            ghJsonFn?: GhJsonFn;
+            forgeJsonFn?: ForgeJsonFn;
             shFn?: ShFn;
             runArgvFn?: ShArgvFn;
             logFn?: LogFn;

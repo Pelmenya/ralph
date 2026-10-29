@@ -16,7 +16,7 @@ const makeForge = (over: Partial<Parameters<typeof createGithubForgeCommands>[0]
         shArgv: () => '',
         shq: (v: string) => `'${String(v)}'`,
         log: () => {},
-        ghJson: () => [] as never,
+        forgeJson: () => [] as never,
         safeBranch: () => true,
         prNumberRe: PR_NUMBER_RE,
         sha40Re: /^[0-9a-f]{40}$/i,
@@ -156,13 +156,13 @@ describe('mergePr — сборка argv squash-мерджа (#55)', () => {
 // пуст — без него авто-половина метрики ревью терялась бы молча.
 describe('phaseMerged / mergedPhasePr — ответ форжа о смердженной фазе (#55)', () => {
     it('есть смердженный PR → true и его номер', () => {
-        const forge = makeForge({ ghJson: (() => [{ number: 77 }]) as never });
+        const forge = makeForge({ forgeJson: (() => [{ number: 77 }]) as never });
         expect(forge.phaseMerged({ branch: 'feature/x' })).toBe(true);
         expect(forge.mergedPhasePr({ branch: 'feature/x' })).toBe(77);
     });
 
     it('пусто → false и null', () => {
-        const forge = makeForge({ ghJson: (() => []) as never });
+        const forge = makeForge({ forgeJson: (() => []) as never });
         expect(forge.phaseMerged({ branch: 'feature/x' })).toBe(false);
         expect(forge.mergedPhasePr({ branch: 'feature/x' })).toBe(null);
     });
@@ -171,7 +171,7 @@ describe('phaseMerged / mergedPhasePr — ответ форжа о смердж�
         // Молчаливый false заставил бы петлю пересоздавать PR уже смердженной фазы,
         // а preflight — падать с ложной причиной.
         const forge = makeForge({
-            ghJson: (() => {
+            forgeJson: (() => {
                 throw new Error('gh недоступен');
             }) as never,
         });

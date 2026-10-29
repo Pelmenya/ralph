@@ -1249,7 +1249,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
     }
 
     // Примитивы исполнения и лога (#365): log/fail/setLogTarget, sh (чтения, #133),
-    // shArgv (мутации argv без шелла, #193/#252), ghJson (ретраи чтений, M3) — exec.ts.
+    // shArgv (мутации argv без шелла, #193/#252), forgeJson (ретраи чтений, M3) — exec.ts.
     // Начальная цель лога — cwd-относительный RUNTIME.log; main() репойнтит на абсолютный
     // путь внутри worktree раннера ещё ДО chdir (#SiaUB).
     const {
@@ -1260,7 +1260,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         setSessionLogsKeep,
         sh,
         shArgv,
-        ghJson,
+        forgeJson,
         saveSessionOutput,
     } = createExec({
         guardSideEffect,
@@ -6014,9 +6014,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // ── Ревью фазы (#363, фаза 3) ────────────────────────────────────────────
     // pickReviewModel / pickReviewFallbackModel / reviewModelRank / strongerReviewModel /
     // assertKnownReviewModels / recordReviewFindings — review.ts. Фабрика захватывает
-    // контекст оркестратора (ленивый config через getConfig, ghJson, sh/shArgv/shq, log,
+    // контекст оркестратора (ленивый config через getConfig, forgeJson, sh/shArgv/shq, log,
     // fail, isPlainObject и уже определённые выше matchRiskPaths/phaseDiffFiles) один раз,
-    // возвращённые функции сохраняют показательную DI (cfg/ghJsonFn/shFn/… параметрами).
+    // возвращённые функции сохраняют показательную DI (cfg/forgeJsonFn/shFn/… параметрами).
     //
     // getConfig, а не config напрямую: config заполняется в main() ПОСЛЕ сборки фабрики,
     // поэтому дефолт pickReviewModel/pickReviewFallbackModel `cfg = config` обязан читать
@@ -6033,7 +6033,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         recordFixReviewFindings,
     } = createReviewModule({
         getConfig: () => config,
-        ghJson,
+        forgeJson,
         sh,
         shArgv,
         shq,
@@ -6485,7 +6485,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // живёт в core/gate.ts. Примитивы форжа (метка blocked разбора #217/#223, мердж PR,
     // проверка «фаза уже смерджена») с #55 живут в adapters/github-forge-commands.ts и
     // приходят гейту инъекцией.
-    // Фабрика захватывает контекст оркестратора (sh/shArgv/shq/log/ghJson, хореографию
+    // Фабрика захватывает контекст оркестратора (sh/shArgv/shq/log/forgeJson, хореографию
     // findOpenPr/ensureClean/park/обновление дерева, санацию env чеков, sleep, DRY, regex'ы)
     // один раз; возвращённые функции сохраняют показательную DI. Состав шагов приезжает из
     // конфига (ralph.config.json → gate.checks/prodChecks/prodDropChecks, #204 фаза 4): ядро
@@ -6512,7 +6512,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         shArgv,
         shq,
         log,
-        ghJson,
+        forgeJson,
         safeBranch,
         prNumberRe: PR_NUMBER_RE,
         sha40Re: SHA40_RE,
@@ -6546,7 +6546,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
     } = createGithubIssueCommands({
         sh,
         shArgv,
-        ghJson,
+        forgeJson,
         shq,
         log,
         fail,
@@ -6560,7 +6560,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
 
     const { prComments, prHeadSha, commentOnPr, createPr, findOpenPr } = createGithubPrCommands({
         shArgv,
-        ghJson,
+        forgeJson,
         shq,
         log,
         prNumberRe: PR_NUMBER_RE,
@@ -6590,7 +6590,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         shq,
         log,
         fail,
-        ghJson,
+        forgeJson,
         // #49/#15: голову PR гейт спрашивает у ШВА — и здесь тоже, лениво (реестр к моменту
         // вызова собран). Раньше сюда уходила GitHub-реализация как «дефолт контекста», а
         // правильный примитив приезжал только прокидом из runLoop в tryMergePhase. Разница
@@ -6623,7 +6623,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // (waitForDeployRun/deployWaitMessage), HTTP-healthcheck прода (probeHttpStatus/
     // checkProdHealth) и классификация итога (isWorkflowGreen/classifyDeployOutcome) —
     // deploy-check.ts. Фабрика захватывает контекст (ленивый config через getConfig,
-    // ghJson, shq, log, sleep, guardSideEffect, positiveIntOrDefault, SHA40_RE) один раз,
+    // forgeJson, shq, log, sleep, guardSideEffect, positiveIntOrDefault, SHA40_RE) один раз,
     // возвращённые функции сохраняют показательную DI.
     const {
         deployPhasePlaceholder,
@@ -6638,7 +6638,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         getConfig: () => config,
         // #72: команды форжа приходят готовыми примитивами — деплой-проверка знает
         // «дай коммит мерджа»/«дай прогоны workflow», а не `gh`.
-        ...createGithubDeployCommands({ ghJson, shq }),
+        ...createGithubDeployCommands({ forgeJson, shq }),
         log,
         sleep,
         guardSideEffect,

@@ -28,7 +28,7 @@ import { positiveIntOrDefault } from '../shared/ralph-util.ts';
 // Обновление CLI занимает секунды-минуты (research в теле issue) — 5 минут суммарного
 // бюджета повторов с запасом кроют его, не превращая честный крах рантайма в вечный сон.
 export const DEFAULT_RUNTIME_UNAVAILABLE_MAX_WAIT_MS = 5 * 60 * 1000;
-// База линейного backoff между попытками — тот же приём, что ghJson (exec.ts): попытка N
+// База линейного backoff между попытками — тот же приём, что forgeJson (exec.ts): попытка N
 // ждёт N × базу, растущая пауза не долбит в стену на полной скорости, но и не запирает
 // первый повтор надолго, пока обновление ещё может завершиться за секунды.
 export const DEFAULT_RUNTIME_UNAVAILABLE_RETRY_DELAY_MS = 10 * 1000;
@@ -37,7 +37,7 @@ type RuntimeUnavailableCfg = {
     runtimeUnavailableRetryDelayMs?: number;
 };
 
-// Длительность паузы перед попыткой N (1-индексация, как у ghJson). Вызывающий сам
+// Длительность паузы перед попыткой N (1-индексация, как у forgeJson). Вызывающий сам
 // обрезает результат остатком бюджета (runtimeUnavailableMaxWaitMs) — эта функция бюджета
 // не знает и не обязана.
 export function runtimeUnavailableWaitMs(attempt: number, cfg: RuntimeUnavailableCfg = {}): number {

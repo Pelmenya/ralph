@@ -23,7 +23,7 @@ export type GithubForgeCommandsEnv = {
     shArgv: ShArgvFn;
     shq: (s: string) => string;
     log: LogFn;
-    ghJson: <T>(cmd: string) => T;
+    forgeJson: <T>(cmd: string) => T;
     /** Anti-injection для имени ветки (инв. C3/7) — общий с ядром. */
     safeBranch: (branch: string, opts: { logFn: LogFn; where: string }) => boolean;
     /** Фильтр номера PR перед argv: `--flag`-образное значение gh распарсил бы как флаг. */
@@ -42,7 +42,7 @@ type BlockedLabelOpts = { shFn?: ShFn; runArgvFn?: ShArgvFn; logFn?: LogFn };
  * зелёные без правок ассертов).
  */
 export function createGithubForgeCommands(env: GithubForgeCommandsEnv) {
-    const { sh, shArgv, shq, log, ghJson, safeBranch, prNumberRe, sha40Re } = env;
+    const { sh, shArgv, shq, log, forgeJson, safeBranch, prNumberRe, sha40Re } = env;
 
     // Снятие и возврат метки — ЗЕРКАЛЬНЫЕ операции: тот же поиск PR, тот же фильтр номера,
     // тот же anti-injection путь и то же fail-open поведение — различаются лишь gh-флагом и
@@ -120,12 +120,12 @@ export function createGithubForgeCommands(env: GithubForgeCommandsEnv) {
     }
 
     // Фаза уже смерджена (авто-мерджем прошлого прогона ИЛИ вручную человеком)?
-    // БРОСАЕТ при недоступности gh (после ретраев ghJson): «не смог проверить» и
+    // БРОСАЕТ при недоступности gh (после ретраев forgeJson): «не смог проверить» и
     // «не смерджена» — принципиально разные ответы; молчаливый false заставил бы
     // preflight-инвариант C4 падать с ложной причиной, а loop — пересоздавать PR уже
     // смердженной фазы.
     function phaseMerged(phase: { branch: string }): boolean {
-        const merged = ghJson<Array<{ number: number }>>(
+        const merged = forgeJson<Array<{ number: number }>>(
             `gh pr list --head ${shq(phase.branch)} --base main --state merged --json number --limit 1`,
         );
         return merged.length > 0;
@@ -135,7 +135,7 @@ export function createGithubForgeCommands(env: GithubForgeCommandsEnv) {
     // там recordReviewFindings не имеет lastGatePr (гейт не прогонялся), и без номера
     // авто-половина метрики терялась бы молча.
     function mergedPhasePr(phase: { branch: string }): number | null {
-        const merged = ghJson<Array<{ number: number }>>(
+        const merged = forgeJson<Array<{ number: number }>>(
             `gh pr list --head ${shq(phase.branch)} --base main --state merged --json number --limit 1`,
         );
         return merged.length > 0 ? merged[0].number : null;

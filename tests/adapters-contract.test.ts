@@ -7,7 +7,7 @@
 //   - здесь — ОДИН и тот же набор поведенческих ассертов на интерфейс прогоняется
 //     против ДВУХ реализаций подряд: минимального in-memory фейка (realizability) и
 //     БОЕВОЙ логики текущих адаптеров (gate.ts/deploy-check.ts/telegram-notifier.ts/
-//     orchestrator.ts) с подменённым на границе I/O (sh/ghJson/execFn/spawnFn — то же
+//     orchestrator.ts) с подменённым на границе I/O (sh/forgeJson/execFn/spawnFn — то же
 //     DI, что и в gate.test.ts/deploy-check.test.ts/telegram-notifier.test.ts).
 //   Так проверяется именно КОНТРАКТ: свойство держится независимо от того, кто за
 //   интерфейсом стоит — ручной фейк или реальный npm/GitHub/Telegram/Claude-адаптер.
@@ -83,8 +83,8 @@ function makeGateEnv(over: Partial<GateEnv> = {}): GateEnv {
         prHeadSha: () => {
             throw new Error('prHeadSha не подменён в тесте');
         },
-        ghJson: () => {
-            throw new Error('ghJson не подменён в тесте');
+        forgeJson: () => {
+            throw new Error('forgeJson не подменён в тесте');
         },
         // #55: примитивы форжа приходят инъекцией. Дефолт падает по той же причине, что
         // и prHeadSha: тест, забывший подменить их, обязан краснеть, а не идти в боевой `gh`.
@@ -378,8 +378,8 @@ function buildFakeTaskSource(): { adapter: TaskSourceAdapter; calls: string[] } 
 // тогда под контрактом оказывается и сам сдвиг имён (openIssues→listReadyIssues и т.п.),
 // а не только функции под ним.
 function buildRealTaskSource(): { adapter: TaskSourceAdapter; gateEnv: GateEnv } {
-    let ghJsonImpl: (cmd: string) => unknown = () => {
-        throw new Error('ghJson не подменён в тесте (gate)');
+    let forgeJsonImpl: (cmd: string) => unknown = () => {
+        throw new Error('forgeJson не подменён в тесте (gate)');
     };
     const shArgvCalls: string[] = [];
     // Трасса argv пишется ДВУМЯ формами. Плоская (`gh pr merge …`) удобна проверкам по
@@ -393,12 +393,12 @@ function buildRealTaskSource(): { adapter: TaskSourceAdapter; gateEnv: GateEnv }
     };
     let authFails = false;
     const gateEnv = makeGateEnv({
-        ghJson: ((cmd: string) => ghJsonImpl(cmd)) as GateEnv['ghJson'],
+        forgeJson: ((cmd: string) => forgeJsonImpl(cmd)) as GateEnv['forgeJson'],
         shArgv: (file, args) => {
             traceArgv(file, args);
             return '';
         },
-        // Пути очереди и мерджа читают gh через ghJson, не sh; для них стаб нейтрален.
+        // Пути очереди и мерджа читают gh через forgeJson, не sh; для них стаб нейтрален.
         // Через `sh` идёт только проверка авторизации — её отказ и моделируем.
         sh: ((cmd: string) => {
             if (authFails && String(cmd).includes('gh auth status')) {
@@ -409,13 +409,13 @@ function buildRealTaskSource(): { adapter: TaskSourceAdapter; gateEnv: GateEnv }
     });
     const g = createGateRunner(gateEnv);
     // #55: примитивы форжа больше не живут в гейте — контракт собирается из их адаптера,
-    // а env берём тот же, что у гейта (одни и те же sh/ghJson/логи в этом сценарии).
+    // а env берём тот же, что у гейта (одни и те же sh/forgeJson/логи в этом сценарии).
     const forge = createGithubForgeCommands({
         sh: gateEnv.sh,
         shArgv: gateEnv.shArgv,
         shq: gateEnv.shq,
         log: gateEnv.log,
-        ghJson: gateEnv.ghJson,
+        forgeJson: gateEnv.forgeJson,
         safeBranch: gateEnv.safeBranch,
         prNumberRe: gateEnv.PR_NUMBER_RE,
         sha40Re: gateEnv.SHA40_RE,
@@ -444,16 +444,16 @@ function buildRealTaskSource(): { adapter: TaskSourceAdapter; gateEnv: GateEnv }
         // собственным DI-хуком на чтение gh. Новый метод шва писался уже под контракт,
         // поэтому «боевой» флейвор здесь честно боевой, а не фейк.
         hasAnyIssues: (milestone: string): boolean =>
-            ralph.hasAnyIssues(milestone, { ghJsonFn: (cmd: string) => ghJsonImpl(cmd) }),
+            ralph.hasAnyIssues(milestone, { forgeJsonFn: (cmd: string) => forgeJsonImpl(cmd) }),
         // #65: статус вехи — боевая функция с DI-хуком на чтение gh.
         milestoneOpen: (title: string): boolean =>
-            ralph.milestoneOpen(title, { ghJsonFn: (cmd: string) => ghJsonImpl(cmd) }),
+            ralph.milestoneOpen(title, { forgeJsonFn: (cmd: string) => forgeJsonImpl(cmd) }),
         // #37: тоже боевая функция с DI-хуком на чтение gh.
         milestoneLabels: (milestone: string): string[] =>
-            ralph.milestoneLabels(milestone, { ghJsonFn: (cmd: string) => ghJsonImpl(cmd) }),
+            ralph.milestoneLabels(milestone, { forgeJsonFn: (cmd: string) => forgeJsonImpl(cmd) }),
         // #50: чтение карточки — боевая функция с DI-хуком на чтение gh.
         getIssue: (number: number) =>
-            ralph.issueDetails(number, { ghJsonFn: (cmd: string) => ghJsonImpl(cmd) }),
+            ralph.issueDetails(number, { forgeJsonFn: (cmd: string) => forgeJsonImpl(cmd) }),
         // #46: заведение PR — боевая функция; `gh pr create` печатает URL, номер из хвоста.
         createPr: (input: NewPullRequest) =>
             ralph.createPr(input, {
@@ -464,21 +464,21 @@ function buildRealTaskSource(): { adapter: TaskSourceAdapter; gateEnv: GateEnv }
         commentOnPr: (prNumber: number, input: NewReviewComment) =>
             ralph.commentOnPr(prNumber, input, {
                 runArgvFn: mutationArgv,
-                ghJsonFn: (cmd: string) => ghJsonImpl(cmd),
+                forgeJsonFn: (cmd: string) => forgeJsonImpl(cmd),
             }),
         // #37: раскладка комментариев по трём поверхностям GitHub — боевая функция,
         // подменено только чтение gh.
         prComments: (prNumber: number): ReviewComment[] =>
-            ralph.prComments(prNumber, { ghJsonFn: (cmd: string) => ghJsonImpl(cmd) }),
+            ralph.prComments(prNumber, { forgeJsonFn: (cmd: string) => forgeJsonImpl(cmd) }),
         findOpenPr: (branch: string): PullRequest | null =>
             ralph.findOpenPr(branch, {
-                ghJsonFn: (cmd: string) => ghJsonImpl(cmd),
+                forgeJsonFn: (cmd: string) => forgeJsonImpl(cmd),
                 logFn: () => {},
             }),
         // #49: голова PR — боевая функция с DI-хуком на чтение gh. Гейт её больше не
         // исполняет сам: на площадке без `gh` тот путь давал `not-merged` навсегда.
         prHeadSha: (prNumber: number): string =>
-            ralph.prHeadSha(prNumber, { ghJsonFn: (cmd: string) => ghJsonImpl(cmd) }),
+            ralph.prHeadSha(prNumber, { forgeJsonFn: (cmd: string) => forgeJsonImpl(cmd) }),
         phaseMerged: forge.phaseMerged,
         mergedPhasePr: forge.mergedPhasePr,
         mergePr: (prNumber: number, headSha?: string | null) => forge.mergePr(prNumber, headSha),
@@ -486,7 +486,7 @@ function buildRealTaskSource(): { adapter: TaskSourceAdapter; gateEnv: GateEnv }
         removeBlockedLabel: (branch: string) => forge.removeBlockedLabel(branch),
         closeMilestoneByTitle: (title: string) =>
             ralph.closeMilestoneByTitle(title, {
-                ghJsonFn: (cmd: string) => ghJsonImpl(cmd),
+                forgeJsonFn: (cmd: string) => forgeJsonImpl(cmd),
                 runArgvFn: (file: string, args: string[]) => {
                     traceArgv(file, args);
                     return '';
@@ -498,7 +498,7 @@ function buildRealTaskSource(): { adapter: TaskSourceAdapter; gateEnv: GateEnv }
             ralph.commentOnIssue(issue, body, { runArgvFn: mutationArgv }),
         // #125: лента карточки — боевая функция, подменено только чтение gh.
         issueComments: (issue: number): string[] =>
-            ralph.issueComments(issue, { ghJsonFn: (cmd: string) => ghJsonImpl(cmd) }),
+            ralph.issueComments(issue, { forgeJsonFn: (cmd: string) => forgeJsonImpl(cmd) }),
         setIssueBody: (issue: number, body: string) =>
             ralph.setIssueBody(issue, body, { runArgvFn: mutationArgv }),
         closeIssue: (issue: number) => ralph.closeIssue(issue, { runArgvFn: mutationArgv }),
@@ -523,11 +523,11 @@ function buildRealTaskSource(): { adapter: TaskSourceAdapter; gateEnv: GateEnv }
                 logFn: () => {},
             }),
     });
-    // Тест-хук: подменить ghJson-диспетчер сценария (разные тесты — разные фикстуры gh).
-    (adapter as unknown as { __setGhJson: (fn: (cmd: string) => unknown) => void }).__setGhJson = (
-        fn,
-    ) => {
-        ghJsonImpl = fn;
+    // Тест-хук: подменить forgeJson-диспетчер сценария (разные тесты — разные фикстуры gh).
+    (
+        adapter as unknown as { __setForgeJson: (fn: (cmd: string) => unknown) => void }
+    ).__setForgeJson = (fn) => {
+        forgeJsonImpl = fn;
     };
     (adapter as unknown as { __setAllOpenThrows: (v: boolean) => void }).__setAllOpenThrows = (
         v: boolean,
@@ -549,10 +549,10 @@ function buildRealTaskSource(): { adapter: TaskSourceAdapter; gateEnv: GateEnv }
 }
 
 type TaskSourceHook = {
-    __setGhJson?: (fn: (cmd: string) => unknown) => void;
+    __setForgeJson?: (fn: (cmd: string) => unknown) => void;
     __setAllOpenThrows: (v: boolean) => void;
     // #39: отказ ИМЕННО hasAnyIssues. Хук опционален: реализации, у которых оба чтения
-    // идут одним транспортом (SourceCraft — один маршрут `/issues?`, GitHub — ghJson),
+    // идут одним транспортом (SourceCraft — один маршрут `/issues?`, GitHub — forgeJson),
     // моделируют отказ своим способом. Не реализовать его совсем нельзя — негативный
     // тест ждёт throw и на no-op'е краснеет.
     __setHasAnyThrows?: (v: boolean) => void;
@@ -564,7 +564,7 @@ type TaskSourceHook = {
     __setPr?: (branch: string, pr: PullRequest | null) => void;
     __shArgvCalls?: () => string[];
     // Множественность открытых PR — для реализаций, которые не ходят через gh и потому
-    // не могут смоделировать её подменой ghJson.
+    // не могут смоделировать её подменой forgeJson.
     __setPrs?: (branch: string, prs: PullRequest[]) => void;
     // Текущая голова PR на стороне форжа. Нужен реализациям, закрывающим TOCTOU СВЕРКОЙ
     // головы, а не серверной привязкой `--match-head-commit`: у SourceCraft такого
@@ -573,7 +573,7 @@ type TaskSourceHook = {
     // Форж отвергает авторизацию — для негативного сценария checkAuth.
     __setAuthFails: (v: boolean) => void;
     // #49: форж не отдал голову PR. Отдельный хук нужен реализациям, которые читают её
-    // своим маршрутом (не через ghJson): связать этот отказ с общим флагом чтения значило
+    // своим маршрутом (не через forgeJson): связать этот отказ с общим флагом чтения значило
     // бы проверять не тот метод.
     __setHeadThrows?: (v: boolean) => void;
     // #127: форж не отдал список открытых PR — для реализаций, читающих его своим маршрутом.
@@ -627,14 +627,14 @@ function registerTaskSourceContract(
             const { adapter } = build();
             const hook = adapter as unknown as TaskSourceHook;
             // Все карточки фикстуры ЗАКРЫТЫ (открытых нет) — метод обязан сказать «были».
-            hook.__setGhJson?.((cmd) => (cmd.includes('--state all') ? [{ number: 1 }] : []));
+            hook.__setForgeJson?.((cmd) => (cmd.includes('--state all') ? [{ number: 1 }] : []));
             expect(adapter.hasAnyIssues(MILESTONE)).toBe(true);
         });
 
         it('hasAnyIssues: false для milestone, заведённого без единой задачи', () => {
             const { adapter } = build();
             const hook = adapter as unknown as TaskSourceHook;
-            hook.__setGhJson?.(() => []);
+            hook.__setForgeJson?.(() => []);
             expect(adapter.hasAnyIssues(EMPTY_MILESTONE)).toBe(false);
         });
 
@@ -645,7 +645,7 @@ function registerTaskSourceContract(
         it('listMilestoneLabels отдаёт ИМЕНА меток карточек фазы, включая закрытые', () => {
             const { adapter } = build();
             const hook = adapter as unknown as TaskSourceHook;
-            hook.__setGhJson?.((cmd) =>
+            hook.__setForgeJson?.((cmd) =>
                 cmd.includes('--state all') ? [{ labels: [{ name: 'blocked' }] }] : [],
             );
             expect(adapter.listMilestoneLabels(MILESTONE)).toContain('blocked');
@@ -656,7 +656,7 @@ function registerTaskSourceContract(
             const hook = adapter as unknown as TaskSourceHook;
             hook.__setAllOpenThrows(true);
             hook.__setIssuesThrow?.(true);
-            hook.__setGhJson?.(() => {
+            hook.__setForgeJson?.(() => {
                 throw new Error('gh issue list упал');
             });
             expect(() => adapter.listMilestoneLabels(MILESTONE)).toThrow();
@@ -668,7 +668,7 @@ function registerTaskSourceContract(
         it('listPullRequestComments отдаёт тела и авторов, сводку помечает isSummary', () => {
             const { adapter } = build();
             const hook = adapter as unknown as TaskSourceHook;
-            hook.__setGhJson?.((cmd) => {
+            hook.__setForgeJson?.((cmd) => {
                 if (cmd.includes(`/pulls/${String(PR_NUMBER)}/comments`)) {
                     return [{ body: FINDING, user: { login: 'ok-author' } }];
                 }
@@ -689,7 +689,7 @@ function registerTaskSourceContract(
         it('пустые тела в ленту не попадают — total метрики не разбавляется', () => {
             const { adapter } = build();
             const hook = adapter as unknown as TaskSourceHook;
-            hook.__setGhJson?.(() => [{ body: '   ', user: { login: 'ok-author' } }]);
+            hook.__setForgeJson?.(() => [{ body: '   ', user: { login: 'ok-author' } }]);
             expect(
                 adapter.listPullRequestComments(PR_NUMBER).every((c) => c.body.trim() !== ''),
             ).toBe(true);
@@ -699,7 +699,7 @@ function registerTaskSourceContract(
             const { adapter } = build();
             const hook = adapter as unknown as TaskSourceHook;
             hook.__setCommentsThrow?.(true);
-            hook.__setGhJson?.(() => {
+            hook.__setForgeJson?.(() => {
                 throw new Error('gh api упал');
             });
             // Молчаливая пустая лента дала бы журналу нули: «ревью прошло, находок нет» —
@@ -713,7 +713,7 @@ function registerTaskSourceContract(
         it('listIssueComments отдаёт тела ленты карточки по порядку, метку намерения — как есть', () => {
             const { adapter } = build();
             const hook = adapter as unknown as TaskSourceHook;
-            hook.__setGhJson?.((cmd) =>
+            hook.__setForgeJson?.((cmd) =>
                 cmd.includes(`/issues/${String(ISSUE_WITH_NOTE)}/comments`)
                     ? [
                           { body: 'первый', user: { login: 'ok-author' } },
@@ -730,7 +730,7 @@ function registerTaskSourceContract(
             const { adapter } = build();
             const hook = adapter as unknown as TaskSourceHook;
             hook.__setCommentsThrow?.(true);
-            hook.__setGhJson?.(() => {
+            hook.__setForgeJson?.(() => {
                 throw new Error('gh api упал');
             });
             // Пустая лента вместо отказа читалась бы сверкой как «эффект не лёг» — и
@@ -744,7 +744,7 @@ function registerTaskSourceContract(
         it('commentOnPullRequest доносит тело и якорь до форжа', () => {
             const { adapter } = build();
             const hook = adapter as unknown as TaskSourceHook;
-            hook.__setGhJson?.(() => ({ headRefOid: SHA }));
+            hook.__setForgeJson?.(() => ({ headRefOid: SHA }));
             adapter.commentOnPullRequest(PR_NUMBER, {
                 body: FINDING,
                 anchor: { path: 'src/a.ts', line: 42 },
@@ -762,7 +762,7 @@ function registerTaskSourceContract(
             const hook = adapter as unknown as TaskSourceHook;
             hook.__setCommentsThrow?.(true);
             hook.__setMutationFails(true);
-            hook.__setGhJson?.(() => {
+            hook.__setForgeJson?.(() => {
                 throw new Error('gh упал');
             });
             // Проглоченный отказ означал бы «замечание ревью просто исчезло»: и дефект
@@ -777,7 +777,11 @@ function registerTaskSourceContract(
         it('getIssue отдаёт заголовок и тело карточки', () => {
             const { adapter } = build();
             const hook = adapter as unknown as TaskSourceHook;
-            hook.__setGhJson?.(() => ({ number: 7, title: 'задача фазы', body: 'что и почему' }));
+            hook.__setForgeJson?.(() => ({
+                number: 7,
+                title: 'задача фазы',
+                body: 'что и почему',
+            }));
             const issue = adapter.getIssue(7);
             expect(issue.title).toBe('задача фазы');
             expect(issue.body).toContain('что и почему');
@@ -787,7 +791,7 @@ function registerTaskSourceContract(
             const { adapter } = build();
             const hook = adapter as unknown as TaskSourceHook;
             hook.__setIssuesThrow?.(true);
-            hook.__setGhJson?.(() => ({}));
+            hook.__setForgeJson?.(() => ({}));
             expect(() => adapter.getIssue(7)).toThrow();
         });
 
@@ -822,7 +826,7 @@ function registerTaskSourceContract(
             // Свой флаг там, где он есть; где чтения делит один транспорт — его отказ.
             hook.__setHasAnyThrows?.(true);
             hook.__setIssuesThrow?.(true);
-            hook.__setGhJson?.(() => {
+            hook.__setForgeJson?.(() => {
                 throw new Error('gh issue list упал');
             });
             // Молчаливое false здесь означало бы «фаза не начата» на сетевом чихе —
@@ -844,7 +848,7 @@ function registerTaskSourceContract(
 
         it('isMilestoneOpen: пустая открытая веха — true, закрытая — false', () => {
             const { adapter } = build();
-            (adapter as unknown as TaskSourceHook).__setGhJson?.(ghMilestones);
+            (adapter as unknown as TaskSourceHook).__setForgeJson?.(ghMilestones);
             expect(adapter.isMilestoneOpen(MILESTONE)).toBe(true);
             expect(adapter.isMilestoneOpen(EMPTY_MILESTONE)).toBe(true);
             expect(adapter.isMilestoneOpen(CLOSED_MILESTONE)).toBe(false);
@@ -854,7 +858,7 @@ function registerTaskSourceContract(
             // И `true`, и `false` здесь были бы выдумкой: первое возвращает #65, второе
             // выдаёт опечатку в конфиге за разобранный том.
             const { adapter } = build();
-            (adapter as unknown as TaskSourceHook).__setGhJson?.(ghMilestones);
+            (adapter as unknown as TaskSourceHook).__setForgeJson?.(ghMilestones);
             expect(() => adapter.isMilestoneOpen('Такой вехи нет')).toThrow();
         });
 
@@ -862,7 +866,7 @@ function registerTaskSourceContract(
             const { adapter } = build();
             const hook = adapter as unknown as TaskSourceHook;
             hook.__setMilestonesThrow?.(true);
-            hook.__setGhJson?.(() => {
+            hook.__setForgeJson?.(() => {
                 throw new Error('gh api упал');
             });
             expect(() => adapter.isMilestoneOpen(MILESTONE)).toThrow();
@@ -975,8 +979,8 @@ function registerTaskSourceContract(
         it('findOpenPullRequest: PR найден → возвращает его', () => {
             const { adapter } = build();
             const hook = adapter as unknown as TaskSourceHook;
-            if (hook.__setGhJson) {
-                hook.__setGhJson((cmd) => {
+            if (hook.__setForgeJson) {
+                hook.__setForgeJson((cmd) => {
                     if (cmd.includes('gh pr list --head')) return [{ number: 9, labels: [] }];
                     throw new Error(`unexpected: ${cmd}`);
                 });
@@ -990,7 +994,7 @@ function registerTaskSourceContract(
             const { adapter } = build();
             // #127: до карточки GitHub-флейвор был здесь зелёным на ПРОГЛОЧЕННОМ отказе
             // неподменённого чтения — «PR нет» доказывал сбой. Форж обязан ответить пустым.
-            (adapter as unknown as TaskSourceHook).__setGhJson?.((cmd) => {
+            (adapter as unknown as TaskSourceHook).__setForgeJson?.((cmd) => {
                 if (cmd.includes('gh pr list --head')) return [];
                 throw new Error(`unexpected: ${cmd}`);
             });
@@ -1004,8 +1008,8 @@ function registerTaskSourceContract(
                 { number: 9, labels: [] },
                 { number: 10, labels: [] },
             ];
-            if (hook.__setGhJson) {
-                hook.__setGhJson((cmd) => {
+            if (hook.__setForgeJson) {
+                hook.__setForgeJson((cmd) => {
                     if (cmd.includes('gh pr list --head')) return two;
                     throw new Error(`unexpected: ${cmd}`);
                 });
@@ -1022,8 +1026,8 @@ function registerTaskSourceContract(
         it('НЕГАТИВНЫЙ: findOpenPullRequest — форж не ответил → бросает, а не null', () => {
             const { adapter } = build();
             const hook = adapter as unknown as TaskSourceHook;
-            if (hook.__setGhJson) {
-                hook.__setGhJson(() => {
+            if (hook.__setForgeJson) {
+                hook.__setForgeJson(() => {
                     throw new Error('форж недоступен');
                 });
             } else if (hook.__setPullsThrow) {
@@ -1041,7 +1045,7 @@ function registerTaskSourceContract(
         it('pullRequestHeadSha отдаёт голову PR', () => {
             const { adapter } = build();
             const hook = adapter as unknown as TaskSourceHook;
-            hook.__setGhJson?.((cmd) => {
+            hook.__setForgeJson?.((cmd) => {
                 if (cmd.includes('gh pr view')) return { headRefOid: SHA };
                 throw new Error(`unexpected: ${cmd}`);
             });
@@ -1054,8 +1058,8 @@ function registerTaskSourceContract(
         it('НЕГАТИВНЫЙ: pullRequestHeadSha fail-closed — форж недоступен → бросает', () => {
             const { adapter } = build();
             const hook = adapter as unknown as TaskSourceHook;
-            if (hook.__setGhJson) {
-                hook.__setGhJson(() => {
+            if (hook.__setForgeJson) {
+                hook.__setForgeJson(() => {
                     throw new Error('форж недоступен');
                 });
             } else if (hook.__setHeadThrows) {
@@ -1072,7 +1076,7 @@ function registerTaskSourceContract(
         it('НЕГАТИВНЫЙ: форж ответил без головы → бросает, а не отдаёт пустую строку', () => {
             const { adapter } = build();
             const hook = adapter as unknown as TaskSourceHook;
-            if (hook.__setGhJson) hook.__setGhJson(() => ({}));
+            if (hook.__setForgeJson) hook.__setForgeJson(() => ({}));
             else if (hook.__setActualHead) hook.__setActualHead('');
             else throw new Error(`${label}: флейвор не дал ручку «ответ без головы»`);
             expect(() => adapter.pullRequestHeadSha(PR_NUMBER)).toThrow();
@@ -1116,7 +1120,7 @@ function registerTaskSourceContract(
         it('addBlockedLabel/removeBlockedLabel/closeMilestone/syncBoard не бросают (fail-open)', () => {
             const { adapter } = build();
             const hook = adapter as unknown as TaskSourceHook;
-            hook.__setGhJson?.((cmd) => {
+            hook.__setForgeJson?.((cmd) => {
                 if (cmd.includes('milestones?state=open')) return [];
                 throw new Error(`unexpected: ${cmd}`);
             });
@@ -1131,7 +1135,7 @@ function registerTaskSourceContract(
 // Третий флейвор — вторая НАСТОЯЩАЯ реализация шва, и в этом его ценность: до сих пор
 // контракт держали фейк и одна боевая логика, а «интерфейс» с единственной реализацией
 // всегда описывает эту реализацию, а не контракт. Здесь подменён только транспорт (одна
-// функция `api` вместо `ghJson`/`shArgv`) — все поведенческие ассерты те же.
+// функция `api` вместо `forgeJson`/`shArgv`) — все поведенческие ассерты те же.
 function buildSourcecraftTaskSource(): { adapter: TaskSourceAdapter; calls: string[] } {
     const calls: string[] = [];
     // Ответы площадки в её форме: карточка — строковый `slug`, автор — `author.slug`.

@@ -175,7 +175,7 @@ describe('ветка фазы отстала от main — настоящий gi
                 throw new Error(msg);
             },
             getConfig: () => ({ gate: { checks: [['lint', 'npm run lint']] } }),
-            ghJson: () => {
+            forgeJson: () => {
                 throw new Error('форж не нужен');
             },
             prHeadSha: () => w.branchHead(),

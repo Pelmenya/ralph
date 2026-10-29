@@ -283,7 +283,7 @@ describe('sendTelegramMessage — ретраи доставки (#224)', () => {
         expect(result).toBe(true);
         expect(execFn).toHaveBeenCalledTimes(3);
         expect(sleepFn).toHaveBeenCalledTimes(2);
-        // Нарастающая пауза: retryBaseMs × номер попытки (образец — ghJson в ralph.js).
+        // Нарастающая пауза: retryBaseMs × номер попытки (образец — forgeJson в ralph.js).
         expect(sleepFn.mock.calls[0][0]).toBe(5000);
         expect(sleepFn.mock.calls[1][0]).toBe(10000);
     });

@@ -22,8 +22,8 @@ function make(over: Partial<Parameters<typeof createGithubIssueCommands>[0]> = {
         shArgv: () => {
             throw new Error('shArgv не подменён в тесте');
         },
-        ghJson: () => {
-            throw new Error('ghJson не подменён в тесте');
+        forgeJson: () => {
+            throw new Error('forgeJson не подменён в тесте');
         },
         shq,
         log: () => {},
@@ -61,9 +61,9 @@ describe('checkAuth — форж авторизован', () => {
 
 describe('openIssues — рабочая очередь фазы', () => {
     it('имя вехи уходит через shq, предел выборки задан явно', () => {
-        const ghJsonFn = vi.fn((_cmd: string) => [] as never);
-        make().openIssues("Фаза 'X'", { ghJsonFn });
-        const cmd = ghJsonFn.mock.calls[0][0];
+        const forgeJsonFn = vi.fn((_cmd: string) => [] as never);
+        make().openIssues("Фаза 'X'", { forgeJsonFn });
+        const cmd = forgeJsonFn.mock.calls[0][0];
         expect(cmd).toContain(shq("Фаза 'X'"));
         expect(cmd).toContain('--state open');
         // #19: без явного предела форж молча отдал бы первые 30 карточек, и «полный
@@ -72,33 +72,35 @@ describe('openIssues — рабочая очередь фазы', () => {
     });
 
     it('отсеивает blocked и чужих авторов, сортирует по возрастанию номера', () => {
-        const ghJsonFn = vi.fn(() => [
+        const forgeJsonFn = vi.fn(() => [
             issue(9),
             issue(3),
             issue(5, { labels: [{ name: 'blocked' }] }),
             issue(7, { author: { login: 'stranger' } }),
         ]);
-        const out = make().openIssues('Фаза X', { ghJsonFn } as never);
+        const out = make().openIssues('Фаза X', { forgeJsonFn } as never);
         expect(out.map((i) => i.number)).toEqual([3, 9]);
     });
 
     it('`human` здесь НЕ фильтруется — фильтр живёт в ядре поверх шва (#133)', () => {
-        const ghJsonFn = vi.fn(() => [issue(4, { labels: [{ name: 'human' }] })]);
-        const out = make().openIssues('Фаза X', { ghJsonFn } as never);
+        const forgeJsonFn = vi.fn(() => [issue(4, { labels: [{ name: 'human' }] })]);
+        const out = make().openIssues('Фаза X', { forgeJsonFn } as never);
         expect(out.map((i) => i.number)).toEqual([4]);
     });
 
     it('отказ форжа уходит в fail с диагнозом, а не в пустую очередь', () => {
-        const ghJsonFn = vi.fn(() => {
+        const forgeJsonFn = vi.fn(() => {
             throw new Error('сеть легла');
         });
-        expect(() => make().openIssues('Фаза X', { ghJsonFn })).toThrow(/сеть легла/);
+        expect(() => make().openIssues('Фаза X', { forgeJsonFn })).toThrow(/сеть легла/);
     });
 
     it('ответ, упёршийся в предел, — отказ, а не «столько и было»', () => {
         const many = Array.from({ length: 200 }, (_, i) => issue(i + 1));
-        const ghJsonFn = vi.fn(() => many);
-        expect(() => make().openIssues('Фаза X', { ghJsonFn } as never)).toThrow(/предела выборки/);
+        const forgeJsonFn = vi.fn(() => many);
+        expect(() => make().openIssues('Фаза X', { forgeJsonFn } as never)).toThrow(
+            /предела выборки/,
+        );
     });
 
     it('#72-ревью: урезание диагностируется СВОИМ текстом, а не «gh упал / проверь auth»', () => {
@@ -110,7 +112,7 @@ describe('openIssues — рабочая очередь фазы', () => {
         const many = Array.from({ length: 200 }, (_, i) => issue(i + 1));
         let caught = '';
         try {
-            make().openIssues('Фаза X', { ghJsonFn: (() => many) as never });
+            make().openIssues('Фаза X', { forgeJsonFn: (() => many) as never });
         } catch (e) {
             caught = (e as Error).message;
         }
@@ -121,46 +123,46 @@ describe('openIssues — рабочая очередь фазы', () => {
     it('список доверенных авторов читается ЛЕНИВО — конфиг заполняется позже сборки', () => {
         let allow: string[] = [];
         const cmds = make({ getAuthorAllowlist: () => allow });
-        const ghJsonFn = vi.fn(() => [issue(1)]);
-        expect(cmds.openIssues('Фаза X', { ghJsonFn } as never)).toEqual([]);
+        const forgeJsonFn = vi.fn(() => [issue(1)]);
+        expect(cmds.openIssues('Фаза X', { forgeJsonFn } as never)).toEqual([]);
         allow = ['owner'];
-        expect(cmds.openIssues('Фаза X', { ghJsonFn } as never)).toHaveLength(1);
+        expect(cmds.openIssues('Фаза X', { forgeJsonFn } as never)).toHaveLength(1);
     });
 });
 
 describe('allOpenIssues / hasAnyIssues / milestoneLabels', () => {
     it('allOpenIssues не фильтрует ничего — на его пустоте стоит разрешение мерджа (C2)', () => {
-        const ghJsonFn = vi.fn(() => [
+        const forgeJsonFn = vi.fn(() => [
             issue(5, { labels: [{ name: 'blocked' }] }),
             issue(7, { author: { login: 'stranger' } }),
         ]);
-        expect(make().allOpenIssues('Фаза X', { ghJsonFn } as never)).toHaveLength(2);
+        expect(make().allOpenIssues('Фаза X', { forgeJsonFn } as never)).toHaveLength(2);
     });
 
     it('allOpenIssues: отказ форжа БРОСАЕТ — вызывающий обязан остановиться', () => {
-        const ghJsonFn = vi.fn(() => {
+        const forgeJsonFn = vi.fn(() => {
             throw new Error('форж лёг');
         });
-        expect(() => make().allOpenIssues('Фаза X', { ghJsonFn })).toThrow(/форж лёг/);
+        expect(() => make().allOpenIssues('Фаза X', { forgeJsonFn })).toThrow(/форж лёг/);
     });
 
     it('hasAnyIssues смотрит карточки ЛЮБОГО статуса (C5) и отвечает булевым', () => {
-        const ghJsonFn = vi.fn((_cmd: string) => [{ number: 1 }]);
-        expect(make().hasAnyIssues('Фаза X', { ghJsonFn } as never)).toBe(true);
-        expect(ghJsonFn.mock.calls[0][0]).toContain('--state all');
+        const forgeJsonFn = vi.fn((_cmd: string) => [{ number: 1 }]);
+        expect(make().hasAnyIssues('Фаза X', { forgeJsonFn } as never)).toBe(true);
+        expect(forgeJsonFn.mock.calls[0][0]).toContain('--state all');
     });
 
     it('hasAnyIssues: пустой ответ = фазу не начинали', () => {
-        expect(make().hasAnyIssues('Фаза X', { ghJsonFn: () => [] as never })).toBe(false);
+        expect(make().hasAnyIssues('Фаза X', { forgeJsonFn: () => [] as never })).toBe(false);
     });
 
     it('milestoneLabels отдаёт плоский список ИМЁН с повторами', () => {
-        const ghJsonFn = vi.fn(() => [
+        const forgeJsonFn = vi.fn(() => [
             { labels: [{ name: 'complexity:high' }, { name: '' }] },
             { labels: [{ name: 'complexity:high' }] },
             {},
         ]);
-        expect(make().milestoneLabels('Фаза X', { ghJsonFn } as never)).toEqual([
+        expect(make().milestoneLabels('Фаза X', { forgeJsonFn } as never)).toEqual([
             'complexity:high',
             'complexity:high',
         ]);
@@ -168,26 +170,26 @@ describe('allOpenIssues / hasAnyIssues / milestoneLabels', () => {
 
     it('milestoneLabels: урезанный ответ — отказ, а не «сложных задач нет» (#37)', () => {
         const many = Array.from({ length: 200 }, () => ({ labels: [] }));
-        expect(() => make().milestoneLabels('Фаза X', { ghJsonFn: () => many as never })).toThrow(
-            /предела выборки/,
-        );
+        expect(() =>
+            make().milestoneLabels('Фаза X', { forgeJsonFn: () => many as never }),
+        ).toThrow(/предела выборки/);
     });
 });
 
 describe('issueDetails — тело карточки для кодер-сессии (#50)', () => {
     it('читает заголовок и тело по номеру', () => {
-        const ghJsonFn = vi.fn((_cmd: string) => ({ title: 'Заголовок', body: 'Тело' }));
-        expect(make().issueDetails(7, { ghJsonFn } as never)).toEqual({
+        const forgeJsonFn = vi.fn((_cmd: string) => ({ title: 'Заголовок', body: 'Тело' }));
+        expect(make().issueDetails(7, { forgeJsonFn } as never)).toEqual({
             number: 7,
             title: 'Заголовок',
             body: 'Тело',
         });
-        expect(ghJsonFn.mock.calls[0][0]).toContain('gh issue view 7');
+        expect(forgeJsonFn.mock.calls[0][0]).toContain('gh issue view 7');
     });
 
     it('#43 статус карточки: OPEN/CLOSED → open, незнакомый — поле не ставится', () => {
         const read = (state: unknown) =>
-            make().issueDetails(7, { ghJsonFn: () => ({ title: 'т', state }) as never });
+            make().issueDetails(7, { forgeJsonFn: () => ({ title: 'т', state }) as never });
         expect(read('OPEN').open).toBe(true);
         expect(read('CLOSED').open).toBe(false);
         expect('open' in read(undefined)).toBe(false);
@@ -195,14 +197,14 @@ describe('issueDetails — тело карточки для кодер-сесс�
     });
 
     it('пустой заголовок — ОТКАЗ: сессия без тела задачи выдумает себе работу', () => {
-        expect(() => make().issueDetails(7, { ghJsonFn: () => ({}) as never })).toThrow(
+        expect(() => make().issueDetails(7, { forgeJsonFn: () => ({}) as never })).toThrow(
             /не прочиталась/,
         );
     });
 
     it('пустое тело при живом заголовке — законно, отказом не считается', () => {
-        const ghJsonFn = () => ({ title: 'Есть' }) as never;
-        expect(make().issueDetails(7, { ghJsonFn }).body).toBe('');
+        const forgeJsonFn = () => ({ title: 'Есть' }) as never;
+        expect(make().issueDetails(7, { forgeJsonFn }).body).toBe('');
     });
 });
 
@@ -241,39 +243,39 @@ describe('намерения кодер-сессии: мутации через 
 
 describe('issueComments — лента карточки для сверки намерения (#125)', () => {
     it('читает issues/N/comments с --paginate и отдаёт тела по порядку', () => {
-        const ghJsonFn = vi.fn(() => [
+        const forgeJsonFn = vi.fn(() => [
             { body: 'первый', user: { login: 'dev' } },
             { body: 'с меткой <!-- ralph-intent:x -->' },
             { user: { login: 'dev' } },
         ]);
-        expect(make().issueComments(7, { ghJsonFn } as never)).toEqual([
+        expect(make().issueComments(7, { forgeJsonFn } as never)).toEqual([
             'первый',
             'с меткой <!-- ralph-intent:x -->',
             '',
         ]);
-        expect(ghJsonFn).toHaveBeenCalledWith(
+        expect(forgeJsonFn).toHaveBeenCalledWith(
             'gh api repos/{owner}/{repo}/issues/7/comments --paginate',
         );
     });
 
     it('НЕГАТИВНЫЙ: ответ не массивом — отказ, а не пустая лента', () => {
-        const ghJsonFn = () => ({ message: 'Not Found' }) as never;
-        expect(() => make().issueComments(7, { ghJsonFn })).toThrow(/не массив/);
+        const forgeJsonFn = () => ({ message: 'Not Found' }) as never;
+        expect(() => make().issueComments(7, { forgeJsonFn })).toThrow(/не массив/);
     });
 
     it('НЕГАТИВНЫЙ: сбой чтения долетает до вызывающего', () => {
-        const ghJsonFn = () => {
+        const forgeJsonFn = () => {
             throw new Error('gh: HTTP 502');
         };
-        expect(() => make().issueComments(7, { ghJsonFn })).toThrow(/502/);
+        expect(() => make().issueComments(7, { forgeJsonFn })).toThrow(/502/);
     });
 });
 
 describe('closeMilestoneByTitle — косметика после сдачи, fail-open', () => {
     it('находит открытую веху по заголовку и закрывает её через argv', () => {
-        const ghJsonFn = vi.fn(() => [{ number: 4, title: 'Фаза X' }]);
+        const forgeJsonFn = vi.fn(() => [{ number: 4, title: 'Фаза X' }]);
         const runArgvFn = vi.fn(() => '');
-        make().closeMilestoneByTitle('Фаза X', { ghJsonFn, runArgvFn } as never);
+        make().closeMilestoneByTitle('Фаза X', { forgeJsonFn, runArgvFn } as never);
         expect(runArgvFn).toHaveBeenCalledWith('gh', [
             'api',
             '-X',
@@ -287,7 +289,7 @@ describe('closeMilestoneByTitle — косметика после сдачи, fa
     it('вехи с таким заголовком нет — тихий выход, ничего не мутируем', () => {
         const runArgvFn = vi.fn(() => '');
         make().closeMilestoneByTitle('Чужая', {
-            ghJsonFn: (() => [{ number: 4, title: 'Фаза X' }]) as never,
+            forgeJsonFn: (() => [{ number: 4, title: 'Фаза X' }]) as never,
             runArgvFn,
         });
         expect(runArgvFn).not.toHaveBeenCalled();
@@ -297,7 +299,7 @@ describe('closeMilestoneByTitle — косметика после сдачи, fa
     it('нецелый номер вехи из ответа форжа в argv не уходит', () => {
         const runArgvFn = vi.fn(() => '');
         make().closeMilestoneByTitle('Фаза X', {
-            ghJsonFn: (() => [{ number: '4 --flag', title: 'Фаза X' }]) as never,
+            forgeJsonFn: (() => [{ number: '4 --flag', title: 'Фаза X' }]) as never,
             runArgvFn,
         });
         expect(runArgvFn).not.toHaveBeenCalled();
@@ -307,7 +309,7 @@ describe('closeMilestoneByTitle — косметика после сдачи, fa
         const logFn = vi.fn();
         expect(() =>
             make().closeMilestoneByTitle('Фаза X', {
-                ghJsonFn: (() => {
+                forgeJsonFn: (() => {
                     throw new Error('форж лёг');
                 }) as never,
                 logFn,

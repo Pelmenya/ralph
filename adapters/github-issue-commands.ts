@@ -22,14 +22,14 @@ import type { Issue, IssueDetails } from './adapters.ts';
 type ExecOpts = { env?: NodeJS.ProcessEnv };
 type ShFn = (cmd: string, opts?: ExecOpts) => string;
 type ShArgvFn = (file: string, args: string[], opts?: ExecOpts) => string;
-type GhJsonFn = <T = unknown>(cmd: string, attempts?: number) => T;
+type ForgeJsonFn = <T = unknown>(cmd: string, attempts?: number) => T;
 type LogFn = (msg: string) => void;
 type FailFn = (msg: string) => never;
 
 export type GithubIssueCommandsEnv = {
     sh: ShFn;
     shArgv: ShArgvFn;
-    ghJson: GhJsonFn;
+    forgeJson: ForgeJsonFn;
     shq: (value: unknown) => string;
     log: LogFn;
     fail: FailFn;
@@ -78,7 +78,7 @@ function assertNotTruncated(count: number, milestone: string, what: string): voi
  * зовут эти функции через ре-экспорт оркестратора и остаются зелёными без правок ассертов.
  */
 export function createGithubIssueCommands(env: GithubIssueCommandsEnv) {
-    const { sh, shArgv, ghJson, shq, log, fail, getAuthorAllowlist, getProjectSyncScript } = env;
+    const { sh, shArgv, forgeJson, shq, log, fail, getAuthorAllowlist, getProjectSyncScript } = env;
 
     // Единственная форма «форж авторизован» у GitHub CLI. Раньше этот вызов стоял прямо в
     // preflight ядра — то есть петля требовала `gh` даже там, где форжем выбран не GitHub
@@ -103,11 +103,14 @@ export function createGithubIssueCommands(env: GithubIssueCommandsEnv) {
      */
     function openIssues(
         milestone: string,
-        { ghJsonFn = ghJson, failFn = fail }: { ghJsonFn?: GhJsonFn; failFn?: FailFn } = {},
+        {
+            forgeJsonFn = forgeJson,
+            failFn = fail,
+        }: { forgeJsonFn?: ForgeJsonFn; failFn?: FailFn } = {},
     ): Issue[] {
         let raw: Issue[];
         try {
-            raw = ghJsonFn<Issue[]>(
+            raw = forgeJsonFn<Issue[]>(
                 `gh issue list --milestone ${shq(milestone)} --state open --json number,title,labels,author,createdAt --limit ${String(ISSUE_LIST_LIMIT)}`,
             );
         } catch (e) {
@@ -147,10 +150,10 @@ export function createGithubIssueCommands(env: GithubIssueCommandsEnv) {
     // исключение, которое вызывающий обязан перехватить.
     function allOpenIssues(
         milestone: string,
-        { ghJsonFn = ghJson }: { ghJsonFn?: GhJsonFn } = {},
+        { forgeJsonFn = forgeJson }: { forgeJsonFn?: ForgeJsonFn } = {},
     ): Issue[] {
         // #133: без `excludeHumanIssues` — фильтр стоит в ядре поверх шва, см. openIssues.
-        const issues = ghJsonFn<Issue[]>(
+        const issues = forgeJsonFn<Issue[]>(
             `gh issue list --milestone ${shq(milestone)} --state open --json number,title,labels,author,createdAt --limit ${String(ISSUE_LIST_LIMIT)}`,
         );
         // #19: именно на пустоте ЭТОГО списка стоит разрешение мерджа (C2). Урезанный
@@ -168,10 +171,10 @@ export function createGithubIssueCommands(env: GithubIssueCommandsEnv) {
     // gh НЕ глушим, вызывающий обязан остановиться.
     function hasAnyIssues(
         milestone: string,
-        { ghJsonFn = ghJson }: { ghJsonFn?: GhJsonFn } = {},
+        { forgeJsonFn = forgeJson }: { forgeJsonFn?: ForgeJsonFn } = {},
     ): boolean {
         return (
-            ghJsonFn<Array<{ number: number }>>(
+            forgeJsonFn<Array<{ number: number }>>(
                 `gh issue list --milestone ${shq(milestone)} --state all --limit 1 --json number`,
             ).length > 0
         );
@@ -183,9 +186,9 @@ export function createGithubIssueCommands(env: GithubIssueCommandsEnv) {
     // отсутствующей. Fail-closed: ошибку gh не глушим.
     function milestoneOpen(
         title: string,
-        { ghJsonFn = ghJson }: { ghJsonFn?: GhJsonFn } = {},
+        { forgeJsonFn = forgeJson }: { forgeJsonFn?: ForgeJsonFn } = {},
     ): boolean {
-        const all = ghJsonFn<unknown>(
+        const all = forgeJsonFn<unknown>(
             'gh api --paginate "repos/{owner}/{repo}/milestones?state=all&per_page=100"',
         );
         if (!Array.isArray(all)) throw new Error('gh api milestones вернул не массив');
@@ -205,9 +208,9 @@ export function createGithubIssueCommands(env: GithubIssueCommandsEnv) {
     // видно» вызывающий трактует как зону риска, и подменять её пустым списком нельзя.
     function milestoneLabels(
         milestone: string,
-        { ghJsonFn = ghJson }: { ghJsonFn?: GhJsonFn } = {},
+        { forgeJsonFn = forgeJson }: { forgeJsonFn?: ForgeJsonFn } = {},
     ): string[] {
-        const issues = ghJsonFn<Array<{ labels?: Array<{ name?: string }> }>>(
+        const issues = forgeJsonFn<Array<{ labels?: Array<{ name?: string }> }>>(
             `gh issue list --milestone ${shq(milestone)} --state all --json labels --limit ${String(ISSUE_LIST_LIMIT)}`,
         );
         // Ответ, упёршийся в предел, — это «часть карточек мы не видели», и отдать его как
@@ -224,9 +227,9 @@ export function createGithubIssueCommands(env: GithubIssueCommandsEnv) {
     // HTTP-доступа, и требование «прочитай issue по номеру» было верно только на GitHub.
     function issueDetails(
         number: number,
-        { ghJsonFn = ghJson }: { ghJsonFn?: GhJsonFn } = {},
+        { forgeJsonFn = forgeJson }: { forgeJsonFn?: ForgeJsonFn } = {},
     ): IssueDetails {
-        const raw = ghJsonFn<{ title?: unknown; body?: unknown; state?: unknown }>(
+        const raw = forgeJsonFn<{ title?: unknown; body?: unknown; state?: unknown }>(
             `gh issue view ${String(number)} --json number,title,body,state`,
         );
         const title = String(raw.title ?? '').trim();
@@ -288,10 +291,10 @@ export function createGithubIssueCommands(env: GithubIssueCommandsEnv) {
     // как «не лёг» и опубликовала бы комментарий вторым.
     function issueComments(
         issue: number,
-        { ghJsonFn = ghJson }: { ghJsonFn?: GhJsonFn } = {},
+        { forgeJsonFn = forgeJson }: { forgeJsonFn?: ForgeJsonFn } = {},
     ): string[] {
         const endpoint = `repos/{owner}/{repo}/issues/${String(issue)}/comments`;
-        const items = ghJsonFn<unknown>(`gh api ${endpoint} --paginate`);
+        const items = forgeJsonFn<unknown>(`gh api ${endpoint} --paginate`);
         if (!Array.isArray(items)) {
             throw new Error(
                 `gh api ${endpoint} вернул не массив — формат ответа неожиданный ` +
@@ -339,13 +342,13 @@ export function createGithubIssueCommands(env: GithubIssueCommandsEnv) {
     function closeMilestoneByTitle(
         title: string,
         {
-            ghJsonFn = ghJson,
+            forgeJsonFn = forgeJson,
             runArgvFn = shArgv,
             logFn = log,
-        }: { ghJsonFn?: GhJsonFn; runArgvFn?: ShArgvFn; logFn?: LogFn } = {},
+        }: { forgeJsonFn?: ForgeJsonFn; runArgvFn?: ShArgvFn; logFn?: LogFn } = {},
     ): void {
         try {
-            const open = ghJsonFn<Array<{ number?: unknown; title?: string }>>(
+            const open = forgeJsonFn<Array<{ number?: unknown; title?: string }>>(
                 'gh api "repos/{owner}/{repo}/milestones?state=open"',
             );
             const ms = open.find((m) => m.title === title);

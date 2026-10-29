@@ -10,7 +10,7 @@
 //   ветки записи и режим наблюдателя проверяет `exec-sinks.test.ts` (задача 128);
 // - sh/shArgv — шелл-строка (только чтения, #133) и argv без шелла (мутации, #193/#252),
 //   обе под предохранителем #138;
-// - ghJson — gh-чтения с ретраями и backoff (M3);
+// - forgeJson — чтения форжа с ретраями и backoff (M3);
 // - loadJson — чтение JSON с фолбэком (общий помощник конфига/стейта);
 // - saveSessionOutput — запись stdout/stderr упавшей кодер-сессии в файл (#390),
 //   секреты редактируются тем же приёмом, что TG-токен в telegram-notifier.ts.
@@ -19,7 +19,7 @@
 // синтаксис — только аннотации типов, ни enum, ни namespace, ни parameter properties).
 //
 // Фабрика, а не standalone-экспорты: sh/shArgv обязаны звать ОБЩИЙ guardSideEffect
-// ralph.js (журнал #138 един на все модули), log — знать текущий logTarget, ghJson —
+// ralph.js (журнал #138 един на все модули), log — знать текущий logTarget, forgeJson —
 // логировать ретраи тем же log. Фабрика захватывает этот контекст один раз; возвращённые
 // функции — те же боевые дефолты-коллабораторы, что раньше жили module-level в ralph.js.
 
@@ -237,7 +237,7 @@ export function createExec(env: ExecEnv) {
     // назвать её чужим именем значило соврать оператору на площадке, где этого CLI нет, —
     // тот же класс, что сторожит барьер чистоты ядра. Прежняя формулировка («gh-чтение»)
     // мимо него и проходила: дефис в хвосте гасил проверку словом.
-    function ghJson<T = unknown>(cmd: string, attempts = 3): T {
+    function forgeJson<T = unknown>(cmd: string, attempts = 3): T {
         let lastErr: unknown;
         for (let i = 1; i <= attempts; i++) {
             try {
@@ -289,7 +289,7 @@ export function createExec(env: ExecEnv) {
         setSessionLogsKeep,
         sh,
         shArgv,
-        ghJson,
+        forgeJson,
         saveSessionOutput,
     };
 }
