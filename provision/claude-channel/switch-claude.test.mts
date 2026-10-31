@@ -253,6 +253,28 @@ describe('switch-claude helper', () => {
         expect(settings(home).env.no_proxy).toBe('localhost,github.com');
     });
 
+    it('единственное исключение Anthropic в шелле перекрывается явным пустым NO_PROXY', () => {
+        const home = homeWith();
+        const result = run(home, ['official'], {
+            HTTPS_PROXY: 'http://127.0.0.1:8118',
+            NO_PROXY: 'api.anthropic.com:443',
+        });
+
+        expect(result.status, result.stderr).toBe(0);
+        expect(settings(home).env).toMatchObject({ NO_PROXY: '', no_proxy: '' });
+    });
+
+    it('отдельный HTTP_PROXY не затирается прокси official', () => {
+        const home = homeWith({
+            env: { HTTPS_PROXY: 'http://10.0.0.1:3128', HTTP_PROXY: 'http://10.0.0.2:8080' },
+        });
+        expect(run(home, ['official']).status).toBe(0);
+        expect(settings(home).env).toMatchObject({
+            HTTPS_PROXY: 'http://10.0.0.1:3128',
+            HTTP_PROXY: 'http://10.0.0.2:8080',
+        });
+    });
+
     it('прокси, записанный только в settings, переживает переключения', () => {
         const home = homeWith({ env: { HTTPS_PROXY: 'http://10.0.0.1:3128' } });
         expect(run(home, ['kimi'], { KIMI_CODE_API_KEY: 'test-kimi-key' }).status).toBe(0);
@@ -308,8 +330,15 @@ describe('switch-claude helper', () => {
         expect(busy.stderr).toContain('another switch is running');
         expect(readFileSync(join(home, '.claude', 'settings.json'), 'utf8')).toBe(before);
 
+        // Живой владелец (этот же процесс тестов) — замок не снимается, как бы стар он ни был.
+        writeFileSync(lock, `${process.pid}:0:alive`);
         const old = new Date(Date.now() - 60_000);
         utimesSync(lock, old, old);
+        expect(run(home, ['official'], { CLAUDE_CHANNEL_LOCK_WAIT_MS: '100' }).status).toBe(1);
+        expect(readFileSync(lock, 'utf8')).toBe(`${process.pid}:0:alive`);
+
+        // Владелец мёртв — замок снимается, свой после работы удаляется.
+        writeFileSync(lock, '2147483646:0:dead');
         expect(run(home, ['official'], { CLAUDE_CHANNEL_LOCK_WAIT_MS: '100' }).status).toBe(0);
         expect(existsSync(lock)).toBe(false);
     });

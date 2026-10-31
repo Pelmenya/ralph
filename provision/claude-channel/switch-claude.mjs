@@ -60,6 +60,11 @@ function requiredValue(get, name) {
 // проверяет egress по стороннему адресу и такой обход не заметит.
 const ANTHROPIC_HOSTS = /^(\*|(.*\.)?anthropic\.com|(.*\.)?claude\.ai)$/;
 
+/** Хост записи NO_PROXY без ведущей точки и порта: `.anthropic.com`, `api.anthropic.com:443`. */
+function bareHost(item) {
+    return item.toLowerCase().replace(/^\./, '').replace(/:\d+$/, '');
+}
+
 /** NO_PROXY поверх базового списка шелла: значение из settings перекрывает шелловое
  *  целиком, поэтому прежние исключения (git, npm) обязаны переехать с ним. Исключения
  *  Anthropic снимаются всегда, хост стороннего канала — добавляется. */
@@ -67,9 +72,12 @@ function noProxyEnv(env, extraHost) {
     const base = `${env.NO_PROXY ?? ''},${env.no_proxy ?? ''}`.split(',');
     const hosts = [...base, extraHost ?? '']
         .map((item) => item.trim())
-        .filter((item) => item && !ANTHROPIC_HOSTS.test(item.toLowerCase().replace(/^\./, '')));
+        .filter((item) => item && !ANTHROPIC_HOSTS.test(bareHost(item)));
     const value = [...new Set(hosts)].join(',');
-    return value ? { NO_PROXY: value, no_proxy: value } : {};
+    // Пустое значение пишется явно, если в шелле что-то было: иначе отфильтрованное
+    // исключение Anthropic унаследовалось бы из окружения.
+    const inherited = Boolean(env.NO_PROXY?.trim() || env.no_proxy?.trim());
+    return value || inherited ? { NO_PROXY: value, no_proxy: value } : {};
 }
 
 /** Прокси official: шелл сильнее хранилища — им же обёртка claude проверяет egress, и
@@ -85,9 +93,12 @@ function officialProxy(env, get, currentEnv = {}) {
     );
 }
 
-function proxyEnv(env, get, currentEnv) {
+function proxyEnv(env, get, currentEnv = {}) {
     const proxy = officialProxy(env, get, currentEnv);
-    return proxy ? { HTTPS_PROXY: proxy, HTTP_PROXY: proxy } : {};
+    if (!proxy) return {};
+    // Отдельно заданный HTTP-прокси — чужое решение о маршруте, его не подменяем.
+    const httpProxy = env.HTTP_PROXY?.trim() || currentEnv.HTTP_PROXY?.trim() || proxy;
+    return { HTTPS_PROXY: proxy, HTTP_PROXY: httpProxy };
 }
 
 function officialProfile(env, get, currentEnv) {
@@ -227,20 +238,45 @@ function securePrivate(file) {
     if (fs.existsSync(dir)) fs.chmodSync(dir, 0o700);
 }
 
+function processAlive(pid) {
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch (error) {
+        return error.code === 'EPERM';
+    }
+}
+
 /** Чтение-изменение-запись хранилища и settings под одним замком: два параллельных
- *  запуска иначе теряют ключи друг друга — атомарный rename бережёт JSON, не данные. */
+ *  запуска иначе теряют ключи друг друга — атомарный rename бережёт JSON, не данные.
+ *  Замок несёт pid и метку владельца. Чужой снимается только если его процесс мёртв, а
+ *  снятие идёт переименованием: из двух конкурентов его выигрывает один. Остаточная гонка —
+ *  два запуска одновременно над замком упавшего процесса — для ручного CLI приемлема. */
 function withLock(lockPath, waitMs, fn) {
     fs.mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
+    const token = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
     const deadline = Date.now() + waitMs;
     for (;;) {
         try {
-            fs.closeSync(fs.openSync(lockPath, 'wx', 0o600));
+            fs.writeFileSync(lockPath, token, { flag: 'wx', mode: 0o600 });
             break;
         } catch (error) {
             if (error.code !== 'EEXIST') throw error;
-            const stat = fs.statSync(lockPath, { throwIfNoEntry: false });
-            if (stat && Date.now() - stat.mtimeMs > 30_000) {
-                fs.rmSync(lockPath, { force: true });
+            let owner = '';
+            try {
+                owner = fs.readFileSync(lockPath, 'utf8');
+            } catch {
+                continue; // замок только что сняли — пробуем снова
+            }
+            const pid = Number(owner.split(':')[0]);
+            if (owner && Number.isInteger(pid) && pid > 0 && !processAlive(pid)) {
+                const stale = `${lockPath}.stale.${token.replace(/:/g, '-')}`;
+                try {
+                    fs.renameSync(lockPath, stale);
+                    fs.rmSync(stale, { force: true });
+                } catch {
+                    // переименовал другой конкурент — следующий круг разберётся
+                }
                 continue;
             }
             if (Date.now() > deadline) throw new Error(`another switch is running (${lockPath})`);
@@ -250,7 +286,12 @@ function withLock(lockPath, waitMs, fn) {
     try {
         return fn();
     } finally {
-        fs.rmSync(lockPath, { force: true });
+        // Снимаем только свой замок: чужой мог появиться, если наш сочли мёртвым.
+        try {
+            if (fs.readFileSync(lockPath, 'utf8') === token) fs.rmSync(lockPath, { force: true });
+        } catch {
+            // замка уже нет
+        }
     }
 }
 
