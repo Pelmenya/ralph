@@ -48,6 +48,7 @@ describe('switch-claude helper', () => {
             CLAUDE_CODE_EFFORT_LEVEL: 'high',
             CLAUDE_CODE_AUTO_COMPACT_WINDOW: '1000000',
             CLAUDE_CODE_MAX_CONTEXT_TOKENS: '1000000',
+            NO_PROXY: 'api.kimi.ai',
         });
         expect(statSync(join(home, '.claude', 'settings.json')).mode & 0o777).toBe(0o600);
         expect(
@@ -128,6 +129,7 @@ describe('switch-claude helper', () => {
             ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-5',
             ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-4-5',
             ANTHROPIC_SMALL_FAST_MODEL: 'claude-haiku-4-5',
+            NO_PROXY: 'gateway.example.com',
         });
 
         expect(run(home, ['official']).status).toBe(0);
@@ -156,6 +158,72 @@ describe('switch-claude helper', () => {
         expect(result.status).toBe(1);
         expect(result.stderr).toContain("unknown profile 'constructor'");
         expect(readFileSync(file, 'utf8')).toBe(before);
+    });
+
+    it('ключи, увиденные один раз, переключают каналы из шелла без окружения', () => {
+        const home = homeWith();
+        expect(
+            run(home, [], {
+                KIMI_CODE_API_KEY: 'saved-kimi-key',
+                ROUTER_CHEAP_KEY: 'saved-gateway-key',
+                CLAUDE_CHEAP_BASE_URL: 'https://gateway.example.com',
+            }).status,
+        ).toBe(0);
+        const store = join(home, '.config', 'claude-channel', 'channels.json');
+        expect(statSync(store).mode & 0o777).toBe(0o600);
+
+        expect(run(home, ['kimi']).status).toBe(0);
+        expect(settings(home).env.ANTHROPIC_API_KEY).toBe('saved-kimi-key');
+        expect(run(home, ['cheap']).status).toBe(0);
+        expect(settings(home).env).toMatchObject({
+            ANTHROPIC_BASE_URL: 'https://gateway.example.com',
+            ANTHROPIC_AUTH_TOKEN: 'saved-gateway-key',
+        });
+        const status = run(home, []);
+        expect(status.stdout).toContain('cheap        ready');
+        expect(status.stdout).toContain('cheap-direct missing CLAUDE_CHEAP_DIRECT_BASE_URL');
+    });
+
+    it('свежий ключ из окружения заменяет сохранённый', () => {
+        const home = homeWith();
+        run(home, [], { KIMI_CODE_API_KEY: 'old-key' });
+        expect(run(home, ['kimi'], { KIMI_CODE_API_KEY: 'new-key' }).status).toBe(0);
+        expect(run(home, ['kimi']).status).toBe(0);
+        expect(settings(home).env.ANTHROPIC_API_KEY).toBe('new-key');
+    });
+
+    it('official идёт через прокси, сторонние каналы — мимо него с прежними исключениями', () => {
+        const home = homeWith();
+        const shell = {
+            HTTPS_PROXY: 'http://127.0.0.1:8118',
+            NO_PROXY: 'localhost,github.com',
+            KIMI_CODE_API_KEY: 'test-kimi-key',
+        };
+        expect(run(home, ['kimi'], shell).status).toBe(0);
+        expect(settings(home).env.NO_PROXY).toBe('localhost,github.com,api.kimi.ai');
+        expect(settings(home).env.HTTPS_PROXY).toBeUndefined();
+
+        expect(run(home, ['official'], shell).status).toBe(0);
+        expect(settings(home).env).toEqual({
+            HTTPS_PROXY: 'http://127.0.0.1:8118',
+            HTTP_PROXY: 'http://127.0.0.1:8118',
+        });
+        // Прокси запомнен: official из шелла без прокси всё равно идёт через него.
+        expect(run(home, ['official']).status).toBe(0);
+        expect(settings(home).env.HTTPS_PROXY).toBe('http://127.0.0.1:8118');
+    });
+
+    it('битое хранилище останавливает переключение и не трогает settings', () => {
+        const home = homeWith({ env: { KEEP_ME: 'yes' } });
+        const store = join(home, '.config', 'claude-channel');
+        mkdirSync(store, { recursive: true });
+        writeFileSync(join(store, 'channels.json'), '{');
+        const before = readFileSync(join(home, '.claude', 'settings.json'), 'utf8');
+        const result = run(home, ['official']);
+
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain('channel store is not valid JSON');
+        expect(readFileSync(join(home, '.claude', 'settings.json'), 'utf8')).toBe(before);
     });
 
     it('--help работает даже при битом settings и перечисляет все каналы', () => {
