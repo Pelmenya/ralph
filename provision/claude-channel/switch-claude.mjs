@@ -30,6 +30,7 @@ const MANAGED_VARS = [
     'HTTPS_PROXY',
     'HTTP_PROXY',
     'NO_PROXY',
+    'no_proxy',
 ];
 
 // Значения, которые достаточно один раз увидеть в окружении: дальше helper берёт их из
@@ -55,24 +56,54 @@ function requiredValue(get, name) {
     return value;
 }
 
-/** Хост канала в NO_PROXY поверх базового списка: значение из settings перекрывает
- *  шелловое целиком, поэтому прежние исключения (git, npm) обязаны переехать с ним. */
-function directNoProxy(env, baseUrl) {
-    const base = (env.NO_PROXY ?? env.no_proxy ?? '').split(',');
-    const host = new URL(baseUrl).hostname;
-    const hosts = [...base, host].map((item) => item.trim()).filter(Boolean);
-    return { NO_PROXY: [...new Set(hosts)].join(',') };
+// Исключения прокси, которые увели бы официальный API мимо туннеля: обёртка claude
+// проверяет egress по стороннему адресу и такой обход не заметит.
+const ANTHROPIC_HOSTS = /^(\*|(.*\.)?anthropic\.com|(.*\.)?claude\.ai)$/;
+
+/** NO_PROXY поверх базового списка шелла: значение из settings перекрывает шелловое
+ *  целиком, поэтому прежние исключения (git, npm) обязаны переехать с ним. Исключения
+ *  Anthropic снимаются всегда, хост стороннего канала — добавляется. */
+function noProxyEnv(env, extraHost) {
+    const base = `${env.NO_PROXY ?? ''},${env.no_proxy ?? ''}`.split(',');
+    const hosts = [...base, extraHost ?? '']
+        .map((item) => item.trim())
+        .filter((item) => item && !ANTHROPIC_HOSTS.test(item.toLowerCase().replace(/^\./, '')));
+    const value = [...new Set(hosts)].join(',');
+    return value ? { NO_PROXY: value, no_proxy: value } : {};
 }
 
-function officialProfile(env, get) {
-    const proxy =
+/** Прокси official: шелл сильнее хранилища — им же обёртка claude проверяет egress, и
+ *  иначе проверялся бы один маршрут, а Claude получал другой. Последний запасной —
+ *  прокси, уже записанный в settings, чтобы переключение его не стирало. */
+function officialProxy(env, get, currentEnv = {}) {
+    return (
         env.CLAUDE_OFFICIAL_PROXY?.trim() ||
         env.HTTPS_PROXY?.trim() ||
-        get('CLAUDE_OFFICIAL_PROXY');
+        get('CLAUDE_OFFICIAL_PROXY') ||
+        currentEnv.HTTPS_PROXY?.trim() ||
+        undefined
+    );
+}
+
+function proxyEnv(env, get, currentEnv) {
+    const proxy = officialProxy(env, get, currentEnv);
     return proxy ? { HTTPS_PROXY: proxy, HTTP_PROXY: proxy } : {};
 }
 
-function gatewayProfile(env, get, baseUrlVar) {
+function officialProfile(env, get, currentEnv) {
+    return { ...proxyEnv(env, get, currentEnv), ...noProxyEnv(env) };
+}
+
+/** Сторонний канал — напрямую, но прокси для остального трафика сессии (MCP,
+ *  телеметрия) остаётся тем же, что у official. */
+function directEnv(env, get, currentEnv, baseUrl) {
+    return {
+        ...proxyEnv(env, get, currentEnv),
+        ...noProxyEnv(env, new URL(baseUrl).hostname),
+    };
+}
+
+function gatewayProfile(env, get, currentEnv, baseUrlVar) {
     const baseUrl = requiredValue(get, baseUrlVar);
     const opus = env.CLAUDE_CHEAP_OPUS_MODEL || 'claude-opus-5-5';
     const sonnet = env.CLAUDE_CHEAP_SONNET_MODEL || 'claude-sonnet-5';
@@ -86,7 +117,7 @@ function gatewayProfile(env, get, baseUrlVar) {
         ANTHROPIC_DEFAULT_SONNET_MODEL: sonnet,
         ANTHROPIC_DEFAULT_HAIKU_MODEL: haiku,
         ANTHROPIC_SMALL_FAST_MODEL: haiku,
-        ...directNoProxy(env, baseUrl),
+        ...directEnv(env, get, currentEnv, baseUrl),
     };
 }
 
@@ -118,14 +149,15 @@ function kimiProfile(env, get, currentEnv = {}) {
         CLAUDE_CODE_EFFORT_LEVEL: effort,
         CLAUDE_CODE_AUTO_COMPACT_WINDOW: contextTokens,
         CLAUDE_CODE_MAX_CONTEXT_TOKENS: contextTokens,
-        ...directNoProxy(env, baseUrl),
+        ...directEnv(env, get, currentEnv, baseUrl),
     };
 }
 
 const PROFILES = {
     official: officialProfile,
-    cheap: (env, get) => gatewayProfile(env, get, 'CLAUDE_CHEAP_BASE_URL'),
-    'cheap-direct': (env, get) => gatewayProfile(env, get, 'CLAUDE_CHEAP_DIRECT_BASE_URL'),
+    cheap: (env, get, current) => gatewayProfile(env, get, current, 'CLAUDE_CHEAP_BASE_URL'),
+    'cheap-direct': (env, get, current) =>
+        gatewayProfile(env, get, current, 'CLAUDE_CHEAP_DIRECT_BASE_URL'),
     kimi: kimiProfile,
 };
 
@@ -142,10 +174,23 @@ function usage() {
     ].join('\n');
 }
 
+/** Учётные данные в URL (user:password@) в терминал не печатаются. */
+function maskUrl(value) {
+    try {
+        const url = new URL(value);
+        if (!url.username && !url.password) return value;
+        url.username = '***';
+        url.password = '';
+        return url.toString();
+    } catch {
+        return '<unparsable url>';
+    }
+}
+
 function show(env) {
-    const via = env?.HTTPS_PROXY ? ` via ${env.HTTPS_PROXY}` : '';
+    const via = env?.HTTPS_PROXY ? ` via ${maskUrl(env.HTTPS_PROXY)}` : '';
     return env?.ANTHROPIC_BASE_URL
-        ? `${env.ANTHROPIC_BASE_URL} (${env.ANTHROPIC_MODEL ?? 'default model'}, direct)`
+        ? `${maskUrl(env.ANTHROPIC_BASE_URL)} (${env.ANTHROPIC_MODEL ?? 'default model'}, direct)`
         : `official (subscription${via})`;
 }
 
@@ -155,8 +200,9 @@ function readJsonObject(file, label) {
     let cfg;
     try {
         cfg = JSON.parse(raw.replace(/^﻿/, ''));
-    } catch (error) {
-        throw new Error(`${label} is not valid JSON: ${error.message}`);
+    } catch {
+        // Сообщение JSON.parse цитирует кусок исходника — а в этих файлах лежат ключи.
+        throw new Error(`${label} is not valid JSON`);
     }
     if (cfg === null || typeof cfg !== 'object' || Array.isArray(cfg)) {
         throw new Error(`${label} root must be an object`);
@@ -171,6 +217,41 @@ function readSettings(settingsPath) {
         throw new Error('settings.json env must be an object');
     }
     return result;
+}
+
+/** Права хранилища чинятся на каждом запуске: после копирования или восстановления
+ *  файл мог стать читаемым всем, а пишем мы его только при изменении значений. */
+function securePrivate(file) {
+    if (fs.existsSync(file)) fs.chmodSync(file, 0o600);
+    const dir = path.dirname(file);
+    if (fs.existsSync(dir)) fs.chmodSync(dir, 0o700);
+}
+
+/** Чтение-изменение-запись хранилища и settings под одним замком: два параллельных
+ *  запуска иначе теряют ключи друг друга — атомарный rename бережёт JSON, не данные. */
+function withLock(lockPath, waitMs, fn) {
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
+    const deadline = Date.now() + waitMs;
+    for (;;) {
+        try {
+            fs.closeSync(fs.openSync(lockPath, 'wx', 0o600));
+            break;
+        } catch (error) {
+            if (error.code !== 'EEXIST') throw error;
+            const stat = fs.statSync(lockPath, { throwIfNoEntry: false });
+            if (stat && Date.now() - stat.mtimeMs > 30_000) {
+                fs.rmSync(lockPath, { force: true });
+                continue;
+            }
+            if (Date.now() > deadline) throw new Error(`another switch is running (${lockPath})`);
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+        }
+    }
+    try {
+        return fn();
+    } finally {
+        fs.rmSync(lockPath, { force: true });
+    }
 }
 
 function readStore(storePath) {
@@ -195,11 +276,16 @@ function writePrivate(file, contents) {
 }
 
 /** Новые значения из окружения оседают в хранилище; пишем только при изменении. */
-function harvest(env, store, storePath) {
+function harvest(env, store, storePath, currentEnv = {}) {
     let changed = false;
     // Прокси шелла запоминается как прокси official: сессию могут поднять из окружения
     // без profile.d (systemd, старый tmux), а без прокси официальный API отвечает 403.
-    const seen = { ...env, CLAUDE_OFFICIAL_PROXY: env.CLAUDE_OFFICIAL_PROXY || env.HTTPS_PROXY };
+    // Нет его ни в шелле, ни в хранилище — берём уже записанный в settings.
+    const proxy =
+        env.CLAUDE_OFFICIAL_PROXY ||
+        env.HTTPS_PROXY ||
+        (store.values.CLAUDE_OFFICIAL_PROXY ? undefined : currentEnv.HTTPS_PROXY);
+    const seen = { ...env, CLAUDE_OFFICIAL_PROXY: proxy };
     for (const name of STORED_VARS) {
         const value = seen[name]?.trim();
         if (value && store.values[name] !== value) {
@@ -248,29 +334,40 @@ export function main(options = {}) {
                 `unknown profile '${name}'. Available: ${Object.keys(PROFILES).join(', ')}`,
             );
         }
-        const { cfg, exists, raw } = readSettings(settingsPath);
-        const store = readStore(storePath);
-        harvest(processEnv, store, storePath);
-        const get = resolver(processEnv, store);
-        if (!name) {
-            stdout(`Current: ${show(cfg.env)}`);
-            stdout(['Profiles:', ...readiness(processEnv, get, cfg.env)].join('\n'));
+        const lockPath = path.join(path.dirname(storePath), '.switch.lock');
+        const waitMs = Number(processEnv.CLAUDE_CHANNEL_LOCK_WAIT_MS) || 5000;
+        return withLock(lockPath, waitMs, () => {
+            securePrivate(storePath);
+            const { cfg, exists, raw } = readSettings(settingsPath);
+            const store = readStore(storePath);
+            harvest(processEnv, store, storePath, cfg.env);
+            const get = resolver(processEnv, store);
+            if (!name) {
+                stdout(`Current: ${show(cfg.env)}`);
+                stdout(['Profiles:', ...readiness(processEnv, get, cfg.env)].join('\n'));
+                return 0;
+            }
+
+            const nextEnv = Object.fromEntries(
+                Object.entries(cfg.env ?? {}).filter(([key]) => !MANAGED_VARS.includes(key)),
+            );
+            Object.assign(nextEnv, PROFILES[name](processEnv, get, cfg.env));
+            if (Object.keys(nextEnv).length > 0) cfg.env = nextEnv;
+            else delete cfg.env;
+
+            if (exists) writePrivate(`${settingsPath}.channel-switch.bak`, raw);
+            writePrivate(settingsPath, `${JSON.stringify(cfg, null, 2)}\n`);
+            stdout(`✓ Claude Code → ${show(cfg.env)}`);
+            const shellProxy = processEnv.HTTPS_PROXY?.trim();
+            if (name === 'official' && shellProxy && cfg.env?.HTTPS_PROXY !== shellProxy) {
+                stderr(
+                    'Warning: CLAUDE_OFFICIAL_PROXY differs from HTTPS_PROXY — the claude ' +
+                        'wrapper checks egress through HTTPS_PROXY, not the proxy written here.',
+                );
+            }
+            stdout('New sessions will use this channel. Restart open sessions to apply.');
             return 0;
-        }
-
-        const nextEnv = Object.fromEntries(
-            Object.entries(cfg.env ?? {}).filter(([key]) => !MANAGED_VARS.includes(key)),
-        );
-        Object.assign(nextEnv, PROFILES[name](processEnv, get, cfg.env));
-
-        if (Object.keys(nextEnv).length > 0) cfg.env = nextEnv;
-        else delete cfg.env;
-
-        if (exists) writePrivate(`${settingsPath}.channel-switch.bak`, raw);
-        writePrivate(settingsPath, `${JSON.stringify(cfg, null, 2)}\n`);
-        stdout(`✓ Claude Code → ${show(cfg.env)}`);
-        stdout('New sessions will use this channel. Restart open sessions to apply.');
-        return 0;
+        });
     } catch (error) {
         stderr(`Error: ${error.message}`);
         return 1;

@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import {
+    chmodSync,
+    existsSync,
+    mkdirSync,
+    mkdtempSync,
+    readFileSync,
+    statSync,
+    utimesSync,
+    writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { main } from './switch-claude.mjs';
@@ -49,6 +58,7 @@ describe('switch-claude helper', () => {
             CLAUDE_CODE_AUTO_COMPACT_WINDOW: '1000000',
             CLAUDE_CODE_MAX_CONTEXT_TOKENS: '1000000',
             NO_PROXY: 'api.kimi.ai',
+            no_proxy: 'api.kimi.ai',
         });
         expect(statSync(join(home, '.claude', 'settings.json')).mode & 0o777).toBe(0o600);
         expect(
@@ -130,6 +140,7 @@ describe('switch-claude helper', () => {
             ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-4-5',
             ANTHROPIC_SMALL_FAST_MODEL: 'claude-haiku-4-5',
             NO_PROXY: 'gateway.example.com',
+            no_proxy: 'gateway.example.com',
         });
 
         expect(run(home, ['official']).status).toBe(0);
@@ -201,12 +212,15 @@ describe('switch-claude helper', () => {
         };
         expect(run(home, ['kimi'], shell).status).toBe(0);
         expect(settings(home).env.NO_PROXY).toBe('localhost,github.com,api.kimi.ai');
-        expect(settings(home).env.HTTPS_PROXY).toBeUndefined();
+        // Прокси для остального трафика сессии остаётся, мимо идёт только хост канала.
+        expect(settings(home).env.HTTPS_PROXY).toBe('http://127.0.0.1:8118');
 
         expect(run(home, ['official'], shell).status).toBe(0);
         expect(settings(home).env).toEqual({
             HTTPS_PROXY: 'http://127.0.0.1:8118',
             HTTP_PROXY: 'http://127.0.0.1:8118',
+            NO_PROXY: 'localhost,github.com',
+            no_proxy: 'localhost,github.com',
         });
         // Прокси запомнен: official из шелла без прокси всё равно идёт через него.
         expect(run(home, ['official']).status).toBe(0);
@@ -224,6 +238,80 @@ describe('switch-claude helper', () => {
         expect(result.status).toBe(1);
         expect(result.stderr).toContain('channel store is not valid JSON');
         expect(readFileSync(join(home, '.claude', 'settings.json'), 'utf8')).toBe(before);
+    });
+
+    it('official снимает исключения Anthropic из NO_PROXY, чтобы не уйти мимо туннеля', () => {
+        const home = homeWith();
+        const result = run(home, ['official'], {
+            HTTPS_PROXY: 'http://127.0.0.1:8118',
+            NO_PROXY: 'localhost,api.anthropic.com,.anthropic.com,*',
+            no_proxy: 'claude.ai,github.com',
+        });
+
+        expect(result.status, result.stderr).toBe(0);
+        expect(settings(home).env.NO_PROXY).toBe('localhost,github.com');
+        expect(settings(home).env.no_proxy).toBe('localhost,github.com');
+    });
+
+    it('прокси, записанный только в settings, переживает переключения', () => {
+        const home = homeWith({ env: { HTTPS_PROXY: 'http://10.0.0.1:3128' } });
+        expect(run(home, ['kimi'], { KIMI_CODE_API_KEY: 'test-kimi-key' }).status).toBe(0);
+        expect(settings(home).env.HTTPS_PROXY).toBe('http://10.0.0.1:3128');
+        expect(run(home, ['official']).status).toBe(0);
+        expect(settings(home).env.HTTPS_PROXY).toBe('http://10.0.0.1:3128');
+    });
+
+    it('пароль прокси не печатается в терминал', () => {
+        const home = homeWith();
+        const result = run(home, ['official'], {
+            HTTPS_PROXY: 'http://user:s3cret-pass@proxy.example.com:3128',
+        });
+
+        expect(result.status).toBe(0);
+        expect(`${result.stdout}${result.stderr}`).not.toContain('s3cret-pass');
+        expect(run(home, []).stdout).not.toContain('s3cret-pass');
+    });
+
+    it('битое хранилище не цитирует своё содержимое в ошибке', () => {
+        const home = homeWith();
+        const dir = join(home, '.config', 'claude-channel');
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, 'channels.json'), '{"values":{"KIMI_CODE_API_KEY":"sk-leak-me"');
+        const result = run(home, []);
+
+        expect(result.status).toBe(1);
+        expect(result.stderr).not.toContain('sk-leak-me');
+    });
+
+    it('права хранилища чинятся, даже если значения не менялись', () => {
+        const home = homeWith();
+        run(home, [], { KIMI_CODE_API_KEY: 'test-kimi-key' });
+        const store = join(home, '.config', 'claude-channel', 'channels.json');
+        chmodSync(store, 0o644);
+        chmodSync(join(home, '.config', 'claude-channel'), 0o755);
+        run(home, []);
+
+        expect(statSync(store).mode & 0o777).toBe(0o600);
+        expect(statSync(join(home, '.config', 'claude-channel')).mode & 0o777).toBe(0o700);
+    });
+
+    it('занятый замок — отказ без записи, протухший — снимается', () => {
+        const home = homeWith({ env: { KEEP_ME: 'yes' } });
+        const dir = join(home, '.config', 'claude-channel');
+        mkdirSync(dir, { recursive: true });
+        const lock = join(dir, '.switch.lock');
+        writeFileSync(lock, '');
+        const before = readFileSync(join(home, '.claude', 'settings.json'), 'utf8');
+        const busy = run(home, ['official'], { CLAUDE_CHANNEL_LOCK_WAIT_MS: '100' });
+
+        expect(busy.status).toBe(1);
+        expect(busy.stderr).toContain('another switch is running');
+        expect(readFileSync(join(home, '.claude', 'settings.json'), 'utf8')).toBe(before);
+
+        const old = new Date(Date.now() - 60_000);
+        utimesSync(lock, old, old);
+        expect(run(home, ['official'], { CLAUDE_CHANNEL_LOCK_WAIT_MS: '100' }).status).toBe(0);
+        expect(existsSync(lock)).toBe(false);
     });
 
     it('--help работает даже при битом settings и перечисляет все каналы', () => {
