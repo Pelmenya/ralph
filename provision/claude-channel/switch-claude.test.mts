@@ -275,6 +275,12 @@ describe('switch-claude helper', () => {
         });
     });
 
+    it('HTTP_PROXY из settings без HTTPS-прокси переживает переключение', () => {
+        const home = homeWith({ env: { HTTP_PROXY: 'http://10.0.0.2:8080' } });
+        expect(run(home, ['official']).status).toBe(0);
+        expect(settings(home).env.HTTP_PROXY).toBe('http://10.0.0.2:8080');
+    });
+
     it('прокси, записанный только в settings, переживает переключения', () => {
         const home = homeWith({ env: { HTTPS_PROXY: 'http://10.0.0.1:3128' } });
         expect(run(home, ['kimi'], { KIMI_CODE_API_KEY: 'test-kimi-key' }).status).toBe(0);

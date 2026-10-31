@@ -95,7 +95,10 @@ function officialProxy(env, get, currentEnv = {}) {
 
 function proxyEnv(env, get, currentEnv = {}) {
     const proxy = officialProxy(env, get, currentEnv);
-    if (!proxy) return {};
+    if (!proxy) {
+        const kept = currentEnv.HTTP_PROXY?.trim();
+        return kept ? { HTTP_PROXY: kept } : {};
+    }
     // Отдельно заданный HTTP-прокси — чужое решение о маршруте, его не подменяем.
     const httpProxy = env.HTTP_PROXY?.trim() || currentEnv.HTTP_PROXY?.trim() || proxy;
     return { HTTPS_PROXY: proxy, HTTP_PROXY: httpProxy };
@@ -262,11 +265,13 @@ function withLock(lockPath, waitMs, fn) {
             break;
         } catch (error) {
             if (error.code !== 'EEXIST') throw error;
+            if (Date.now() > deadline) throw new Error(`another switch is running (${lockPath})`);
             let owner = '';
             try {
                 owner = fs.readFileSync(lockPath, 'utf8');
-            } catch {
-                continue; // замок только что сняли — пробуем снова
+            } catch (readError) {
+                if (readError.code === 'ENOENT') continue; // замок только что сняли
+                throw readError;
             }
             const pid = Number(owner.split(':')[0]);
             if (owner && Number.isInteger(pid) && pid > 0 && !processAlive(pid)) {
@@ -274,12 +279,12 @@ function withLock(lockPath, waitMs, fn) {
                 try {
                     fs.renameSync(lockPath, stale);
                     fs.rmSync(stale, { force: true });
-                } catch {
-                    // переименовал другой конкурент — следующий круг разберётся
+                } catch (renameError) {
+                    // ENOENT — переименовал другой конкурент; прочее — постоянный отказ
+                    if (renameError.code !== 'ENOENT') throw renameError;
                 }
                 continue;
             }
-            if (Date.now() > deadline) throw new Error(`another switch is running (${lockPath})`);
             Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
         }
     }
