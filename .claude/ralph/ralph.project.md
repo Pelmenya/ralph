@@ -39,7 +39,7 @@
 
 ## Большие файлы — только фрагментами
 
-Целиком не читаются: `core/orchestrator.ts` (~13 тыс. строк), `core/orchestrator.test.ts`
+По умолчанию читай фрагментами: `core/orchestrator.ts` (~13 тыс. строк), `core/orchestrator.test.ts`
 (~19 тыс.), `core/session-settings.test.ts` и `core/gate.test.ts` (по ~2 тыс.). Порядок —
 `rg -n '<символ>' core/orchestrator.ts`, затем чтение с `offset`/`limit` вокруг находки;
 в тестах — `rg -n "describe\('<поведение>"`. Сессия, прочитавшая оркестратор целиком,
