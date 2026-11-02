@@ -219,6 +219,8 @@ describe('switch-claude helper', () => {
         expect(settings(home).env).toEqual({
             HTTPS_PROXY: 'http://127.0.0.1:8118',
             HTTP_PROXY: 'http://127.0.0.1:8118',
+            https_proxy: 'http://127.0.0.1:8118',
+            http_proxy: 'http://127.0.0.1:8118',
             NO_PROXY: 'localhost,github.com',
             no_proxy: 'localhost,github.com',
         });
@@ -264,15 +266,80 @@ describe('switch-claude helper', () => {
         expect(settings(home).env).toMatchObject({ NO_PROXY: '', no_proxy: '' });
     });
 
-    it('отдельный HTTP_PROXY не затирается прокси official', () => {
+    it('official заменяет прокси обоих протоколов и регистров выбранным маршрутом', () => {
         const home = homeWith({
-            env: { HTTPS_PROXY: 'http://10.0.0.1:3128', HTTP_PROXY: 'http://10.0.0.2:8080' },
+            env: {
+                HTTPS_PROXY: 'http://proxy.example.com:3128',
+                HTTP_PROXY: 'http://old.example.com:8080',
+                https_proxy: 'http://old.example.com:8080',
+                http_proxy: 'http://old.example.com:8080',
+            },
+        });
+        expect(run(home, ['official'], { HTTP_PROXY: 'http://old.example.com:8080' }).status).toBe(
+            0,
+        );
+        expect(settings(home).env).toEqual({
+            HTTPS_PROXY: 'http://proxy.example.com:3128',
+            HTTP_PROXY: 'http://proxy.example.com:3128',
+            https_proxy: 'http://proxy.example.com:3128',
+            http_proxy: 'http://proxy.example.com:3128',
+        });
+    });
+
+    it('нижний регистр управляется и удаляется при отсутствии выбранного прокси', () => {
+        const home = homeWith({
+            env: { https_proxy: 'http://old.example.com', http_proxy: 'http://old.example.com' },
         });
         expect(run(home, ['official']).status).toBe(0);
-        expect(settings(home).env).toMatchObject({
-            HTTPS_PROXY: 'http://10.0.0.1:3128',
-            HTTP_PROXY: 'http://10.0.0.2:8080',
+        expect(settings(home).env).toBeUndefined();
+    });
+
+    it('сохранённый выбор сильнее старого шелла, явный выбор его заменяет', () => {
+        const home = homeWith();
+        const oldProxy = 'http://old.example.com';
+        const selectedProxy = 'http://proxy.example.com';
+        const nextProxy = 'http://next.example.com';
+        expect(run(home, [], { HTTPS_PROXY: oldProxy }).status).toBe(0);
+        expect(
+            run(home, ['official'], { CLAUDE_OFFICIAL_PROXY: selectedProxy, HTTPS_PROXY: oldProxy })
+                .status,
+        ).toBe(0);
+        expect(settings(home).env.HTTPS_PROXY).toBe(selectedProxy);
+        expect(run(home, ['official'], { HTTPS_PROXY: oldProxy }).status).toBe(0);
+        expect(settings(home).env.HTTPS_PROXY).toBe(selectedProxy);
+        expect(
+            run(home, ['official'], { CLAUDE_OFFICIAL_PROXY: nextProxy, HTTPS_PROXY: oldProxy })
+                .status,
+        ).toBe(0);
+        expect(run(home, ['official'], { HTTPS_PROXY: oldProxy }).status).toBe(0);
+        expect(settings(home).env.HTTPS_PROXY).toBe(nextProxy);
+    });
+
+    it('сохраняет ожидаемый адрес выхода и обновляет его из окружения', () => {
+        const home = homeWith();
+        const store = join(home, '.config', 'claude-channel', 'channels.json');
+        expect(run(home, [], { CLAUDE_OFFICIAL_EXPECTED_EGRESS: 'first.example.com' }).status).toBe(
+            0,
+        );
+        expect(JSON.parse(readFileSync(store, 'utf8')).values.CLAUDE_OFFICIAL_EXPECTED_EGRESS).toBe(
+            'first.example.com',
+        );
+        expect(
+            run(home, ['official'], { CLAUDE_OFFICIAL_EXPECTED_EGRESS: 'next.example.com' }).status,
+        ).toBe(0);
+        expect(JSON.parse(readFileSync(store, 'utf8')).values.CLAUDE_OFFICIAL_EXPECTED_EGRESS).toBe(
+            'next.example.com',
+        );
+    });
+
+    it('не предупреждает о различии явного прокси и прокси шелла', () => {
+        const home = homeWith();
+        const result = run(home, ['official'], {
+            CLAUDE_OFFICIAL_PROXY: 'http://proxy.example.com',
+            HTTPS_PROXY: 'http://old.example.com',
         });
+        expect(result.status).toBe(0);
+        expect(result.stderr).toBe('');
     });
 
     it('HTTP_PROXY из settings без HTTPS-прокси переживает переключение', () => {
