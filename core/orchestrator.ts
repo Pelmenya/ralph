@@ -804,6 +804,9 @@ export type RalphConfig = {
         // бюджет ходов (--max-turns). Целое ≥ 0, дефолт FIX_TURN_RETRIES; 0 — повторов нет
         // (прежнее поведение: исчерпание ходов = стоп сдачи).
         fixTurnRetries?: unknown;
+        // #248: предел успешно разобранных планов правок на фазу. Целое ≥ 1; после него
+        // незакрытый блокер — стоп до следующего планировщика, а не новый круг.
+        maxFixPlans?: unknown;
         // #625: сильнейшая модель для независимого арбитра — последней ступени лестницы
         // ревью правок. Не задана — берётся вершина modelStrength (сильнейшая известная
         // планке), поднятая до reviewModelFloor. Смысл ключа в том, чтобы арбитром можно
@@ -5886,6 +5889,21 @@ export function createOrchestrator(env: OrchestratorEnv) {
         }
         return raw;
     }
+    // #248: число планов правок ограничено на фазу. Битый предел отвергается на старте,
+    // иначе незакрытый блокер снова гонял бы планировщик до потолков соседних брейкеров.
+    const MAX_FIX_PLANS = 4;
+    function resolveMaxFixPlans(cfg: RalphConfig, failFn: (msg: string) => unknown): number {
+        const raw = cfg.review?.maxFixPlans;
+        if (raw === undefined) return MAX_FIX_PLANS;
+        if (typeof raw !== 'number' || !Number.isInteger(raw) || raw < 1) {
+            failFn(
+                `ralph.config.json: review.maxFixPlans = ${JSON.stringify(raw)} — ожидалось целое ` +
+                    'положительное число (сколько планов правок петля вправе разобрать на фазу).',
+            );
+            return MAX_FIX_PLANS;
+        }
+        return raw;
+    }
     // #97: дефолт порога серии «прогресс неизвестен». Один сбой чтения петля переживает
     // (живучесть), серия — уже не чих: под ней брейкер maxNoProgress слеп, и петля, не
     // делающая ничего, крутилась бы до maxIterations. Три — как у maxNoProgress: серия
@@ -6927,6 +6945,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
         st.noProgress = 0;
         st.gateHeals = 0;
         st.blockedHeals = 0;
+        // #248: бюджет планов относится к блокерам своей фазы и не переходит на следующую.
+        st.fixPlans = 0;
         // #217: планка ревью привязана к фазе — новая фаза начинает с чистой (иначе floor
         // прошлой фазы зря задрал бы модель повторного ревью следующей).
         st.reviewModelFloor = null;
@@ -7292,6 +7312,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // #67: порог брейкера серии — тем же ранним отказом.
         resolveMaxSameIssue(cfg, failFn);
         resolveMaxSameRefusal(cfg, failFn);
+        resolveMaxFixPlans(cfg, failFn);
         resolveMaxProgressUnknown(cfg, failFn);
         // Задача 95: порог диска, ротация логов сессий и тарифы — тем же ранним отказом:
         // опечатка выключила бы порог молча, а тариф строкой дал бы NaN в стоимости попытки.
@@ -7951,6 +7972,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
             throw new Error(msg);
         });
         const maxSameRefusal = resolveMaxSameRefusal(cfg, (msg) => {
+            throw new Error(msg);
+        });
+        const maxFixPlans = resolveMaxFixPlans(cfg, (msg) => {
             throw new Error(msg);
         });
         const persistRefusalOutcome = refusalOutcomePersister(state, saveStateFn, logFn);
@@ -9609,6 +9633,21 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     commentsContext: string,
                     model: string | null | undefined,
                 ): TFixPlan | null => {
+                    const fixPlans = state.fixPlans ?? 0;
+                    if (fixPlans >= maxFixPlans) {
+                        pushEventFn(
+                            `⛔ Ralph: фаза "${phase.milestone}" — планировщик правок не выполнен. ` +
+                                formatStopMessage({
+                                    reason: 'fix-plan',
+                                    diagnosis: `планов ${String(fixPlans)} из предела ${String(maxFixPlans)}, блокер остался`,
+                                    question:
+                                        'разбери находки и перережь правку или подними review.maxFixPlans, затем перезапусти loop',
+                                }),
+                            cfg,
+                            { logFn },
+                        );
+                        return null;
+                    }
                     const stop = (diagnosis: string): null => {
                         pushEventFn(
                             `⛔ Ralph: фаза "${phase.milestone}" — планировщик правок не выполнен. ` +
@@ -9672,6 +9711,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     if ('error' in extracted) {
                         return stop(`вывод не разобран: ${extracted.error}`);
                     }
+                    // #248: расходуется только успешно разобранный план. Запись до возврата
+                    // обязательна: иначе рестарт подарил бы тому же блокеру ещё один план.
+                    state.fixPlans = fixPlans + 1;
+                    saveStateFn(state);
                     return extracted.plan;
                 };
 
@@ -11569,16 +11612,15 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 // разбирай по кругу» и увела бы петлю в разбор находок, которых нет.
                 // Честный стоп с ДИАГНОЗОМ (лог + пуш) — то, ради чего карточка и заведена.
                 const forgeRed = getLastForgeRedCheck();
-                // #269-ревью: чек форжа остановил гейт БЕЗ вердикта — потолок ожидания,
-                // устойчивый сбой чтения или красный прогон без названного куба. Раньше все
-                // три отдавали `not-merged` и доезжали до финальной строки цикла БЕЗ пуша,
-                // хотя соседние исходы (`forge-env`, `forge-red`) пушат. Потолок в 20 минут
-                // при `max_slots: 1` достижим штатно (гейт идёт 6–10,5 мин, один чужой
-                // прогон в очереди съедает бюджет), deadman при этом не сработает — процесс
-                // завершился штатно, — то есть ночная остановка выяснялась бы утром. Ровно
-                // тот отказ, ради которого карточка и заведена.
-                if (gate === 'forge-unknown') {
-                    const why = getLastForgeStop() ?? 'чек форжа не дал вердикта';
+                // #269-ревью: стоп на чеке форжа отдаётся пушем, а не молчаливым `not-merged`.
+                // Отсутствие вердикта и известный красный прогон без названного куба разведены
+                // типами: человеку нельзя подменять факт красного CI диагнозом «вердикта нет».
+                if (gate === 'forge-unknown' || gate === 'forge-red-unnamed') {
+                    const why =
+                        getLastForgeStop() ??
+                        (gate === 'forge-red-unnamed'
+                            ? 'чек форжа красный, но упавший куб не назван'
+                            : 'чек форжа не дал вердикта');
                     // #289: ОДНА строка обоим каналам (push и лог) — раньше push нёс «PR
                     // оставлен человеку», а отдельный logFn ниже нёс «Разберись, перезапусти»,
                     // и Telegram с ralph.log расходились текстом об одном и том же стопе.
@@ -11592,23 +11634,21 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     const stopMsg =
                         `⛔ Ralph: чек площадки — PR оставлен человеку. ` +
                         formatStopMessage({
-                            reason: 'platform-check-red',
+                            reason:
+                                gate === 'forge-red-unnamed'
+                                    ? 'platform-check-red'
+                                    : 'platform-check-no-verdict',
                             diagnosis: why,
                             question:
                                 'проверь прогон CI площадки руками (вкладка CI/CD репозитория) и перезапусти loop',
                         });
                     pushEventFn(stopMsg, cfg, { logFn });
                     // Счётчик лечения сбрасываем по той же причине, что и на исчерпании
-                    // бюджета строкой ниже: человек чинит СРЕДУ, а не код, и после
-                    // рестарта петля обязана получить полный бюджет попыток на следующий
-                    // отказ — прошлые к нему отношения не имеют.
+                    // бюджета строкой ниже: человек разбирает отказ, а не продолжает серию
+                    // чини-сессий, и после рестарта бюджет обязан быть полным.
                     state.gateHeals = 0;
-                    // Второй слой той же мысли (#269, второй проход ревью): память о уже
-                    // пролеченном прогоне тоже обнуляется. Сюда петля попадает в том числе
-                    // потому, что ЖДАЛА прогон новее пролеченного и не дождалась, — и
-                    // рестарт с той же памятью ушёл бы ждать его снова, то есть повторил
-                    // бы стоп заведомо. Стоп отдан человеку ⇒ следующий заход обязан уметь
-                    // прочитать вердикт форжа заново.
+                    // Память о пролеченном прогоне сбрасывается тем же движением: стоп отдан
+                    // человеку, и следующий заход обязан прочитать вердикт форжа заново.
                     state.forgeHealedRunId = null;
                     saveStateFn(state);
                     break;
@@ -11867,7 +11907,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         // и ночная вахта узнавала о нём лишь читая ralph.log утром. Причина
                         // различает локальный чек (похоже на #281 — код не чинит N попыток
                         // подряд, то есть чек нестабилен) от чека площадки (уже покрыт
-                        // отдельным пушем forge-red/forge-unknown выше по своей причине).
+                        // отдельным пушем forge-red-unnamed/forge-unknown выше по своей причине).
                         // Ревью #289: исчерпанный бюджет чини-сессий доказывает ровно
                         // одно — N сессий не зазеленили чек. Это столько же похоже на
                         // настоящий дефект или на несовместимость среды, сколько на
@@ -13360,7 +13400,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // #67: порог брейкера серии — валидатор конфига, проверяемый отдельно.
         resolveMaxSameIssue,
         resolveMaxSameRefusal,
+        resolveMaxFixPlans,
         resolveMaxProgressUnknown,
+        advancePhase,
         // #88: барьер деплоя на старте — его зовёт и рестарт матрицы «убить до / после».
         stopOnDeployBlock,
         commentOnIssue,

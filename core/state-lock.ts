@@ -87,6 +87,9 @@ export type RalphState = {
     // проверяет parseRefusalSeries (refusal-series.ts), а не вера в тип: файл мог написать
     // прошлый раннер или человек, и битая серия не должна читаться как «серии нет».
     refusalSeries?: unknown;
+    // #248: успешно разобранные планы правок текущей фазы. Отсутствие — ноль; поле живёт в
+    // state, чтобы рестарт не возвращал незакрытому блокеру новый бюджет планирования.
+    fixPlans?: number;
     // #93: журнал этапов сдачи фазы (submit-journal.ts). `submitted`, `deployBlock` и
     // `reviewOfFixes.arbitrated` выше — его проекции: у state, прошедшего
     // `attachSubmitJournal`, они аксессоры, и на диск ложится журнал, а не поля.
@@ -114,7 +117,7 @@ export type TStateInspection =
 
 // Счётчики проверяются так же, как `count`: целое неотрицательное. `gateHeals: -1` или `1.5`
 // сравнивались бы с бюджетом лечения молча и давали бы лишнюю попытку или ни одной.
-const NUMBER_FIELDS = ['noProgress', 'gateHeals', 'blockedHeals'] as const;
+const NUMBER_FIELDS = ['noProgress', 'gateHeals', 'blockedHeals', 'fixPlans'] as const;
 const NULLABLE_STRING_FIELDS = ['reviewModelFloor', 'lastReviewModel', 'forgeHealedRunId'] as const;
 
 /**

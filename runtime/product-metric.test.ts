@@ -379,6 +379,40 @@ describe('счётчик барьеров', () => {
         });
     });
 
+    it('стоп без вердикта площадки не дублирует парную строку гейта', () => {
+        const summary = summarizeTasks({
+            events: parseLogEvents(
+                [
+                    '[2026-10-26T10:08:00.000Z] ⛔ Гейт: чек PR #5 у форжа не дал вердикта (потолок ожидания) — мердж отменён, PR оставлен человеку.',
+                    '[2026-10-26T10:08:05.000Z] 🔔 PUSH: ⛔ Ralph: чек площадки — PR оставлен человеку. причина: чек площадки не дал вердикта (platform-check-no-verdict). диагноз: д. вопрос человеку: в',
+                ].join('\n'),
+            ),
+            budgetMs: 30 * MIN,
+            since: SINCE,
+            until: UNTIL,
+            currentMilestone: null,
+        });
+        expect(nonZero(summary.barriers)).toEqual({ 'forge-no-verdict': 1 });
+        expect(nonZero(summary.stops)).toEqual({ 'stop:platform-check-no-verdict': 1 });
+    });
+
+    it('красный без названного куба не дублирует парный platform-check-red', () => {
+        const summary = summarizeTasks({
+            events: parseLogEvents(
+                [
+                    '[2026-10-26T10:08:00.000Z] ⛔ Гейт: чек PR #5 красный (прогон 44), но упавший куб не назван — чинить вслепую нельзя, PR оставлен человеку.',
+                    '[2026-10-26T10:08:05.000Z] 🔔 PUSH: ⛔ Ralph: чек площадки — PR оставлен человеку. причина: красный чек площадки (platform-check-red). диагноз: д. вопрос человеку: в',
+                ].join('\n'),
+            ),
+            budgetMs: 30 * MIN,
+            since: SINCE,
+            until: UNTIL,
+            currentMilestone: null,
+        });
+        expect(nonZero(summary.barriers)).toEqual({ 'forge-red-unnamed': 1 });
+        expect(nonZero(summary.stops)).toEqual({ 'stop:platform-check-red': 1 });
+    });
+
     it('стопы петли — отдельным разделом: все стопы с кодом, без пушей без кода', () => {
         expect(nonZero(barrierSummary().stops)).toEqual({
             'stop:gate-red': 1,

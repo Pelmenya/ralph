@@ -92,6 +92,22 @@ describe('inspectState — версия схемы и форма state', () => {
         expect(r.state).toMatchObject({ schemaVersion: 2, count: 2, milestone: 'M1' });
         expect(r.state.submitted).toBe(false);
         expect(r.state).not.toHaveProperty('refusalSeries');
+        expect(r.state.fixPlans ?? 0).toBe(0);
+    });
+
+    it('годный fixPlans сохраняется при чтении v2', () => {
+        const r = inspectState(JSON.stringify({ ...v2, fixPlans: 3 }));
+        expect(r.status).toBe('ok');
+        if (r.status !== 'ok') return;
+        expect(r.state.fixPlans).toBe(3);
+    });
+
+    it.each(['3', -1])('битый fixPlans (%j) — повреждение с именем поля', (fixPlans) => {
+        const r = inspectState(JSON.stringify({ ...v2, fixPlans }));
+        expect(r).toMatchObject({
+            status: 'corrupt',
+            reason: expect.stringMatching(/fixPlans/),
+        });
     });
 
     it('годная refusalSeries сохраняется при чтении v2', () => {

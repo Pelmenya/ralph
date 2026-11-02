@@ -14,6 +14,7 @@
 
 export type TStopReason =
     | 'platform-check-red'
+    | 'platform-check-no-verdict'
     | 'gate-red'
     | 'gate-tool-failure'
     | 'review-dispute'
@@ -58,6 +59,7 @@ export type TStopMessageInput = {
 // не компилируется без нового ключа.
 export const REASON_TITLES: Record<TStopReason, string> = {
     'platform-check-red': 'красный чек площадки',
+    'platform-check-no-verdict': 'чек площадки не дал вердикта',
     'gate-red': 'чек не зазеленел за отведённые чини-сессии',
     'gate-tool-failure': 'чек упал на инструменте, а не на коде',
     'review-dispute': 'спор ревью',

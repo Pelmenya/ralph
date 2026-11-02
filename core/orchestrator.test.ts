@@ -6793,6 +6793,28 @@ describe('runLoop — основной while-цикл: итерации коде
             expect(failFn).not.toHaveBeenCalled();
         });
 
+        it.each([0, -1, 1.5, '3'])(
+            'битый review.maxFixPlans (%j) — стоп на старте с именем ключа',
+            (v) => {
+                const failFn = vi.fn((m: string) => {
+                    throw new Error(m);
+                });
+                expect(() =>
+                    ralph.resolveMaxFixPlans({ review: { maxFixPlans: v } } as never, failFn),
+                ).toThrow(/review\.maxFixPlans = .* целое положительное/);
+            },
+        );
+
+        it('review.maxFixPlans без ключа — 4, целое положительное значение сохраняется', () => {
+            const failFn = vi.fn();
+            expect(ralph.resolveMaxFixPlans({} as never, failFn)).toBe(4);
+            expect(ralph.resolveMaxFixPlans({ review: {} } as never, failFn)).toBe(4);
+            expect(ralph.resolveMaxFixPlans({ review: { maxFixPlans: 3 } } as never, failFn)).toBe(
+                3,
+            );
+            expect(failFn).not.toHaveBeenCalled();
+        });
+
         it('maxSameIssue ниже coderTurnRetries + 1 — стоп на старте, а не молчаливый подъём', () => {
             const failFn = vi.fn((m: string) => {
                 throw new Error(m);
@@ -8201,6 +8223,44 @@ describe('runLoop — основной while-цикл: итерации коде
             expect(result.pushes[0]).toContain('fix-plan');
             expect(result.pushes[0]).toMatch(diagnosis);
         };
+
+        it('maxFixPlans: предел исчерпан, блокер остался → стоп до планировщика с обоими числами', () => {
+            const result = runPlannerPath(
+                {},
+                {},
+                {
+                    state: mkState({ fixPlans: 2 }),
+                    config: { review: { default: 'claude-rev', maxFixPlans: 2 } },
+                },
+            );
+            const prompts = result.runClaudeFn.mock.calls.map(([prompt]) => prompt);
+            expect(prompts.some((prompt) => prompt.includes('Ты планировщик правок'))).toBe(false);
+            expectPlanStop(result, /планов 2 из предела 2, блокер остался/);
+            expect(result.pushes[0]).toContain('подними review.maxFixPlans');
+        });
+
+        it('maxFixPlans: успешный разбор плана увеличивает счёт и пишет state', () => {
+            const state = mkState();
+            const saves: Array<number | undefined> = [];
+            runPlannerPath(
+                {
+                    advancePhaseFn: () => {},
+                    saveStateFn: (current: { fixPlans?: number }) => saves.push(current.fixPlans),
+                },
+                {},
+                { state },
+            );
+            expect(state.fixPlans).toBe(1);
+            expect(saves).toContain(1);
+        });
+
+        it('maxFixPlans: переход фазы обнуляет счёт планов', () => {
+            const state = mkState({ fixPlans: 1 });
+            buildRuntime({ ...FLAGS_OFF, dry: true }).advancePhase(state as RalphState, 0, [
+                { milestone: 'M1', branch: 'feature/m1' },
+            ]);
+            expect(state.fixPlans).toBe(0);
+        });
 
         it('ревью с находками → планировщик до правок, решение плана — в их промпте', () => {
             const { runClaudeFn } = runPlannerPath();
@@ -11622,9 +11682,9 @@ describe('runLoop — основной while-цикл: итерации коде
         expect(texts.some((t) => t.includes('lint') && t.includes('1/3'))).toBe(true);
     });
 
-    // #269-ревью: три стопа на чеке форжа БЕЗ вердикта (потолок ожидания, устойчивый сбой
-    // чтения, красный прогон без названного куба) уходили как `not-merged` — то есть без
-    // единого пуша, только строкой в `ralph.log`. Потолок в 20 минут при `max_slots: 1`
+    // #269-ревью: стопы на чеке форжа БЕЗ вердикта (потолок ожидания, устойчивый сбой
+    // чтения) уходили как `not-merged` — то есть без единого пуша, только строкой в
+    // `ralph.log`. Потолок в 20 минут при `max_slots: 1`
     // достижим штатно, deadman на штатном завершении не сработает, и ночная остановка
     // выяснялась бы утром — ровно тот отказ, ради которого карточка и заведена.
     it('#269: forge-unknown — стоп ПУШЕМ с причиной, а не молча в лог', () => {
@@ -11653,11 +11713,46 @@ describe('runLoop — основной while-цикл: итерации коде
         const stopText = String(pushEventFn.mock.calls[0][0]);
         expect(stopText).toContain('за 20 мин чек не сошёлся');
         // #289: стоп несёт причину, диагноз и вопрос — не только маркер «оставлен человеку».
-        expect(stopText).toContain('platform-check-red');
+        // #254: отсутствие вердикта не выдаётся за красный чек — у этих отказов разные действия.
+        expect(stopText).toContain('platform-check-no-verdict');
+        expect(stopText).toContain('чек площадки не дал вердикта');
+        expect(stopText).not.toContain('platform-check-red');
         expect(stopText).toContain('диагноз:');
         expect(stopText).toContain('вопрос человеку:');
         // Человек чинит СРЕДУ, а не код: после рестарта бюджет лечения обязан быть полным.
         expect(state.gateHeals).toBe(0);
+    });
+
+    it('красный CI без названного куба — platform-check-red, без чини-сессии', () => {
+        const logs: string[] = [];
+        const state = mkState({ submitted: true, gateHeals: 1, forgeHealedRunId: '356' });
+        const runClaudeFn = vi.fn<RunClaudeFake>(() => 0);
+        const pushEventFn = vi.fn((msg: string) => msg.length > 0);
+        runLoop(
+            validCfg({ gateHealAttempts: 2 }),
+            ctx(state),
+            deps(logs, {
+                openIssuesFn: () => [],
+                allOpenIssuesFn: () => [],
+                phaseMergedFn: () => false,
+                tryMergePhaseFn: () => 'forge-red-unnamed',
+                getLastRedCheck: () => null,
+                getLastForgeRedCheck: () => null,
+                getLastForgeStop: () =>
+                    'чек PR #12 красный (прогон 357), но упавший куб не назван — чинить вслепую нельзя',
+                runClaudeFn,
+                pushEventFn,
+            }),
+        );
+
+        expect(runClaudeFn).not.toHaveBeenCalled();
+        expect(pushEventFn).toHaveBeenCalledTimes(1);
+        const stopText = String(pushEventFn.mock.calls[0][0]);
+        expect(stopText).toContain('platform-check-red');
+        expect(stopText).not.toContain('platform-check-no-verdict');
+        expect(stopText).toContain('упавший куб не назван');
+        expect(state.gateHeals).toBe(0);
+        expect(state.forgeHealedRunId).toBe(null);
     });
 
     // Задача 81: сбой ИНСТРУМЕНТА гейта — третий исход рядом с «прошёл» и «регрессия».

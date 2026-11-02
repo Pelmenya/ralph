@@ -1183,10 +1183,7 @@ describe('tryMergePhase — чек PR у площадки (#269)', () => {
             forgeDiagnosisFn: () => null,
         });
 
-        // #269-ревью: отдельный статус, а не 'not-merged'. Разница не косметическая —
-        // цикл обязан отдать такой стоп ПУШЕМ: ночью «фаза не сдалась» иначе выясняется
-        // утром, а deadman не сработает (процесс завершился штатно).
-        expect(res).toBe('forge-unknown');
+        expect(res).toBe('forge-red-unnamed');
         expect(merge).not.toHaveBeenCalled();
         expect(g.getLastForgeRedCheck()).toBeNull();
         expect(g.getLastForgeStop()).toContain('упавший куб не назван');
@@ -1201,7 +1198,7 @@ describe('tryMergePhase — чек PR у площадки (#269)', () => {
             },
         });
 
-        expect(res).toBe('forge-unknown');
+        expect(res).toBe('forge-red-unnamed');
     });
 
     it('потолок ожидания — стоп с причиной, а не мердж вслепую', () => {
