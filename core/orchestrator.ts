@@ -122,6 +122,12 @@ type TPhaseBranchStopKind = Extract<
 import { createReviewModule, reviewVerdict } from './review.ts';
 import { createGateRunner, resolveGateChecks, resolveGatePolicy } from './gate.ts';
 import { describeMergeFailure, resolveMergeRetryMaxMs } from './merge-retry.ts';
+import {
+    parseRefusalSeries,
+    recordRefusal,
+    refusalStopText,
+    shouldStopOnSeries,
+} from './refusal-series.ts';
 import { resolveObservability } from './observability.ts';
 import {
     checkIssueFormat,
@@ -184,6 +190,7 @@ import {
 // #217: сверка исправленного батча намерений с исходным — чистый модуль рядом с разбором.
 import { checkIntentRepair, intentRepairObstacle } from './intent-repair.ts';
 import type { TSessionRequest } from './session-requests.ts';
+import { refusalOfParseError, type TRefusal } from './refusal-series.ts';
 import { liveProbeForIntent } from './live-probe.ts';
 // #625: лестница «ревью правок». Чистая арифметика сходимости (дедуп находок, потолок
 // проходов, анти-пинг-понг, решение «мердж / ещё круг / арбитр») живёт отдельным модулем —
@@ -875,6 +882,8 @@ export type RalphConfig = {
     // #67: сколько итераций ПОДРЯД петля вправе взять одну карточку, прежде чем встать с
     // причиной. Целое > 0, дефолт MAX_SAME_ISSUE; не ниже `coderTurnRetries + 1`.
     maxSameIssue?: unknown;
+    // #240: сколько одинаковых отказов подряд петля терпит по карточке. Целое > 0, дефолт 2.
+    maxSameRefusal?: unknown;
     // #97: сколько итераций ПОДРЯД оценка прогресса вправе не прочитаться (HEAD или
     // очередь), прежде чем петля встанет с причиной. Целое > 0, дефолт MAX_PROGRESS_UNKNOWN.
     maxProgressUnknown?: unknown;
@@ -4039,6 +4048,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         repairFn,
         orphanPrFn,
         liveProbeFn,
+        secretEnvNamesFn = () => adapters.taskSource.secretEnvNames(),
     }: {
         cfg: RalphConfig;
         // #45: контекст фазы нужен намерениям по PR — сам PR они не называют (сессия не
@@ -4094,6 +4104,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             verdict: string;
             comment: string;
         };
+        secretEnvNamesFn?: () => readonly string[];
     }): {
         applied: number;
         failed: boolean;
@@ -4114,8 +4125,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // Необязательное по той же причине, что и `outcomeUnknown`.
         dropped?: TDroppedIntent[];
         // #124: батч отвергнут разбором; `quarantined` — куда он снят, `null` — снять не
-        // вышло, и файл на месте. Без `quarantineFn` поля нет.
-        rejected?: { quarantined: string | null };
+        // вышло, и файл на месте. Без `quarantineFn` поля нет. #239: `refusal` отделяет
+        // неизвестную пару живой пробы от остальных ошибок разбора.
+        rejected?: { quarantined: string | null; refusal: TRefusal | null };
     } {
         const raw = readFn();
         if (!raw || raw.trim() === '')
@@ -4233,10 +4245,13 @@ export function createOrchestrator(env: OrchestratorEnv) {
         };
         let requests: TSessionRequest[] = [];
         let parseError: string | null = null;
+        let parseRefusal: TRefusal | null = null;
+        const sessionSecrets = collectSessionSecrets(cfg, secretEnvNamesFn);
         try {
             requests = parseBatch(pending);
         } catch (e) {
             parseError = (e as Error).message;
+            parseRefusal = refusalOfParseError(e, sessionSecrets);
         }
         // #217: один переспрос на батч. Исправление проходит тот же парсер и сверку с
         // исходным; отказ любого из трёх шагов — стоп ниже с причинами обоих разборов, а
@@ -4256,15 +4271,17 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     parseError =
                         `${parseError}; переспрос не помог — исправление тоже не разобралось: ` +
                         (e as Error).message;
+                    parseRefusal = refusalOfParseError(e, sessionSecrets);
                     // Решать, править ли батч руками и в какую сторону, человеку проще всего
                     // по тексту предложенной правки — как `Отвергнутый батч намерений:`.
-                    logFn(`Отвергнутое исправление:\n${r.text}`);
+                    logFn(`Отвергнутое исправление:\n${redactSecrets(r.text, sessionSecrets)}`);
                 }
                 if (fixed !== null) {
                     const check = checkIntentRepair(pending, fixed, r.text);
                     if (!check.ok) {
                         parseError = `${parseError}; исправление отвергнуто сверкой с исходным — ${check.why}`;
-                        logFn(`Отвергнутое исправление:\n${r.text}`);
+                        parseRefusal = refusalOfParseError(check.why, sessionSecrets);
+                        logFn(`Отвергнутое исправление:\n${redactSecrets(r.text, sessionSecrets)}`);
                     } else {
                         // Исправленный батч ложится на диск до первого эффекта: раннер, убитый
                         // посреди применения, иначе нашёл бы после рестарта исходный, битый.
@@ -4275,12 +4292,13 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         );
                         requests = fixed;
                         parseError = null;
+                        parseRefusal = null;
                     }
                 }
             }
         }
         if (parseError !== null) {
-            const why = parseError;
+            const why = redactSecrets(parseError, sessionSecrets);
             const failed = {
                 applied: 0,
                 failed: true,
@@ -4298,13 +4316,13 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 return failed;
             }
             // #124: текст — в лог до снятия: карантинный файл могут убрать, а лог остаётся.
-            logFn(`Отвергнутый батч намерений:\n${raw}`);
+            logFn(`Отвергнутый батч намерений:\n${redactSecrets(raw, sessionSecrets)}`);
             let quarantined: string | null = null;
             let moveError = '';
             try {
                 quarantined = quarantineFn();
             } catch (err) {
-                moveError = (err as Error).message;
+                moveError = redactSecrets((err as Error).message, sessionSecrets);
             }
             pushEventFn(
                 quarantined !== null
@@ -4325,7 +4343,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 cfg,
                 { logFn },
             );
-            return { ...failed, rejected: { quarantined } };
+            return { ...failed, rejected: { quarantined, refusal: parseRefusal } };
         }
         if (requests.length === 0)
             return {
@@ -5851,6 +5869,21 @@ export function createOrchestrator(env: OrchestratorEnv) {
         }
         return raw;
     }
+    // #240: порог серии одинаковых отказов — отдельный от maxSameIssue: у этих серий разные
+    // причины и решения. Битое значение отвергается на старте, а не превращается в дефолт.
+    const MAX_SAME_REFUSAL = 2;
+    function resolveMaxSameRefusal(cfg: RalphConfig, failFn: (msg: string) => unknown): number {
+        const raw = cfg.maxSameRefusal;
+        if (raw === undefined) return MAX_SAME_REFUSAL;
+        if (typeof raw !== 'number' || !Number.isInteger(raw) || raw < 1) {
+            failFn(
+                `ralph.config.json: maxSameRefusal = ${JSON.stringify(raw)} — ожидалось целое ` +
+                    'положительное число (сколько одинаковых отказов подряд петля терпит по карточке).',
+            );
+            return MAX_SAME_REFUSAL;
+        }
+        return raw;
+    }
     // #97: дефолт порога серии «прогресс неизвестен». Один сбой чтения петля переживает
     // (живучесть), серия — уже не чих: под ней брейкер maxNoProgress слеп, и петля, не
     // делающая ничего, крутилась бы до maxIterations. Три — как у maxNoProgress: серия
@@ -7256,6 +7289,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         resolveMergeRetryMaxMs(cfg, failFn);
         // #67: порог брейкера серии — тем же ранним отказом.
         resolveMaxSameIssue(cfg, failFn);
+        resolveMaxSameRefusal(cfg, failFn);
         resolveMaxProgressUnknown(cfg, failFn);
         // Задача 95: порог диска, ротация логов сессий и тарифы — тем же ранним отказом:
         // опечатка выключила бы порог молча, а тариф строкой дал бы NaN в стоимости попытки.
@@ -7547,6 +7581,45 @@ export function createOrchestrator(env: OrchestratorEnv) {
         return { state, maxIterations, maxTurns };
     }
 
+    function refusalOutcomePersister(
+        state: RalphState,
+        saveStateFn: typeof saveState,
+        logFn: LogFn,
+    ) {
+        return (
+            intents: ReturnType<typeof applySessionRequests>,
+            phase: Phase,
+            issue: number,
+            headBefore: string | Error | null,
+        ): void => {
+            const refusal = intents.rejected?.refusal ?? null;
+            if (refusal !== null) {
+                const refusalSeries = recordRefusal(
+                    parseRefusalSeries(state.refusalSeries),
+                    {
+                        milestone: phase.milestone,
+                        issue,
+                        sha: typeof headBefore === 'string' ? headBefore.trim() : null,
+                        evidence: intents.rejected?.quarantined ?? null,
+                    },
+                    refusal,
+                );
+                state.refusalSeries = refusalSeries;
+                saveStateFn(state);
+                logFn(
+                    `🔁 Отказ ${refusal.code} по Issue #${String(issue)}: ${String(refusalSeries.count)} подряд`,
+                );
+            } else if (
+                intents.failed === false &&
+                (intents.applied ?? 0) > 0 &&
+                state.refusalSeries != null
+            ) {
+                state.refusalSeries = null;
+                saveStateFn(state);
+            }
+        };
+    }
+
     // Типы DI-коллабораторов runLoop. Почти всё — typeof боевых дефолтов; два
     // исключения типизированы шире боевой сигнатуры (номер PR может быть null —
     // getLastGatePr() отдаёт null, если гейт не дошёл до findOpenPr; рантайм-guard'ы
@@ -7679,6 +7752,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // «совпали» по той же причине, что у stopRequestedFn: чтение lock — чтение боевого
         // файла; main передаёт боевую сверку только ядру из установки.
         coreDriftFn?: () => TLockDrift | null;
+        // Ревизия исполняемой установки для стопа недоступной пробы, не SHA дерева потребителя.
+        coreSha?: string;
         // #221: перечитать конфиг на границе фаз. Дефолт «не перечитывать» по той же
         // причине, что у stopRequestedFn: чтение боевого конфига в тесте — побочка; main
         // передаёт боевое чтение, и это сторожит структурный тест.
@@ -7822,6 +7897,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             stopRequestedFn = () => false,
             clearStopRequestFn = () => {},
             coreDriftFn = () => null,
+            coreSha = sessionSettingsRoots?.coreSha ?? '',
             reloadPhasesFn = () => null,
             stageJournal = createStageJournal(memoryStageJournalStore()),
             monitorConfigPath,
@@ -7872,6 +7948,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
         const maxSameIssue = resolveMaxSameIssue(cfg, (msg) => {
             throw new Error(msg);
         });
+        const maxSameRefusal = resolveMaxSameRefusal(cfg, (msg) => {
+            throw new Error(msg);
+        });
+        const persistRefusalOutcome = refusalOutcomePersister(state, saveStateFn, logFn);
         // `intentsNote` — что последний батч намерений по карточке сказал о себе: вероятная
         // причина круга для диагноза брейкера, `null` — батч прошёл чисто.
         let issueStreak: { issue: number; count: number; intentsNote: string | null } | null = null;
@@ -8691,6 +8771,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     pushEventFn(body.stop, cfg, { logFn });
                     break;
                 }
+                // Фаза 18: повтор одного отказа — стоп до спавна и до счёта итерации.
+                if (stopOnRefusalSeries(phase, next)) break;
                 // #67: стоп ДО спавна и до счёта итерации — следующая сессия по той же
                 // карточке была бы уже `maxSameIssue + 1`-й, и итерацию она не тратит.
                 if (
@@ -8985,15 +9067,11 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         },
                         liveProbeFn,
                     });
-                    // `?? []` — не тихий дефолт, а совместимость шва: подменённая реализация
-                    // (тест, чужой taskSource) может не знать про поле. Потеря фильтра здесь
-                    // возвращает прежнее поведение — лишнюю сессию, — но не неверный мердж.
+                    // Поле необязательно у подменённого шва: отсутствие означает «никого не закрыто».
                     for (const n of intents.closedIssues ?? []) closedThisRun.add(n);
-                    // #67: брейкер серии назовёт отказ намерений вероятной причиной круга.
                     if (issueStreak !== null) issueStreak.intentsNote = intentsStreakNote(intents);
-                    // #86: исход намерения неизвестен — стоп, пуш уже ушёл изнутри. Следующая
-                    // сессия дописала бы свои намерения в файл, который не применится никогда,
-                    // и закрытая по существу карточка крутилась бы до брейкера.
+                    persistRefusalOutcome(intents, phase, next.number, headBefore);
+                    // #86: неизвестный исход — стоп до журнала и новой сессии; пуш уже ушёл.
                     if (intents.outcomeUnknown === true) {
                         journal('исход применения намерений', () =>
                             stageJournal.finish('intents', 'stop'),
@@ -11844,6 +11922,31 @@ export function createOrchestrator(env: OrchestratorEnv) {
             }
         }
 
+        function stopOnRefusalSeries(phase: Phase, next: Issue): boolean {
+            const series = parseRefusalSeries(state.refusalSeries);
+            if (
+                once ||
+                dry ||
+                series === null ||
+                !shouldStopOnSeries(
+                    series,
+                    { milestone: phase.milestone, issue: next.number },
+                    maxSameRefusal,
+                )
+            ) {
+                return false;
+            }
+            pushEventFn(
+                `⛔ Ralph: повтор одного отказа на фазе "${phase.milestone}". ` +
+                    formatStopMessage(refusalStopText(series, maxSameRefusal, coreSha)),
+                cfg,
+                { logFn },
+            );
+            state.refusalSeries = null;
+            saveStateFn(state);
+            return true;
+        }
+
         logFn('🏁 Ralph loop завершён.');
     }
 
@@ -12984,6 +13087,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             stopRequestedFn: stopRequested,
             clearStopRequestFn: clearStopRequest,
             coreDriftFn,
+            coreSha,
             reloadPhasesFn: (milestone: string) =>
                 reloadPhasesFromConfig(runnerConfigPath, milestone, {
                     profileFlag,
@@ -13107,6 +13211,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         stopOnInFlightIntent,
         // #67: порог брейкера серии — валидатор конфига, проверяемый отдельно.
         resolveMaxSameIssue,
+        resolveMaxSameRefusal,
         resolveMaxProgressUnknown,
         // #88: барьер деплоя на старте — его зовёт и рестарт матрицы «убить до / после».
         stopOnDeployBlock,

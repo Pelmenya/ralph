@@ -171,13 +171,39 @@ const LIVE_PROBE_FIELDS: readonly string[] = ['kind', 'issue', 'cli', 'case'];
 const SAFE_PATH_RE = /^[A-Za-z0-9._][A-Za-z0-9._\-/[\]()]*$/;
 const MAX_PATH = 400;
 
-function fail(lineNo: number, what: string): never {
-    throw new Error(`Запрос сессии, строка ${String(lineNo)}: ${what}`);
+// Серия отказов сравнивает стабильный класс, а не диагноз с номером строки, PID и значениями
+// из запроса. Текст сообщения остаётся прежним для оператора и в идентичность не входит.
+export class SessionRequestParseError extends Error {
+    refusalWhat: string;
+
+    constructor(message: string, refusalWhat: string) {
+        super(message);
+        this.refusalWhat = refusalWhat;
+    }
+}
+
+function fail(lineNo: number, what: string, refusalWhat: string): never {
+    throw new SessionRequestParseError(
+        `Запрос сессии, строка ${String(lineNo)}: ${what}`,
+        refusalWhat,
+    );
+}
+
+// #239: отказ живой пробы отличается от опечатки в батче по своей паре, а не по тексту.
+export class UnknownLiveProbeError extends Error {
+    cli: string;
+    probeCase: string;
+
+    constructor(message: string, cli: string, probeCase: string) {
+        super(message);
+        this.cli = cli;
+        this.probeCase = probeCase;
+    }
 }
 
 function asRecord(value: unknown, lineNo: number): Record<string, unknown> {
     if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-        fail(lineNo, 'ожидался объект JSON');
+        fail(lineNo, 'ожидался объект JSON', 'json-object');
     }
     return value as Record<string, unknown>;
 }
@@ -190,17 +216,24 @@ function issueNumber(value: unknown, lineNo: number): number {
         fail(
             lineNo,
             `номер карточки должен быть целым положительным, пришло ${JSON.stringify(value)}`,
+            'issue-number',
         );
     }
     return value;
 }
 
-function text(value: unknown, lineNo: number, what: string, max: number): string {
+function text(
+    value: unknown,
+    lineNo: number,
+    what: string,
+    max: number,
+    refusalWhat: string,
+): string {
     if (typeof value !== 'string' || value.trim() === '') {
-        fail(lineNo, `${what} обязателен и не может быть пустым`);
+        fail(lineNo, `${what} обязателен и не может быть пустым`, refusalWhat);
     }
     if (value.length > max) {
-        fail(lineNo, `${what} длиннее предела ${String(max)} символов`);
+        fail(lineNo, `${what} длиннее предела ${String(max)} символов`, refusalWhat);
     }
     return value;
 }
@@ -220,28 +253,42 @@ function anchor(req: Record<string, unknown>, lineNo: number): { anchor?: TReque
     const rawSide = field('side');
     if (rawPath === undefined && rawLine === undefined) {
         if (rawSide !== undefined)
-            fail(lineNo, 'сторона диффа (side) задаётся только при паре path+line');
+            fail(
+                lineNo,
+                'сторона диффа (side) задаётся только при паре path+line',
+                'anchor-side-without-path',
+            );
         return {};
     }
     if (rawPath === undefined || rawLine === undefined) {
-        fail(lineNo, 'якорь комментария задаётся ПАРОЙ path+line: одного поля мало');
+        fail(
+            lineNo,
+            'якорь комментария задаётся ПАРОЙ path+line: одного поля мало',
+            'anchor-incomplete',
+        );
     }
-    const path = text(rawPath, lineNo, 'путь файла', MAX_PATH);
+    const path = text(rawPath, lineNo, 'путь файла', MAX_PATH, 'anchor-path-text');
     if (!SAFE_PATH_RE.test(path) || path.split('/').includes('..')) {
         fail(
             lineNo,
             `путь ${JSON.stringify(path)} не похож на файл этого репозитория ` +
                 '(ожидается относительный путь без «..» и без ведущего дефиса)',
+            'anchor-path-unsafe',
         );
     }
     if (typeof rawLine !== 'number' || !Number.isInteger(rawLine) || rawLine <= 0) {
-        fail(lineNo, `строка должна быть целым положительным, пришло ${JSON.stringify(rawLine)}`);
+        fail(
+            lineNo,
+            `строка должна быть целым положительным, пришло ${JSON.stringify(rawLine)}`,
+            'anchor-line-number',
+        );
     }
     if (rawSide === undefined) return { anchor: { path, line: rawLine } };
     if (typeof rawSide !== 'string' || !DIFF_SIDES.includes(rawSide)) {
         fail(
             lineNo,
             `сторона диффа должна быть ${DIFF_SIDES.join(' или ')}, пришло ${JSON.stringify(rawSide)}`,
+            'anchor-side',
         );
     }
     return { anchor: { path, line: rawLine, side: rawSide as TDiffSide } };
@@ -249,7 +296,11 @@ function anchor(req: Record<string, unknown>, lineNo: number): { anchor?: TReque
 
 function labels(value: unknown, lineNo: number, allowlist: readonly string[]): string[] {
     if (!Array.isArray(value) || value.length === 0) {
-        fail(lineNo, 'метки обязательны: карточка без меток не видна ни роутингу, ни человеку');
+        fail(
+            lineNo,
+            'метки обязательны: карточка без меток не видна ни роутингу, ни человеку',
+            'labels-required',
+        );
     }
     const seen: string[] = [];
     for (const label of value) {
@@ -257,6 +308,7 @@ function labels(value: unknown, lineNo: number, allowlist: readonly string[]): s
             fail(
                 lineNo,
                 `метка ${JSON.stringify(label)} вне разрешённого списка (${allowlist.join(', ')})`,
+                'label-not-allowed',
             );
         }
         // Повтор метки схлопываем, а не отвергаем: это невнимательность модели, а не
@@ -280,20 +332,40 @@ function liveProbe(
             lineNo,
             `live-probe принимает только ${LIVE_PROBE_FIELDS.join(', ')}; лишнее: ${extra.join(', ')} — ` +
                 'команду пробы задаёт каталог раннера, а не сессия',
+            'live-probe-extra-field',
         );
     }
     const issue = issueNumber(req['issue'], lineNo);
     const cli = req['cli'];
     const known = Object.keys(LIVE_PROBE_CASES);
-    if (typeof cli !== 'string' || !Object.hasOwn(LIVE_PROBE_CASES, cli)) {
-        fail(lineNo, `cli пробы ${JSON.stringify(cli)} не из каталога (${known.join(', ')})`);
-    }
-    const probeCase = req['case'];
-    const cases = LIVE_PROBE_CASES[cli];
-    if (typeof probeCase !== 'string' || !cases.includes(probeCase)) {
+    if (typeof cli !== 'string') {
         fail(
             lineNo,
-            `case пробы ${JSON.stringify(probeCase)} не из каталога ${cli} (${cases.join(', ')})`,
+            `cli пробы ${JSON.stringify(cli)} не из каталога (${known.join(', ')})`,
+            'live-probe-cli-type',
+        );
+    }
+    const probeCase = req['case'];
+    if (typeof probeCase !== 'string') {
+        fail(
+            lineNo,
+            `case пробы ${JSON.stringify(probeCase)} не из каталога ${cli}`,
+            'live-probe-case-type',
+        );
+    }
+    if (!Object.hasOwn(LIVE_PROBE_CASES, cli)) {
+        throw new UnknownLiveProbeError(
+            `Запрос сессии, строка ${String(lineNo)}: cli пробы ${JSON.stringify(cli)} не из каталога (${known.join(', ')})`,
+            cli,
+            probeCase,
+        );
+    }
+    const cases = LIVE_PROBE_CASES[cli];
+    if (!cases.includes(probeCase)) {
+        throw new UnknownLiveProbeError(
+            `Запрос сессии, строка ${String(lineNo)}: case пробы ${JSON.stringify(probeCase)} не из каталога ${cli} (${cases.join(', ')})`,
+            cli,
+            probeCase,
         );
     }
     return { kind: 'live-probe', issue, cli, case: probeCase };
@@ -340,7 +412,7 @@ export function parseSessionRequests(
         try {
             parsed = JSON.parse(source);
         } catch {
-            fail(no, 'не разобралось как JSON');
+            fail(no, 'не разобралось как JSON', 'json-syntax');
         }
         const req = asRecord(parsed, no);
         // #9: служебная строка раннера в батче. Отказ блока раннер пишет строкой с причиной
@@ -348,16 +420,24 @@ export function parseSessionRequests(
         // другая служебная строка здесь — подделка или порча, а не «неизвестный kind».
         if (Object.hasOwn(req, 'ralph')) {
             if (req['ralph'] === REJECTED_BLOCK_TAG && typeof req['why'] === 'string')
-                fail(no, `блок намерений в выводе сессии отвергнут раннером — ${req['why']}`);
-            fail(no, 'служебная строка раннера в батче намерений не на своём месте');
+                fail(
+                    no,
+                    `блок намерений в выводе сессии отвергнут раннером — ${req['why']}`,
+                    'runner-rejected-block',
+                );
+            fail(
+                no,
+                'служебная строка раннера в батче намерений не на своём месте',
+                'runner-marker-out-of-place',
+            );
         }
         const kind = req['kind'];
 
         if (kind === 'new-issue') {
             const issue = {
                 kind: 'new-issue' as const,
-                title: text(req['title'], no, 'заголовок', MAX_TITLE),
-                body: text(req['body'], no, 'тело карточки', MAX_BODY),
+                title: text(req['title'], no, 'заголовок', MAX_TITLE, 'new-issue-title'),
+                body: text(req['body'], no, 'тело карточки', MAX_BODY, 'new-issue-body'),
                 labels: labels(req['labels'], no, labelAllowlist),
                 ...(req['blocks'] === undefined ? {} : { blocks: issueNumber(req['blocks'], no) }),
             };
@@ -371,6 +451,7 @@ export function parseSessionRequests(
                         no,
                         'новая карточка не по формату потребителя (issueFormat) — ' +
                             describeFormatViolations(violations),
+                        'new-issue-format',
                     );
             }
             return issue;
@@ -380,7 +461,7 @@ export function parseSessionRequests(
         if (kind === 'pr-comment') {
             return {
                 kind: 'pr-comment' as const,
-                comment: text(req['comment'], no, 'комментарий', MAX_COMMENT),
+                comment: text(req['comment'], no, 'комментарий', MAX_COMMENT, 'comment-text'),
                 ...anchor(req, no),
             };
         }
@@ -389,7 +470,7 @@ export function parseSessionRequests(
         if (kind === 'pr-block') {
             return {
                 kind: 'pr-block' as const,
-                comment: text(req['comment'], no, 'комментарий', MAX_COMMENT),
+                comment: text(req['comment'], no, 'комментарий', MAX_COMMENT, 'comment-text'),
             };
         }
         if (kind === 'live-probe') return liveProbe(req, no);
@@ -397,13 +478,14 @@ export function parseSessionRequests(
             return {
                 kind: kind as 'comment' | 'close' | 'block',
                 issue: issueNumber(req['issue'], no),
-                comment: text(req['comment'], no, 'комментарий', MAX_COMMENT),
+                comment: text(req['comment'], no, 'комментарий', MAX_COMMENT, 'comment-text'),
             };
         }
         fail(
             no,
             `неизвестный kind ${JSON.stringify(kind)}. Разрешено: ${SESSION_REQUEST_KINDS.join(', ')}. ` +
                 'Снятие hold и blocked, одобрение ревью и мердж намерениями сессии не являются.',
+            'unknown-kind',
         );
     });
 

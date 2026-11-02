@@ -34,6 +34,7 @@ import {
     stateToDisk,
     type TSubmitRecord,
 } from './submit-journal.ts';
+import { parseRefusalSeries } from './refusal-series.ts';
 
 // Формат ralph.state.json — контракт (критерий #359). milestone === null означает «все
 // фазы пройдены» (см. phaseIndexOf/advancePhase в ralph.js). Остальные поля — счётчики
@@ -82,6 +83,10 @@ export type RalphState = {
     // считается смердженной без ответа форжа. Опциональна: state прошлых ревизий её не
     // содержит, и отсутствие читается как «мерджа не начинали».
     mergeInFlight?: TMergeInFlight | null;
+    // #240: серия одинаковых отказов переживает рестарт вместе с остальным state. Форму
+    // проверяет parseRefusalSeries (refusal-series.ts), а не вера в тип: файл мог написать
+    // прошлый раннер или человек, и битая серия не должна читаться как «серии нет».
+    refusalSeries?: unknown;
     // #93: журнал этапов сдачи фазы (submit-journal.ts). `submitted`, `deployBlock` и
     // `reviewOfFixes.arbitrated` выше — его проекции: у state, прошедшего
     // `attachSubmitJournal`, они аксессоры, и на диск ложится журнал, а не поля.
@@ -225,6 +230,14 @@ export function inspectState(text: string): TStateInspection {
             );
         }
     }
+    let refusalSeries: ReturnType<typeof parseRefusalSeries> | undefined;
+    if (raw.refusalSeries !== undefined) {
+        try {
+            refusalSeries = parseRefusalSeries(raw.refusalSeries);
+        } catch (e) {
+            return bad((e as Error).message);
+        }
+    }
     let stages: TSubmitRecord[] = [];
     if (!legacy) {
         if (raw.submitStages === undefined) return bad('submitStages отсутствует');
@@ -238,7 +251,8 @@ export function inspectState(text: string): TStateInspection {
     // аксессорами (`attachSubmitJournal`), и форма журнала после них проверяется тем же
     // разбором, что у v2 с диска. Молча принят не будет ни один файл, который v2 отверг бы.
     const { submitStages: _drop, ...rest } = raw;
-    const base = legacy ? rest : { ...rest, submitStages: stages };
+    const normalized = refusalSeries !== undefined ? { ...rest, refusalSeries } : { ...rest };
+    const base = legacy ? normalized : { ...normalized, submitStages: stages };
     let state: RalphState;
     try {
         state = attachSubmitJournal({ ...base, schemaVersion: STATE_SCHEMA_VERSION } as RalphState);

@@ -91,6 +91,40 @@ describe('inspectState — версия схемы и форма state', () => {
         if (r.status !== 'ok') return;
         expect(r.state).toMatchObject({ schemaVersion: 2, count: 2, milestone: 'M1' });
         expect(r.state.submitted).toBe(false);
+        expect(r.state).not.toHaveProperty('refusalSeries');
+    });
+
+    it('годная refusalSeries сохраняется при чтении v2', () => {
+        const refusalSeries = {
+            milestone: 'M1',
+            issue: 7,
+            stage: 'coder',
+            code: 'intent-rejected',
+            params: { what: 'битое намерение' },
+            count: 1,
+            reason: 'отказ разбора',
+            evidence: null,
+            attemptShas: ['abc'],
+        };
+        const r = inspectState(JSON.stringify({ ...v2, refusalSeries }));
+        expect(r.status).toBe('ok');
+        if (r.status !== 'ok') return;
+        expect(r.state.refusalSeries).toEqual(refusalSeries);
+    });
+
+    it('refusalSeries null означает отсутствие серии', () => {
+        const r = inspectState(JSON.stringify({ ...v2, refusalSeries: null }));
+        expect(r.status).toBe('ok');
+        if (r.status !== 'ok') return;
+        expect(r.state.refusalSeries).toBeNull();
+    });
+
+    it('битая refusalSeries — повреждение с именем поля', () => {
+        const r = inspectState(JSON.stringify({ ...v2, refusalSeries: { count: 0 } }));
+        expect(r).toMatchObject({
+            status: 'corrupt',
+            reason: expect.stringMatching(/refusalSeries/),
+        });
     });
 
     it('годный v1 — проверенная миграция в v2', () => {

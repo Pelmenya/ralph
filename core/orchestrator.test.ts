@@ -6501,6 +6501,125 @@ describe('runLoop — основной while-цикл: итерации коде
                 const append = (line: string) => (f.text = `${f.text ?? ''}${line}\n`);
                 return { f, closed, quarantineFn, apply, append };
             };
+
+            it('незнакомая живая проба — refusal live-probe-unavailable с парой пробы', () => {
+                const { f, apply, quarantineFn } = intentFile();
+                f.text = `${JSON.stringify({ kind: 'live-probe', issue: 7, cli: 'claude', case: 'нет-такого' })}\n`;
+
+                const result = apply({
+                    cfg: validCfg(),
+                    currentMilestone: 'Ralph · Ф18',
+                    quarantineFn,
+                    logFn: () => {},
+                    pushEventFn: () => {},
+                });
+
+                expect(result.rejected?.refusal?.code).toBe('live-probe-unavailable');
+                expect(result.rejected?.refusal?.params.case).toBe('нет-такого');
+                expect(result.rejected?.refusal?.params.cli).toBe('claude');
+            });
+
+            it('другая ошибка разбора — refusal intent-rejected', () => {
+                const { f, apply, quarantineFn } = intentFile();
+                f.text = `${JSON.stringify({ kind: 'close', issue: '7', comment: 'готово' })}\n`;
+
+                const result = apply({
+                    cfg: validCfg(),
+                    currentMilestone: 'Ralph · Ф18',
+                    quarantineFn,
+                    logFn: () => {},
+                    pushEventFn: () => {},
+                });
+
+                expect(result.rejected?.refusal?.code).toBe('intent-rejected');
+            });
+
+            it('сырое значение из ошибки редактируется до refusal и не становится identity', () => {
+                const { f, apply, quarantineFn } = intentFile();
+                const secret = ['fixture', 'refusal', '0123456789abcdef'].join('-');
+                vi.stubEnv('RALPH_TEST_REFUSAL_SECRET', secret);
+                f.text = `${JSON.stringify({ kind: 'close', issue: secret, comment: 'готово' })}\n`;
+
+                let result: ReturnType<typeof ralph.applySessionRequests>;
+                try {
+                    result = apply({
+                        cfg: validCfg(),
+                        currentMilestone: 'Ralph · Ф18',
+                        quarantineFn,
+                        logFn: () => {},
+                        pushEventFn: () => {},
+                        secretEnvNamesFn: () => ['RALPH_TEST_REFUSAL_SECRET'],
+                    });
+                } finally {
+                    vi.unstubAllEnvs();
+                }
+
+                expect(result.rejected?.refusal?.params).toEqual({ what: 'issue-number' });
+                expect(JSON.stringify(result.rejected?.refusal)).not.toContain(secret);
+                expect(result.rejected?.refusal?.reason).toContain('***');
+            });
+
+            it.each([
+                {
+                    name: 'обычная ошибка исправления заменяет отказ неизвестной пробы',
+                    original: { kind: 'live-probe', issue: 7, cli: 'claude', case: 'нет-такого' },
+                    repaired: { kind: 'close', issue: '7', comment: 'готово' },
+                    code: 'intent-rejected',
+                },
+                {
+                    name: 'неизвестная проба исправления заменяет обычную ошибку',
+                    original: { kind: 'close', issue: '7', comment: 'готово' },
+                    repaired: { kind: 'live-probe', issue: 7, cli: 'claude', case: 'нет-такого' },
+                    code: 'live-probe-unavailable',
+                },
+            ])('$name', ({ original, repaired, code }) => {
+                const { f, apply, quarantineFn } = intentFile();
+                f.text = `${JSON.stringify(original)}\n`;
+
+                const result = apply({
+                    cfg: validCfg(),
+                    currentMilestone: 'Ralph · Ф18',
+                    quarantineFn,
+                    logFn: () => {},
+                    pushEventFn: () => {},
+                    repairFn: () => ({ ok: true, text: `${JSON.stringify(repaired)}\n` }),
+                });
+
+                expect(result.rejected?.refusal?.code).toBe(code);
+            });
+
+            it('секрет не попадает в событие и логи исходного батча и исправления', () => {
+                const { f, apply, quarantineFn } = intentFile();
+                const secret = ['fixture', 'repair', '0123456789abcdef'].join('-');
+                vi.stubEnv('RALPH_TEST_REFUSAL_SECRET', secret);
+                const rejected = `${JSON.stringify({ kind: 'close', issue: secret, comment: 'готово' })}\n`;
+                f.text = rejected;
+                const logs: string[] = [];
+                const pushes: string[] = [];
+
+                try {
+                    apply({
+                        cfg: validCfg(),
+                        currentMilestone: 'Ralph · Ф18',
+                        quarantineFn,
+                        logFn: (message: string) => logs.push(message),
+                        pushEventFn: (message: string) => pushes.push(message),
+                        repairFn: () => ({ ok: true, text: rejected }),
+                        secretEnvNamesFn: () => ['RALPH_TEST_REFUSAL_SECRET'],
+                    });
+                } finally {
+                    vi.unstubAllEnvs();
+                }
+
+                expect(logs).toHaveLength(2);
+                expect(logs[0]).toContain('Отвергнутое исправление:');
+                expect(logs[1]).toContain('Отвергнутый батч намерений:');
+                expect(pushes).toHaveLength(1);
+                const messages = [...logs, ...pushes].join('\n');
+                expect(messages).not.toContain(secret);
+                expect(messages).toContain('***');
+            });
+
             const sessions = (append: (l: string) => void) => {
                 let n = 0;
                 return vi.fn(() => {
@@ -6651,6 +6770,25 @@ describe('runLoop — основной while-цикл: итерации коде
             },
         );
 
+        it.each([0, -1, 1.5, '2', null])(
+            'битый maxSameRefusal (%j) — стоп на старте с причиной, а не дефолт',
+            (v) => {
+                const failFn = vi.fn((m: string) => {
+                    throw new Error(m);
+                });
+                expect(() =>
+                    ralph.resolveMaxSameRefusal({ maxSameRefusal: v } as never, failFn),
+                ).toThrow(/maxSameRefusal = .* целое положительное/);
+            },
+        );
+
+        it('maxSameRefusal без ключа — 2, целое положительное значение сохраняется', () => {
+            const failFn = vi.fn();
+            expect(ralph.resolveMaxSameRefusal({} as never, failFn)).toBe(2);
+            expect(ralph.resolveMaxSameRefusal({ maxSameRefusal: 3 } as never, failFn)).toBe(3);
+            expect(failFn).not.toHaveBeenCalled();
+        });
+
         it('maxSameIssue ниже coderTurnRetries + 1 — стоп на старте, а не молчаливый подъём', () => {
             const failFn = vi.fn((m: string) => {
                 throw new Error(m);
@@ -6712,6 +6850,300 @@ describe('runLoop — основной while-цикл: итерации коде
             expect(pushEventFn.mock.calls.map((c) => String(c[0])).join('\n')).not.toMatch(
                 /подряд/,
             );
+        });
+    });
+
+    describe('Фаза 18: серия отказов в state', () => {
+        const movingHead = () => {
+            let n = 0;
+            return () => `HEAD_${String(n++)}`;
+        };
+        const rejectedWith = (refusal: {
+            code: 'intent-rejected' | 'live-probe-unavailable';
+            params: Record<string, string>;
+            reason: string;
+        }) => ({
+            applied: 0,
+            failed: true,
+            rejected: { quarantined: '/q/1', refusal },
+        });
+        const rejectedResult = () =>
+            rejectedWith({ code: 'intent-rejected', params: { what: 'x' }, reason: 'x' });
+
+        it('отказ кодер-итерации записывает серию и доказательство в state', () => {
+            const state = mkState();
+            runLoop(
+                validCfg({ maxIterations: 1 }),
+                { ...ctx(state), maxIterations: 1 },
+                deps([], {
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                    shFn: movingHead(),
+                    runClaudeFn: () => 0,
+                    applySessionRequestsFn: rejectedResult,
+                }),
+            );
+
+            expect(state.refusalSeries).toMatchObject({
+                count: 1,
+                evidence: '/q/1',
+                attemptShas: [expect.any(String)],
+            });
+        });
+
+        it('два одинаковых отказа увеличивают одну серию', () => {
+            const state = mkState();
+            const runClaudeFn = vi.fn(() => 0);
+            runLoop(
+                validCfg({ maxIterations: 2 }),
+                { ...ctx(state), maxIterations: 2 },
+                deps([], {
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                    shFn: movingHead(),
+                    runClaudeFn,
+                    applySessionRequestsFn: rejectedResult,
+                }),
+            );
+
+            expect(state.refusalSeries).toMatchObject({ count: 2 });
+            expect(runClaudeFn).toHaveBeenCalledTimes(2);
+        });
+
+        it('два одинаковых отказа останавливают петлю до третьей сессии', () => {
+            const state = mkState();
+            const runClaudeFn = vi.fn(() => 0);
+            const pushEventFn = vi.fn();
+            runLoop(
+                validCfg({ maxIterations: 5 }),
+                { ...ctx(state), maxIterations: 5 },
+                deps([], {
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                    shFn: movingHead(),
+                    runClaudeFn,
+                    applySessionRequestsFn: rejectedResult,
+                    pushEventFn,
+                }),
+            );
+
+            expect(runClaudeFn).toHaveBeenCalledTimes(2);
+            expect(pushEventFn).toHaveBeenCalledTimes(1);
+            const message = String(pushEventFn.mock.calls[0][0]);
+            expect(message).toContain('повтор одного отказа');
+            expect(message).toContain('Issue #7');
+            expect(message).toContain('intent-rejected');
+            expect(message).toContain('/q/1');
+            expect(state.refusalSeries).toBeNull();
+            expect(state.count).toBe(2);
+        });
+
+        it('серия переживает рестарт и останавливает следующий прогон', () => {
+            const state = mkState();
+            const runClaudeFn = vi.fn(() => 0);
+            const pushEventFn = vi.fn();
+            const shFn = movingHead();
+            const loopDeps = () =>
+                deps([], {
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                    shFn,
+                    runClaudeFn,
+                    applySessionRequestsFn: rejectedResult,
+                    pushEventFn,
+                });
+            runLoop(
+                validCfg({ maxIterations: 1 }),
+                { ...ctx(state), maxIterations: 1 },
+                loopDeps(),
+            );
+            runLoop(
+                validCfg({ maxIterations: 5 }),
+                { ...ctx(state), maxIterations: 5 },
+                loopDeps(),
+            );
+
+            expect(runClaudeFn).toHaveBeenCalledTimes(2);
+            const stops = pushEventFn.mock.calls.filter((call) =>
+                String(call[0]).includes('повтор одного отказа'),
+            );
+            expect(stops).toHaveLength(1);
+            expect(state.refusalSeries).toBeNull();
+        });
+
+        it('разные отказы не останавливают петлю', () => {
+            const state = mkState();
+            const runClaudeFn = vi.fn(() => 0);
+            const pushEventFn = vi.fn();
+            let applyCalls = 0;
+            runLoop(
+                validCfg({ maxIterations: 2 }),
+                { ...ctx(state), maxIterations: 2 },
+                deps([], {
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                    shFn: movingHead(),
+                    runClaudeFn,
+                    applySessionRequestsFn: () => {
+                        const what = ++applyCalls === 1 ? 'a' : 'b';
+                        return rejectedWith({
+                            code: 'intent-rejected',
+                            params: { what },
+                            reason: what,
+                        });
+                    },
+                    pushEventFn,
+                }),
+            );
+
+            expect(runClaudeFn).toHaveBeenCalledTimes(2);
+            expect(pushEventFn.mock.calls.map((call) => String(call[0])).join('\n')).not.toContain(
+                'повтор одного отказа',
+            );
+            expect(state.refusalSeries).toMatchObject({ count: 1, params: { what: 'b' } });
+        });
+
+        it('недоступная живая проба останавливает петлю после первой сессии', () => {
+            const state = mkState();
+            const runClaudeFn = vi.fn(() => 0);
+            const pushEventFn = vi.fn();
+            runLoop(
+                validCfg({ maxIterations: 5 }),
+                { ...ctx(state), maxIterations: 5 },
+                deps([], {
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                    shFn: movingHead(),
+                    runClaudeFn,
+                    applySessionRequestsFn: () =>
+                        rejectedWith({
+                            code: 'live-probe-unavailable',
+                            params: { cli: 'claude', case: 'нет-такого' },
+                            reason: 'пробы нет в каталоге',
+                        }),
+                    coreSha: 'core-revision-1',
+                    pushEventFn,
+                }),
+            );
+
+            expect(runClaudeFn).toHaveBeenCalledTimes(1);
+            expect(pushEventFn).toHaveBeenCalledTimes(1);
+            const message = String(pushEventFn.mock.calls[0][0]);
+            expect(message).toContain('нет в каталоге установленного раннера');
+            expect(message).toContain('live-probe-unavailable');
+            expect(message).toContain('Ревизия установки: core-revision-1');
+            expect(state.refusalSeries).toBeNull();
+            expect(state.count).toBe(1);
+        });
+
+        it('maxSameRefusal из конфига разрешает три отказа до стопа', () => {
+            const state = mkState();
+            const runClaudeFn = vi.fn(() => 0);
+            const pushEventFn = vi.fn();
+            runLoop(
+                validCfg({ maxIterations: 5, maxSameRefusal: 3 }),
+                { ...ctx(state), maxIterations: 5 },
+                deps([], {
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                    shFn: movingHead(),
+                    runClaudeFn,
+                    applySessionRequestsFn: rejectedResult,
+                    pushEventFn,
+                }),
+            );
+
+            expect(runClaudeFn).toHaveBeenCalledTimes(3);
+            expect(pushEventFn).toHaveBeenCalledTimes(1);
+            expect(String(pushEventFn.mock.calls[0][0])).toContain('maxSameRefusal = 3');
+            expect(state.refusalSeries).toBeNull();
+            expect(state.count).toBe(3);
+        });
+
+        it('подтверждённое применение намерений сбрасывает серию', () => {
+            const state = mkState();
+            let applyCalls = 0;
+            runLoop(
+                validCfg({ maxIterations: 2 }),
+                { ...ctx(state), maxIterations: 2 },
+                deps([], {
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                    shFn: movingHead(),
+                    runClaudeFn: () => 0,
+                    applySessionRequestsFn: () =>
+                        ++applyCalls === 1 ? rejectedResult() : { applied: 1, failed: false },
+                }),
+            );
+
+            expect(state.refusalSeries).toBeNull();
+        });
+
+        it('код 0 без применённых намерений серию не сбрасывает', () => {
+            const state = mkState();
+            let applyCalls = 0;
+            runLoop(
+                validCfg({ maxIterations: 2 }),
+                { ...ctx(state), maxIterations: 2 },
+                deps([], {
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                    shFn: movingHead(),
+                    runClaudeFn: () => 0,
+                    applySessionRequestsFn: () =>
+                        ++applyCalls === 1 ? rejectedResult() : { applied: 0, failed: false },
+                }),
+            );
+
+            expect(state.refusalSeries).toMatchObject({ count: 1 });
+        });
+
+        it('ошибка записи серии останавливает петлю', () => {
+            const state = mkState();
+            const runClaudeFn = vi.fn(() => 0);
+            expect(() =>
+                runLoop(
+                    validCfg({ maxIterations: 2 }),
+                    { ...ctx(state), maxIterations: 2 },
+                    deps([], {
+                        phaseIndexOfFn: () => 0,
+                        openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                        shFn: movingHead(),
+                        runClaudeFn,
+                        applySessionRequestsFn: rejectedResult,
+                        saveStateFn: (saved: FakeState) => {
+                            if (saved.refusalSeries != null) throw new Error('ENOSPC');
+                        },
+                    }),
+                ),
+            ).toThrow('ENOSPC');
+            expect(runClaudeFn).toHaveBeenCalledTimes(1);
+        });
+
+        it('ошибка записи сброса серии тоже не глотается', () => {
+            const state = mkState();
+            const runClaudeFn = vi.fn(() => 0);
+            let applyCalls = 0;
+            expect(() =>
+                runLoop(
+                    validCfg({ maxIterations: 2 }),
+                    { ...ctx(state), maxIterations: 2 },
+                    deps([], {
+                        phaseIndexOfFn: () => 0,
+                        openIssuesFn: () => [{ number: 7, title: 't', labels: [] }],
+                        shFn: movingHead(),
+                        runClaudeFn,
+                        applySessionRequestsFn: () =>
+                            ++applyCalls === 1 ? rejectedResult() : { applied: 1, failed: false },
+                        saveStateFn: (saved: FakeState) => {
+                            if (applyCalls === 2 && saved.refusalSeries === null) {
+                                throw new Error('ENOSPC on reset');
+                            }
+                        },
+                    }),
+                ),
+            ).toThrow('ENOSPC on reset');
+            expect(runClaudeFn).toHaveBeenCalledTimes(2);
         });
     });
 

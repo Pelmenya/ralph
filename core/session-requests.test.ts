@@ -12,6 +12,7 @@ import {
     MAX_MUTATION_REQUESTS,
     MAX_COMMENT_REQUESTS,
     MAX_REQUEST_LINES,
+    UnknownLiveProbeError,
     classifyIntentFailure,
     intentFailureText,
     classifySessionRequests,
@@ -811,6 +812,56 @@ describe('live-probe: разбор (#219)', () => {
             { kind: 'live-probe', issue: 219, cli: 'claude', case: 'unknown-tool' },
         ]);
     });
+
+    it('незнакомый case — UnknownLiveProbeError с парой пробы и прежним сообщением', () => {
+        let thrown: unknown;
+        try {
+            parseSessionRequests(probe({ case: 'rm-everything' }), OPTS);
+        } catch (e) {
+            thrown = e;
+        }
+
+        expect(thrown).toBeInstanceOf(UnknownLiveProbeError);
+        const error = thrown as UnknownLiveProbeError;
+        expect(error.cli).toBe('claude');
+        expect(error.probeCase).toBe('rm-everything');
+        expect(error.message).toMatch(/case пробы .* не из каталога/);
+    });
+
+    it('незнакомый cli — тот же класс с парой из запроса', () => {
+        let thrown: unknown;
+        try {
+            parseSessionRequests(probe({ cli: 'codex' }), OPTS);
+        } catch (e) {
+            thrown = e;
+        }
+
+        expect(thrown).toBeInstanceOf(UnknownLiveProbeError);
+        const error = thrown as UnknownLiveProbeError;
+        expect(error.cli).toBe('codex');
+        expect(error.probeCase).toBe('unknown-tool');
+        expect(error.message).toMatch(/cli пробы .* не из каталога/);
+    });
+
+    it.each([
+        [{ cli: 7 }, /cli пробы 7/],
+        [{ case: 9 }, /case пробы 9/],
+        [{ cli: 'codex', case: 9 }, /case пробы 9/],
+    ])(
+        'нестроковое поле пробы — обычный malformed intent, а не отказ установки: %j',
+        (over, re) => {
+            let thrown: unknown;
+            try {
+                parseSessionRequests(probe(over), OPTS);
+            } catch (e) {
+                thrown = e;
+            }
+
+            expect(thrown).toBeInstanceOf(Error);
+            expect(thrown).not.toBeInstanceOf(UnknownLiveProbeError);
+            expect((thrown as Error).message).toMatch(re);
+        },
+    );
 
     it.each([
         [{ case: 'rm-everything' }, /case пробы "rm-everything" не из каталога claude/],
