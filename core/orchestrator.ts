@@ -181,12 +181,14 @@ import {
     buildIssueContext,
     buildFixArbiterPrompt,
     buildFixByReviewPrompt,
+    buildFixPlanPrompt,
     buildFixReviewPrompt,
     buildGateHealPrompt,
     buildIntentRepairPrompt,
     buildReReviewPrompt,
     buildReviewPrompt,
 } from './prompts.ts';
+import { extractFixPlan, formatFixPlan, validateFixPlan, type TFixPlan } from './fix-plan.ts';
 // #217: сверка исправленного батча намерений с исходным — чистый модуль рядом с разбором.
 import { checkIntentRepair, intentRepairObstacle } from './intent-repair.ts';
 import type { TSessionRequest } from './session-requests.ts';
@@ -9592,6 +9594,86 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     cfg.review?.fixTurnRetries,
                     FIX_TURN_RETRIES,
                 );
+                // #45: набор проверок — из конфига гейта, как у разбора blocked ниже.
+                // Раньше здесь был прошит список npm-скриптов ДРУГОГО проекта (включая
+                // `npm run lint:fsd`, которого тут нет вовсе): сессия честно пыталась
+                // выполнить несуществующую команду, а прогнать то, что реально проверяет
+                // гейт, ей никто не велел.
+                const fixGateCmdList = gateChecksFor(cfg.profileName, cfg)
+                    .map(([, cmd]) => cmd)
+                    .join(', ');
+                const reviewTurns = positiveIntOrDefault(cfg.review?.maxTurns, maxTurns);
+                const reviewLimit = positiveIntOrDefault(cfg.review?.diffLimit, REVIEW_DIFF_LIMIT);
+                const runFixPlanner = (
+                    what: string,
+                    commentsContext: string,
+                    model: string | null | undefined,
+                ): TFixPlan | null => {
+                    const stop = (diagnosis: string): null => {
+                        pushEventFn(
+                            `⛔ Ralph: фаза "${phase.milestone}" — планировщик правок не выполнен. ` +
+                                formatStopMessage({
+                                    reason: 'fix-plan',
+                                    diagnosis: `шаг «${what}»: ${diagnosis}`,
+                                    question: 'разбери вывод планировщика и перезапусти loop',
+                                }),
+                            cfg,
+                            { logFn },
+                        );
+                        return null;
+                    };
+                    if (!model || model === 'none') return stop('ревью-модель не задана');
+                    const headBefore = branchHeadShaFn(phase.branch);
+                    if (!headBefore) {
+                        return stop(`HEAD ветки ${phase.branch} до сессии не прочитан`);
+                    }
+                    let output = '';
+                    const plannerCode = runClaudeFn(
+                        buildFixPlanPrompt({
+                            branch: phase.branch,
+                            diffContext: reviewDiffContextFn(phase.branch, {
+                                // Правки прошлого круга меняют дифф: снимок первого ревью устарел.
+                                files: phaseDiffFilesFn(phase.branch),
+                                limit: reviewLimit,
+                            }),
+                            commentsContext,
+                            gateCmdList: fixGateCmdList,
+                        }),
+                        {
+                            model,
+                            maxTurns: reviewTurns,
+                            fallbackModel: pickReviewFallbackModel(cfg),
+                        },
+                        {
+                            onOutput: (text: string) => {
+                                output = text;
+                            },
+                            // Read-only сессия не оставляет намерений следующим этапам.
+                            collectIntentsFn: () => {},
+                        },
+                    );
+                    if (plannerCode !== 0) {
+                        return stop(`сессия завершилась кодом ${String(plannerCode)}`);
+                    }
+                    const headAfter = branchHeadShaFn(phase.branch);
+                    if (!headAfter || headAfter !== headBefore) {
+                        return stop(
+                            `HEAD ветки ${phase.branch} изменился: до ${headBefore}, после ${headAfter ?? 'не прочитан'}`,
+                        );
+                    }
+                    let dirty = '';
+                    try {
+                        dirty = shFn('git status --porcelain');
+                    } catch (e) {
+                        return stop(`git status --porcelain упал: ${(e as Error).message}`);
+                    }
+                    if (dirty) return stop(`дерево после сессии грязное:\n${dirty}`);
+                    const extracted = extractFixPlan(output);
+                    if ('error' in extracted) {
+                        return stop(`вывод не разобран: ${extracted.error}`);
+                    }
+                    return extracted.plan;
+                };
 
                 // #93: этапы сдачи — в журнал с обязательным исходом. Этап с исходом `ok`
                 // или `skip` второй раз не идёт: рестарт посреди сдачи продолжает с первого
@@ -9895,14 +9977,6 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     // владельца, поэтому allowlist покрывает и его комментарии.
                     logFn('🔧 Правки по ревью...');
                     const allowNames = cfg.authorAllowlist.join(', ');
-                    // #45: набор проверок — из конфига гейта, как у разбора blocked ниже.
-                    // Раньше здесь был прошит список npm-скриптов ДРУГОГО проекта (включая
-                    // `npm run lint:fsd`, которого тут нет вовсе): сессия честно пыталась
-                    // выполнить несуществующую команду, а прогнать то, что реально проверяет
-                    // гейт, ей никто не велел.
-                    const fixGateCmdList = gateChecksFor(cfg.profileName, cfg)
-                        .map(([, cmd]) => cmd)
-                        .join(', ');
                     // #45: обоснования пропусков приходят намерением pr-comment; #594:
                     // исчерпание ходов — не отказ, а «не успела» (см. runSessionWithTurnRetries).
                     // #97: комментарии первой сессии вызывающий читает ДО спавна и при `null`
@@ -9910,7 +9984,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     // их само: первая сессия могла оставить намерения `pr-comment`
                     // (обоснования пропусков, #45), и продолжение, не видящее их, повторило
                     // бы уже отклонённую правку.
-                    const runFixSession = (what: string, commentsContext: string) =>
+                    const runFixSession = (what: string, commentsContext: string, plan?: string) =>
                         runSessionWithTurnRetries(
                             (resumed) => {
                                 const comments = resumed
@@ -9922,11 +9996,66 @@ export function createOrchestrator(env: OrchestratorEnv) {
                                     allowNames,
                                     gateCmdList: fixGateCmdList,
                                     commentsContext: comments,
+                                    plan,
                                     resumed,
                                 });
                             },
                             { what, retries: fixTurnRetries },
                         );
+                    const planRecords = subRecords();
+                    const planDone = subDone('plan');
+                    const planDetail = stageDetail(planRecords, 'plan');
+                    let fixPlan: TFixPlan | undefined;
+                    const planSaved = planRecords.some(
+                        (record) =>
+                            record.stage === 'plan' &&
+                            record.event === 'outcome' &&
+                            record.outcome === 'ok',
+                    );
+                    if (planSaved) {
+                        const restored = validateFixPlan(
+                            planDetail && typeof planDetail === 'object' && 'plan' in planDetail
+                                ? planDetail.plan
+                                : undefined,
+                        );
+                        if ('error' in restored) {
+                            pushEventFn(
+                                `⛔ Ralph: фаза "${phase.milestone}" — планировщик правок не выполнен. ` +
+                                    formatStopMessage({
+                                        reason: 'fix-plan',
+                                        diagnosis: `шаг «план правок»: сохранённый план не разобран: ${restored.error}`,
+                                        question:
+                                            'разбери запись плана в журнале сдачи и перезапусти loop',
+                                    }),
+                                cfg,
+                                { logFn },
+                            );
+                            break;
+                        }
+                        fixPlan = restored.plan;
+                    }
+                    const reviewHadFindings =
+                        lastPrBlocked ||
+                        lastPrFindings.some((finding) => finding.anchor !== undefined);
+                    const planStarted = planRecords.some((record) => record.stage === 'plan');
+                    const plannerModel = reviewModel ?? state.lastReviewModel;
+                    if (!planDone && !planStarted && !reviewDone && !reviewHadFindings) {
+                        if (!subFinish('plan', 'skip')) break;
+                    } else if (!planDone && plannerModel && plannerModel !== 'none') {
+                        if (!subStart('plan')) break;
+                        const planComments = trustedCommentsContext(phase.branch, 'план правок');
+                        if (planComments === null) {
+                            subFinish('plan', 'stop');
+                            break;
+                        }
+                        const planned = runFixPlanner('план правок', planComments, plannerModel);
+                        if (!planned) {
+                            subFinish('plan', 'stop');
+                            break;
+                        }
+                        if (!subFinish('plan', 'ok', { plan: planned })) break;
+                        fixPlan = planned;
+                    } else if (!planDone && !subFinish('plan', 'skip')) break;
                     // #625: база диффа правок — голова ветки ДО сессии. Снимаем ЗАРАНЕЕ:
                     // после её пуша эта точка уже невосстановима, а без неё предметом
                     // «ревью правок» молча стала бы вся фаза.
@@ -9961,7 +10090,11 @@ export function createOrchestrator(env: OrchestratorEnv) {
                             subFinish('fixes', 'stop');
                             break;
                         }
-                        const fix = runFixSession('правки по ревью', fixComments);
+                        const fix = runFixSession(
+                            'правки по ревью',
+                            fixComments,
+                            fixPlan ? formatFixPlan(fixPlan) : undefined,
+                        );
                         if (fix.branchLost || fix.intentsBroken || fix.promptLost) {
                             subFinish('fixes', 'stop');
                             break;
@@ -10008,11 +10141,6 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     const fixReviewMax = nonNegativeIntOrDefault(
                         cfg.fixReviewAttempts,
                         FIX_REVIEW_MAX_PASSES,
-                    );
-                    const reviewTurns = positiveIntOrDefault(cfg.review?.maxTurns, maxTurns);
-                    const reviewLimit = positiveIntOrDefault(
-                        cfg.review?.diffLimit,
-                        REVIEW_DIFF_LIMIT,
                     );
                     const backlogLabels = (
                         Array.isArray(cfg.review?.backlogLabels) ? cfg.review.backlogLabels : []
@@ -10738,7 +10866,20 @@ export function createOrchestrator(env: OrchestratorEnv) {
                                 ladderStop = true;
                                 break;
                             }
-                            const again = runFixSession('правки по ревью правок', againComments);
+                            const againPlan = runFixPlanner(
+                                'правки по ревью правок',
+                                againComments,
+                                plannerModel,
+                            );
+                            if (!againPlan) {
+                                ladderStop = true;
+                                break;
+                            }
+                            const again = runFixSession(
+                                'правки по ревью правок',
+                                againComments,
+                                formatFixPlan(againPlan),
+                            );
                             if (again.branchLost || again.promptLost) {
                                 ladderStop = true;
                                 break;
@@ -11089,8 +11230,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 }
                 if (gate === 'blocked') {
                     // Дима (2026-07-19): blocked от ревью — тоже не повод стоять до утра.
-                    // Разбор блокеров: чини-сессия читает [blocker]-комментарии доверенных
-                    // авторов и чинит, но label НЕ трогает. Снятие метки — прерогатива
+                    // Разбор блокеров: чини-сессия читает [blocker]/[major]-комментарии
+                    // доверенных авторов и чинит, но label НЕ трогает. Снятие метки — прерогатива
                     // РАННЕРА по итогу ПОВТОРНОГО РЕВЬЮ (#217, тот же принцип, что в #207:
                     // решение принимает не тот, кого проверяют — кодер-сессия исполнитель, а
                     // не судья). Поэтому раннер сам снимает метку, гоняет повторное ревью
@@ -11185,6 +11326,12 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     // #97: замечания читаются ДО спавна; не прочитались — стоп уже отправлен.
                     const blockedComments = trustedCommentsContext(phase.branch, 'разбор blocked');
                     if (blockedComments === null) break;
+                    const blockedPlan = runFixPlanner(
+                        'разбор blocked',
+                        blockedComments,
+                        state.lastReviewModel ?? cfg.model,
+                    );
+                    if (!blockedPlan) break;
                     // Продолжение по ходам перечитывает замечания — как у правок по ревью.
                     const blocked = runSessionWithTurnRetries(
                         (resumed) => {
@@ -11197,6 +11344,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                                 allowNames: cfg.authorAllowlist.join(', '),
                                 gateCmdList: bGateCmdList,
                                 commentsContext: comments,
+                                plan: formatFixPlan(blockedPlan),
                                 resumed,
                             });
                         },

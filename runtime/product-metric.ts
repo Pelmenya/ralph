@@ -90,8 +90,9 @@ export const STOP_ROLES: Record<TStopReason, 'barrier' | 'paired' | 'loop'> = {
     'gate-tool-failure': 'paired',
     // Спор ревью доходит до стопа через PR с меткой blocked — строка гейта `помечен 'blocked'`.
     'review-dispute': 'paired',
-    // Ревью без вердикта и неподтверждённая метка ловятся ДО гейта: строки гейта нет.
+    // Ревью без вердикта, планировщик и неподтверждённая метка ловятся ДО гейта: строки его нет.
     'review-no-verdict': 'barrier',
+    'fix-plan': 'barrier',
     'blocked-unconfirmed': 'barrier',
     'main-conflict': 'loop',
     // #139: строка гейта `сверка защищаемых путей PR #…` уже посчитана барьером.

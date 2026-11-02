@@ -70,4 +70,15 @@ describe('formatStopMessage — причина, диагноз и вопрос �
         });
         expect(msg).toContain('красный чек площадки');
     });
+
+    it('fix-plan называет отказ планировщика, диагноз и вопрос человеку', () => {
+        const msg = formatStopMessage({
+            reason: 'fix-plan',
+            diagnosis: 'планировщик вернул вывод без блока плана',
+            question: 'проверь отказ и перезапусти loop',
+        });
+        expect(msg).toContain('причина: отказ планировщика правок (fix-plan).');
+        expect(msg).toContain('диагноз: планировщик вернул вывод без блока плана.');
+        expect(msg).toContain('вопрос человеку: проверь отказ и перезапусти loop');
+    });
 });

@@ -32,12 +32,13 @@ const REVIEW_MODEL = 'claude-opus-4-8';
 const PR = 777;
 const BRANCH = 'feature/m1';
 
-type TSession = 'review' | 'fix' | 'fix-review' | 'arbiter' | 're-review' | 'heal';
+type TSession = 'review' | 'plan' | 'fix' | 'fix-review' | 'arbiter' | 're-review' | 'heal';
 function sessionOf(prompt: string): TSession {
     if (prompt.includes('Ты независимый арбитр')) return 'arbiter';
     if (prompt.includes('отревьюй ИМЕННО ЭТИ ПРАВКИ')) return 'fix-review';
     if (prompt.includes('Ранее ревью пометило его меткой blocked')) return 're-review';
     if (prompt.includes('проведи детальное code review')) return 'review';
+    if (prompt.includes('Ты планировщик правок')) return 'plan';
     if (prompt.includes('Разбери замечания code review')) return 'fix';
     return 'heal';
 }
@@ -48,10 +49,10 @@ const BLOCKER: Finding = {
     comment: '🔴 [blocker] отказ теряется в catch',
     anchor: { path: 'src/a.ts', line: 42 },
 };
-// Сдача, проходящая ВСЕ этапы: ревью правок находит блокер, потолок (1) исчерпан —
+// Сдача, проходящая ВСЕ этапы: ревью и ревью правок находят блокер, потолок (1) исчерпан —
 // арбитр, он блокера не воспроизводит — гейт, мердж, деплой.
 const PASSES: Partial<Record<TSession, Finding[]>> = {
-    review: [SUMMARY],
+    review: [BLOCKER, SUMMARY],
     'fix-review': [BLOCKER, SUMMARY],
     arbiter: [SUMMARY],
 };
@@ -203,16 +204,40 @@ function runProcess(
                 }),
                 reviewDiffContextFn: read(() => ''),
                 branchHeadShaFn: read(() => opts.head ?? 'b'.repeat(40)),
-                runClaudeFn: read((prompt: string) => {
-                    const kind = sessionOf(prompt);
-                    lastSession = kind;
-                    u.sessions[kind] = (u.sessions[kind] ?? 0) + 1;
-                    if (kind === 'review') killIf('review');
-                    if (kind === 'fix') killIf('fixes');
-                    if (kind === 'fix-review') killIf('fix-review');
-                    if (kind === 'arbiter') killIf('arbiter');
-                    return 0;
-                }),
+                runClaudeFn: read(
+                    (prompt: string, _opts: unknown, sessionDeps?: Record<string, unknown>) => {
+                        const kind = sessionOf(prompt);
+                        lastSession = kind;
+                        u.sessions[kind] = (u.sessions[kind] ?? 0) + 1;
+                        if (kind === 'review') killIf('review');
+                        if (kind === 'plan') {
+                            killIf('plan');
+                            const output = [
+                                '<<<RALPH-FIX-PLAN>>>',
+                                JSON.stringify({
+                                    decision: 'Сохранить единый порядок разбора',
+                                    rejected: [],
+                                    steps: [
+                                        {
+                                            do: 'Проверить правки гейтом',
+                                            check: 'npm run test',
+                                            expect: 'GREEN',
+                                        },
+                                    ],
+                                }),
+                                '<<<END-RALPH-FIX-PLAN>>>',
+                            ].join('\n');
+                            (
+                                sessionDeps?.onOutput as
+                                    ((text: string, end: string) => void) | undefined
+                            )?.(output, 'completed');
+                        }
+                        if (kind === 'fix') killIf('fixes');
+                        if (kind === 'fix-review') killIf('fix-review');
+                        if (kind === 'arbiter') killIf('arbiter');
+                        return 0;
+                    },
+                ),
                 applySessionRequestsFn: read(() => {
                     u.applies.push(lastSession);
                     const findings = (lastSession && PASSES[lastSession]) ?? [];
@@ -299,17 +324,24 @@ function runProcess(
 /** Сколько раз за историю шла сессия этапа, если её этап убит (второй раз — рестарт). */
 const SESSION_OF: Partial<Record<TSubmitStage, TSession>> = {
     review: 'review',
+    plan: 'plan',
     fixes: 'fix',
     'fix-review': 'fix-review',
     arbiter: 'arbiter',
 };
 
 describe('#93 сдача без убийств проходит все этапы', () => {
-    it('ревью → правки → ревью правок → арбитр → гейт → мердж → деплой, журнал снят', () => {
+    it('ревью → план → правки → ревью правок → арбитр → гейт → мердж → деплой, журнал снят', () => {
         const u = universe();
         const p = runProcess(u);
         expect(p.killed).toBe(false);
-        expect(u.sessions).toMatchObject({ review: 1, fix: 1, 'fix-review': 1, arbiter: 1 });
+        expect(u.sessions).toMatchObject({
+            review: 1,
+            plan: 1,
+            fix: 1,
+            'fix-review': 1,
+            arbiter: 1,
+        });
         expect(u.forge).toEqual({ prs: 1, merged: 1, posts: 1 });
         expect(u.chat.at(-1)).toMatch(MERGED);
         // Доведённая попытка снимается: на диске ни этапов, ни барьера.
@@ -319,7 +351,9 @@ describe('#93 сдача без убийств проходит все этап�
     });
 });
 
-describe.each(SUBMIT_STAGES.map((s) => [s]))('#93 убит посреди этапа «%s»', (stage) => {
+const ORCHESTRATED_STAGES = SUBMIT_STAGES;
+
+describe.each(ORCHESTRATED_STAGES.map((s) => [s]))('#93 убит посреди этапа «%s»', (stage) => {
     it('рестарт продолжает с этапа: сделанное не повторяется, исход сказан', () => {
         const u = universe();
         expect(runProcess(u, stage).killed).toBe(true);

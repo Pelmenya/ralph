@@ -82,6 +82,43 @@ export const noSessionRequests = (): {
     prBlocked: boolean;
 } => ({ applied: 0, failed: false, closedIssues: [], prFindings: [], prBlocked: false });
 
+const DEFAULT_FIX_PLAN_OUTPUT = [
+    '<<<RALPH-FIX-PLAN>>>',
+    JSON.stringify({
+        decision: 'План по умолчанию',
+        rejected: [],
+        steps: [{ do: 'Шаг', check: 'npm test', expect: 'GREEN' }],
+    }),
+    '<<<END-RALPH-FIX-PLAN>>>',
+].join('\n');
+
+type RunSessionFake = (
+    prompt: string,
+    opts: { model?: string; fallbackModel?: string; [key: string]: unknown },
+    deps?: {
+        onOutput?: (output: string, endReason: string) => void;
+        [key: string]: unknown;
+    },
+) => unknown;
+
+// #247: сценарии после планировщика получают валидный план, не маскируя их исходный предмет.
+export function withDefaultFixPlan<T extends RunSessionFake>(run: T): T {
+    return ((prompt, opts, deps) => {
+        if (!prompt.includes('Ты планировщик правок')) return run(prompt, opts, deps);
+        let emitted = false;
+        const onOutput = deps?.onOutput;
+        const result = run(prompt, opts, {
+            ...deps,
+            onOutput: (text: string, endReason: string) => {
+                emitted = true;
+                onOutput?.(text, endReason);
+            },
+        });
+        if (result === 0 && !emitted) deps?.onOutput?.(DEFAULT_FIX_PLAN_OUTPUT, 'completed');
+        return result;
+    }) as T;
+}
+
 // ── Оркестратор сценарного прогона гейта (#223, было дублем в blocked-/hold-scenarios) ──
 // Модель ревью, поставившего блок (по ней встаёт планка #217), и лимит разбора blocked.
 export const SCENARIO_REVIEW_MODEL = 'claude-opus-4-8';
@@ -168,7 +205,7 @@ export function makeRunLoopScenario(
 } {
     const logs: string[] = [];
     const saved: RalphState[] = [];
-    const runClaudeFn = vi.fn((_prompt: string) => 0);
+    const runClaudeFn = vi.fn(withDefaultFixPlan((_prompt: string) => 0));
     const pushEventFn = vi.fn();
     const removeBlockedLabelFn = vi.fn();
     const addBlockedLabelFn = vi.fn();

@@ -63,7 +63,7 @@ describe('боевое чтение файла намерений в теста�
         const s = scenario();
         s.pass('blocked');
         expect(s.state.blockedHeals).toBe(1);
-        expect(s.runClaudeFn).toHaveBeenCalledTimes(2);
+        expect(s.runClaudeFn).toHaveBeenCalledTimes(3);
         expect(Object.keys(noSessionRequests()).sort()).toEqual([
             'applied',
             'closedIssues',

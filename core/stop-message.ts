@@ -18,6 +18,7 @@ export type TStopReason =
     | 'gate-tool-failure'
     | 'review-dispute'
     | 'review-no-verdict'
+    | 'fix-plan'
     | 'blocked-unconfirmed'
     | 'main-conflict'
     | 'main-sync-failed'
@@ -61,6 +62,7 @@ export const REASON_TITLES: Record<TStopReason, string> = {
     'gate-tool-failure': 'чек упал на инструменте, а не на коде',
     'review-dispute': 'спор ревью',
     'review-no-verdict': 'ревью без вердикта',
+    'fix-plan': 'отказ планировщика правок',
     'blocked-unconfirmed': 'метка blocked не подтверждена',
     'main-conflict': 'конфликт веток',
     // fetch, identity, пуш или `--abort` упали. Заголовок нейтральный в обе стороны:

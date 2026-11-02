@@ -5,6 +5,7 @@ import {
     finishStage,
     formatSubmitSummary,
     parseSubmitJournal,
+    stageDetail,
     startStage,
     stateToDisk,
     submittedOf,
@@ -42,11 +43,77 @@ const PENDING = { status: 'pending', milestone: M, sha: null, reason: 'не до
 const RED = { status: 'completed', milestone: M, sha: 'abc', reason: 'workflow failure' };
 
 describe('журнал этапов сдачи (#93): исход у каждого этапа', () => {
+    const reviewed = (): TSubmitRecord[] => finishStage(brokenAt('review'), M, 'review', 'ok', AT);
+
     it.each(SUBMIT_STAGES.map((s) => [s]))('рестарт посреди «%s» продолжает с него', (stage) => {
         const records = parseSubmitJournal(JSON.parse(JSON.stringify(brokenAt(stage))), 'тест');
         const s = summarizeSubmit(records);
         expect(s?.resumeStage).toBe(stage);
         expect(s?.stages.find((x) => x.stage === stage)?.status).toBe('не завершён');
+    });
+
+    it('после review продолжает с plan, а после plan: ok — с fixes и сохраняет план', () => {
+        expect(summarizeSubmit(parseSubmitJournal(reviewed(), 'тест'))?.resumeStage).toBe('plan');
+
+        const detail = { plan: { decision: 'вынести общий разбор', steps: ['добавить тест'] } };
+        const records = parseSubmitJournal(
+            [
+                ...reviewed(),
+                { v: 1, track: 'submit', milestone: M, stage: 'plan', event: 'start', at: AT },
+                {
+                    v: 1,
+                    track: 'submit',
+                    milestone: M,
+                    stage: 'plan',
+                    event: 'outcome',
+                    outcome: 'ok',
+                    detail,
+                    at: AT,
+                },
+            ],
+            'тест',
+        );
+        expect(summarizeSubmit(records)?.resumeStage).toBe('fixes');
+        expect(stageDetail(records, 'plan')).toEqual(detail);
+    });
+
+    it.each([
+        ['без исхода', null, 'fixes'],
+        ['ok', 'ok', 'fix-review'],
+        ['skip', 'skip', 'fix-review'],
+        ['stop', 'stop', 'fixes'],
+    ] as const)(
+        'журнал прежней ревизии: fixes %s без plan читается как plan: skip',
+        (_name, outcome, resume) => {
+            const fixesStart = {
+                v: 1,
+                track: 'submit',
+                milestone: M,
+                stage: 'fixes',
+                event: 'start',
+                at: AT,
+            };
+            const records = parseSubmitJournal(
+                [
+                    ...reviewed(),
+                    fixesStart,
+                    ...(outcome === null ? [] : [{ ...fixesStart, event: 'outcome', outcome }]),
+                ],
+                'тест',
+            );
+            const summary = summarizeSubmit(records);
+            expect(summary?.resumeStage).toBe(resume);
+            expect(summary?.stages.find((x) => x.stage === 'plan')?.status).toBe('пропущен');
+            expect(() => parseSubmitJournal(records, 'повторный разбор')).not.toThrow();
+        },
+    );
+
+    it('прежний переход review → fixes тоже восстанавливает plan: skip', () => {
+        const records = startStage(reviewed(), M, 'fixes', AT);
+        const summary = summarizeSubmit(records);
+        expect(summary?.resumeStage).toBe('fixes');
+        expect(summary?.stages.find((x) => x.stage === 'plan')?.status).toBe('пропущен');
+        expect(() => parseSubmitJournal(records, 'тест')).not.toThrow();
     });
 
     it('стоп этапа сдачи не кончает попытку: рестарт повторяет остановленный этап', () => {

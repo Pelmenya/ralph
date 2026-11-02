@@ -52,6 +52,7 @@ import type { AdapterRegistries, AdapterConfig } from '../adapters/adapters-impl
 import type { ReviewComment } from '../adapters/adapters.ts';
 import type { DeployOutcome } from './deploy-check.ts';
 import type { RalphState } from './state-lock.ts';
+import type { RalphConfig } from './orchestrator.ts';
 import {
     COMMENT_NOTICE_THRESHOLD,
     IN_FLIGHT_PREFIX,
@@ -65,6 +66,7 @@ import { classifyClaudeSessionEnd } from '../adapters/session-end.ts';
 import { HARNESS_REGISTRY } from '../adapters/harness-registry.ts';
 import { codexUntrustArgs } from '../adapters/codex-home.ts';
 import { reconcilePhases } from './phase-reload.ts';
+import { withDefaultFixPlan } from '../tests/test-helpers.ts';
 
 // Фаза 16: исход сессии называет адаптер рантайма, ядро текста не читает. Фейк рантайма
 // с выводом Claude получает исход тем же классификатором, что боевой spawnClaude, — тест
@@ -4735,7 +4737,6 @@ describe('runLoop — основной while-цикл: итерации коде
             removeBlockedLabelFn: () => {},
             // Задача 79: чтение метки после записи — «встала»; отказы сверки — свои сценарии.
             prHasBlockedLabelFn: () => true,
-            runClaudeFn: () => 0,
             ensureCleanFn: () => true,
             // #85: пуш коммитов сессии разбора blocked — настоящий git push. Заглушено «пушить
             // нечего»; сценарии пуша и отказа переопределяют, модуль — core/session-push.test.ts.
@@ -4788,6 +4789,9 @@ describe('runLoop — основной while-цикл: итерации коде
             // (реальный curl к https://app.example.com).
             checkProdHealthFn: () => ({ ok: true, status: 200, url: 'https://app.example.com' }),
             ...o,
+            runClaudeFn: withDefaultFixPlan(
+                (o.runClaudeFn as RunClaudeFake | undefined) ?? (() => 0),
+            ),
         };
     };
     const ctx = (state: unknown, o: Record<string, unknown> = {}) => ({
@@ -8117,6 +8121,426 @@ describe('runLoop — основной while-цикл: итерации коде
         expect((state as { count: number }).count).toBe(3);
     });
 
+    describe('#246 планировщик перед первыми правками', () => {
+        const plan = {
+            decision: 'Вынести общий разбор границы в отдельную функцию',
+            rejected: ['Добавлять ещё одну регулярку для названного края'],
+            steps: [
+                {
+                    do: 'Добавить тест на общий класс границ',
+                    check: 'npx vitest run core/fix-plan.test.ts',
+                    expect: 'RED',
+                },
+                {
+                    do: 'Реализовать общий разбор',
+                    check: 'npx vitest run core/fix-plan.test.ts',
+                    expect: 'GREEN',
+                },
+            ],
+        };
+        const planOutput = [
+            '<<<RALPH-FIX-PLAN>>>',
+            JSON.stringify(plan),
+            '<<<END-RALPH-FIX-PLAN>>>',
+        ].join('\n');
+        const reviewFindings = [
+            { comment: '⚪ [nit] сводка: есть находка' },
+            {
+                comment: '🟠 [major] разобран только частный случай',
+                anchor: { path: 'core/x.ts', line: 10 },
+            },
+        ];
+
+        const runPlannerPath = (
+            overrides: Record<string, unknown> = {},
+            planner: { code?: number; output?: string } = {},
+            options: { config?: Partial<RalphConfig>; state?: ReturnType<typeof mkState> } = {},
+        ) => {
+            const pushes: string[] = [];
+            const runClaudeFn = vi.fn<RunClaudeFake>((prompt, _opts, d) => {
+                if (prompt.includes('Ты планировщик правок')) {
+                    emitOutput(d, planner.output ?? planOutput, planner.code ?? 0);
+                    return planner.code ?? 0;
+                }
+                return 0;
+            });
+            let applications = 0;
+            runLoop(
+                validCfg({ review: { default: 'claude-rev', maxTurns: 37 }, ...options.config }),
+                ctx(options.state ?? mkState()),
+                deps([], {
+                    pickReviewModelFn: () => 'claude-rev',
+                    runClaudeFn,
+                    applySessionRequestsFn: () => ({
+                        applied: 1,
+                        failed: false,
+                        closedIssues: [],
+                        prFindings: ++applications === 1 ? reviewFindings : [],
+                        prBlocked: false,
+                    }),
+                    pushEventFn: (message: string) => {
+                        pushes.push(message);
+                        return false;
+                    },
+                    tryMergePhaseFn: () => 'merged',
+                    ...overrides,
+                }),
+            );
+            return { runClaudeFn, pushes };
+        };
+
+        const expectPlanStop = (
+            result: ReturnType<typeof runPlannerPath>,
+            diagnosis: RegExp,
+        ): void => {
+            const prompts = result.runClaudeFn.mock.calls.map(([prompt]) => prompt);
+            expect(prompts.some((prompt) => prompt.includes('Разбери замечания code review'))).toBe(
+                false,
+            );
+            expect(result.pushes).toHaveLength(1);
+            expect(result.pushes[0]).toContain('fix-plan');
+            expect(result.pushes[0]).toMatch(diagnosis);
+        };
+
+        it('ревью с находками → планировщик до правок, решение плана — в их промпте', () => {
+            const { runClaudeFn } = runPlannerPath();
+            const prompts = runClaudeFn.mock.calls.map(([prompt]) => prompt);
+            const reviewAt = prompts.findIndex((prompt) =>
+                prompt.includes('проведи детальное code review'),
+            );
+            const planAt = prompts.findIndex((prompt) => prompt.includes('Ты планировщик правок'));
+            const fixAt = prompts.findIndex((prompt) =>
+                prompt.includes('Разбери замечания code review'),
+            );
+
+            expect(reviewAt).toBeGreaterThanOrEqual(0);
+            expect(planAt).toBeGreaterThan(reviewAt);
+            expect(fixAt).toBeGreaterThan(planAt);
+            expect(prompts[planAt]).toContain('<<<RALPH-FIX-PLAN>>>');
+            expect(runClaudeFn.mock.calls[planAt][1]).toMatchObject({
+                model: 'claude-rev',
+                maxTurns: 37,
+            });
+            expect(prompts[fixAt]).toContain(`Решение: ${plan.decision}`);
+            expect(prompts[fixAt]).toContain(plan.steps[0].do);
+        });
+
+        it('планировщик получает review.fallback, а не общий fallbackModel', () => {
+            const { runClaudeFn } = runPlannerPath(
+                {},
+                {},
+                {
+                    config: {
+                        fallbackModel: 'claude-sonnet-5',
+                        review: {
+                            default: 'claude-rev',
+                            fallback: 'claude-fable-5',
+                            maxTurns: 37,
+                        },
+                    },
+                },
+            );
+            const planAt = runClaudeFn.mock.calls.findIndex(([prompt]) =>
+                prompt.includes('Ты планировщик правок'),
+            );
+            expect(runClaudeFn.mock.calls[planAt][1].fallbackModel).toBe('claude-fable-5');
+            expect(runClaudeFn.mock.calls[planAt][1].fallbackModel).not.toBe('claude-sonnet-5');
+        });
+
+        it('намерения read-only планировщика не собираются для последующего применения', () => {
+            const seen = new Set<string>();
+            const runClaudeFn = vi.fn<RunClaudeFake>((prompt, _opts, d) => {
+                if (prompt.includes('Ты планировщик правок')) {
+                    const collect = d?.collectIntentsFn as
+                        ((output: string, opts: { seen: Set<string> }) => void) | undefined;
+                    expect(collect).toBeTypeOf('function');
+                    collect?.(
+                        [
+                            INTENTS_BEGIN,
+                            JSON.stringify({
+                                kind: 'pr-block',
+                                comment: 'ложный блок планировщика',
+                            }),
+                            INTENTS_END,
+                        ].join('\n'),
+                        { seen },
+                    );
+                    emitOutput(d, planOutput, 0);
+                }
+                return 0;
+            });
+
+            runPlannerPath({ runClaudeFn });
+
+            expect(seen).toEqual(new Set());
+        });
+
+        it('повторный планировщик пересчитывает список файлов: [] → новый файл', () => {
+            const files = [[] as string[], ['core/new.ts']];
+            const seen: Array<string[] | null | undefined> = [];
+            runPlannerPath({
+                phaseDiffFilesFn: () => files.shift() ?? ['core/new.ts'],
+                reviewDiffContextFn: (
+                    _branch: string,
+                    opts: { files?: string[] | null; base?: string },
+                ) => {
+                    if (opts.base === undefined) seen.push(opts.files);
+                    return '';
+                },
+            });
+            expect(seen).toEqual([[], ['core/new.ts']]);
+        });
+
+        it('обрезанный дифф повторного планировщика называет новый файл для дочитывания', () => {
+            const files = [['core/old.ts'], ['core/old.ts', 'core/new.ts']];
+            const { runClaudeFn } = runPlannerPath(
+                {
+                    phaseDiffFilesFn: () => files.shift() ?? ['core/old.ts', 'core/new.ts'],
+                    reviewDiffContextFn: (
+                        branch: string,
+                        opts: { files?: string[] | null; limit?: number; base?: string },
+                    ) =>
+                        ralph.reviewDiffContext(branch, {
+                            ...opts,
+                            shFn: () => 'x'.repeat(500),
+                            runArgvFn: () => '',
+                            logFn: () => {},
+                        }),
+                },
+                {},
+                { config: { review: { default: 'claude-rev', maxTurns: 37, diffLimit: 100 } } },
+            );
+            const plannerPrompt = runClaudeFn.mock.calls.find(([prompt]) =>
+                prompt.includes('Ты планировщик правок'),
+            )?.[0];
+            expect(plannerPrompt).toContain('- core/new.ts');
+            expect(plannerPrompt).toContain('ДИФФ ОБРЕЗАН');
+            expect(plannerPrompt).toMatch(/дочитай по файлам/i);
+        });
+
+        it('планировщик упал → правки не запущены, стоп fix-plan с кодом', () => {
+            expectPlanStop(runPlannerPath({}, { code: 1 }), /кодом 1/);
+        });
+
+        it('вывод планировщика без блока → правки не запущены, стоп fix-plan с разбором', () => {
+            expectPlanStop(
+                runPlannerPath({}, { output: 'План готов, но маркеров нет' }),
+                /блока плана нет/,
+            );
+        });
+
+        it('планировщик сдвинул HEAD → правки не запущены, стоп fix-plan с обоими SHA', () => {
+            const heads = ['a'.repeat(40), 'b'.repeat(40)];
+            expectPlanStop(
+                runPlannerPath({ branchHeadShaFn: () => heads.shift() ?? 'b'.repeat(40) }),
+                /HEAD ветки feature\/m1 изменился/,
+            );
+        });
+
+        it('планировщик оставил грязное дерево → правки не запущены, стоп fix-plan', () => {
+            expectPlanStop(
+                runPlannerPath({
+                    shFn: (command: string) =>
+                        command === 'git status --porcelain' ? ' M core/x.ts' : '',
+                }),
+                /дерево после сессии грязное/,
+            );
+        });
+
+        const stateWithSavedPlan = (detail?: unknown): ReturnType<typeof mkState> => {
+            const at = '2026-01-01T00:00:00.000Z';
+            let records: ReturnType<typeof startStage> = [];
+            for (const stage of ['pr', 'review'] as const) {
+                records = startStage(records, 'M1', stage, at);
+                records = finishStage(records, 'M1', stage, 'ok', at);
+            }
+            records = startStage(records, 'M1', 'plan', at);
+            records = finishStage(records, 'M1', 'plan', 'ok', at, detail);
+            return mkState({ submitStages: records });
+        };
+
+        it('рестарт после plan: ok → планировщик не повторяется, правки получают сохранённый план', () => {
+            const { runClaudeFn } = runPlannerPath(
+                {},
+                {},
+                {
+                    state: stateWithSavedPlan({ plan }),
+                },
+            );
+            const prompts = runClaudeFn.mock.calls.map(([prompt]) => prompt);
+            expect(prompts.some((prompt) => prompt.includes('Ты планировщик правок'))).toBe(false);
+            const fixPrompt = prompts.find((prompt) =>
+                prompt.includes('Разбери замечания code review'),
+            );
+            expect(fixPrompt).toContain(`Решение: ${plan.decision}`);
+            expect(fixPrompt).toContain(plan.steps[0].do);
+        });
+
+        it.each([
+            ['без detail.plan', undefined, /план — не объект/],
+            [
+                'с повреждённым detail.plan',
+                { plan: { decision: 'неполный' } },
+                /rejected — не массив/,
+            ],
+        ])(
+            'рестарт после plan: ok %s → стоп fix-plan, правки не запущены',
+            (_name, detail, error) => {
+                expectPlanStop(
+                    runPlannerPath({}, {}, { state: stateWithSavedPlan(detail) }),
+                    error,
+                );
+            },
+        );
+
+        it('#247: круг лестницы с блокером → планировщик до повторных правок, план в промпте', () => {
+            let applications = 0;
+            let head = 1;
+            const runClaudeFn = vi.fn<RunClaudeFake>((prompt, _opts, d) => {
+                if (prompt.includes('Ты планировщик правок')) {
+                    emitOutput(d, planOutput, 0);
+                } else if (prompt.includes('Разбери замечания code review')) {
+                    head++;
+                }
+                return 0;
+            });
+
+            runLoop(
+                validCfg({ review: { default: 'claude-rev' } }),
+                ctx(mkState()),
+                deps([], {
+                    pickReviewModelFn: () => 'claude-rev',
+                    runClaudeFn,
+                    branchHeadShaFn: () => head.toString(16).repeat(40),
+                    phaseDiffFilesFn: () => ['core/x.ts'],
+                    applySessionRequestsFn: () => ({
+                        applied: 1,
+                        failed: false,
+                        closedIssues: [],
+                        prFindings:
+                            ++applications === 1 || applications === 3 ? reviewFindings : [],
+                        prBlocked: false,
+                    }),
+                    tryMergePhaseFn: () => 'merged',
+                }),
+            );
+
+            const prompts = runClaudeFn.mock.calls.map(([prompt]) => prompt);
+            const plannerCalls = prompts.flatMap((prompt, index) =>
+                prompt.includes('Ты планировщик правок') ? [index] : [],
+            );
+            const fixCalls = prompts.flatMap((prompt, index) =>
+                prompt.includes('Разбери замечания code review') ? [index] : [],
+            );
+            expect(plannerCalls).toHaveLength(2);
+            expect(fixCalls).toHaveLength(2);
+            expect(plannerCalls[1]).toBeGreaterThan(fixCalls[0]);
+            expect(plannerCalls[1]).toBeLessThan(fixCalls[1]);
+            expect(prompts[fixCalls[1]]).toContain(`Решение: ${plan.decision}`);
+            expect(prompts[fixCalls[1]]).toContain(plan.steps[0].do);
+        });
+
+        const runBlockedPath = (
+            runClaudeFn: RunClaudeFake,
+            overrides: Record<string, unknown> = {},
+        ): void => {
+            runLoop(
+                validCfg({ blockedHealAttempts: 3 }),
+                ctx(mkState({ submitted: true, lastReviewModel: 'claude-rev' })),
+                deps([], {
+                    tryMergePhaseFn: () => 'blocked',
+                    pickReviewModelFn: () => 'claude-rev',
+                    runClaudeFn,
+                    ...overrides,
+                }),
+            );
+        };
+
+        it('#247: разбор blocked → планировщик до чини-сессии, план в её промпте', () => {
+            const runClaudeFn = vi.fn<RunClaudeFake>((prompt, _opts, d) => {
+                if (prompt.includes('Ты планировщик правок')) {
+                    emitOutput(d, planOutput, 0);
+                }
+                return 0;
+            });
+
+            runBlockedPath(runClaudeFn);
+
+            const prompts = runClaudeFn.mock.calls.map(([prompt]) => prompt);
+            const planAt = prompts.findIndex((prompt) => prompt.includes('Ты планировщик правок'));
+            const fixAt = prompts.findIndex((prompt) =>
+                prompt.includes('PR ветки feature/m1 помечен меткой blocked'),
+            );
+            expect(planAt).toBeGreaterThanOrEqual(0);
+            expect(fixAt).toBeGreaterThan(planAt);
+            expect(prompts[fixAt]).toContain(`Решение: ${plan.decision}`);
+            expect(prompts[fixAt]).toContain(plan.steps[0].do);
+        });
+
+        it('#247: отказ планировщика blocked → чини-сессии нет, стоп fix-plan', () => {
+            const pushes: string[] = [];
+            const runClaudeFn = vi.fn<RunClaudeFake>((prompt, _opts, d) => {
+                if (prompt.includes('Ты планировщик правок')) {
+                    emitOutput(d, 'planner failed', 1);
+                    return 1;
+                }
+                return 0;
+            });
+
+            runBlockedPath(runClaudeFn, {
+                pushEventFn: (message: string) => {
+                    pushes.push(message);
+                    return false;
+                },
+            });
+
+            const prompts = runClaudeFn.mock.calls.map(([prompt]) => prompt);
+            expect(
+                prompts.some((prompt) =>
+                    prompt.includes('PR ветки feature/m1 помечен меткой blocked'),
+                ),
+            ).toBe(false);
+            expect(pushes).toHaveLength(1);
+            expect(pushes[0]).toContain('fix-plan');
+            expect(pushes[0]).toMatch(/кодом 1/);
+        });
+
+        it('#247: продолжение blocked по бюджету ходов использует тот же план без перепланирования', () => {
+            let fixAttempts = 0;
+            const runClaudeFn = vi.fn<RunClaudeFake>((prompt, _opts, d) => {
+                if (prompt.includes('Ты планировщик правок')) {
+                    emitOutput(d, planOutput, 0);
+                    return 0;
+                }
+                if (prompt.includes('PR ветки feature/m1 помечен меткой blocked')) {
+                    fixAttempts++;
+                    if (fixAttempts === 1) {
+                        emitOutput(d, 'Error: Reached max turns (200)', 1);
+                        return 1;
+                    }
+                }
+                return 0;
+            });
+
+            runBlockedPath(runClaudeFn);
+
+            const prompts = runClaudeFn.mock.calls.map(([prompt]) => prompt);
+            const plannerCalls = prompts.filter((prompt) =>
+                prompt.includes('Ты планировщик правок'),
+            );
+            const fixPrompts = prompts.filter((prompt) =>
+                prompt.includes('PR ветки feature/m1 помечен меткой blocked'),
+            );
+            expect(plannerCalls).toHaveLength(1);
+            expect(fixPrompts).toHaveLength(2);
+            expect(fixPrompts[1]).toContain('ПРОДОЛЖЕНИЕ прерванного разбора');
+            for (const prompt of fixPrompts) {
+                expect(prompt).toContain(`Решение: ${plan.decision}`);
+                expect(prompt).toContain(plan.steps[0].do);
+            }
+        });
+    });
+
     // Снятие барьера #415 для taskSource. Раньше `tryMergePhase` брал примитивы форжа из
     // замыкания gate.ts, поэтому недефолтная реализация шва была бы «тихим дефолтом» —
     // резолвер её и отвергал. Теперь composition root передаёт их явно.
@@ -9196,9 +9620,15 @@ describe('runLoop — основной while-цикл: итерации коде
                 pushEventFn,
             }),
         );
-        // Довоз на входе в гейт → разбор → пуш раннером → повторное ревью: ревью и гейт
-        // судят то, что в PR.
-        expect(order).toEqual(['push:feature/m1', 'session', 'push:feature/m1', 'session']);
+        // Довоз на входе в гейт → планировщик → разбор → пуш раннером → повторное ревью:
+        // ревью и гейт судят то, что в PR.
+        expect(order).toEqual([
+            'push:feature/m1',
+            'session',
+            'session',
+            'push:feature/m1',
+            'session',
+        ]);
         expect(pushEventFn.mock.calls.some((c) => /оставлен человеку/.test(String(c[0])))).toBe(
             false,
         );
@@ -9256,8 +9686,8 @@ describe('runLoop — основной while-цикл: итерации коде
                 pushEventFn,
             }),
         );
-        // Повторного ревью нет: судить пришлось бы то, чего нет в PR.
-        expect(runClaudeFn).toHaveBeenCalledTimes(1);
+        // Повторного ревью нет: судить пришлось бы то, чего нет в PR. Были планировщик и разбор.
+        expect(runClaudeFn).toHaveBeenCalledTimes(2);
         expect(removeBlockedLabelFn).not.toHaveBeenCalled();
         const stops = pushEventFn.mock.calls.map((c) => String(c[0]));
         expect(stops).toHaveLength(1);
@@ -9293,8 +9723,8 @@ describe('runLoop — основной while-цикл: итерации коде
                 pushEventFn,
             }),
         );
-        // Разбор и повторное ревью — как при in-sync: отставание гейт подтянет сам.
-        expect(runClaudeFn).toHaveBeenCalledTimes(2);
+        // Планировщик, разбор и повторное ревью — отставание гейт подтянет сам.
+        expect(runClaudeFn).toHaveBeenCalledTimes(3);
         expect(pushEventFn.mock.calls.some((c) => /session-unpushed/.test(String(c[0])))).toBe(
             false,
         );
@@ -9634,13 +10064,13 @@ describe('runLoop — основной while-цикл: итерации коде
         // #217: submitted НЕ сбрасывается — следующий проход идёт сразу на гейт, который
         // перечитает метку, выставленную повторным ревью раннера.
         expect(state.submitted).toBe(true);
-        // Две сессии: чини-сессия блокеров + повторное ревью раннером.
-        expect(runClaudeFn).toHaveBeenCalledTimes(2);
+        // Три сессии: планировщик + чини-сессия блокеров + повторное ревью раннером.
+        expect(runClaudeFn).toHaveBeenCalledTimes(3);
         // Чини-сессии явно запрещено снимать метку — это делает раннер (#217). С #45
         // запрет стал структурным: намерения на снятие блока не существует вовсе.
-        expect(runClaudeFn.mock.calls[0][0]).toMatch(/метку blocked снять ты не можешь/i);
-        // Второй вызов — повторное ревью: вешает blocked заново, если блокеры остались.
-        expect(runClaudeFn.mock.calls[1][0]).toMatch(/повторн|устранен/i);
+        expect(runClaudeFn.mock.calls[1][0]).toMatch(/метку blocked снять ты не можешь/i);
+        // Третий вызов — повторное ревью: вешает blocked заново, если блокеры остались.
+        expect(runClaudeFn.mock.calls[2][0]).toMatch(/повторн|устранен/i);
         // Метку снял РАННЕР (не кодер-сессия), перед повторным ревью.
         expect(removeBlockedLabelFn).toHaveBeenCalledTimes(1);
         expect(removeBlockedLabelFn.mock.calls[0][0]).toBe('feature/m1');
@@ -9652,7 +10082,8 @@ describe('runLoop — основной while-цикл: итерации коде
         const logs: string[] = [];
         const state = mkState({ submitted: true, blockedHeals: 0, lastReviewModel: 'claude-rev' });
         let calls = 0;
-        const runClaudeFn = vi.fn<RunClaudeFake>((_prompt, _opts, d) => {
+        const runClaudeFn = vi.fn<RunClaudeFake>((prompt, _opts, d) => {
+            if (prompt.includes('Ты планировщик правок')) return 0;
             calls++;
             if (calls === 1) {
                 emitOutput(d, 'Error: Reached max turns (200)');
@@ -9672,17 +10103,18 @@ describe('runLoop — основной while-цикл: итерации коде
                 runClaudeFn,
             }),
         );
-        // Три сессии: прерванная чини-сессия + её продолжение + повторное ревью раннером.
+        // Четыре сессии: планировщик + прерванная чини-сессия + продолжение + повторное ревью.
         // Барьер #217 не ослаблен — вердикт по-прежнему выносит ревью, а не исполнитель.
-        expect(runClaudeFn).toHaveBeenCalledTimes(3);
-        expect(String(runClaudeFn.mock.calls[1][0])).toMatch(/ПРОДОЛЖЕНИЕ прерванного разбора/);
+        expect(runClaudeFn).toHaveBeenCalledTimes(4);
+        expect(String(runClaudeFn.mock.calls[2][0])).toMatch(/ПРОДОЛЖЕНИЕ прерванного разбора/);
         expect(state.blockedHeals).toBe(1);
     });
 
     it('#594 НЕГАТИВНЫЙ: разбор blocked не влезает в бюджет каждый раз → стоп с советом про размер, не «перезапусти»', () => {
         const logs: string[] = [];
         const state = mkState({ submitted: true, blockedHeals: 0, lastReviewModel: 'claude-rev' });
-        const runClaudeFn = vi.fn<RunClaudeFake>((_prompt, _opts, d) => {
+        const runClaudeFn = vi.fn<RunClaudeFake>((prompt, _opts, d) => {
+            if (prompt.includes('Ты планировщик правок')) return 0;
             emitOutput(d, 'Error: Reached max turns (200)');
             return 1;
         });
@@ -9698,8 +10130,8 @@ describe('runLoop — основной while-цикл: итерации коде
                 runClaudeFn,
             }),
         );
-        // Попытка + один повтор — и стоп ДО повторного ревью (третьей сессии нет).
-        expect(runClaudeFn).toHaveBeenCalledTimes(2);
+        // Планировщик + попытка + один повтор — и стоп ДО повторного ревью.
+        expect(runClaudeFn).toHaveBeenCalledTimes(3);
         // Совет человеку — про объём блокеров, а не «перезапусти loop»: рестарт прогнал бы
         // тот же разбор с тем же потолком.
         expect(logs.join('\n')).toMatch(
@@ -9780,7 +10212,7 @@ describe('runLoop — основной while-цикл: итерации коде
                 pushEventFn,
             }),
         );
-        expect(runClaudeFn).toHaveBeenCalledTimes(2); // разбор + повторное ревью
+        expect(runClaudeFn).toHaveBeenCalledTimes(3); // планировщик + разбор + повторное ревью
         expect(state.blockedHeals).toBe(1);
         expect(pushEventFn).not.toHaveBeenCalled(); // блокер не ушёл человеку
     });
@@ -10042,15 +10474,15 @@ describe('runLoop — основной while-цикл: итерации коде
             }),
         );
         expect(state.reviewModelFloor).toBe('claude-fable-5');
-        // Второй вызов runClaude — повторное ревью: модель = планка (fable), не haiku.
-        expect(runClaudeFn).toHaveBeenCalledTimes(2);
-        expect(runClaudeFn.mock.calls[1][1].model).toBe('claude-fable-5');
+        // Третий вызов runClaude — повторное ревью: модель = планка (fable), не haiku.
+        expect(runClaudeFn).toHaveBeenCalledTimes(3);
+        expect(runClaudeFn.mock.calls[2][1].model).toBe('claude-fable-5');
         // #221: фолбэк повторного ревью тоже поднят до планки (fable) через
         // strongerReviewModel — иначе overload молча деградировал бы модель ниже
         // планки, обходя барьер #217 на уровне CLI-фолбэка. cfg тут без блока review
         // (validCfg), поэтому pickReviewFallbackModel вернул бы null, но
         // strongerReviewModel(null, floor) поднимает его до floor.
-        expect(runClaudeFn.mock.calls[1][1].fallbackModel).toBe('claude-fable-5');
+        expect(runClaudeFn.mock.calls[2][1].fallbackModel).toBe('claude-fable-5');
     });
 
     // #221-ревью (PR #241): явное review.fallback: 'none' — honest-стоп, планка floor его
@@ -10082,8 +10514,8 @@ describe('runLoop — основной while-цикл: итерации коде
         );
         // Модель повторного ревью — по-прежнему планка (fable), а вот фолбэк — 'none'
         // (honest-стоп), не поднят до floor.
-        expect(runClaudeFn.mock.calls[1][1].model).toBe('claude-fable-5');
-        expect(runClaudeFn.mock.calls[1][1].fallbackModel).toBe('none');
+        expect(runClaudeFn.mock.calls[2][1].model).toBe('claude-fable-5');
+        expect(runClaudeFn.mock.calls[2][1].fallbackModel).toBe('none');
     });
 
     // #217: судить блок нечем (review: none и планки нет) — fail-closed, PR человеку.
@@ -10160,10 +10592,10 @@ describe('runLoop — основной while-цикл: итерации коде
         expect(advancePhaseFn).toHaveBeenCalledTimes(1);
         // Раннер сам снял метку (не кодер) перед повторным ревью — ровно один раз.
         expect(removeBlockedLabelFn).toHaveBeenCalledTimes(1);
-        // До мерджа прошли обе сессии blocked-цикла: чини + повторное ревью раннера.
-        expect(runClaudeFn).toHaveBeenCalledTimes(2);
-        expect(runClaudeFn.mock.calls[0][0]).toMatch(/метку blocked снять ты не можешь/i);
-        expect(runClaudeFn.mock.calls[1][0]).toMatch(/повторн|устранен/i);
+        // До мерджа прошли планировщик, чини-сессия и повторное ревью раннера.
+        expect(runClaudeFn).toHaveBeenCalledTimes(3);
+        expect(runClaudeFn.mock.calls[1][0]).toMatch(/метку blocked снять ты не можешь/i);
+        expect(runClaudeFn.mock.calls[2][0]).toMatch(/повторн|устранен/i);
     });
 
     // Задача 78: повторное ревью, вышедшее с кодом 0 без единого намерения, — не «блокеры
@@ -11788,7 +12220,8 @@ describe('runLoop — основной while-цикл: итерации коде
                 overrides: () => ({
                     tryMergePhaseFn: () => 'blocked',
                     pickReviewModelFn: () => 'claude-rev',
-                    runClaudeFn: () => 1,
+                    runClaudeFn: (prompt: string) =>
+                        prompt.includes('Ты планировщик правок') ? 0 : 1,
                 }),
                 text: /сессия разбора blocked фазы "M1" упала \(код 1\)/,
             },
@@ -11800,7 +12233,7 @@ describe('runLoop — основной while-цикл: итерации коде
                     return {
                         tryMergePhaseFn: () => 'blocked',
                         pickReviewModelFn: () => 'claude-rev',
-                        runClaudeFn: () => (++calls === 1 ? 0 : 1),
+                        runClaudeFn: () => (++calls <= 2 ? 0 : 1),
                     };
                 },
                 text: /повторное ревью blocked фазы "M1" упало \(код 1\)/,

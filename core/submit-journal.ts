@@ -35,6 +35,7 @@ import { normalizeReviewOfFixes, type ClassifiedFinding } from './review-of-fixe
 export const SUBMIT_STAGES = [
     'pr',
     'review',
+    'plan',
     'fixes',
     'fix-review',
     'arbiter',
@@ -47,6 +48,7 @@ export type TSubmitStage = (typeof SUBMIT_STAGES)[number];
 export const SUBMIT_STAGE_TITLES: Record<TSubmitStage, string> = {
     pr: 'создание PR',
     review: 'ревью',
+    plan: 'план правок',
     fixes: 'правки по ревью',
     'fix-review': 'ревью правок',
     arbiter: 'арбитр',
@@ -118,7 +120,9 @@ function isDeployDetail(d: unknown): boolean {
  * Проверка журнала, прочитанного с диска: форма каждой записи и их ПОРЯДОК. Порядок
  * строгий — этап начинается только после исхода предыдущего, после стопа записей нет:
  * повторный вход усекает журнал, а не дописывает его, поэтому любое другое расположение
- * означает, что журнал писали не мы, и решать по нему нельзя.
+ * означает, что журнал писали не мы, и решать по нему нельзя. Единственное исключение —
+ * журнал прежней ревизии, где fixes следует сразу за review: отсутствующий plan восстанавливается
+ * пропущенным, чтобы обновление ядра посреди сдачи не планировало уже сделанные правки.
  */
 export function parseSubmitJournal(raw: unknown, where: string): TSubmitRecord[] {
     if (!Array.isArray(raw)) fail(where, 0, 'журнал — не массив записей');
@@ -155,6 +159,22 @@ export function parseSubmitJournal(raw: unknown, where: string): TSubmitRecord[]
         };
         if (o.event === 'start') {
             if (open !== null) fail(where, n, 'начат новый этап, у прошлого нет исхода');
+            if (o.stage === 'fixes' && lastClosed === idx('review')) {
+                // До появления планировщика правки следовали сразу за ревью. Восстанавливаем
+                // пропуск plan записью, иначе рестарт после обновления спланировал бы правки заново.
+                const legacyPlan = {
+                    v: 1 as const,
+                    track: 'submit' as const,
+                    milestone: o.milestone,
+                    stage: 'plan' as const,
+                    at: o.at,
+                };
+                out.push(
+                    { ...legacyPlan, event: 'start' },
+                    { ...legacyPlan, event: 'outcome', outcome: 'skip' },
+                );
+                lastClosed = idx('plan');
+            }
             if (k !== lastClosed + 1)
                 fail(where, n, `этап «${String(o.stage)}» начат не по порядку`);
             open = k;
@@ -269,7 +289,12 @@ export function startStage(
     const mine = forPhase(records, milestone);
     const last = mine[mine.length - 1];
     if (last && last.event === 'start' && last.stage === stage) return mine;
-    const kept = before(mine, stage);
+    let kept = before(mine, stage);
+    if (stage === 'fixes' && stageDone(kept, 'review') && !kept.some((r) => r.stage === 'plan')) {
+        // Прежний оркестратор начинает правки сразу после ревью. Такой переход — тот же
+        // журнал прежней ревизии, поэтому и здесь plan доводится пропуском, а не отказом.
+        kept = finishStage(kept, milestone, 'plan', 'skip', at);
+    }
     for (const s of SUBMIT_STAGES.slice(0, idx(stage))) {
         if (!stageDone(kept, s)) {
             throw new Error(

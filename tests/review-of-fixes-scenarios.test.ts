@@ -22,6 +22,7 @@ import type { RalphConfig } from '../core/orchestrator.ts';
 import type { RalphState } from '../core/state-lock.ts';
 import type { SessionPushResult } from '../core/session-push.ts';
 import { normalizeReviewOfFixes } from '../core/review-of-fixes.ts';
+import { withDefaultFixPlan } from './test-helpers.ts';
 
 type Runtime = ReturnType<typeof import('../core/orchestrator.ts').createOrchestrator>;
 const runLoop = ralph.runLoop as Runtime['runLoop'];
@@ -169,11 +170,11 @@ function runPhase({
     let passIdx = 0;
     let idxCalls = 0;
     let fixDiffIdx = 0;
-    // Голова ветки МЕНЯЕТСЯ от круга к кругу — иначе не отличить «дифф последнего круга»
-    // от «диффа всех правок фазы», а это ровно предмет проверки для арбитра.
-    let headCalls = 0;
+    // Голова меняется от сессии правок, а не от чтения SHA: планировщик сверяет неизменность
+    // ветки до и после своей read-only сессии, но между кругами диффы обязаны различаться.
+    let fixCount = 0;
     const HEADS = ['b', 'c', 'd', 'e', 'f'].map((c) => c.repeat(40));
-    const nextHead = () => HEADS[Math.min(headCalls++, HEADS.length - 1)];
+    const currentHead = () => HEADS[Math.min(fixCount, HEADS.length - 1)];
     const applyArgs: Array<{ currentMilestone?: string }> = [];
 
     runLoop(
@@ -245,7 +246,7 @@ function runPhase({
             // в текст — по ней видно, от какой точки собран дифф.
             reviewDiffContextFn: (_b: string, opts?: { base?: string }) =>
                 opts?.base ? `${FIX_DIFF}(${opts.base})` : PHASE_DIFF,
-            branchHeadShaFn: () => (headSha === null ? null : nextHead()),
+            branchHeadShaFn: () => (headSha === null ? null : currentHead()),
             createIssueFn: (input) => {
                 issues.push(input);
                 return 100 + issues.length;
@@ -261,13 +262,16 @@ function runPhase({
             removeBlockedLabelFn: () => {},
             addBlockedLabelFn,
             prHasBlockedLabelFn: labelReadBack,
-            runClaudeFn: (prompt: string, opts?: { model?: string }) => {
+            runClaudeFn: withDefaultFixPlan((prompt: string, opts: { model?: string } = {}) => {
                 prompts.push(prompt);
-                models.push(opts?.model ?? '');
+                models.push(opts.model ?? '');
+                if (isFixPrompt(prompt)) fixCount += 1;
                 if (isArbiterPrompt(prompt)) return arbiterCode;
-                const nth = prompts.filter((p) => p === prompt).length - 1;
+                const nth = isFixPrompt(prompt)
+                    ? prompts.filter(isFixPrompt).length - 1
+                    : prompts.filter((p) => p === prompt).length - 1;
                 return sessionCode(prompt, nth) ?? 0;
-            },
+            }),
             // Намерения применяет петля; здесь фейк отдаёт то, что «оставила» сессия.
             applySessionRequestsFn: (args: { currentMilestone?: string }) => {
                 // Аргументы записываем, а не только ответ подменяем: веху текущей фазы
@@ -1428,7 +1432,10 @@ describe('задача 73: сессии правок стартуют на ве�
         const s = runPhase(ladder());
         const fixAt = s.prompts.flatMap((p, i) => (isFixPrompt(p) ? [i] : []));
         const at = fixAt[nth] ?? -1;
-        return { at, call: s.placements.lastIndexOf(at) };
+        return {
+            at,
+            call: s.placements.reduce((last, count, index) => (count <= at ? index : last), -1),
+        };
     };
 
     it.each(CASES)('$name: проводка стоит после предыдущей сессии и до этой', ({ nth }) => {

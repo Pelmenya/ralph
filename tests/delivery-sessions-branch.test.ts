@@ -47,7 +47,10 @@ describe.each(CASES)('задача 73: $name стартует на ветке ф
         const s = scenario();
         s.pass(c.verdict, { redCheck: RED_CHECK });
         const at = promptsOf(s).findIndex(c.isSession);
-        return { at, call: s.placements.lastIndexOf(at) };
+        return {
+            at,
+            call: s.placements.reduce((last, count, index) => (count <= at ? index : last), -1),
+        };
     };
 
     // Здесь сессия первая в проходе, и «после предыдущей» проверять не на чем: зелёный

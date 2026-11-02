@@ -46,9 +46,9 @@ describe('блокер устранён с первой попытки → ме�
         const s = scenario();
         s.pass('blocked'); // ревью поставило блок → раунд разбора
         expect(s.state.blockedHeals).toBe(1);
-        // Раунд разбора = чини-сессия + повторное ревью раннера (две сессии), снятие
+        // Раунд разбора = планировщик + чини-сессия + повторное ревью (три сессии), снятие
         // метки — раннером (не кодер-сессией), планка встала по модели, поставившей блок.
-        expect(s.runClaudeFn).toHaveBeenCalledTimes(2);
+        expect(s.runClaudeFn).toHaveBeenCalledTimes(3);
         expect(s.removeBlockedLabelFn).toHaveBeenCalledTimes(1);
         expect(s.removeBlockedLabelFn.mock.calls[0][0]).toBe('feature/m1');
         expect(s.state.reviewModelFloor).toBe(REVIEW_MODEL);

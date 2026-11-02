@@ -24,6 +24,7 @@ import type { RalphState } from '../core/state-lock.ts';
 import { IN_FLIGHT_PREFIX } from '../core/session-requests.ts';
 import { REASON_TITLES } from '../core/stop-message.ts';
 import { Killed, world } from './crash-world.ts';
+import { withDefaultFixPlan } from './test-helpers.ts';
 
 type Runtime = ReturnType<typeof import('../core/orchestrator.ts').createOrchestrator>;
 const runLoop = ralph.runLoop as Runtime['runLoop'];
@@ -35,12 +36,13 @@ const BRANCH = 'feature/m1';
 
 // Промпты различаем по их собственным формулировкам (prompts.ts) — тот же приём, что в
 // review-of-fixes-scenarios.
-type TSession = 'review' | 'fix' | 'fix-review' | 'arbiter' | 're-review' | 'heal';
+type TSession = 'review' | 'plan' | 'fix' | 'fix-review' | 'arbiter' | 're-review' | 'heal';
 function sessionOf(prompt: string): TSession {
     if (prompt.includes('Ты независимый арбитр')) return 'arbiter';
     if (prompt.includes('отревьюй ИМЕННО ЭТИ ПРАВКИ')) return 'fix-review';
     if (prompt.includes('Ранее ревью пометило его меткой blocked')) return 're-review';
     if (prompt.includes('проведи детальное code review')) return 'review';
+    if (prompt.includes('Ты планировщик правок')) return 'plan';
     if (prompt.includes('Разбери замечания code review')) return 'fix';
     return 'heal';
 }
@@ -302,13 +304,15 @@ function runProcess(
                 phaseDiffFilesFn: read(() => ['src/a.ts']),
                 reviewDiffContextFn: read(() => ''),
                 branchHeadShaFn: read(() => 'b'.repeat(40)),
-                runClaudeFn: read((prompt: string) => {
-                    lastSession = sessionOf(prompt);
-                    const nth = u.sessions[lastSession] ?? 0;
-                    u.sessions[lastSession] = nth + 1;
-                    lastPass = sc.passes[lastSession]?.(nth) ?? { findings: [] };
-                    return 0;
-                }),
+                runClaudeFn: read(
+                    withDefaultFixPlan((prompt: string) => {
+                        lastSession = sessionOf(prompt);
+                        const nth = u.sessions[lastSession] ?? 0;
+                        u.sessions[lastSession] = nth + 1;
+                        lastPass = sc.passes[lastSession]?.(nth) ?? { findings: [] };
+                        return 0;
+                    }),
+                ),
                 // Применение намерений сессии — эффект на форже целиком: комментарии и
                 // `pr-block`. Клетки ВНУТРИ применения — у `applySessionRequests` ниже.
                 applySessionRequestsFn: g(
