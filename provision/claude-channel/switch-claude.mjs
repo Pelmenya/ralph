@@ -29,6 +29,8 @@ const MANAGED_VARS = [
     'CLAUDE_CODE_MAX_CONTEXT_TOKENS',
     'HTTPS_PROXY',
     'HTTP_PROXY',
+    'https_proxy',
+    'http_proxy',
     'NO_PROXY',
     'no_proxy',
 ];
@@ -42,6 +44,7 @@ const STORED_VARS = [
     'KIMI_CODE_API_KEY',
     'CLAUDE_KIMI_BASE_URL',
     'CLAUDE_OFFICIAL_PROXY',
+    'CLAUDE_OFFICIAL_EXPECTED_EGRESS',
 ];
 
 const KIMI_DEFAULT_BASE_URL = 'https://api.kimi.ai/coding/';
@@ -80,14 +83,14 @@ function noProxyEnv(env, extraHost) {
     return value || inherited ? { NO_PROXY: value, no_proxy: value } : {};
 }
 
-/** Прокси official: шелл сильнее хранилища — им же обёртка claude проверяет egress, и
- *  иначе проверялся бы один маршрут, а Claude получал другой. Последний запасной —
- *  прокси, уже записанный в settings, чтобы переключение его не стирало. */
+/** Явный выбор канала и сохранённая настройка сильнее общего прокси шелла:
+ *  старое окно tmux не должно возвращать прежний маршрут после переключения.
+ *  Обёртка claude сверяет egress по тому же прокси из settings. */
 function officialProxy(env, get, currentEnv = {}) {
     return (
         env.CLAUDE_OFFICIAL_PROXY?.trim() ||
-        env.HTTPS_PROXY?.trim() ||
         get('CLAUDE_OFFICIAL_PROXY') ||
+        env.HTTPS_PROXY?.trim() ||
         currentEnv.HTTPS_PROXY?.trim() ||
         undefined
     );
@@ -99,9 +102,9 @@ function proxyEnv(env, get, currentEnv = {}) {
         const kept = currentEnv.HTTP_PROXY?.trim();
         return kept ? { HTTP_PROXY: kept } : {};
     }
-    // Отдельно заданный HTTP-прокси — чужое решение о маршруте, его не подменяем.
-    const httpProxy = env.HTTP_PROXY?.trim() || currentEnv.HTTP_PROXY?.trim() || proxy;
-    return { HTTPS_PROXY: proxy, HTTP_PROXY: httpProxy };
+    // Оба протокола и оба регистра используют выбранный канал: нижний регистр
+    // в Claude Code сильнее HTTPS_PROXY и мог остаться от старого окружения.
+    return { HTTPS_PROXY: proxy, HTTP_PROXY: proxy, https_proxy: proxy, http_proxy: proxy };
 }
 
 function officialProfile(env, get, currentEnv) {
@@ -324,13 +327,13 @@ function writePrivate(file, contents) {
 /** Новые значения из окружения оседают в хранилище; пишем только при изменении. */
 function harvest(env, store, storePath, currentEnv = {}) {
     let changed = false;
-    // Прокси шелла запоминается как прокси official: сессию могут поднять из окружения
-    // без profile.d (systemd, старый tmux), а без прокси официальный API отвечает 403.
-    // Нет его ни в шелле, ни в хранилище — берём уже записанный в settings.
+    // Общий прокси наследуется только при первом заполнении: старое окружение
+    // не должно перезаписывать сохранённый выбор официального канала.
     const proxy =
         env.CLAUDE_OFFICIAL_PROXY ||
-        env.HTTPS_PROXY ||
-        (store.values.CLAUDE_OFFICIAL_PROXY ? undefined : currentEnv.HTTPS_PROXY);
+        (store.values.CLAUDE_OFFICIAL_PROXY
+            ? undefined
+            : env.HTTPS_PROXY || currentEnv.HTTPS_PROXY);
     const seen = { ...env, CLAUDE_OFFICIAL_PROXY: proxy };
     for (const name of STORED_VARS) {
         const value = seen[name]?.trim();
@@ -404,13 +407,6 @@ export function main(options = {}) {
             if (exists) writePrivate(`${settingsPath}.channel-switch.bak`, raw);
             writePrivate(settingsPath, `${JSON.stringify(cfg, null, 2)}\n`);
             stdout(`✓ Claude Code → ${show(cfg.env)}`);
-            const shellProxy = processEnv.HTTPS_PROXY?.trim();
-            if (name === 'official' && shellProxy && cfg.env?.HTTPS_PROXY !== shellProxy) {
-                stderr(
-                    'Warning: CLAUDE_OFFICIAL_PROXY differs from HTTPS_PROXY — the claude ' +
-                        'wrapper checks egress through HTTPS_PROXY, not the proxy written here.',
-                );
-            }
             stdout('New sessions will use this channel. Restart open sessions to apply.');
             return 0;
         });
