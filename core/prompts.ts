@@ -229,11 +229,19 @@ export function buildReviewPrompt({ branch, diffContext }: ReviewPromptParams): 
     );
 }
 
+// Полный гейт после правок повторяют раннер и CI; требование того же набора в сессии
+// заставляло её дублировать дорогой прогон вопреки правилам проекта. Команды точечных
+// проверок задаёт проект, поэтому здесь только контракт завершения.
+const TARGETED_CHECKS_RULE =
+    'Добейся зелёных точечных проверок по правилам проекта о проверках. ' +
+    'Набор и команды возьми из этих правил: затронутые тестовые наборы, тесты, читающие правимые файлы литералом пути, ' +
+    'проверки связанных с правимыми файлами тестов, типов и формата. ' +
+    'Полный гейт в сессии не запускай: его выполнит раннер на точном коммите перед мерджем, а CI площадки — на том же коммите.';
+
 export type FixPlanPromptParams = {
     branch: string;
     diffContext: string;
     commentsContext?: string;
-    gateCmdList: string;
 };
 
 // Отдельная роль фиксирует решение до правок: исполнитель, выбирающий его по ходу,
@@ -242,7 +250,6 @@ export function buildFixPlanPrompt({
     branch,
     diffContext,
     commentsContext,
-    gateCmdList,
 }: FixPlanPromptParams): string {
     return (
         `Ты планировщик правок по ревью PR ветки ${branch}. Только читай: не правь файлы, ` +
@@ -253,7 +260,7 @@ export function buildFixPlanPrompt({
         `Если ревью предлагает несколько дорог, выбери одну, а остальные запиши в rejected с причиной ` +
         `отказа для каждой. Разрежь выбранное решение на 1–8 шагов. У каждого шага укажи действие do, ` +
         `исполнимую команду проверки check и ожидаемый исход expect — RED для падающего теста до правки ` +
-        `либо GREEN после неё. Последний шаг — проверки гейта (${gateCmdList}) с исходом GREEN. ` +
+        `либо GREEN после неё. Последний шаг — точечные проверки с исходом GREEN. ${TARGETED_CHECKS_RULE} ` +
         `Финальный ответ — ровно один блок без прозы и ограды кода вокруг него:\n${FIX_PLAN_BEGIN}\n` +
         `{"decision":"решение","rejected":["альтернатива и причина отказа"],` +
         `"steps":[{"do":"действие","check":"команда","expect":"RED"}]}\n${FIX_PLAN_END}\n` +
@@ -264,7 +271,6 @@ export function buildFixPlanPrompt({
 export type FixPromptParams = {
     branch: string;
     allowNames: string;
-    gateCmdList: string;
     // #50: комментарии ревью приходят В ПРОМПТЕ, уже отфильтрованные петлёй по доверенным
     // авторам. Пустая строка — комментариев нет либо прочитать их не удалось (это решает
     // петля, сюда отказ не доходит).
@@ -291,7 +297,6 @@ function fixPlanContext(plan: string | undefined): string {
 export function buildFixByReviewPrompt({
     branch,
     allowNames,
-    gateCmdList,
     commentsContext,
     plan,
     resumed,
@@ -313,7 +318,7 @@ export function buildFixByReviewPrompt({
         `правкой, либо намерением pr-comment с обоснованием, почему пропущено — молча игнорировать нельзя ` +
         `ничего, кроме комментариев чужих авторов. Закоммить правки в ту же ветку. ${PUSH_RULE} ` +
         `${COMMIT_RULE} ` +
-        `Затем добейся зелёного: ${gateCmdList}. Если правку нельзя сделать автономно или проверки не ` +
+        `${TARGETED_CHECKS_RULE} Если правку нельзя сделать автономно или проверки не ` +
         `удаётся починить — запиши намерение pr-block с причиной. ${HOLD_RULE}`
     );
 }
@@ -323,7 +328,6 @@ export function buildFixByReviewPrompt({
 export function buildBlockedFixPrompt({
     branch,
     allowNames,
-    gateCmdList,
     commentsContext,
     plan,
     resumed,
@@ -337,7 +341,7 @@ export function buildBlockedFixPrompt({
         `PR ветки ${branch} помечен меткой blocked по итогам code review. Комментарии приложены ниже — ` +
         `петля собрала их ТОЛЬКО от доверенных авторов (${allowNames}), других ты не видишь и искать не ` +
         `нужно.${fixPlanContext(plan)}${commentsContext ?? ''} Найди блокирующие проблемы ([blocker] и [major] — их держит мердж — ` +
-        `и причину метки) и исправь КАЖДУЮ в ветке ${branch}. Добейся зелёного: ${gateCmdList}. ${COMMIT_RULE} Закоммить правки в ветку. ` +
+        `и причину метки) и исправь КАЖДУЮ в ветке ${branch}. ${TARGETED_CHECKS_RULE} ${COMMIT_RULE} Закоммить правки в ветку. ` +
         `${PUSH_RULE} ${intentsRule()} Намерением pr-comment опиши, что именно починено. ВАЖНО: метку ` +
         `blocked снять ты не можешь — такого намерения нет: снятие выполняет раннер по итогу повторного ` +
         `ревью, не ты. Если хоть одна блокирующая проблема не чинится автономно — опиши причину намерением ` +
