@@ -8231,6 +8231,233 @@ describe('runLoop — основной while-цикл: итерации коде
             expect(result.pushes[0]).toMatch(diagnosis);
         };
 
+        describe('fixSeverityFloor — порог правок ревью фазы', () => {
+            const anchored = (comment: string) => ({
+                comment,
+                anchor: { path: 'core/x.ts', line: 10 },
+            });
+            const withFloor = {
+                review: { default: 'claude-rev', fixSeverityFloor: 'minor' as const },
+            };
+
+            it('только nit ниже порога → plan: skip, правок нет, сдача идёт к гейту', () => {
+                const state = mkState();
+                const logs: string[] = [];
+                const tryMergePhaseFn = vi.fn(() => 'merged' as const);
+                const { runClaudeFn } = runPlannerPath(
+                    { tryMergePhaseFn, logFn: (line: string) => logs.push(line) },
+                    {},
+                    {
+                        state,
+                        findings: [{ comment: 'сводка' }, anchored('⚪ [nit] косметика')],
+                        config: withFloor,
+                    },
+                );
+
+                const prompts = runClaudeFn.mock.calls.map(([prompt]) => prompt);
+                expect(prompts.some((prompt) => prompt.includes('Ты планировщик правок'))).toBe(
+                    false,
+                );
+                expect(
+                    prompts.some((prompt) => prompt.includes('Разбери замечания code review')),
+                ).toBe(false);
+                expect(state.submitStages).toContainEqual(
+                    expect.objectContaining({ stage: 'plan', event: 'outcome', outcome: 'skip' }),
+                );
+                expect(tryMergePhaseFn).toHaveBeenCalled();
+                expect(logs.join('\n')).toContain('ниже порога review.fixSeverityFloor=minor');
+            });
+
+            it('minor среди находок проходит порог → планировщик и правки запущены', () => {
+                const { runClaudeFn } = runPlannerPath(
+                    {},
+                    {},
+                    {
+                        findings: [
+                            { comment: 'сводка' },
+                            anchored('⚪ [nit] косметика'),
+                            anchored('🟡 [minor] дефект'),
+                        ],
+                        config: withFloor,
+                    },
+                );
+
+                const prompts = runClaudeFn.mock.calls.map(([prompt]) => prompt);
+                expect(prompts.some((prompt) => prompt.includes('Ты планировщик правок'))).toBe(
+                    true,
+                );
+                expect(
+                    prompts.some((prompt) => prompt.includes('Разбери замечания code review')),
+                ).toBe(true);
+            });
+
+            it('⚪ [blocker] остаётся unmarked и запускает планировщик и правки', () => {
+                const { runClaudeFn } = runPlannerPath(
+                    {},
+                    {},
+                    {
+                        findings: [
+                            { comment: 'сводка' },
+                            anchored('⚪ [blocker] противоречивая разметка'),
+                        ],
+                        config: withFloor,
+                    },
+                );
+
+                const prompts = runClaudeFn.mock.calls.map(([prompt]) => prompt);
+                expect(prompts.some((prompt) => prompt.includes('Ты планировщик правок'))).toBe(
+                    true,
+                );
+                expect(
+                    prompts.some((prompt) => prompt.includes('Разбери замечания code review')),
+                ).toBe(true);
+            });
+
+            it('порог не задан → nit запускает планировщик и правки', () => {
+                const { runClaudeFn } = runPlannerPath(
+                    {},
+                    {},
+                    { findings: [{ comment: 'сводка' }, anchored('⚪ [nit] косметика')] },
+                );
+
+                const prompts = runClaudeFn.mock.calls.map(([prompt]) => prompt);
+                expect(prompts.some((prompt) => prompt.includes('Ты планировщик правок'))).toBe(
+                    true,
+                );
+                expect(
+                    prompts.some((prompt) => prompt.includes('Разбери замечания code review')),
+                ).toBe(true);
+            });
+        });
+
+        describe('fixSkip — сохранённая причина пропуска правок', () => {
+            const anchored = (comment: string) => ({
+                comment,
+                anchor: { path: 'core/x.ts', line: 10 },
+            });
+            const withFloor = {
+                review: { default: 'claude-rev', fixSeverityFloor: 'minor' as const },
+            };
+
+            it('свежий ниже-пороговый пропуск называет floor и не объявляет находки отсутствующими', () => {
+                const state = mkState();
+                const logs: string[] = [];
+                runPlannerPath(
+                    { logFn: (line: string) => logs.push(line) },
+                    {},
+                    {
+                        state,
+                        findings: [{ comment: 'сводка' }, anchored('⚪ [nit] косметика')],
+                        config: withFloor,
+                    },
+                );
+
+                expect(state.submitStages).toContainEqual(
+                    expect.objectContaining({
+                        stage: 'review',
+                        event: 'outcome',
+                        detail: {
+                            blocked: false,
+                            hasAnchoredFindings: false,
+                            fixSkip: { reason: 'below-fix-severity-floor', floor: 'minor' },
+                        },
+                    }),
+                );
+                expect(logs.join('\n')).toContain('ниже порога review.fixSeverityFloor=minor');
+                expect(logs.join('\n')).not.toContain('у первого ревью нет якорных находок');
+            });
+
+            it('свежий пропуск без находок сохраняет прежнее сообщение', () => {
+                const state = mkState();
+                const logs: string[] = [];
+                runPlannerPath(
+                    { logFn: (line: string) => logs.push(line) },
+                    {},
+                    { state, findings: [{ comment: '⚪ [nit] сводка без находок' }] },
+                );
+
+                expect(state.submitStages).toContainEqual(
+                    expect.objectContaining({
+                        stage: 'review',
+                        event: 'outcome',
+                        detail: {
+                            blocked: false,
+                            hasAnchoredFindings: false,
+                            fixSkip: { reason: 'no-anchored-findings' },
+                        },
+                    }),
+                );
+                expect(logs.join('\n')).toContain('у первого ревью нет якорных находок');
+            });
+
+            it('сериализованный рестарт ниже порога использует сохранённый floor, а не текущий конфиг', () => {
+                const at = '2026-01-01T00:00:00.000Z';
+                let submitStages = finishStage([], 'M1', 'pr', 'ok', at);
+                submitStages = finishStage(submitStages, 'M1', 'review', 'ok', at, {
+                    blocked: false,
+                    hasAnchoredFindings: false,
+                    fixSkip: { reason: 'below-fix-severity-floor', floor: 'minor' },
+                });
+                submitStages = JSON.parse(JSON.stringify(submitStages)) as typeof submitStages;
+                const state = mkState({ submitStages, lastReviewModel: null });
+                const logs: string[] = [];
+
+                const result = runPlannerPath(
+                    { logFn: (line: string) => logs.push(line) },
+                    {},
+                    {
+                        state,
+                        config: {
+                            review: { default: 'claude-rev', fixSeverityFloor: 'major' as const },
+                        },
+                    },
+                );
+
+                const prompts = result.runClaudeFn.mock.calls.map(([prompt]) => prompt);
+                expect(prompts.some((prompt) => prompt.includes('Ты планировщик правок'))).toBe(
+                    false,
+                );
+                expect(logs.join('\n')).toContain('ниже порога review.fixSeverityFloor=minor');
+                expect(logs.join('\n')).not.toContain('review.fixSeverityFloor=major');
+                expect(logs.join('\n')).not.toContain('у первого ревью нет якорных находок');
+            });
+
+            it('сериализованный рестарт без находок сохраняет прежнее сообщение', () => {
+                const at = '2026-01-01T00:00:00.000Z';
+                let submitStages = finishStage([], 'M1', 'pr', 'ok', at);
+                submitStages = finishStage(submitStages, 'M1', 'review', 'ok', at, {
+                    blocked: false,
+                    hasAnchoredFindings: false,
+                    fixSkip: { reason: 'no-anchored-findings' },
+                });
+                submitStages = JSON.parse(JSON.stringify(submitStages)) as typeof submitStages;
+                const state = mkState({ submitStages, lastReviewModel: null });
+                const logs: string[] = [];
+
+                runPlannerPath({ logFn: (line: string) => logs.push(line) }, {}, { state });
+
+                expect(logs.join('\n')).toContain('у первого ревью нет якорных находок');
+            });
+
+            it('legacy-вердикт без fixSkip получает нейтральный лог', () => {
+                const at = '2026-01-01T00:00:00.000Z';
+                let submitStages = finishStage([], 'M1', 'pr', 'ok', at);
+                submitStages = finishStage(submitStages, 'M1', 'review', 'ok', at, {
+                    blocked: false,
+                    hasAnchoredFindings: false,
+                });
+                submitStages = JSON.parse(JSON.stringify(submitStages)) as typeof submitStages;
+                const state = mkState({ submitStages, lastReviewModel: null });
+                const logs: string[] = [];
+
+                runPlannerPath({ logFn: (line: string) => logs.push(line) }, {}, { state });
+
+                expect(logs.join('\n')).toContain('пропущены по журналу сдачи прежней ревизии');
+                expect(logs.join('\n')).not.toContain('у первого ревью нет якорных находок');
+                expect(logs.join('\n')).not.toContain('ниже порога review.fixSeverityFloor');
+            });
+        });
+
         it('рестарт после ревью с находками без ревью-модели → stop fix-plan, plan: stop, правки не запущены', () => {
             const at = '2026-01-01T00:00:00.000Z';
             let submitStages = startStage([], 'M1', 'pr', at);

@@ -288,12 +288,10 @@ export function createConfigProfile(env: ConfigProfileEnv) {
         return true;
     }
 
-    // #16/#18/#110: схема блока `review`, отвечающего за карточки, которые петля заводит
-    // по ходу работы, — ПЯТЬ независимых ключей: `backlogMilestone`, `backlogMilestoneCap`,
-    // `backlogStaleDays`, `backlogStaleBudget` и `backlogSeverityFloor`. Имя без «вехи»
-    // намеренно (ревью правок #110): последний ключ к вехе отношения не имеет вовсе — это
-    // порог серьёзности находки, и ищущий, где он валидируется, по имени «…Milestone»
-    // сюда бы не пришёл.
+    // #16/#18/#110/#259: этот валидатор проверяет ШЕСТЬ ключей политик обработки находок
+    // внутри `review`, а не всю схему блока: `backlogMilestone`, `backlogMilestoneCap`,
+    // `backlogStaleDays`, `backlogStaleBudget`, `backlogSeverityFloor` и `fixSeverityFloor`.
+    // Пороги режут разные решения по серьёзности находки: заведение карточки и запуск правок.
     //
     // Оба ключа адреса необязательны — не задан ни один,
     // карточки едут как раньше, без вехи. Но ЗАДАННЫЙ мусор валит старт, а не тихо
@@ -307,7 +305,7 @@ export function createConfigProfile(env: ConfigProfileEnv) {
     // которую ничего не влезает (все карточки мимо адреса), дробное — сравнение, которое
     // сработает на половине карточки.
     // Возврат: true — валиден; иначе результат failFn (мягкий failFn пробрасываем наверх).
-    function assertValidReviewBacklog(
+    function assertValidReviewFindingPolicies(
         cfg: Record<string, unknown>,
         profileName: string,
         failFn: FailFn = fail,
@@ -415,6 +413,17 @@ export function createConfigProfile(env: ConfigProfileEnv) {
                     `${FIX_SEVERITY_LEVELS.join(', ')} (#110). Неизвестный уровень выглядел бы как заполненный ` +
                     `порог, а фильтр молча пропускал бы всё — то же самое, что и отсутствие ключа, просто без ` +
                     `предупреждения. Убери ключ (дефолт — заводить карточку на любую находку) либо задай ` +
+                    `известный уровень.`,
+            );
+        }
+        const fixSeverityFloor = review.fixSeverityFloor;
+        if (
+            fixSeverityFloor !== undefined &&
+            !(FIX_SEVERITY_LEVELS as readonly unknown[]).includes(fixSeverityFloor)
+        ) {
+            return failFn(
+                `${where}fixSeverityFloor = ${JSON.stringify(fixSeverityFloor)} — ожидался один из уровней ` +
+                    `${FIX_SEVERITY_LEVELS.join(', ')}. Убери ключ (правки по любой находке) либо задай ` +
                     `известный уровень.`,
             );
         }
@@ -965,10 +974,10 @@ export function createConfigProfile(env: ConfigProfileEnv) {
         // провайдера по label'ам issue.
         const routingOk = assertValidModelRouting(merged, wanted, failFn);
         if (routingOk !== true) return routingOk; // мягкий failFn — наверх как есть
-        // #16: адрес карточек лестницы — схема обоих ключей (fail-closed: заданный мусор
-        // валит старт, а не превращается в тихое «адреса нет»).
-        const backlogOk = assertValidReviewBacklog(merged, wanted, failFn);
-        if (backlogOk !== true) return backlogOk; // мягкий failFn — наверх как есть
+        // Политики обработки находок и оба порога — fail-closed: заданный мусор валит старт,
+        // а не превращается в тихое «карточки без адреса» или «правки без фильтра».
+        const findingPoliciesOk = assertValidReviewFindingPolicies(merged, wanted, failFn);
+        if (findingPoliciesOk !== true) return findingPoliciesOk; // мягкий failFn — наверх как есть
         // #48: плейсхолдеры промпта — последняя проверка схемы: она про содержимое, а не
         // про форму, и осмысленна только на уже слитом конфиге.
         const promptOk = assertValidPromptPlaceholders(merged, wanted, failFn);
@@ -1007,7 +1016,7 @@ export function createConfigProfile(env: ConfigProfileEnv) {
         assertValidRuntimeSections,
         assertValidModelRouting,
         assertValidPromptPlaceholders,
-        assertValidReviewBacklog,
+        assertValidReviewFindingPolicies,
         assertValidConsumerScripts,
         assertValidRoots,
         resolveProfile,

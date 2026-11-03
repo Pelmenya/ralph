@@ -29,7 +29,12 @@
 // раньше, а запись уходит в журнал. Отдельного поля, которое могло бы разойтись с
 // журналом, нет ни в памяти, ни на диске.
 
-import { normalizeReviewOfFixes, type ClassifiedFinding } from './review-of-fixes.ts';
+import {
+    FIX_SEVERITY_LEVELS,
+    normalizeReviewOfFixes,
+    type ClassifiedFinding,
+    type FixSeverity,
+} from './review-of-fixes.ts';
 
 /** Этапы сдачи — в порядке исполнения. */
 export const SUBMIT_STAGES = [
@@ -71,12 +76,29 @@ const OUTCOMES: ReadonlySet<string> = new Set(['ok', 'skip', 'stop']);
 export type TReviewVerdict = {
     blocked: boolean;
     hasAnchoredFindings: boolean;
+    fixSkip?:
+        | { reason: 'no-anchored-findings' }
+        | { reason: 'below-fix-severity-floor'; floor: Exclude<FixSeverity, null> };
 };
+
+function isFixSkip(value: unknown): boolean {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+    const skip = value as Record<string, unknown>;
+    if (skip.reason === 'no-anchored-findings') return true;
+    return (
+        skip.reason === 'below-fix-severity-floor' &&
+        (FIX_SEVERITY_LEVELS as readonly unknown[]).includes(skip.floor)
+    );
+}
 
 function isReviewVerdict(d: unknown): d is TReviewVerdict {
     if (d === null || typeof d !== 'object' || Array.isArray(d)) return false;
     const v = d as Record<string, unknown>;
-    return typeof v.blocked === 'boolean' && typeof v.hasAnchoredFindings === 'boolean';
+    return (
+        typeof v.blocked === 'boolean' &&
+        typeof v.hasAnchoredFindings === 'boolean' &&
+        (v.fixSkip === undefined || isFixSkip(v.fixSkip))
+    );
 }
 
 // До строгого вердикта миграция чекпоинта писала review с этой пометкой. Форма ровно с

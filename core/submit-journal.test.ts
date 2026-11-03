@@ -71,6 +71,37 @@ describe('журнал этапов сдачи (#93): исход у каждог
         expect(() => parseSubmitJournal(records, 'тест')).toThrow(/вердикт ревью/);
     });
 
+    it.each([
+        {
+            blocked: false,
+            hasAnchoredFindings: false,
+            fixSkip: { reason: 'no-anchored-findings' },
+        },
+        {
+            blocked: false,
+            hasAnchoredFindings: false,
+            fixSkip: { reason: 'below-fix-severity-floor', floor: 'minor' },
+        },
+    ])('причина пропуска правок переживает round-trip журнала: %j', (verdict) => {
+        const records = finishStage(brokenAt('review'), M, 'review', 'ok', AT, verdict);
+        const restored = parseSubmitJournal(JSON.parse(JSON.stringify(records)), 'тест');
+        expect(reviewVerdictOf(restored)).toEqual(verdict);
+    });
+
+    it.each([
+        { fixSkip: null },
+        { fixSkip: 'no-anchored-findings' },
+        { fixSkip: {} },
+        { fixSkip: { reason: 'unknown' } },
+        { fixSkip: { reason: 'below-fix-severity-floor' } },
+        { fixSkip: { reason: 'below-fix-severity-floor', floor: 'critical' } },
+        { fixSkip: { reason: 'below-fix-severity-floor', floor: null } },
+    ])('повреждённая fixSkip отвергается: %j', (part) => {
+        const detail = { blocked: false, hasAnchoredFindings: false, ...part };
+        const records = finishStage(brokenAt('review'), M, 'review', 'ok', AT, detail);
+        expect(() => parseSubmitJournal(records, 'тест')).toThrow(/вердикт ревью/);
+    });
+
     it('прежняя запись review без detail читается, но чистый вердикт не выдумывается', () => {
         const records = parseSubmitJournal(reviewed(), 'тест');
         expect(reviewVerdictOf(records)).toBeNull();

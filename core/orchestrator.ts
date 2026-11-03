@@ -210,6 +210,7 @@ import {
     meetsSeverityFloor,
     normalizeReviewOfFixes,
     pingPongIssueFor,
+    severityOf,
     staleLadderCards,
 } from './review-of-fixes.ts';
 import type {
@@ -822,7 +823,7 @@ export type RalphConfig = {
         // Строка принимается как список из одного элемента: конфиг с одной вехой не должен
         // выглядеть сложнее, чем он есть. Ключа НЕТ ⇒ карточка заводится без адреса
         // (прежнее поведение). А вот ЗАДАННЫЙ мусор — пустая строка, пустой список,
-        // не-строка — валит старт (assertValidReviewBacklog): он выглядит как
+        // не-строка — валит старт (assertValidReviewFindingPolicies): он выглядит как
         // заполненный ключ, а работает как отсутствующий.
         backlogMilestone?: string | string[];
         // #16: сколько открытых карточек веха вмещает, прежде чем переполнение поедет в
@@ -859,9 +860,11 @@ export type RalphConfig = {
         // режет анти-пинг-понг: спорная карточка фиксирует разногласие ДВУХ ревью, а не
         // серьёзность находки. Не задан ⇒ прежнее поведение — карточка заводится на любую
         // находку, включая nit (fail-closed: заданный неизвестный уровень валит старт,
-        // assertValidReviewBacklog). Тип — союз литералов, а не голая строка: опечатка
+        // assertValidReviewFindingPolicies). Тип — союз литералов, а не голая строка: опечатка
         // уровня в тесте/конфиге тогда красит tsc, а не проезжает мимо него до рантайма.
         backlogSeverityFloor?: Exclude<FixSeverity, null>;
+        // #259: косметика ревью фазы остаётся комментариями, не запуская круг правок.
+        fixSeverityFloor?: Exclude<FixSeverity, null>;
     };
     reviewModel?: string;
     authorAllowlist: string[];
@@ -10015,16 +10018,40 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     } else {
                         logFn('👀 Ревью PR — за супервизором (review: none).');
                     }
+                    const anchoredFindings = lastPrFindings.filter(
+                        (finding) => finding.anchor !== undefined,
+                    );
+                    // Отсутствие вердикта у прежнего журнала — не отсутствие находок:
+                    // консервативно планируем правки, а не пропускаем их по пустой памяти.
+                    const reviewHadFindings = reviewDone
+                        ? (restoredReview?.hasAnchoredFindings ?? true)
+                        : lastPrBlocked ||
+                          anchoredFindings.some((finding) =>
+                              meetsSeverityFloor(
+                                  severityOf(finding.comment),
+                                  cfg.review?.fixSeverityFloor,
+                              ),
+                          );
+                    const fixSkip =
+                        !reviewDone && !reviewHadFindings && reviewModel && reviewModel !== 'none'
+                            ? anchoredFindings.length > 0 && cfg.review?.fixSeverityFloor
+                                ? {
+                                      reason: 'below-fix-severity-floor' as const,
+                                      floor: cfg.review.fixSeverityFloor,
+                                  }
+                                : { reason: 'no-anchored-findings' as const }
+                            : undefined;
                     const reviewOutcome = reviewDone
                         ? restoredReview
                         : reviewModel && reviewModel !== 'none'
                           ? {
                                 blocked: phaseReviewBlocked,
-                                hasAnchoredFindings:
-                                    phaseReviewBlocked ||
-                                    lastPrFindings.some((finding) => finding.anchor !== undefined),
+                                hasAnchoredFindings: reviewHadFindings,
+                                ...(fixSkip ? { fixSkip } : {}),
                             }
                           : null;
+                    const belowFixFloorMessage = (floor: Exclude<FixSeverity, null>): string =>
+                        `находки ревью фазы ниже порога review.fixSeverityFloor=${floor} — остаются комментариями на PR`;
                     if (
                         !reviewDone &&
                         !subFinish(
@@ -10098,9 +10125,6 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         }
                         fixPlan = restored.plan;
                     }
-                    // Отсутствие вердикта у прежнего журнала — не отсутствие находок:
-                    // консервативно планируем правки, а не пропускаем их по пустой памяти.
-                    const reviewHadFindings = reviewOutcome?.hasAnchoredFindings ?? true;
                     const planStarted = planRecords.some((record) => record.stage === 'plan');
                     const plannerModel = reviewModel ?? state.lastReviewModel;
                     if (
@@ -10108,6 +10132,14 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         !planStarted &&
                         (!reviewHadFindings || reviewModel === 'none' || reviewSkipped)
                     ) {
+                        if (
+                            !reviewHadFindings &&
+                            reviewOutcome?.fixSkip?.reason === 'below-fix-severity-floor'
+                        ) {
+                            logFn(
+                                `▫ Правки пропущены: ${belowFixFloorMessage(reviewOutcome.fixSkip.floor)}.`,
+                            );
+                        }
                         if (!subFinish('plan', 'skip')) break;
                     } else if (!planDone) {
                         if (!subStart('plan')) break;
@@ -10163,10 +10195,20 @@ export function createOrchestrator(env: OrchestratorEnv) {
                             record.event === 'outcome' &&
                             record.outcome === 'skip',
                     );
+                    const fixesSkipMessage = ((): string => {
+                        const skip = reviewOutcome?.fixSkip;
+                        if (skip?.reason === 'below-fix-severity-floor') {
+                            return `⏭ Правки по ревью фазы "${phase.milestone}" не нужны: ${belowFixFloorMessage(skip.floor)} — к ревью правок.`;
+                        }
+                        if (skip?.reason === 'no-anchored-findings') {
+                            return `⏭ Правки по ревью фазы "${phase.milestone}" не нужны: у первого ревью нет якорных находок — к ревью правок.`;
+                        }
+                        return `⏭ Правки по ревью фазы "${phase.milestone}" пропущены по журналу сдачи прежней ревизии — к ревью правок.`;
+                    })();
                     if (fixesDone) {
                         logFn(
                             fixesSkipped
-                                ? `⏭ Правки по ревью фазы "${phase.milestone}" не нужны: у первого ревью нет якорных находок — к ревью правок.`
+                                ? fixesSkipMessage
                                 : `⏭ Правки по ревью фазы "${phase.milestone}" уже сделаны прошлым процессом (журнал сдачи) — к ревью правок.`,
                         );
                     } else {
@@ -10238,7 +10280,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         Array.isArray(cfg.review?.backlogLabels) ? cfg.review.backlogLabels : []
                     ).filter((l): l is string => typeof l === 'string' && !!l.trim());
                     // #110: порог серьёзности карточек лестницы. Валидирован на старте
-                    // (assertValidReviewBacklog) — здесь берём как есть, без ключа
+                    // (assertValidReviewFindingPolicies) — здесь берём как есть, без ключа
                     // фильтр пропускает всё (meetsSeverityFloor(sev, undefined) === true).
                     const backlogSeverityFloor = cfg.review?.backlogSeverityFloor;
                     // Метки СПОРНОЙ карточки — те же, минус метки роутинга модели.

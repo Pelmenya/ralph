@@ -43,8 +43,9 @@
 #
 # ЗАПУСК:
 #   provision/install-stand.sh <claude|codex|kimi|opencode> [проба…]
-# Код выхода: 0 — ни одна проба не дала FAIL, FAIL-OPEN или INCONCLUSIVE; 1 — хоть одна
-# дала. Код решает вся строка проб, а не одна: `claude block override` с block FAIL и
+# Код выхода: 0 — каждая проба дала PASS, FAIL-CLOSED, SKIP или INFO; 1 — любой другой,
+# пустой или неизвестный вердикт, включая FAIL, FAIL-OPEN, INCONCLUSIVE и сбой судьи.
+# Код решает вся строка проб, а не одна: `claude block override` с block FAIL и
 # override PASS — единица.
 #
 # STAND_SUBJECT_ROOT=<дерево> — хуки и пакеты харнессов под проверкой берутся оттуда, а не из
@@ -108,7 +109,7 @@ trap cleanup EXIT
 say() { printf '%s\n' "$*"; }
 result() {
     say "RESULT $CLI $1 $2 — $3"
-    case "$2" in FAIL | FAIL-OPEN | INCONCLUSIVE) RC=1 ;; esac
+    case "$2" in PASS | FAIL-CLOSED | SKIP | INFO) ;; *) RC=1 ;; esac
 }
 
 # Сессия под CLI не должна унаследовать признаки родительской сессии Claude Code:
@@ -441,7 +442,7 @@ probe_block() {
 }
 
 probe_session-context() {
-    local STAND_ISOLATE_ARGS="${STAND_ISOLATE_ARGS:-}" verdict why
+    local STAND_ISOLATE_ARGS="${STAND_ISOLATE_ARGS:-}" out verdict why
     make_repos ""
     export RALPH_STAND_CONTEXT_EXPECTED=$(node -e 'process.stdout.write(JSON.stringify({ralphStandContext: crypto.randomUUID()}))')
     export RALPH_SESSION_CONTEXT=$RALPH_STAND_CONTEXT_EXPECTED
@@ -451,8 +452,12 @@ probe_session-context() {
     "${CLI}_register" context.cjs
     : >"$LOGS/canon.log"
     session session-context "$MARK"
-    read -r verdict why < <(node "$CANON_ROOT/provision/stand/context-judge.mts" "$LOGS/canon.log" RALPH_STAND_CONTEXT_EXPECTED)
-    result session-context "$verdict" "$why"
+    out=$(node "$CANON_ROOT/provision/stand/context-judge.mts" "$LOGS/canon.log" RALPH_STAND_CONTEXT_EXPECTED) || out=""
+    read -r verdict why <<<"$out"
+    case "$verdict" in
+        PASS | FAIL | INCONCLUSIVE) result session-context "$verdict" "$why" ;;
+        *) result session-context FAIL "судья не дал вердикта: ${out:-пустой вывод}" ;;
+    esac
     unset RALPH_SESSION_CONTEXT
 }
 

@@ -28,12 +28,31 @@ const at = (path: string, line: number) => ({ path, line });
 const f = (comment: string, anchor = at('src/a.ts', 1)): FixFinding => ({ comment, anchor });
 
 describe('severityOf — разметка серьёзности из контракта ревью-промпта', () => {
-    it('читает метку в начале комментария', () => {
-        expect(severityOf('🔴 [blocker] тут теряется отказ')).toBe('blocker');
-        expect(severityOf('🟠 [major] дубль логики')).toBe('major');
-        expect(severityOf('🟡 [minor] нейминг')).toBe('minor');
-        expect(severityOf('⚪ [nit] лишний пробел')).toBe('nit');
+    const markers = [
+        ['🔴', 'blocker'],
+        ['🟠', 'major'],
+        ['🟡', 'minor'],
+        ['⚪', 'nit'],
+    ] as const;
+
+    it.each(
+        markers.flatMap(([marker, markedSeverity]) =>
+            SEVERITY_LEVELS.map((tag) => ({
+                marker,
+                tag,
+                expected: tag === markedSeverity ? markedSeverity : null,
+            })),
+        ),
+    )('$marker [$tag] принимается только согласованной парой', ({ marker, tag, expected }) => {
+        expect(severityOf(`${marker} [${tag}] текст находки`)).toBe(expected);
     });
+
+    it.each(['🔴', '[blocker]', '🔴 [critical]', '🔴 []', '🔴 blocker'])(
+        'неполная или неизвестная разметка «%s» — unmarked',
+        (comment) => {
+            expect(severityOf(comment)).toBe(null);
+        },
+    );
 
     it('метка не в начале — не разметка, а упоминание', () => {
         expect(severityOf('это не 🔴 [blocker], а цитата')).toBe(null);
@@ -71,7 +90,7 @@ describe('severityOf — разметка серьёзности из контр
     });
 });
 
-describe('meetsSeverityFloor — порог серьёзности карточек лестницы (#110)', () => {
+describe('meetsSeverityFloor — общий порог серьёзности находок (#110/#259)', () => {
     it('порог не задан → пропускает любую находку (дефолт сохраняет прежнее поведение)', () => {
         expect(meetsSeverityFloor('nit', undefined)).toBe(true);
         expect(meetsSeverityFloor('nit', null)).toBe(true);

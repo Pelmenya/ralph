@@ -527,6 +527,24 @@ describe('review.backlogMilestone / backlogMilestoneCap — схема ключ�
             ).toThrow(/backlogSeverityFloor/);
         });
     });
+
+    describe('fixSeverityFloor — порог правок ревью фазы', () => {
+        it('ключ не задан → валиден', () => {
+            expect(() => resolveProfile(withReview({}), 'prod', boom)).not.toThrow();
+        });
+
+        it.each([...FIX_SEVERITY_LEVELS])('известный уровень «%s» — валиден', (level) => {
+            expect(() =>
+                resolveProfile(withReview({ fixSeverityFloor: level }), 'prod', boom),
+            ).not.toThrow();
+        });
+
+        it.each(['critical', ''])('неизвестный уровень «%s» валит старт с причиной', (level) => {
+            expect(() =>
+                resolveProfile(withReview({ fixSeverityFloor: level }), 'prod', boom),
+            ).toThrow(/fixSeverityFloor/);
+        });
+    });
 });
 
 // #376 (фаза 6): modelRouting провайдер-осведомлён — значение может быть строкой
