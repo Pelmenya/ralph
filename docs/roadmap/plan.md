@@ -991,6 +991,8 @@ fixSeverityFloor)`; `lastPrBlocked` считается всегда. После 
 `install-stand.sh` — 4, `runtime-profile.ts` — 3, `session-context.ts` — 2, `stand.mts` — 2;
 плюс `npx vitest related --run` по правимым файлам ядра (скилл `plan-phase`, «Задетые барьеры»).
 
+**Размер:** 7 задач (6 петли и одна `human`) — решение человека 03.11.
+
 **Задачи:**
 
 - [ ] Своя копия CLI закреплённой версии: поставка пакета, установка, манифест, защита

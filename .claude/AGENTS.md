@@ -30,7 +30,7 @@
 | `hooks/load-context.cjs`                              | SessionStart: подгружает `local/HANDOFF.md`                                                  |
 | `hooks/sync-docs.cjs`                                 | PostToolUse: пересобирает `AGENTS.md` после правки `CLAUDE.md`                               |
 | `skills/vitest/`                                      | скилл vitest (сгенерирован в antfu/skills), правится только регенерацией                     |
-| `skills/prd/`, `skills/plan-phase/`, `skills/issues/` | цепочка планирования: раздел PRD → фазы до 5 карточек → вехи, карточки, строка конфига петли |
+| `skills/prd/`, `skills/plan-phase/`, `skills/issues/` | цепочка планирования: раздел PRD → фазы ≤5–7 карточек → вехи, карточки, строка конфига петли |
 | `skills/git-commit/`                                  | коммит по конвенции: сообщение проверяет `commit-msg.mts` до `git commit -F`                 |
 | `local/HANDOFF.md`                                    | передача между сессиями; локальный, под `.gitignore`                                         |
 | `ralph/ralph.project.md`                              | проектная половина промпта петли на каноне (конфиг рядом — локальный)                        |
