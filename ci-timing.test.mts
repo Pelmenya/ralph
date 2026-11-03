@@ -91,10 +91,16 @@ describe('CI — диагностика без права менять выхо�
             path.join(import.meta.dirname, '.sourcecraft', 'ci.yaml'),
             'utf8',
         );
-        const commands = [...yaml.matchAll(/- 'if (.*?); then (.*?); else (.*?); fi'/g)];
-        expect(commands.map((match) => match[3])).toEqual([
-            'node ci-timing.mts install',
-            'node ci-timing.mts gate',
+        // Конфиг CI действует из main, а дерево — из PR: у ветки, отрезанной до замера,
+        // обёртки нет, и куб обязан идти прежней командой, а не падать на «файл не найден».
+        const commands = [
+            ...yaml.matchAll(
+                /- 'if (.*?); then (.*?); elif \[ -f ci-timing\.mts \]; then (.*?); else (.*?); fi'/g,
+            ),
+        ];
+        expect(commands.map((match) => [match[3], match[4]])).toEqual([
+            ['node ci-timing.mts install', 'npm ci'],
+            ['node ci-timing.mts gate', 'npm run gate'],
         ]);
         expect(commands[0][1]).toBe(commands[1][1]);
         expect(commands[0][1]).toBe(
