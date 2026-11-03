@@ -45,16 +45,19 @@ workflows:
                     script:
                         - node ci-stale-run.mts
 
+                  ## Замер (#268) без зависимостей: ресурсы до установки и время npm ci.
+                  ## Отказ чтения cgroup остаётся диагностикой, код выхода берётся у npm.
                   - name: install
                     script:
-                        - 'if printf "%s" "${RALPH_STALE_RUN:-}" | grep -Eqx "[0-9a-f]{40}"; then echo "⏭ npm ci пропущен: прогон устарел, HEAD уже ${RALPH_STALE_RUN}"; else npm ci; fi'
+                        - 'if printf "%s" "${RALPH_STALE_RUN:-}" | grep -Eqx "[0-9a-f]{40}"; then echo "⏭ npm ci пропущен: прогон устарел, HEAD уже ${RALPH_STALE_RUN}"; else node ci-timing.mts install; fi'
 
                   ## Один скрипт, а не список кубов: порядок и состав проверок — часть продукта
                   ## и живут в gate.mts. Разложи их здесь по кубам — и появится второй источник
                   ## правды, который разойдётся с локальным прогоном молча.
+                  ## Обёртка печатает cpu.stat и после красного гейта, сохраняя его код.
                   - name: gate
                     script:
-                        - 'if printf "%s" "${RALPH_STALE_RUN:-}" | grep -Eqx "[0-9a-f]{40}"; then echo "⏭ Гейт пропущен: прогон устарел, HEAD уже ${RALPH_STALE_RUN}"; else npm run gate; fi'
+                        - 'if printf "%s" "${RALPH_STALE_RUN:-}" | grep -Eqx "[0-9a-f]{40}"; then echo "⏭ Гейт пропущен: прогон устарел, HEAD уже ${RALPH_STALE_RUN}"; else node ci-timing.mts gate; fi'
 
     ## Закрытие карточек, названных смердженным PR. Отдельный workflow, а не куб гейта:
     ## он МУТИРУЕТ карточки трекера, а гейт только проверяет код — у мутаций свой прогон,
