@@ -20,7 +20,8 @@ import { describe, expect, it } from 'vitest';
 // orchestrator.test.ts, #366): дефолт ralph.js — ре-экспорт runtime фабрики.
 import ralph from '../ralph.js';
 import type { RalphConfig } from '../core/orchestrator.ts';
-import type { RalphState } from '../core/state-lock.ts';
+import { inspectState, type RalphState } from '../core/state-lock.ts';
+import { stateToDisk } from '../core/submit-journal.ts';
 import { IN_FLIGHT_PREFIX } from '../core/session-requests.ts';
 import { REASON_TITLES } from '../core/stop-message.ts';
 import { Killed, world } from './crash-world.ts';
@@ -77,7 +78,7 @@ const MERGED = /^✅ Ralph: фаза "M1" смерджена в main — гот�
 
 const SCENARIOS: Record<string, TScenario> = {
     clean: {
-        title: 'ревью без блокеров → правки → ревью правок → мердж',
+        title: 'ревью без находок → без плана и правок → ревью правок → мердж',
         passes: {
             review: () => ({ findings: [SUMMARY] }),
             'fix-review': () => ({ findings: [SUMMARY] }),
@@ -94,30 +95,21 @@ const SCENARIOS: Record<string, TScenario> = {
         ],
     },
     'blocked-heal': {
-        title: 'ревью ставит blocked → разбор → повторное ревью чисто → мердж',
+        title: 'ревью ставит blocked → чистое ревью правок снимает метку → мердж',
         passes: {
             review: () => ({ findings: [BLOCKER, SUMMARY], blocked: true }),
             'fix-review': () => ({ findings: [SUMMARY] }),
-            're-review': () => ({ findings: [SUMMARY] }),
         },
         outcome: 'merged',
         accept: MERGED,
-        effects: [
-            'apply:review',
-            'save:submitted=true',
-            'save:reReviewPending=true',
-            'removeBlocked',
-            'apply:re-review',
-            'save:reReviewPending=false',
-            'merge',
-        ],
+        effects: ['apply:review', 'save:submitted=true', 'removeBlocked', 'merge'],
     },
     'arbiter-confirms': {
         // Блокер — без `pr-block`, одной severity: метку тогда ставит раннер по вердикту
         // арбитра, и только она отделяет фазу от мерджа.
         title: 'ревью правок находит блокер, арбитр его подтверждает → мерджа нет',
         passes: {
-            review: () => ({ findings: [SUMMARY] }),
+            review: () => ({ findings: [BLOCKER, SUMMARY] }),
             'fix-review': () => ({ findings: [BLOCKER, SUMMARY] }),
             arbiter: () => ({ findings: [BLOCKER, SUMMARY] }),
             're-review': () => ({ findings: [BLOCKER, SUMMARY], blocked: true }),
@@ -172,14 +164,16 @@ const freshState = (): RalphState => ({
 
 /** Всё, что переживает смерть процесса: state на диске и форж. Чат — общий для всех. */
 type TUniverse = {
-    disk: RalphState;
+    disk: string;
     forge: {
         prs: number;
         labels: Set<string>;
         comments: string[];
         merged: number;
         // Сколько вердиктов ревью легло на PR и сколько из них — после последнего снятия
-        // `blocked`: снятая метка без нового вердикта и есть мердж «без доказательства».
+        // `blocked`, если оно последовало за блокирующим вердиктом: чистое ревью правок
+        // само является доказательством для снятия, а мердж после блокера без нового
+        // вердикта остаётся запрещённым.
         verdicts: number;
         verdictsSinceLift: number;
         // Блокер, подтверждённый последним ревью, ещё не опровергнут следующим.
@@ -192,7 +186,7 @@ type TUniverse = {
 };
 
 const universe = (): TUniverse => ({
-    disk: freshState(),
+    disk: JSON.stringify(freshState()),
     forge: {
         prs: 0,
         labels: new Set(),
@@ -208,7 +202,11 @@ const universe = (): TUniverse => ({
     mergeAudit: [],
 });
 
-const clone = (s: RalphState): RalphState => JSON.parse(JSON.stringify(s)) as RalphState;
+function load(u: TUniverse): RalphState {
+    const r = inspectState(u.disk);
+    if (r.status !== 'ok') throw new Error(`state не прочитан: ${JSON.stringify(r)}`);
+    return r.state;
+}
 
 /** Имя записи state — по тому, какие чекпоинты она меняет. */
 function saveName(before: RalphState, after: RalphState): string {
@@ -227,6 +225,15 @@ function saveName(before: RalphState, after: RalphState): string {
     if (la.arbitrated === true && lb.arbitrated !== true) changed.push('arbitrated=true');
     else if (JSON.stringify(before.reviewOfFixes) !== JSON.stringify(after.reviewOfFixes)) {
         changed.push('reviewOfFixes');
+    }
+    for (const stage of ['review', 'plan', 'fixes'] as const) {
+        const outcome = (state: RalphState) => {
+            const record = state.submitStages?.find(
+                (r) => r.stage === stage && r.event === 'outcome',
+            );
+            return record?.event === 'outcome' ? record.outcome : undefined;
+        };
+        if (outcome(before) !== outcome(after)) changed.push(`${stage}=${String(outcome(after))}`);
     }
     return `save:${changed.join(',') || '—'}`;
 }
@@ -257,7 +264,7 @@ function runProcess(
             return act(...a);
         };
     const { forge } = u;
-    const state = clone(u.disk);
+    const state = load(u);
     let lastSession: TSession | null = null;
     let lastPass: TPass = { findings: [] };
     let idxCalls = 0;
@@ -276,9 +283,9 @@ function runProcess(
                 shFn: read(() => ''),
                 runArgvFn: read(() => ''),
                 saveStateFn: g(
-                    (s: RalphState) => saveName(u.disk, s),
+                    (s: RalphState) => saveName(load(u), s),
                     (s: RalphState) => {
-                        u.disk = clone(s);
+                        u.disk = JSON.stringify(stateToDisk(s));
                     },
                 ),
                 openIssuesFn: read(() => []),
@@ -349,7 +356,7 @@ function runProcess(
                     () => 'removeBlocked',
                     () => {
                         forge.labels.delete('blocked');
-                        forge.verdictsSinceLift = 0;
+                        if (forge.standingBlocker) forge.verdictsSinceLift = 0;
                     },
                 ),
                 prHasBlockedLabelFn: read(() => forge.labels.has('blocked')),
@@ -408,9 +415,9 @@ const isEffect = (op: string): boolean =>
     op === 'removeBlocked' ||
     op === 'merge' ||
     (op.startsWith('apply:') && op !== 'apply:none' && op !== 'apply:heal') ||
-    /^save:.*(submitted|reviewOfFixes|arbitrated|reReviewPending)/.test(op);
+    /^save:.*(submitted|reviewOfFixes|arbitrated|reReviewPending|review=|plan=|fixes=)/.test(op);
 
-describe.each(Object.entries(SCENARIOS))('#87 матрица сдачи: %s', (_key, sc) => {
+describe.each(Object.entries(SCENARIOS))('#87 матрица сдачи: %s', (key, sc) => {
     // Прогон без убийств задаёт и верный исход, и список эффектов, вокруг которых режем.
     const reference = universe();
     runProcess(reference, sc);
@@ -424,6 +431,12 @@ describe.each(Object.entries(SCENARIOS))('#87 матрица сдачи: %s', (_
         expect(reference.forge.merged).toBe(sc.outcome === 'merged' ? 1 : 0);
         expect(reference.forge.prs).toBe(1);
         expect(reference.chat.at(-1)).toMatch(sc.accept);
+        if (key === 'clean') {
+            expect(reference.sessions.plan).toBeUndefined();
+            expect(reference.sessions.fix).toBeUndefined();
+            expect(reference.trace).toContain('save:plan=skip');
+            expect(reference.trace).toContain('save:fixes=skip');
+        }
         // Каждый заявленный вид эффекта в трассе есть: матрица, не дошедшая до эффекта,
         // утверждала бы «окна нет» про окно, которого не видела.
         for (const op of sc.effects) expect(reference.trace).toContain(op);

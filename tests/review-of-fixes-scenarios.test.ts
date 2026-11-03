@@ -145,6 +145,8 @@ function runPhase({
     labelReadBack = (() => true) as () => boolean,
     // Ревью 16c2: исход пуша раннера по его номеру (с нуля); `null` — пушить нечего.
     pushResult = (() => null) as (nth: number) => SessionPushResult | null,
+    firstReviewBlocked = false,
+    removeBlockedLabelError = null as Error | null,
 } = {}) {
     const prompts: string[] = [];
     // Сколько сессий уже отработало к каждому пушу раннера — так видно, после какой он стоит.
@@ -165,6 +167,13 @@ function runPhase({
     const closedIssues: number[] = [];
     const issueComments: Array<{ issue: number; body: string }> = [];
     const addBlockedLabelFn = vi.fn();
+    const removeBlockedLabelFn = vi.fn();
+    if (removeBlockedLabelError) {
+        removeBlockedLabelFn.mockImplementationOnce(() => {
+            throw removeBlockedLabelError;
+        });
+    }
+    const tryMergePhaseFn = vi.fn(() => gate);
     const pushEventFn = vi.fn();
     const syncProjectBoardFn = vi.fn();
     let passIdx = 0;
@@ -173,6 +182,7 @@ function runPhase({
     // Голова меняется от сессии правок, а не от чтения SHA: планировщик сверяет неизменность
     // ветки до и после своей read-only сессии, но между кругами диффы обязаны различаться.
     let fixCount = 0;
+    let headReads = 0;
     const HEADS = ['b', 'c', 'd', 'e', 'f'].map((c) => c.repeat(40));
     const currentHead = () => HEADS[Math.min(fixCount, HEADS.length - 1)];
     const applyArgs: Array<{ currentMilestone?: string }> = [];
@@ -246,7 +256,12 @@ function runPhase({
             // в текст — по ней видно, от какой точки собран дифф.
             reviewDiffContextFn: (_b: string, opts?: { base?: string }) =>
                 opts?.base ? `${FIX_DIFF}(${opts.base})` : PHASE_DIFF,
-            branchHeadShaFn: () => (headSha === null ? null : currentHead()),
+            branchHeadShaFn: () => {
+                if (headSha !== null) return currentHead();
+                headReads += 1;
+                // Два чтения планировщика успешны; база правок уже сталкивается с отказом.
+                return headReads <= 2 ? currentHead() : null;
+            },
             createIssueFn: (input) => {
                 issues.push(input);
                 return 100 + issues.length;
@@ -259,7 +274,7 @@ function runPhase({
             ) => {
                 journal.push({ pass, counts, pr });
             },
-            removeBlockedLabelFn: () => {},
+            removeBlockedLabelFn,
             addBlockedLabelFn,
             prHasBlockedLabelFn: labelReadBack,
             runClaudeFn: withDefaultFixPlan((prompt: string, opts: { model?: string } = {}) => {
@@ -299,17 +314,20 @@ function runPhase({
                         prBlocked: arbiter.blocked === true,
                     };
                 }
-                // Задача 78: ревью фазы и повторное ревью засчитываются по вердикту —
-                // сводке без якоря.
+                // У первого ревью есть предмет правок; у чистого повторного — только сводка.
                 return {
                     applied: 0,
                     failed: false,
                     closedIssues: [],
-                    prFindings:
-                        isPhaseReviewPrompt(last) || isReReviewPrompt(last)
-                            ? [{ comment: '⚪ [nit] сводка прохода ревью фазы' }]
-                            : [],
-                    prBlocked: false,
+                    prFindings: isPhaseReviewPrompt(last)
+                        ? [
+                              major('первое ревью требует правки', 1),
+                              { comment: '⚪ [nit] сводка прохода ревью фазы' },
+                          ]
+                        : isReReviewPrompt(last)
+                          ? [{ comment: '⚪ [nit] сводка прохода ревью фазы' }]
+                          : [],
+                    prBlocked: isPhaseReviewPrompt(last) && firstReviewBlocked,
                 };
             },
             ensureCleanFn: () => true,
@@ -331,7 +349,7 @@ function runPhase({
             phaseMergedFn: () => false,
             mergedPhasePrFn: () => null,
             advancePhaseFn: () => {},
-            tryMergePhaseFn: () => gate,
+            tryMergePhaseFn,
             closeMilestoneByTitleFn: () => {},
             syncProjectBoardFn,
             recordReviewFindingsFn: () => {},
@@ -350,6 +368,8 @@ function runPhase({
         issues,
         journal,
         addBlockedLabelFn,
+        removeBlockedLabelFn,
+        tryMergePhaseFn,
         pushEventFn,
         syncProjectBoardFn,
         closedIssues,
@@ -370,6 +390,61 @@ function runPhase({
             pushEventFn.mock.calls.some((c: unknown[]) => /смерджена в main/.test(c[0] as string)),
     };
 }
+
+describe('merge снимает blocked после чистого ревью правок', () => {
+    it('снимает метку первого ревью до гейта и не запускает разбор blocked', () => {
+        const s = runPhase({ firstReviewBlocked: true, passes: [{ findings: [] }] });
+
+        expect(s.removeBlockedLabelFn).toHaveBeenCalledTimes(1);
+        expect(s.removeBlockedLabelFn).toHaveBeenCalledWith('feature/m1', {
+            shFn: expect.any(Function),
+            logFn: expect.any(Function),
+        });
+        expect(s.removeBlockedLabelFn.mock.invocationCallOrder[0]).toBeLessThan(
+            s.tryMergePhaseFn.mock.invocationCallOrder[0],
+        );
+        expect(s.prompts.some(isReReviewPrompt)).toBe(false);
+        expect(s.state.blockedHeals).toBe(0);
+        expect(s.merged()).toBe(true);
+    });
+
+    it('ошибка снятия метки логируется, а гейт ведёт штатный разбор blocked', () => {
+        const s = runPhase({
+            firstReviewBlocked: true,
+            passes: [{ findings: [] }],
+            gate: 'blocked',
+            removeBlockedLabelError: new Error('форж не ответил'),
+        });
+
+        expect(
+            s.logs.some((l) =>
+                l.includes(
+                    '⚠ Ralph: метка blocked на PR не снята после «merge» ревью правок: форж не ответил — гейт поведёт разбор blocked',
+                ),
+            ),
+        ).toBe(true);
+        expect(s.prompts.some(isReReviewPrompt)).toBe(true);
+        expect(s.state.blockedHeals).toBeGreaterThan(0);
+    });
+
+    it('блокирующая находка ревью правок оставляет метку нетронутой', () => {
+        const s = runPhase({
+            firstReviewBlocked: true,
+            passes: [{ findings: [blocker('правка теряет отказ', 1)] }],
+            config: cfg({ fixReviewAttempts: 1 }),
+        });
+
+        expect(s.arbiterPrompts()).toHaveLength(1);
+        expect(s.removeBlockedLabelFn).not.toHaveBeenCalled();
+    });
+
+    it('без метки от первого ревью снятие не вызывается', () => {
+        const s = runPhase({ passes: [{ findings: [] }] });
+
+        expect(s.removeBlockedLabelFn).not.toHaveBeenCalled();
+        expect(s.merged()).toBe(true);
+    });
+});
 
 describe('крит. 1: фаза БЕЗ блокеров всё равно получает второй проход по диффу правок', () => {
     // Симптом PR #624: 19 находок ревью, ни одного blocker → повторного прохода не было,

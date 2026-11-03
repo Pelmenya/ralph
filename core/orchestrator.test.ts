@@ -4491,6 +4491,7 @@ describe('preflight — валидация конфига/среды и подг
         let stages = startStage([], 'M1', 'pr', at);
         stages = finishStage(stages, 'M1', 'pr', 'ok', at);
         stages = finishStage(stages, 'M1', 'review', 'ok', at);
+        stages = finishStage(stages, 'M1', 'plan', 'ok', at);
         stages = finishStage(stages, 'M1', 'fixes', 'stop', at, { base: 'a'.repeat(40) });
         const state = attachSubmitJournal({
             count: 2,
@@ -4511,6 +4512,7 @@ describe('preflight — валидация конфига/среды и подг
         for (const s of [
             'pr',
             'review',
+            'plan',
             'fixes',
             'fix-review',
             'arbiter',
@@ -8176,7 +8178,11 @@ describe('runLoop — основной while-цикл: итерации коде
         const runPlannerPath = (
             overrides: Record<string, unknown> = {},
             planner: { code?: number; output?: string } = {},
-            options: { config?: Partial<RalphConfig>; state?: ReturnType<typeof mkState> } = {},
+            options: {
+                config?: Partial<RalphConfig>;
+                state?: ReturnType<typeof mkState>;
+                findings?: typeof reviewFindings;
+            } = {},
         ) => {
             const pushes: string[] = [];
             const runClaudeFn = vi.fn<RunClaudeFake>((prompt, _opts, d) => {
@@ -8197,7 +8203,8 @@ describe('runLoop — основной while-цикл: итерации коде
                         applied: 1,
                         failed: false,
                         closedIssues: [],
-                        prFindings: ++applications === 1 ? reviewFindings : [],
+                        prFindings:
+                            ++applications === 1 ? (options.findings ?? reviewFindings) : [],
                         prBlocked: false,
                     }),
                     pushEventFn: (message: string) => {
@@ -8223,6 +8230,125 @@ describe('runLoop — основной while-цикл: итерации коде
             expect(result.pushes[0]).toContain('fix-plan');
             expect(result.pushes[0]).toMatch(diagnosis);
         };
+
+        it('рестарт после ревью с находками без ревью-модели → stop fix-plan, plan: stop, правки не запущены', () => {
+            const at = '2026-01-01T00:00:00.000Z';
+            let submitStages = startStage([], 'M1', 'pr', at);
+            submitStages = finishStage(submitStages, 'M1', 'pr', 'ok', at);
+            submitStages = startStage(submitStages, 'M1', 'review', at);
+            submitStages = finishStage(submitStages, 'M1', 'review', 'ok', at, {
+                blocked: false,
+                hasAnchoredFindings: true,
+            });
+            const state = mkState({ submitStages, lastReviewModel: null });
+
+            const result = runPlannerPath({}, {}, { state });
+
+            expectPlanStop(result, /ревью-модель не задана/);
+            expect(state.submitStages).toContainEqual(
+                expect.objectContaining({ stage: 'plan', event: 'outcome', outcome: 'stop' }),
+            );
+            expect(state.submitStages).not.toContainEqual(
+                expect.objectContaining({ stage: 'plan', event: 'outcome', outcome: 'skip' }),
+            );
+        });
+
+        it.each([null, 'claude-rev'])(
+            'рестарт после review: skip при lastReviewModel=%s → plan: skip и правки без плана',
+            (lastReviewModel) => {
+                const at = '2026-01-01T00:00:00.000Z';
+                let submitStages = finishStage([], 'M1', 'pr', 'ok', at);
+                submitStages = finishStage(submitStages, 'M1', 'review', 'skip', at);
+                const state = JSON.parse(
+                    JSON.stringify(mkState({ submitStages, lastReviewModel })),
+                ) as ReturnType<typeof mkState>;
+
+                const result = runPlannerPath({}, {}, { state });
+
+                const prompts = result.runClaudeFn.mock.calls.map(([prompt]) => prompt);
+                expect(prompts.some((prompt) => prompt.includes('Ты планировщик правок'))).toBe(
+                    false,
+                );
+                expect(result.pushes.join('\n')).not.toContain('fix-plan');
+                expect(state.submitStages).toContainEqual(
+                    expect.objectContaining({ stage: 'plan', event: 'outcome', outcome: 'skip' }),
+                );
+                const fixPrompt = prompts.find((prompt) =>
+                    prompt.includes('Разбери замечания code review'),
+                );
+                expect(fixPrompt).toBeDefined();
+                expect(fixPrompt).not.toContain(`Решение: ${plan.decision}`);
+                expect(state.submitStages).toContainEqual(
+                    expect.objectContaining({ stage: 'fixes', event: 'outcome', outcome: 'ok' }),
+                );
+            },
+        );
+
+        it('чистое ревью → plan: skip и fixes: skip без планировщика и сессии правок', () => {
+            const state = mkState();
+            const result = runPlannerPath(
+                {},
+                {},
+                { state, findings: [{ comment: '⚪ [nit] сводка без находок' }] },
+            );
+
+            const prompts = result.runClaudeFn.mock.calls.map(([prompt]) => prompt);
+            expect(prompts.some((prompt) => prompt.includes('Ты планировщик правок'))).toBe(false);
+            expect(prompts.some((prompt) => prompt.includes('Разбери замечания code review'))).toBe(
+                false,
+            );
+            for (const stage of ['plan', 'fixes']) {
+                expect(state.submitStages).toContainEqual(
+                    expect.objectContaining({ stage, event: 'outcome', outcome: 'skip' }),
+                );
+            }
+        });
+
+        it('рестарт после сериализованного review: ok без находок сам доводит plan и fixes до skip', () => {
+            const at = '2026-01-01T00:00:00.000Z';
+            let submitStages = finishStage([], 'M1', 'pr', 'ok', at);
+            submitStages = finishStage(submitStages, 'M1', 'review', 'ok', at, {
+                blocked: false,
+                hasAnchoredFindings: false,
+            });
+            submitStages = JSON.parse(JSON.stringify(submitStages)) as typeof submitStages;
+            const state = mkState({ submitStages, lastReviewModel: null });
+
+            const result = runPlannerPath({}, {}, { state });
+
+            const prompts = result.runClaudeFn.mock.calls.map(([prompt]) => prompt);
+            expect(prompts.some((prompt) => prompt.includes('Ты планировщик правок'))).toBe(false);
+            expect(prompts.some((prompt) => prompt.includes('Разбери замечания code review'))).toBe(
+                false,
+            );
+            for (const stage of ['plan', 'fixes']) {
+                expect(state.submitStages).toContainEqual(
+                    expect.objectContaining({ stage, event: 'outcome', outcome: 'skip' }),
+                );
+            }
+        });
+
+        it('рестарт после plan: skip доводит fixes: skip без обеих сессий', () => {
+            const at = '2026-01-01T00:00:00.000Z';
+            let submitStages = finishStage([], 'M1', 'pr', 'ok', at);
+            submitStages = finishStage(submitStages, 'M1', 'review', 'ok', at, {
+                blocked: false,
+                hasAnchoredFindings: false,
+            });
+            submitStages = finishStage(submitStages, 'M1', 'plan', 'skip', at);
+            const state = mkState({ submitStages, lastReviewModel: null });
+
+            const result = runPlannerPath({}, {}, { state });
+
+            const prompts = result.runClaudeFn.mock.calls.map(([prompt]) => prompt);
+            expect(prompts.some((prompt) => prompt.includes('Ты планировщик правок'))).toBe(false);
+            expect(prompts.some((prompt) => prompt.includes('Разбери замечания code review'))).toBe(
+                false,
+            );
+            expect(state.submitStages).toContainEqual(
+                expect.objectContaining({ stage: 'fixes', event: 'outcome', outcome: 'skip' }),
+            );
+        });
 
         it('maxFixPlans: предел исчерпан, блокер остался → стоп до планировщика с обоими числами', () => {
             const result = runPlannerPath(

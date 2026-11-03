@@ -68,6 +68,25 @@ export const SUBMIT_STAGE_TITLES: Record<TSubmitStage, string> = {
 export type TSubmitOutcome = 'ok' | 'skip' | 'stop';
 const OUTCOMES: ReadonlySet<string> = new Set(['ok', 'skip', 'stop']);
 
+export type TReviewVerdict = {
+    blocked: boolean;
+    hasAnchoredFindings: boolean;
+};
+
+function isReviewVerdict(d: unknown): d is TReviewVerdict {
+    if (d === null || typeof d !== 'object' || Array.isArray(d)) return false;
+    const v = d as Record<string, unknown>;
+    return typeof v.blocked === 'boolean' && typeof v.hasAnchoredFindings === 'boolean';
+}
+
+// До строгого вердикта миграция чекпоинта писала review с этой пометкой. Форма ровно с
+// одним ключом читается как неизвестный вердикт; похожие объекты остаются повреждением.
+function isLegacyReviewDetail(d: unknown): boolean {
+    if (d === null || typeof d !== 'object' || Array.isArray(d)) return false;
+    const v = d as Record<string, unknown>;
+    return Object.keys(v).length === 1 && v.from === 'checkpoint';
+}
+
 export type TSubmitRecord =
     | {
           v: 1;
@@ -149,6 +168,15 @@ export function parseSubmitJournal(raw: unknown, where: string): TSubmitRecord[]
         if (o.stage === 'deploy' && o.detail !== undefined && !isDeployDetail(o.detail)) {
             fail(where, n, 'барьер деплоя без строковых milestone и reason');
         }
+        if (
+            o.stage === 'review' &&
+            o.event === 'outcome' &&
+            o.detail !== undefined &&
+            !isReviewVerdict(o.detail) &&
+            !isLegacyReviewDetail(o.detail)
+        ) {
+            fail(where, n, 'вердикт ревью без булевых blocked и hasAnchoredFindings');
+        }
         const base = {
             v: 1 as const,
             track: 'submit' as const,
@@ -201,6 +229,12 @@ const outcomeOf = (
     records: readonly TSubmitRecord[],
     stage: TSubmitStage,
 ): TSubmitRecord | undefined => records.find((r) => r.stage === stage && r.event === 'outcome');
+
+/** `null` у прежнего журнала без вердикта: неизвестные находки не становятся чистым ревью. */
+export function reviewVerdictOf(records: readonly TSubmitRecord[]): TReviewVerdict | null {
+    const detail = outcomeOf(records, 'review')?.detail;
+    return isReviewVerdict(detail) ? detail : null;
+}
 
 /** Этап доведён: исход `ok` или `skip`. Стоп — не доведён, рестарт его повторит. */
 export function stageDone(records: readonly TSubmitRecord[], stage: TSubmitStage): boolean {
@@ -289,12 +323,7 @@ export function startStage(
     const mine = forPhase(records, milestone);
     const last = mine[mine.length - 1];
     if (last && last.event === 'start' && last.stage === stage) return mine;
-    let kept = before(mine, stage);
-    if (stage === 'fixes' && stageDone(kept, 'review') && !kept.some((r) => r.stage === 'plan')) {
-        // Прежний оркестратор начинает правки сразу после ревью. Такой переход — тот же
-        // журнал прежней ревизии, поэтому и здесь plan доводится пропуском, а не отказом.
-        kept = finishStage(kept, milestone, 'plan', 'skip', at);
-    }
+    const kept = before(mine, stage);
     for (const s of SUBMIT_STAGES.slice(0, idx(stage))) {
         if (!stageDone(kept, s)) {
             throw new Error(
@@ -374,8 +403,16 @@ function fillTo(
         }
         // Этап, о котором известно только «флаг стоял», доводится с пометкой, откуда он
         // взялся: в сводке видно, что этап восстановлен по чекпоинту, а не записан тем,
-        // кто его делал.
-        out = finishStage(before(out, s), milestone, s, outcome, at, { from: 'checkpoint' });
+        // кто его делал. У review пометки нет: его detail — строго вердикт, а старый
+        // чекпоинт о находках ничего не знает.
+        out = finishStage(
+            before(out, s),
+            milestone,
+            s,
+            outcome,
+            at,
+            s === 'review' ? undefined : { from: 'checkpoint' },
+        );
     }
     return out;
 }

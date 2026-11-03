@@ -100,6 +100,7 @@ import {
     finishStage,
     fixBaseOf,
     restartSubmitAttempt,
+    reviewVerdictOf,
     withOpenStageDetail,
     ladderFindingsOf,
     formatSubmitSummary,
@@ -9505,6 +9506,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 // проход, не оставивший ни одного намерения, унаследовал бы находки соседа.
                 let lastPrFindings: TFixFinding[] = [];
                 let lastPrBlocked = false;
+                // Метка первого ревью живёт дольше флага последнего батча: применение
+                // намерений правок обнуляет его до чистого вердикта ревью правок.
+                let phaseReviewBlocked = false;
                 const sessionIntentsApplied = (what: string): boolean => {
                     lastPrFindings = [];
                     lastPrBlocked = false;
@@ -9846,8 +9850,20 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     // риска), и для контекста ревью — раньше fetch+diff шли дважды.
                     //
                     // #93: ревью, проведённое прошлым процессом, не повторяется: второй проход
-                    // того же диффа задвоил бы замечания на PR.
+                    // того же диффа задвоил бы замечания на PR. Его вердикт восстанавливается
+                    // из журнала, а не из памяти нового процесса. У прежней записи без detail
+                    // находки неизвестны: ни чистый пропуск, ни снятие blocked не выдумываем.
                     const reviewDone = subDone('review');
+                    const restoredReview = reviewDone ? reviewVerdictOf(subRecords()) : null;
+                    // Исход skip сохраняет review: none после рестарта: планировщик по-прежнему
+                    // не нужен, но без вердикта правки супервизорских замечаний не пропускаем.
+                    const reviewSkipped = subRecords().some(
+                        (record) =>
+                            record.stage === 'review' &&
+                            record.event === 'outcome' &&
+                            record.outcome === 'skip',
+                    );
+                    if (restoredReview) phaseReviewBlocked = restoredReview.blocked;
                     // Повтор этапа ревью (прошлый процесс начал его и не довёл): в файле
                     // намерений может лежать хвост ПРОШЛОГО прохода — метка ушедшего
                     // запроса и неприменённое за ней. Новая сессия дописала бы свои
@@ -9956,6 +9972,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                                 break;
                             }
                             verdict = reviewVerdict(lastPrFindings, lastPrBlocked);
+                            phaseReviewBlocked = lastPrBlocked;
                             if (verdict || lastPrFindings.length > 0) break;
                             if (reviewEnd !== 'interrupted') break;
                             if (attempt >= MODEL_PROXY_RETRIES) break;
@@ -10007,9 +10024,23 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     } else {
                         logFn('👀 Ревью PR — за супервизором (review: none).');
                     }
+                    const reviewOutcome = reviewDone
+                        ? restoredReview
+                        : reviewModel && reviewModel !== 'none'
+                          ? {
+                                blocked: phaseReviewBlocked,
+                                hasAnchoredFindings:
+                                    phaseReviewBlocked ||
+                                    lastPrFindings.some((finding) => finding.anchor !== undefined),
+                            }
+                          : null;
                     if (
                         !reviewDone &&
-                        !subFinish('review', reviewModel && reviewModel !== 'none' ? 'ok' : 'skip')
+                        !subFinish(
+                            'review',
+                            reviewModel && reviewModel !== 'none' ? 'ok' : 'skip',
+                            reviewOutcome ?? undefined,
+                        )
                     )
                         break;
 
@@ -10077,14 +10108,18 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         }
                         fixPlan = restored.plan;
                     }
-                    const reviewHadFindings =
-                        lastPrBlocked ||
-                        lastPrFindings.some((finding) => finding.anchor !== undefined);
+                    // Отсутствие вердикта у прежнего журнала — не отсутствие находок:
+                    // консервативно планируем правки, а не пропускаем их по пустой памяти.
+                    const reviewHadFindings = reviewOutcome?.hasAnchoredFindings ?? true;
                     const planStarted = planRecords.some((record) => record.stage === 'plan');
                     const plannerModel = reviewModel ?? state.lastReviewModel;
-                    if (!planDone && !planStarted && !reviewDone && !reviewHadFindings) {
+                    if (
+                        !planDone &&
+                        !planStarted &&
+                        (!reviewHadFindings || reviewModel === 'none' || reviewSkipped)
+                    ) {
                         if (!subFinish('plan', 'skip')) break;
-                    } else if (!planDone && plannerModel && plannerModel !== 'none') {
+                    } else if (!planDone) {
                         if (!subStart('plan')) break;
                         const planComments = trustedCommentsContext(phase.branch, 'план правок');
                         if (planComments === null) {
@@ -10098,7 +10133,23 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         }
                         if (!subFinish('plan', 'ok', { plan: planned })) break;
                         fixPlan = planned;
-                    } else if (!planDone && !subFinish('plan', 'skip')) break;
+                    }
+                    const planSkipped = subRecords().some(
+                        (record) =>
+                            record.stage === 'plan' &&
+                            record.event === 'outcome' &&
+                            record.outcome === 'skip',
+                    );
+                    // Пропуск плана по явному чистому вердикту закрывает и правки: иначе
+                    // рестарт между записями запускал бы сессию без плана. У review: none
+                    // чистого вердикта нет, поэтому его прежний путь разбора здесь не режем.
+                    if (
+                        planSkipped &&
+                        reviewOutcome?.hasAnchoredFindings === false &&
+                        !subDone('fixes') &&
+                        !subFinish('fixes', 'skip')
+                    )
+                        break;
                     // #625: база диффа правок — голова ветки ДО сессии. Снимаем ЗАРАНЕЕ:
                     // после её пуша эта точка уже невосстановима, а без неё предметом
                     // «ревью правок» молча стала бы вся фаза.
@@ -10116,9 +10167,17 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     let fixBase: string | null = fixesDone
                         ? savedFixBase
                         : (savedFixBase ?? branchHeadShaFn(phase.branch));
+                    const fixesSkipped = subRecords().some(
+                        (record) =>
+                            record.stage === 'fixes' &&
+                            record.event === 'outcome' &&
+                            record.outcome === 'skip',
+                    );
                     if (fixesDone) {
                         logFn(
-                            `⏭ Правки по ревью фазы "${phase.milestone}" уже сделаны прошлым процессом (журнал сдачи) — к ревью правок.`,
+                            fixesSkipped
+                                ? `⏭ Правки по ревью фазы "${phase.milestone}" не нужны: у первого ревью нет якорных находок — к ревью правок.`
+                                : `⏭ Правки по ревью фазы "${phase.milestone}" уже сделаны прошлым процессом (журнал сдачи) — к ревью правок.`,
                         );
                     } else {
                         if (!subStart('fixes', { base: fixBase })) break;
@@ -10970,6 +11029,18 @@ export function createOrchestrator(env: OrchestratorEnv) {
                             }
                             runArbiter(decision.blocking, pendingCosmetic, prNow);
                             break;
+                        }
+
+                        if (phaseReviewBlocked) {
+                            try {
+                                removeBlockedLabelFn(phase.branch, { shFn, logFn });
+                                phaseReviewBlocked = false;
+                                lastPrBlocked = false;
+                            } catch (e) {
+                                logFn(
+                                    `⚠ Ralph: метка blocked на PR не снята после «merge» ревью правок: ${(e as Error).message} — гейт поведёт разбор blocked`,
+                                );
+                            }
                         }
 
                         // 'merge': держать нечем. Незакрытая косметика (её уже никто не

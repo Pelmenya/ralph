@@ -5,6 +5,7 @@ import {
     finishStage,
     formatSubmitSummary,
     parseSubmitJournal,
+    reviewVerdictOf,
     stageDetail,
     startStage,
     stateToDisk,
@@ -44,6 +45,66 @@ const RED = { status: 'completed', milestone: M, sha: 'abc', reason: 'workflow f
 
 describe('журнал этапов сдачи (#93): исход у каждого этапа', () => {
     const reviewed = (): TSubmitRecord[] => finishStage(brokenAt('review'), M, 'review', 'ok', AT);
+
+    it.each([
+        { blocked: false, hasAnchoredFindings: false },
+        { blocked: true, hasAnchoredFindings: true },
+    ])('вердикт первого ревью переживает round-trip журнала: %j', (verdict) => {
+        const records = finishStage(brokenAt('review'), M, 'review', 'ok', AT, verdict);
+        const restored = parseSubmitJournal(JSON.parse(JSON.stringify(records)), 'тест');
+        expect(reviewVerdictOf(restored)).toEqual(verdict);
+    });
+
+    it.each([
+        null,
+        [],
+        {},
+        { blocked: false },
+        { hasAnchoredFindings: false },
+        { blocked: 'false', hasAnchoredFindings: false },
+        { blocked: false, hasAnchoredFindings: 0 },
+        { from: 'other' },
+        { from: 'checkpoint', extra: true },
+        { from: 'checkpoint', blocked: false },
+    ])('повреждённая detail исхода review отвергается: %j', (detail) => {
+        const records = finishStage(brokenAt('review'), M, 'review', 'ok', AT, detail);
+        expect(() => parseSubmitJournal(records, 'тест')).toThrow(/вердикт ревью/);
+    });
+
+    it('прежняя запись review без detail читается, но чистый вердикт не выдумывается', () => {
+        const records = parseSubmitJournal(reviewed(), 'тест');
+        expect(reviewVerdictOf(records)).toBeNull();
+    });
+
+    it('legacy-detail review переживает round-trip v2-state как неизвестный вердикт', () => {
+        const disk = stateToDisk(
+            attachSubmitJournal({
+                schemaVersion: 2,
+                count: 0,
+                milestone: M,
+                submitted: true,
+                noProgress: 0,
+                reviewOfFixes: null,
+                deployBlock: null,
+            }),
+        );
+        disk.submitStages = (disk.submitStages as TSubmitRecord[]).map((record) =>
+            record.stage === 'review' && record.event === 'outcome'
+                ? { ...record, detail: { from: 'checkpoint' } }
+                : record,
+        );
+
+        const first = inspectState(JSON.stringify(disk));
+        expect(first.status).toBe('ok');
+        if (first.status !== 'ok') return;
+        expect(reviewVerdictOf(first.state.submitStages ?? [])).toBeNull();
+
+        const again = inspectState(JSON.stringify(stateToDisk(first.state)));
+        expect(again.status).toBe('ok');
+        if (again.status !== 'ok') return;
+        expect(again.state.submitStages).toEqual(disk.submitStages);
+        expect(reviewVerdictOf(again.state.submitStages ?? [])).toBeNull();
+    });
 
     it.each(SUBMIT_STAGES.map((s) => [s]))('рестарт посреди «%s» продолжает с него', (stage) => {
         const records = parseSubmitJournal(JSON.parse(JSON.stringify(brokenAt(stage))), 'тест');
@@ -108,12 +169,12 @@ describe('журнал этапов сдачи (#93): исход у каждог
         },
     );
 
-    it('прежний переход review → fixes тоже восстанавливает plan: skip', () => {
-        const records = startStage(reviewed(), M, 'fixes', AT);
-        const summary = summarizeSubmit(records);
-        expect(summary?.resumeStage).toBe('fixes');
-        expect(summary?.stages.find((x) => x.stage === 'plan')?.status).toBe('пропущен');
-        expect(() => parseSubmitJournal(records, 'тест')).not.toThrow();
+    it('начало fixes без plan в текущем журнале отвергается без записи пропуска', () => {
+        const records = reviewed();
+        expect(() => startStage(records, M, 'fixes', AT)).toThrow(
+            'журнал сдачи: этап «правки по ревью» начат раньше исхода этапа «план правок»',
+        );
+        expect(records.some((record) => record.stage === 'plan')).toBe(false);
     });
 
     it('стоп этапа сдачи не кончает попытку: рестарт повторяет остановленный этап', () => {
