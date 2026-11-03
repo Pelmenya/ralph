@@ -19,6 +19,9 @@
 #
 # Пробы:
 #   block    — внешний хук блокирует инструмент в linked worktree (отрицательная проба);
+#   session-context — общая для claude, codex, kimi и opencode: настоящий вызов внешнего
+#             хука наследует RALPH_SESSION_CONTEXT, а судья сверяет его со случайным
+#             ожидаемым значением из окружения хоста;
 #   override — настройки потребителя выключают хуки: внешний хук обязан выжить;
 #   crash   — внешний хук падает (exit 1): блок или пропуск;
 #   merge   — хук потребителя из его настроек и внешний хук срабатывают оба;
@@ -131,6 +134,18 @@ process.stdin.on('end', () => {
         process.stderr.write('ralph-stand: blocked by external hook');
         process.exit(2);
     }
+    process.exit(0);
+});
+EOF
+    # Контекст проверяет отдельный хук: его журнал не зависит от правил и решений guard.
+    cat >"$EXT/context.cjs" <<'EOF'
+const fs = require('fs');
+const path = require('path');
+let s = '';
+process.stdin.on('data', (d) => (s += d));
+process.stdin.on('end', () => {
+    const context = process.env.RALPH_SESSION_CONTEXT ?? 'absent';
+    fs.appendFileSync(path.join(__dirname, 'canon.log'), `context ${context}\n`);
     process.exit(0);
 });
 EOF
@@ -423,6 +438,22 @@ probe_block() {
     "${CLI}_register" guard.cjs
     session block "$MARK"
     judge_block block
+}
+
+probe_session-context() {
+    local STAND_ISOLATE_ARGS="${STAND_ISOLATE_ARGS:-}" verdict why
+    make_repos ""
+    export RALPH_STAND_CONTEXT_EXPECTED=$(node -e 'process.stdout.write(JSON.stringify({ralphStandContext: crypto.randomUUID()}))')
+    export RALPH_SESSION_CONTEXT=$RALPH_STAND_CONTEXT_EXPECTED
+    if [ "${STAND_ISOLATE:-0}" = 1 ]; then
+        STAND_ISOLATE_ARGS="${STAND_ISOLATE_ARGS:-} --pass-env RALPH_SESSION_CONTEXT"
+    fi
+    "${CLI}_register" context.cjs
+    : >"$LOGS/canon.log"
+    session session-context "$MARK"
+    read -r verdict why < <(node "$CANON_ROOT/provision/stand/context-judge.mts" "$LOGS/canon.log" RALPH_STAND_CONTEXT_EXPECTED)
+    result session-context "$verdict" "$why"
+    unset RALPH_SESSION_CONTEXT
 }
 
 # Приоритеты: потребитель кладёт в СВОИ настройки выключатель хуков. Внешний хук обязан
