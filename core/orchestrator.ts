@@ -9625,6 +9625,14 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     cfg.review?.fixTurnRetries,
                     FIX_TURN_RETRIES,
                 );
+                // #45: набор проверок — из конфига гейта, как у разбора blocked ниже.
+                // Раньше здесь был прошит список npm-скриптов ДРУГОГО проекта (включая
+                // `npm run lint:fsd`, которого тут нет вовсе): сессия честно пыталась
+                // выполнить несуществующую команду, а прогнать то, что реально проверяет
+                // гейт, ей никто не велел.
+                const fixGateCmdList = gateChecksFor(cfg.profileName, cfg)
+                    .map(([, cmd]) => cmd)
+                    .join(', ');
                 const reviewTurns = positiveIntOrDefault(cfg.review?.maxTurns, maxTurns);
                 const reviewLimit = positiveIntOrDefault(cfg.review?.diffLimit, REVIEW_DIFF_LIMIT);
                 const runFixPlanner = (
@@ -9675,6 +9683,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                                 limit: reviewLimit,
                             }),
                             commentsContext,
+                            gateCmdList: fixGateCmdList,
                         }),
                         {
                             model,
@@ -10086,6 +10095,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                                 return buildFixByReviewPrompt({
                                     branch: phase.branch,
                                     allowNames,
+                                    gateCmdList: fixGateCmdList,
                                     commentsContext: comments,
                                     plan,
                                     resumed,
@@ -11454,6 +11464,13 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     logFn(
                         `🩹 Разбор blocked ${state.blockedHeals}/${bMax}: чиним блокеры ревью...`,
                     );
+                    // Набор чеков — из gateChecksFor(profileName), а не хардкод базовых 5:
+                    // в prod «весь набор» включает толстые чеки (см. gate-heal ниже). С #216
+                    // prod разбор blocked включён, так что чини-сессия гоняет именно толстый
+                    // набор — хардкод базовых 5 тут прямо соврал бы.
+                    const bGateCmdList = gateChecksFor(cfg.profileName, cfg)
+                        .map(([, cmd]) => cmd)
+                        .join(', ');
                     // #217: чини-сессия ЧИНИТ, но label blocked НЕ снимает — снятие за
                     // раннером по итогу повторного ревью. Иначе исполнитель сам себе выносит
                     // вердикт и обходит проверку.
@@ -11481,6 +11498,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                             return buildBlockedFixPrompt({
                                 branch: phase.branch,
                                 allowNames: cfg.authorAllowlist.join(', '),
+                                gateCmdList: bGateCmdList,
                                 commentsContext: comments,
                                 plan: formatFixPlan(blockedPlan),
                                 resumed,
