@@ -309,6 +309,7 @@ function runProcess(
                 pickRouteFn: () => ({ provider: 'claude', model: 'claude-coder' }),
                 pickReviewModelFn: () => REVIEW_MODEL,
                 phaseDiffFilesFn: read(() => ['src/a.ts']),
+                phaseDiffLinesFn: read(() => 10),
                 reviewDiffContextFn: read(() => ''),
                 branchHeadShaFn: read(() => 'b'.repeat(40)),
                 runClaudeFn: read(

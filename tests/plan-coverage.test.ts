@@ -1,7 +1,14 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { coverageIds, coverageProblems, criteriaIds } from './plan-coverage.ts';
+import {
+    coverageIds,
+    coveragePhases,
+    coverageProblems,
+    criteriaIds,
+    criteriaSizeProblems,
+    MAX_CRITERIA_PER_PHASE,
+} from './plan-coverage.ts';
 
 const PRD = [
     '## S2a. Раздел без номеров',
@@ -156,6 +163,59 @@ describe('покрытие критериев PRD планом фаз', () => {
     });
 });
 
+const rows = (phase: string, n: number): string =>
+    Array.from({ length: n }, (_, i) => `| [S9.${i + 1}] | ${phase} | Задача |`).join('\n');
+const planOf = (body: string): string =>
+    ['### Покрытие по критерию', '', '| Критерий | Фаза | Задача |', '| - | - | - |', body].join(
+        '\n',
+    );
+
+describe('предел критериев на фазу', () => {
+    it('считает строки по второй колонке', () => {
+        const plan = planOf(`${rows('30', 2)}\n| [S8.1] |  31 | X |`);
+
+        expect(coveragePhases(plan)).toEqual(
+            new Map([
+                ['30', 2],
+                ['31', 1],
+            ]),
+        );
+    });
+
+    it('13 критериев — причина с фазой и числом', () => {
+        expect(criteriaSizeProblems(planOf(rows('30', MAX_CRITERIA_PER_PHASE + 1)))).toEqual([
+            `Фаза 30: ${MAX_CRITERIA_PER_PHASE + 1} критериев PRD — больше ${MAX_CRITERIA_PER_PHASE}, дели фазу`,
+        ]);
+    });
+
+    it('предельное число критериев — без причин', () => {
+        expect(criteriaSizeProblems(planOf(rows('30', MAX_CRITERIA_PER_PHASE)))).toEqual([]);
+    });
+
+    it('долг пропускает ровно свой счёт', () => {
+        expect(criteriaSizeProblems(planOf(rows('24', 21)), { '24': 21 })).toEqual([]);
+        expect(criteriaSizeProblems(planOf(rows('24', 20)), { '24': 21 })).toHaveLength(1);
+        expect(criteriaSizeProblems(planOf(rows('24', 22)), { '24': 21 })).toHaveLength(1);
+    });
+
+    it.each(['24, 25', '24/25', '24 25'])('ячейка фазы %j — не один токен, красный', (cell) => {
+        const problems = criteriaSizeProblems(planOf(rows(cell, 1)));
+
+        expect(problems).toHaveLength(1);
+        expect(problems[0]).toContain('не один номер фазы');
+    });
+
+    it('фаза из долга без строк — причина', () => {
+        expect(criteriaSizeProblems(planOf(rows('30', 1)), { '24': 21 })).toHaveLength(1);
+    });
+
+    it('строки внутри ограды кода не считаются', () => {
+        const plan = planOf(`\`\`\`\n${rows('30', MAX_CRITERIA_PER_PHASE + 1)}\n\`\`\``);
+
+        expect(criteriaSizeProblems(plan)).toEqual([]);
+    });
+});
+
 describe('настоящие PRD и план фаз', () => {
     const prd = readFileSync(resolve(import.meta.dirname, '../docs/roadmap/prd.md'), 'utf-8');
     const plan = readFileSync(resolve(import.meta.dirname, '../docs/roadmap/plan.md'), 'utf-8');
@@ -166,5 +226,15 @@ describe('настоящие PRD и план фаз', () => {
 
     it('каждый номер покрыт ровно одной строкой, лишних номеров нет', () => {
         expect(coverageProblems(prd, plan)).toEqual([]);
+    });
+
+    // Долг: фазы вошли в петлю до предела; число сверяется равенством.
+    const DEBT = {
+        '24': 21, // резка до предела: 21 критерий, ветка +8,3 тыс. строк
+        '25': 17, // резка до предела
+    };
+
+    it('критериев на фазу не больше предела, кроме долга', () => {
+        expect(criteriaSizeProblems(plan, DEBT)).toEqual([]);
     });
 });

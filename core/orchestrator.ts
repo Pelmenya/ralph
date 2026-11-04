@@ -187,6 +187,7 @@ import {
     buildGateHealPrompt,
     buildIntentRepairPrompt,
     buildReReviewPrompt,
+    buildBaseReviewPrompt,
     buildReviewPrompt,
 } from './prompts.ts';
 import { extractFixPlan, formatFixPlan, validateFixPlan, type TFixPlan } from './fix-plan.ts';
@@ -727,9 +728,55 @@ export function assertPhaseIssuesFormat(
         );
 }
 
+// Строго полный sha (40 hex). Не путать с SAFE_SHA_RE (7–40) в фабрике: тот пропускает
+// сокращённые sha для диффа, а база ревью и голова ветки обязаны быть полными.
+const FULL_SHA_RE = /^[0-9a-f]{40}$/;
+
+// #275/#276: исход проверки базы ревью — структурный, а не «любой catch». Сетевой сбой fetch
+// (unreachable) и ответ git «не предок»/не-sha (invalid) — разные классы: первый переживается
+// повтором и не имеет отношения к конфигу, второй — реально битая база.
+export type TReviewBaseCheck =
+    | { kind: 'ok' }
+    | { kind: 'invalid'; problem: string }
+    | { kind: 'unreachable'; problem: string };
+
+export function verifyReviewBase(
+    branch: string,
+    base: string,
+    { dry, runArgvFn }: { dry: boolean; runArgvFn: ShArgvFn },
+): TReviewBaseCheck {
+    if (!FULL_SHA_RE.test(base)) return { kind: 'invalid', problem: 'не 40 hex-символов' };
+    // fetch — мутация ссылок .git, в --dry-run не идёт. Один повтор: транзиент не стоп.
+    if (!dry) {
+        let fetchError: unknown = null;
+        for (let attempt = 0; attempt < 2; attempt++) {
+            try {
+                runArgvFn('git', ['fetch', 'origin', branch, '--quiet'], gitNetworkOpts());
+                fetchError = null;
+                break;
+            } catch (e) {
+                fetchError = e;
+            }
+        }
+        if (fetchError !== null) {
+            return {
+                kind: 'unreachable',
+                problem: `не удалось обновить ветку с origin (${(fetchError as Error).message})`,
+            };
+        }
+    }
+    try {
+        runArgvFn('git', ['merge-base', '--is-ancestor', base, `origin/${branch}`]);
+    } catch {
+        return { kind: 'invalid', problem: 'не найдена или не предок HEAD ветки' };
+    }
+    return { kind: 'ok' };
+}
+
 // ── Типы контрактов ──────────────────────────────────────────────────────────
 // Фаза в форме, которую хранит config.phases.
-type Phase = { milestone: string; branch: string };
+// reviewBase (#275): sha, от которого ревьюится фаза-продолжение; без него предмет ревью — весь PR.
+type Phase = { milestone: string; branch: string; reviewBase?: string };
 // #38: исход runLoop. `activation-restart` — lock назвал другую ревизию, петля встала на
 // подтверждённой границе и ждёт рестарта; иначе цикл кончился штатно или стопом.
 type TLoopExit = 'activation-restart' | undefined;
@@ -809,6 +856,9 @@ export type RalphConfig = {
         // #248: предел успешно разобранных планов правок на фазу. Целое ≥ 1; после него
         // незакрытый блокер — стоп до следующего планировщика, а не новый круг.
         maxFixPlans?: unknown;
+        // #274: предел изменённых строк ветки фазы (вставки + удаления) перед ревью.
+        // Целое ≥ 1, дефолт MAX_PHASE_DIFF_LINES; превышение — стоп `phase-too-large`.
+        maxPhaseDiffLines?: unknown;
         // #625: сильнейшая модель для независимого арбитра — последней ступени лестницы
         // ревью правок. Не задана — берётся вершина modelStrength (сильнейшая известная
         // планке), поднятая до reviewModelFloor. Смысл ключа в том, чтобы арбитром можно
@@ -5822,6 +5872,47 @@ export function createOrchestrator(env: OrchestratorEnv) {
         }
     }
 
+    // #274: размер ветки фазы в изменённых строках — сумма вставок и удалений numstat в том
+    // же диапазоне, что у phaseDiffFiles. Бинарный файл (`-`) — 0 строк. null — счёт не
+    // прочитался: вызывающий останавливается (fail-closed), а не пропускает проверку.
+    function phaseDiffLines(
+        branch: string,
+        {
+            shFn = sh,
+            runArgvFn = shArgv,
+            logFn = log,
+            base,
+        }: { shFn?: ShFn; runArgvFn?: ShArgvFn; logFn?: LogFn; base?: string } = {},
+    ): number | null {
+        if (!safeBranch(branch, { logFn, where: 'счёт размера ветки фазы' })) return null;
+        if (base !== undefined && !safeBase(base, { logFn })) return null;
+        try {
+            if (!DRY) {
+                runArgvFn('git', ['fetch', 'origin', 'main', branch, '--quiet'], gitNetworkOpts());
+            }
+            const out = shFn(
+                `git -c core.quotePath=false diff --numstat --no-renames ${shq(diffRange(branch, base))}`,
+            );
+            let total = 0;
+            for (const line of (out ?? '').split('\n')) {
+                if (!line.trim()) continue;
+                const [added, deleted] = line.split('\t');
+                for (const cell of [added, deleted]) {
+                    if (cell === '-') continue;
+                    if (!/^\d+$/.test(cell ?? '')) {
+                        logFn(`⚠ Не разобрал строку numstat: ${JSON.stringify(line)}`);
+                        return null;
+                    }
+                    total += Number(cell);
+                }
+            }
+            return total;
+        } catch (e) {
+            logFn(`⚠ Не смог посчитать размер ветки фазы: ${(e as Error).message}`);
+            return null;
+        }
+    }
+
     // #133: ревью получает дифф фазы прямо в промпт — вторая половина пункта про
     // бюджет ходов. Со срезанным до review.maxTurns бюджетом блуждание по репозиторию
     // в поисках того, что можно подать сразу, стоит слишком дорого.
@@ -5905,6 +5996,23 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     'положительное число (сколько планов правок петля вправе разобрать на фазу).',
             );
             return MAX_FIX_PLANS;
+        }
+        return raw;
+    }
+    // #274: предел изменённых строк ветки фазы перед ревью. Битый предел — отказ на старте.
+    // Третья копия resolveMaxFixPlans/resolveMaxSameIssue: общий resolvePositiveIntKey рано,
+    // к четвёртой понадобится. positiveIntOrDefault не подходит — он молча берёт дефолт, а
+    // здесь нужен отказ (fail-closed), поэтому дубль осознанный.
+    const MAX_PHASE_DIFF_LINES = 4000;
+    function resolveMaxPhaseDiffLines(cfg: RalphConfig, failFn: (msg: string) => unknown): number {
+        const raw = cfg.review?.maxPhaseDiffLines;
+        if (raw === undefined) return MAX_PHASE_DIFF_LINES;
+        if (typeof raw !== 'number' || !Number.isInteger(raw) || raw < 1) {
+            failFn(
+                `ralph.config.json: review.maxPhaseDiffLines = ${JSON.stringify(raw)} — ожидалось целое ` +
+                    'положительное число (сколько изменённых строк ветка фазы может нести до ревью).',
+            );
+            return MAX_PHASE_DIFF_LINES;
         }
         return raw;
     }
@@ -6951,6 +7059,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
         st.blockedHeals = 0;
         // #248: бюджет планов относится к блокерам своей фазы и не переходит на следующую.
         st.fixPlans = 0;
+        // #276: база ревью правки гейта относится к PR прошлой фазы.
+        st.healReviewBase = null;
         // #217: планка ревью привязана к фазе — новая фаза начинает с чистой (иначе floor
         // прошлой фазы зря задрал бы модель повторного ревью следующей).
         st.reviewModelFloor = null;
@@ -7317,6 +7427,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         resolveMaxSameIssue(cfg, failFn);
         resolveMaxSameRefusal(cfg, failFn);
         resolveMaxFixPlans(cfg, failFn);
+        resolveMaxPhaseDiffLines(cfg, failFn);
         resolveMaxProgressUnknown(cfg, failFn);
         // Задача 95: порог диска, ротация логов сессий и тарифы — тем же ранним отказом:
         // опечатка выключила бы порог молча, а тариф строкой дал бы NaN в стоимости попытки.
@@ -7690,6 +7801,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         pickReviewModelFn?: typeof pickReviewModel;
         reviewDiffContextFn?: typeof reviewDiffContext;
         phaseDiffFilesFn?: typeof phaseDiffFiles;
+        phaseDiffLinesFn?: typeof phaseDiffLines;
         removeBlockedLabelFn?: typeof removeBlockedLabel;
         addBlockedLabelFn?: typeof addBlockedLabel;
         // Задача 79: чтение ПОСЛЕ записи метки blocked. Запись fail-open по контракту
@@ -7848,6 +7960,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             pickReviewModelFn = pickReviewModel,
             reviewDiffContextFn = reviewDiffContext,
             phaseDiffFilesFn = phaseDiffFiles,
+            phaseDiffLinesFn = phaseDiffLines,
             removeBlockedLabelFn = adapters.taskSource.removeBlockedLabel,
             addBlockedLabelFn = adapters.taskSource.addBlockedLabel,
             prHasBlockedLabelFn = (branch: string) =>
@@ -7979,6 +8092,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
             throw new Error(msg);
         });
         const maxFixPlans = resolveMaxFixPlans(cfg, (msg) => {
+            throw new Error(msg);
+        });
+        const maxPhaseDiffLines = resolveMaxPhaseDiffLines(cfg, (msg) => {
             throw new Error(msg);
         });
         const persistRefusalOutcome = refusalOutcomePersister(state, saveStateFn, logFn);
@@ -9885,8 +10001,95 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         lastPrFindings = [];
                         lastPrBlocked = false;
                     }
+                    // #275: база ревью фазы-продолжения. Проверка до счёта строк и до сессии:
+                    // битая база молча расширила бы предмет до всего PR (или сузила бы ревью
+                    // чужой работы), поэтому она — стоп с названием базы и ветки.
+                    // #276: после чини-сессии гейта предмет ревью — правка гейта, база новее
+                    // reviewBase фазы (она записана раньше самой чини-сессии).
+                    // Пустая строка из state — тоже «выставлено» (идёт в проверку формы и
+                    // откатывается), поэтому сравнение с null/undefined, а не truthy.
+                    const healBase = state.healReviewBase ?? undefined;
+                    let reviewBase = healBase ?? phase.reviewBase;
+                    let baseName = healBase !== undefined ? 'healReviewBase' : 'reviewBase';
+                    const clearHealReviewBase = (): void => {
+                        if (state.healReviewBase !== null && state.healReviewBase !== undefined) {
+                            state.healReviewBase = null;
+                            saveStateFn(state);
+                        }
+                    };
+                    if (!reviewDone && reviewBase !== undefined) {
+                        let check = verifyReviewBase(phase.branch, reviewBase, { dry, runArgvFn });
+                        if (check.kind === 'invalid' && healBase !== undefined) {
+                            // База из state — не слово человека: безопасный откат. Поле
+                            // сбрасывается, ревью идёт от reviewBase фазы либо полным
+                            // (шире, не уже), стопа нет.
+                            logFn(
+                                `⚠ healReviewBase "${healBase}" ветки ${phase.branch}: ${check.problem} — ` +
+                                    'сброшена, правка гейта пройдёт ревью шире.',
+                            );
+                            clearHealReviewBase();
+                            reviewBase = phase.reviewBase;
+                            baseName = 'reviewBase';
+                            check =
+                                reviewBase !== undefined
+                                    ? verifyReviewBase(phase.branch, reviewBase, { dry, runArgvFn })
+                                    : { kind: 'ok' };
+                        }
+                        if (check.kind === 'unreachable') {
+                            pushEventFn(
+                                `⛔ Ralph: фаза "${phase.milestone}" не сдана — ` +
+                                    formatStopMessage({
+                                        reason: 'origin-network',
+                                        diagnosis: `базу ревью ${baseName} ветки ${phase.branch} не проверить: ${check.problem}, и после повтора`,
+                                        question:
+                                            'проверь доступ к origin и перезапусти loop; база и конфиг не виноваты, их не трогай.',
+                                    }),
+                                cfg,
+                                { logFn },
+                            );
+                            break;
+                        } else if (check.kind === 'invalid') {
+                            pushEventFn(
+                                `⛔ Ralph: фаза "${phase.milestone}" не сдана — ` +
+                                    formatStopMessage({
+                                        reason: 'review-base',
+                                        diagnosis: `база ревью ${baseName} "${reviewBase}" ветки ${phase.branch}: ${check.problem}`,
+                                        question:
+                                            'поправь reviewBase строки phases в конфиге (полный sha предка ветки) или убери поле, затем перезапусти loop.',
+                                    }),
+                                cfg,
+                                { logFn },
+                            );
+                            break;
+                        }
+                    }
+                    const baseOpt = reviewBase !== undefined ? { base: reviewBase } : {};
+                    if (!reviewDone) {
+                        // #274: размер ветки сверяем ДО ревью — дифф, не сходящийся в один
+                        // проход, сжигает круги правок. Счёт не прочитался — тоже стоп.
+                        const phaseLines = phaseDiffLinesFn(phase.branch, baseOpt);
+                        if (phaseLines === null || phaseLines > maxPhaseDiffLines) {
+                            pushEventFn(
+                                `⛔ Ralph: фаза "${phase.milestone}" не сдана — ` +
+                                    formatStopMessage({
+                                        reason: 'phase-too-large',
+                                        diagnosis:
+                                            phaseLines === null
+                                                ? `не удалось посчитать изменённые строки ветки ${phase.branch} — размер неизвестен`
+                                                : `в ветке ${String(phaseLines)} изменённых строк при пороге ${String(maxPhaseDiffLines)} (review.maxPhaseDiffLines)`,
+                                        question:
+                                            phaseLines === null
+                                                ? 'проверь доступ к origin и перезапусти loop.'
+                                                : 'перережь фазу (скилл plan-phase, «Перерезка») или подними review.maxPhaseDiffLines, затем перезапусти loop.',
+                                    }),
+                                cfg,
+                                { logFn },
+                            );
+                            break;
+                        }
+                    }
                     if (!reviewDone && !subStart('review')) break;
-                    const phaseFiles = reviewDone ? null : phaseDiffFilesFn(phase.branch);
+                    const phaseFiles = reviewDone ? null : phaseDiffFilesFn(phase.branch, baseOpt);
                     const reviewModel = reviewDone
                         ? null
                         : pickReviewModelFn(phase.milestone, phase.branch, { files: phaseFiles });
@@ -9894,6 +10097,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         logFn(
                             `⏭ Ревью фазы "${phase.milestone}" уже проведено прошлым процессом (журнал сдачи) — к правкам.`,
                         );
+                        // Процесс мог умереть между вердиктом и снятием базы: поле не должно
+                        // дожить до следующей чини-сессии.
+                        clearHealReviewBase();
                     } else if (reviewModel && reviewModel !== 'none') {
                         // #217: запоминаем модель этого ревью. Если оно повесит blocked, ветка
                         // gate === 'blocked' поднимет по ней планку повторного ревью — судить
@@ -9926,11 +10132,28 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         const diffContext = reviewDiffContextFn(phase.branch, {
                             files: phaseFiles,
                             limit: positiveIntOrDefault(cfg.review?.diffLimit, REVIEW_DIFF_LIMIT),
+                            ...baseOpt,
                         });
-                        const reviewPrompt = buildReviewPrompt({
-                            branch: phase.branch,
-                            diffContext,
-                        });
+                        let reviewPrompt: string;
+                        if (reviewBase !== undefined) {
+                            // #275: открытые находки PR — часть предмета ревью от базы.
+                            const baseComments = trustedCommentsContext(
+                                phase.branch,
+                                'ревью фазы от базы',
+                            );
+                            if (baseComments === null) {
+                                subFinish('review', 'stop');
+                                break;
+                            }
+                            reviewPrompt = buildBaseReviewPrompt({
+                                branch: phase.branch,
+                                diffContext,
+                                commentsContext: baseComments,
+                                allowNames: cfg.authorAllowlist.join(', '),
+                            });
+                        } else {
+                            reviewPrompt = buildReviewPrompt({ branch: phase.branch, diffContext });
+                        }
                         let reviewCode = 0;
                         // Фаза 16: исход прохода от адаптера, а не его вывод: «сбой прокси» —
                         // это `interrupted`, названный рантаймом, текст ядро не читает.
@@ -10024,8 +10247,11 @@ export function createOrchestrator(env: OrchestratorEnv) {
                             subFinish('review', 'stop');
                             break;
                         }
+                        // #276: вердикт засчитан — правка гейта отревьюена, база снимается.
+                        clearHealReviewBase();
                     } else {
                         logFn('👀 Ревью PR — за супервизором (review: none).');
+                        clearHealReviewBase();
                     }
                     const anchoredFindings = lastPrFindings.filter(
                         (finding) => finding.anchor !== undefined,
@@ -12058,6 +12284,16 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     // ЗАПУЩЕННУЮ сессию, а не на отказ проводки.
                     if (!placeOnPhaseBranch('чини-сессия гейта')) break;
                     state.gateHeals = healsDone + 1;
+                    // #276: ревью после чини-сессии идёт от HEAD ДО неё — база пишется до
+                    // запуска, чтобы пережить рестарт между сессией и ревью. HEAD не
+                    // прочитался — база не ставится, ревью остаётся полным (шире, не уже).
+                    // Рестарт после упавшей чини-сессии базу НЕ перезаписывает (`??=`): она
+                    // остаётся прежней, ревью шире, не уже. `=` сузил бы его до коммитов
+                    // последней сессии, и правки упавших выпали бы из ревью.
+                    const healHead = branchHeadShaFn(phase.branch);
+                    if (healHead !== null && FULL_SHA_RE.test(healHead)) {
+                        state.healReviewBase ??= healHead;
+                    }
                     saveStateFn(state);
                     // #376 доп.скоуп: эскалация heal-сессий гейта «с дешёвой на сильную» —
                     // после modelRouting.healEscalation.afterAttempts НЕУДАЧНЫХ heal-попыток
@@ -12181,10 +12417,12 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         state.forgeHealedRunId = forgeRed?.runId ?? null;
                     }
                     // Дима (2026-07-19): исправление гейта — не мимо ревью. Сбрасываем
-                    // submitted → цикл повторит ПОЛНУЮ сдачу поверх heal-коммита: PR уже
-                    // есть (шаг идемпотентен) → свежее ревью → правки → гейт → авто-мердж.
-                    // Дубли ревью-комментариев — осознанная цена ночной автономии; blocked
-                    // от повторного ревью остаётся честным стопом.
+                    // submitted → цикл повторит сдачу поверх heal-коммита: PR уже есть
+                    // (шаг идемпотентен) → ревью → правки → гейт → авто-мердж.
+                    // Решение 04.11 (#276) сужает ПРЕДМЕТ, не отменяя ревью: полное ревью
+                    // фазы после семиминутной правки теста нашло блокер, пропущенный пятью
+                    // проходами, и фаза встала на пределе планов. Теперь ревьюится дифф от
+                    // healReviewBase (HEAD до чини-сессии) и открытые находки PR.
                     state.submitted = false;
                     // #115-ревью (blocker): heal-коммит — НОВЫЙ код, и лестница ревью
                     // правок обязана начать по нему с чистого листа. Иначе `arbitrated`
@@ -12194,7 +12432,11 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     // непрочитанной. Ровно та дыра, ради которой лестница и заводилась.
                     state.reviewOfFixes = null;
                     saveStateFn(state);
-                    logFn('🔁 После чини-сессии — повторное ревью фазы перед гейтом.');
+                    logFn(
+                        state.healReviewBase
+                            ? `🔁 После чини-сессии — ревью от ${state.healReviewBase.slice(0, 7)} перед гейтом.`
+                            : '🔁 После чини-сессии — повторное ревью фазы перед гейтом.',
+                    );
                     continue;
                 }
                 // #289: последний катч-олл — сюда доходят исходы гейта без собственного
@@ -13514,6 +13756,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
         resolveMaxSameIssue,
         resolveMaxSameRefusal,
         resolveMaxFixPlans,
+        resolveMaxPhaseDiffLines,
+        phaseDiffLines,
         resolveMaxProgressUnknown,
         advancePhase,
         // #88: барьер деплоя на старте — его зовёт и рестарт матрицы «убить до / после».

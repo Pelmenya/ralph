@@ -198,6 +198,7 @@ function runProcess(
                 pickRuntimeFn: () => 'claude',
                 pickRouteFn: () => ({ provider: 'claude', model: 'claude-coder' }),
                 pickReviewModelFn: () => REVIEW_MODEL,
+                phaseDiffLinesFn: read(() => 10),
                 phaseDiffFilesFn: read((_branch: string, o?: { base?: string }) => {
                     opts.bases?.push(o?.base);
                     return ['src/a.ts'];

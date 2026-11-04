@@ -246,6 +246,7 @@ function runPhase({
             pickRuntimeFn: () => 'claude',
             pickRouteFn: () => ({ provider: 'claude', model: 'claude-coder' }),
             pickReviewModelFn: () => REVIEW_MODEL,
+            phaseDiffLinesFn: () => 10,
             phaseDiffFilesFn: (_b: string, opts?: { base?: string }) => {
                 if (!opts?.base) return ['src/a.ts'];
                 const i = Math.min(fixDiffIdx, fixDiffFiles.length - 1);

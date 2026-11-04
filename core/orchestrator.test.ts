@@ -4733,6 +4733,8 @@ describe('runLoop — основной while-цикл: итерации коде
             // `git fetch origin main feature/m1` (ветка из фикстуры выше) и реальный
             // log(), дописывавший в ralph.log живого прогона.
             phaseDiffFilesFn: () => [],
+            // #274: размер ветки — малый по умолчанию, иначе звался бы настоящий git numstat.
+            phaseDiffLinesFn: () => 10,
             reviewDiffContextFn: () => '',
             // #217: снятие label blocked — побочка (gh), в тестах заглушка. Реальный
             // removeBlockedLabel зовёт sh и попал бы в предохранитель #138.
@@ -8590,6 +8592,410 @@ describe('runLoop — основной while-цикл: итерации коде
             expect(prompts.some((prompt) => prompt.includes('Ты планировщик правок'))).toBe(false);
             expectPlanStop(result, /планов 2 из предела 2, блокер остался/);
             expect(result.pushes[0]).toContain('подними review.maxFixPlans');
+        });
+
+        describe('reviewBase — ревью фазы-продолжения от базы', () => {
+            const BASE = 'a'.repeat(40);
+            const run = (reviewBase: string | undefined, ancestor = true) => {
+                const phaseDiffFilesFn = vi.fn(() => ['core/a.ts']);
+                const phaseDiffLinesFn = vi.fn(() => 10);
+                const reviewDiffContextFn = vi.fn(() => '\n<дифф от базы>');
+                const runArgvFn = vi.fn((_file: string, args: string[]) => {
+                    if (args[0] === 'merge-base' && !ancestor) throw new Error('exit 1');
+                    return '';
+                });
+                const result = runPlannerPath(
+                    {
+                        phaseDiffFilesFn,
+                        phaseDiffLinesFn,
+                        reviewDiffContextFn,
+                        runArgvFn,
+                        prCommentsFn: () => [],
+                        findOpenPrFn: () => ({ number: 7, url: 'u' }),
+                    },
+                    {},
+                    {
+                        config: {
+                            phases: [
+                                {
+                                    milestone: 'M1',
+                                    branch: 'feature/m1',
+                                    ...(reviewBase !== undefined ? { reviewBase } : {}),
+                                },
+                            ],
+                        },
+                    },
+                );
+                const prompts = result.runClaudeFn.mock.calls.map(([prompt]) => prompt);
+                return {
+                    ...result,
+                    prompts,
+                    phaseDiffFilesFn,
+                    phaseDiffLinesFn,
+                    reviewDiffContextFn,
+                    runArgvFn,
+                };
+            };
+
+            it('с reviewBase: промпт от базы, база в файлах, диффе и счёте строк', () => {
+                const r = run(BASE);
+                expect(r.prompts.some((p) => p.includes('Весь PR заново НЕ пересматривай'))).toBe(
+                    true,
+                );
+                expect(r.prompts.some((p) => p.includes('проведи детальное code review: '))).toBe(
+                    false,
+                );
+                expect(r.phaseDiffFilesFn).toHaveBeenCalledWith('feature/m1', { base: BASE });
+                expect(r.phaseDiffLinesFn).toHaveBeenCalledWith('feature/m1', { base: BASE });
+                expect(r.reviewDiffContextFn).toHaveBeenCalledWith(
+                    'feature/m1',
+                    expect.objectContaining({ base: BASE }),
+                );
+                expect(r.runArgvFn).toHaveBeenCalledWith('git', [
+                    'merge-base',
+                    '--is-ancestor',
+                    BASE,
+                    'origin/feature/m1',
+                ]);
+            });
+
+            it('без reviewBase: прежний buildReviewPrompt', () => {
+                const r = run(undefined);
+                expect(r.prompts.some((p) => p.includes('Весь PR заново НЕ пересматривай'))).toBe(
+                    false,
+                );
+                expect(r.prompts.some((p) => p.includes('проведи детальное code review: '))).toBe(
+                    true,
+                );
+                expect(r.reviewDiffContextFn).toHaveBeenCalledWith(
+                    'feature/m1',
+                    expect.not.objectContaining({ base: expect.anything() }),
+                );
+            });
+
+            it.each(['abc123', 'A'.repeat(40), '--upload-pack=x'])(
+                'база %j не 40 hex → стоп review-base, ревью не звано',
+                (bad) => {
+                    const r = run(bad);
+                    expect(r.pushes[0]).toContain('review-base');
+                    expect(r.pushes[0]).toContain(bad);
+                    expect(r.pushes[0]).toContain('feature/m1');
+                    expect(r.prompts.some((p) => p.includes('code review'))).toBe(false);
+                },
+            );
+
+            it('база не предок ветки → тот же стоп', () => {
+                const r = run(BASE, false);
+                expect(r.pushes[0]).toContain('review-base');
+                expect(r.pushes[0]).toContain(BASE);
+                expect(r.prompts.some((p) => p.includes('code review'))).toBe(false);
+            });
+
+            it('phase.reviewBase не предок — остаётся стопом review-base с советом по конфигу', () => {
+                const r = run(BASE, false);
+                expect(r.pushes[0]).toContain('review-base');
+                expect(r.pushes[0]).toContain('reviewBase строки phases');
+            });
+
+            it('PR не читается при ревью от базы → стоп forge-unreadable, ревью не звано', () => {
+                const result = runPlannerPath(
+                    {
+                        runArgvFn: () => '',
+                        phaseDiffFilesFn: () => ['core/a.ts'],
+                        phaseDiffLinesFn: () => 10,
+                        reviewDiffContextFn: () => '\n<дифф>',
+                        findOpenPrFn: () => ({ number: 7, url: 'u' }),
+                        prCommentsFn: () => {
+                            throw new Error('forge down');
+                        },
+                    },
+                    {},
+                    {
+                        config: {
+                            phases: [{ milestone: 'M1', branch: 'feature/m1', reviewBase: BASE }],
+                        },
+                    },
+                );
+                expect(result.pushes.some((m) => m.includes('forge-unreadable'))).toBe(true);
+                const prompts = result.runClaudeFn.mock.calls.map(([prompt]) => prompt);
+                expect(prompts.some((p) => p.includes('code review'))).toBe(false);
+            });
+
+            it('падение git fetch — стоп про origin после одного повтора, не review-base', () => {
+                let fetches = 0;
+                const runArgvFn = vi.fn((_file: string, args: string[]) => {
+                    if (args[0] === 'fetch') {
+                        fetches++;
+                        throw new Error('timeout');
+                    }
+                    return '';
+                });
+                const result = runPlannerPath(
+                    {
+                        runArgvFn,
+                        phaseDiffFilesFn: () => ['core/a.ts'],
+                        phaseDiffLinesFn: () => 10,
+                        reviewDiffContextFn: () => '\n<дифф>',
+                        prCommentsFn: () => [],
+                        findOpenPrFn: () => ({ number: 7, url: 'u' }),
+                    },
+                    {},
+                    {
+                        config: {
+                            phases: [{ milestone: 'M1', branch: 'feature/m1', reviewBase: BASE }],
+                        },
+                    },
+                );
+                expect(fetches).toBe(2);
+                expect(result.pushes[0]).toContain('origin-network');
+                expect(result.pushes[0]).not.toContain('review-base');
+                expect(result.pushes[0]).not.toContain('reviewBase строки phases');
+                expect(result.pushes[0]).not.toContain('healReviewBase');
+                const prompts = result.runClaudeFn.mock.calls.map(([prompt]) => prompt);
+                expect(prompts.some((p) => p.includes('code review'))).toBe(false);
+            });
+        });
+
+        describe('healReviewBase — ревью от HEAD до чини-сессии гейта', () => {
+            const HEAD = 'c'.repeat(40);
+            const run = (
+                options: {
+                    state?: ReturnType<typeof mkState>;
+                    head?: string | null;
+                    notAncestor?: boolean;
+                } = {},
+            ) => {
+                const state = options.state ?? mkState({ submitted: true, gateHeals: 0 });
+                const prompts: string[] = [];
+                const logs: string[] = [];
+                const saved: Array<string | null | undefined> = [];
+                const atGate: Array<string | null | undefined> = [];
+                let last = '';
+                let gates = 0;
+                let passes = 0;
+                const phaseDiffFilesFn = vi.fn(() => ['core/a.ts']);
+                const reviewDiffContextFn = vi.fn(() => '\n<дифф>');
+                const runClaudeFn = vi.fn<RunClaudeFake>((prompt) => {
+                    prompts.push(prompt);
+                    last = prompt.includes('code review') ? 'review' : 'other';
+                    return 0;
+                });
+                const result = runPlannerPath(
+                    {
+                        runClaudeFn,
+                        phaseDiffFilesFn,
+                        phaseDiffLinesFn: () => 10,
+                        phaseMergedFn: () => false,
+                        // Два захода в фазу: гейт с чини-сессией и повторная сдача.
+                        phaseIndexOfFn: () => (passes++ < 2 ? 0 : 99),
+                        reviewDiffContextFn,
+                        prCommentsFn: () => [],
+                        findOpenPrFn: () => ({ number: 7, url: 'u' }),
+                        branchHeadShaFn: () => (options.head === undefined ? HEAD : options.head),
+                        runArgvFn: (_file: string, args: string[]) => {
+                            if (args[0] === 'merge-base' && options.notAncestor)
+                                throw new Error('exit 1');
+                            return '';
+                        },
+                        saveStateFn: () => saved.push(state.healReviewBase),
+                        logFn: (line: string) => logs.push(line),
+                        tryMergePhaseFn: () => {
+                            atGate.push(state.healReviewBase);
+                            return ++gates === 1 ? 'red-checks' : 'merged';
+                        },
+                        getLastRedCheck: () => ({
+                            name: 'test',
+                            cmd: 'npm run test',
+                            excerpt: 'x',
+                        }),
+                        applySessionRequestsFn: () => ({
+                            applied: 1,
+                            failed: false,
+                            closedIssues: [],
+                            prFindings: last === 'review' ? [{ comment: 'сводка' }] : [],
+                            prBlocked: false,
+                        }),
+                    },
+                    {},
+                    { state, config: { gateHealAttempts: 2 } },
+                );
+                return {
+                    ...result,
+                    state,
+                    prompts,
+                    logs,
+                    saved,
+                    atGate,
+                    phaseDiffFilesFn,
+                    reviewDiffContextFn,
+                };
+            };
+
+            it('healReviewBase: ревью после чини-сессии идёт от HEAD до неё, полного промпта нет', () => {
+                const r = run();
+                const reviews = r.prompts.filter((p) => p.includes('code review'));
+                expect(reviews.length).toBeGreaterThan(0);
+                expect(reviews.every((p) => p.includes('Весь PR заново НЕ пересматривай'))).toBe(
+                    true,
+                );
+                expect(r.phaseDiffFilesFn).toHaveBeenCalledWith('feature/m1', { base: HEAD });
+                expect(r.reviewDiffContextFn).toHaveBeenCalledWith(
+                    'feature/m1',
+                    expect.objectContaining({ base: HEAD }),
+                );
+                expect(r.logs.some((l) => l.includes('ревью от ccccccc перед гейтом'))).toBe(true);
+            });
+
+            it('healReviewBase: база записана в state до чини-сессии и снята засчитанным ревью', () => {
+                const r = run();
+                expect(r.saved).toContain(HEAD);
+                expect(r.state.healReviewBase).toBeNull();
+            });
+
+            it('healReviewBase: рестарт между чини-сессией и ревью берёт базу из state', () => {
+                const OLD = 'd'.repeat(40);
+                const r = run({ state: mkState({ submitted: false, healReviewBase: OLD }) });
+                expect(r.phaseDiffFilesFn).toHaveBeenCalledWith('feature/m1', { base: OLD });
+            });
+
+            it('healReviewBase: HEAD не прочитан — базы нет, ревью полное', () => {
+                const r = run({ head: null });
+                expect(r.state.healReviewBase ?? null).toBeNull();
+                expect(r.prompts.some((p) => p.includes('Весь PR заново НЕ пересматривай'))).toBe(
+                    false,
+                );
+            });
+
+            it('healReviewBase не предок HEAD: сброс в null, state сохранён, ревью полное без стопа', () => {
+                const OLD = 'd'.repeat(40);
+                const r = run({
+                    state: mkState({ submitted: false, healReviewBase: OLD }),
+                    notAncestor: true,
+                });
+                expect(r.pushes.some((m) => m.includes('review-base'))).toBe(false);
+                expect(r.state.healReviewBase ?? null).toBeNull();
+                expect(r.saved).toContain(null);
+                expect(r.prompts.some((p) => p.includes('Весь PR заново НЕ пересматривай'))).toBe(
+                    false,
+                );
+                expect(r.prompts.some((p) => p.includes('code review'))).toBe(true);
+            });
+
+            it('healReviewBase: рестарт с reviewDone снимает поле', () => {
+                const OLD = 'd'.repeat(40);
+                const at = '2026-01-01T00:00:00.000Z';
+                let submitStages = finishStage([], 'M1', 'pr', 'ok', at);
+                submitStages = finishStage(submitStages, 'M1', 'review', 'ok', at, {
+                    blocked: false,
+                    hasAnchoredFindings: false,
+                });
+                const state = mkState({
+                    submitted: false,
+                    healReviewBase: OLD,
+                    submitStages,
+                });
+                const r = run({ state });
+                expect(r.logs.some((l) => l.includes('уже проведено прошлым процессом'))).toBe(
+                    true,
+                );
+                // Снято ДО гейта, а не только advancePhase в конце фазы.
+                expect(r.atGate[0] ?? null).toBeNull();
+                expect(r.saved).toContain(null);
+            });
+
+            it('healReviewBase: advancePhase снимает поле', () => {
+                const r = run({
+                    state: mkState({ submitted: false, healReviewBase: 'e'.repeat(40) }),
+                });
+                expect(r.state.healReviewBase ?? null).toBeNull();
+            });
+        });
+
+        describe('maxPhaseDiffLines', () => {
+            const run = (lines: number | null, config: Record<string, unknown> = {}) => {
+                const phaseDiffLinesFn = vi.fn(() => lines);
+                const pickReviewModelFn = vi.fn(() => 'none');
+                const result = runPlannerPath(
+                    { phaseDiffLinesFn, pickReviewModelFn },
+                    {},
+                    {
+                        state: mkState({}),
+                        config: { review: { default: 'claude-rev', ...config } },
+                    },
+                );
+                return { result, pickReviewModelFn };
+            };
+
+            it('4001 строка при пороге по умолчанию → стоп phase-too-large с порогом и числом, ревью не звано', () => {
+                const { result, pickReviewModelFn } = run(4001);
+                expect(pickReviewModelFn).not.toHaveBeenCalled();
+                expect(result.pushes[0]).toContain('4000');
+                expect(result.pushes[0]).toContain('4001');
+                expect(result.pushes[0]).toContain('Перерезка');
+            });
+
+            it('4000 строк → ревью идёт', () => {
+                const { pickReviewModelFn } = run(4000);
+                expect(pickReviewModelFn).toHaveBeenCalled();
+            });
+
+            it('счёт не прочитался (null) → стоп, ревью не звано', () => {
+                const { result, pickReviewModelFn } = run(null);
+                expect(pickReviewModelFn).not.toHaveBeenCalled();
+                expect(result.pushes[0]).toContain('не удалось посчитать');
+            });
+
+            it.each([0, 'x'])('битый review.maxPhaseDiffLines (%j) — отказ с именем ключа', (v) => {
+                const failFn = vi.fn((msg: string) => {
+                    throw new Error(msg);
+                });
+                expect(() =>
+                    ralph.resolveMaxPhaseDiffLines(
+                        { review: { maxPhaseDiffLines: v } } as never,
+                        failFn,
+                    ),
+                ).toThrow(/review\.maxPhaseDiffLines = .* целое положительное/);
+            });
+
+            it('phaseDiffLines суммирует вставки и удаления, бинарный файл — 0', () => {
+                const shFn = vi.fn(() => '10\t5\tcore/a.ts\n-\t-\timg.png\n3\t0\tb.ts');
+                const n = ralph.phaseDiffLines('feature/m1', {
+                    shFn: shFn as never,
+                    runArgvFn: vi.fn() as never,
+                    logFn: vi.fn(),
+                });
+                expect(n).toBe(18);
+                expect((shFn.mock.calls as unknown as string[][])[0][0]).toContain(
+                    '--numstat --no-renames',
+                );
+            });
+
+            it('phaseDiffLines в DRY: fetch не идёт, счёт читается', () => {
+                const runArgvFn = vi.fn();
+                const n = buildRuntime({ ...FLAGS_OFF, dry: true }).phaseDiffLines('feature/m1', {
+                    shFn: (() => '4\t1\tcore/a.ts') as never,
+                    runArgvFn: runArgvFn as never,
+                    logFn: vi.fn(),
+                });
+                expect(n).toBe(5);
+                expect(runArgvFn).not.toHaveBeenCalled();
+            });
+
+            it('phaseDiffLines: мусор в numstat или сбой git → null', () => {
+                const logFn = vi.fn();
+                const opts = { runArgvFn: vi.fn() as never, logFn };
+                expect(
+                    ralph.phaseDiffLines('feature/m1', { ...opts, shFn: (() => 'oops') as never }),
+                ).toBeNull();
+                expect(
+                    ralph.phaseDiffLines('feature/m1', {
+                        ...opts,
+                        shFn: (() => {
+                            throw new Error('boom');
+                        }) as never,
+                    }),
+                ).toBeNull();
+            });
         });
 
         it('maxFixPlans: успешный разбор плана увеличивает счёт и пишет state', () => {
@@ -15809,6 +16215,7 @@ describe('runLoop → промпт ревью получает контекст 
                 dry: false,
                 logFn: () => {},
                 shFn: () => '',
+                phaseDiffLinesFn: () => 10,
                 saveStateFn: () => {},
                 openIssuesFn: () => [],
                 allOpenIssuesFn: () => [],

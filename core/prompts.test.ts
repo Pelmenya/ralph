@@ -24,6 +24,8 @@ import {
     buildGateHealPrompt,
     buildReReviewPrompt,
     buildIntentRepairPrompt,
+    buildBaseReviewPrompt,
+    reviewFindingsRules,
     buildReviewPrompt,
     INTENT_SCHEMA_LINES,
 } from './prompts.ts';
@@ -778,5 +780,39 @@ describe('#224: ни один промпт сессии не велит пуши
         const rules = readFileSync(resolve(import.meta.dirname, '..', 'ralph.md'), 'utf-8');
         expect(rules).toMatch(/\*\*Не пушь\*\*/);
         expect(rules).not.toMatch(/git push -u origin/);
+    });
+});
+
+describe('buildBaseReviewPrompt', () => {
+    const prompt = buildBaseReviewPrompt({
+        branch: BRANCH,
+        diffContext: '<дифф от базы>',
+        commentsContext: '<комментарии PR>',
+        allowNames: 'owner',
+    });
+
+    it('содержит дифф от базы, комментарии и ветку', () => {
+        expect(prompt).toContain('<дифф от базы>');
+        expect(prompt).toContain('<комментарии PR>');
+        expect(prompt).toContain(BRANCH);
+    });
+
+    it('требует пометок серьёзности и сводки-вердикта, как buildReviewPrompt', () => {
+        for (const needle of ['🔴 [blocker]', '🟠 [major]', 'ВЕРДИКТ', 'pr-block', 'path']) {
+            expect(prompt).toContain(needle);
+        }
+    });
+
+    it('хвост правил находок — один источник с buildReviewPrompt', () => {
+        const full = buildReviewPrompt({ branch: BRANCH, diffContext: '<дифф>' });
+        const rules = reviewFindingsRules();
+        expect(rules).toContain('🔴 [blocker]');
+        expect(rules).toContain('ВЕРДИКТ');
+        expect(full.endsWith(rules)).toBe(true);
+        expect(prompt.endsWith(rules)).toBe(true);
+    });
+
+    it('прямо запрещает пересматривать PR целиком', () => {
+        expect(prompt).toContain('Весь PR заново НЕ пересматривай');
     });
 });

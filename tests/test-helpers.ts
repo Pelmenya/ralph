@@ -253,6 +253,7 @@ export function makeRunLoopScenario(
                 pickReviewModelFn: () => SCENARIO_REVIEW_MODEL,
                 reviewDiffContextFn: () => '',
                 phaseDiffFilesFn: () => [],
+                phaseDiffLinesFn: () => 10,
                 removeBlockedLabelFn,
                 addBlockedLabelFn,
                 // Задача 79: чтение метки после записи — «встала»; отказы сверки — свои сценарии.
@@ -291,6 +292,8 @@ export function makeRunLoopScenario(
                 // #625: заглушки лестницы ревью правок (база диффа правок, карточки,
                 // журнал прохода) — иначе сценарий уходил бы в настоящие git/форж/диск.
                 branchHeadShaFn: () => 'a'.repeat(40),
+                // #276: ревью после чини-сессии идёт от базы — проверка предка идёт через git.
+                runArgvFn: () => '',
                 createIssueFn: () => 1,
                 recordFixReviewFindingsFn: () => {},
                 getLastRedCheck: () => redCheck,
