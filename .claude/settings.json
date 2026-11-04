@@ -1,8 +1,8 @@
 {
     "permissions": {
         "allow": [
-            "Edit(*)",
-            "Write(*)",
+            "Edit(./**)",
+            "Write(./**)",
             "Bash(npm run *)",
             "Bash(npx tsc*)",
             "Bash(npx prettier*)",
