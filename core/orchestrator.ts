@@ -7049,7 +7049,12 @@ export function createOrchestrator(env: OrchestratorEnv) {
 
     // #221: `phases` — список, по которому выбрана следующая фаза. На границе фаз это
     // свежий список из перечитанного конфига, и индекс `idx` — индекс в нём.
-    function advancePhase(st: RalphState, idx: number, phases: Phase[] = config.phases): void {
+    function advancePhase(
+        st: RalphState,
+        idx: number,
+        phases: Phase[] = config.phases,
+        saveStateFn: typeof saveState = saveState,
+    ): void {
         const next = phases[idx + 1];
         st.milestone = next ? next.milestone : null;
         st.count = 0;
@@ -7061,6 +7066,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
         st.fixPlans = 0;
         // #276: база ревью правки гейта относится к PR прошлой фазы.
         st.healReviewBase = null;
+        // #284: незавершённая чини-сессия тоже относится к PR прошлой фазы.
+        st.healInFlight = null;
         // #217: планка ревью привязана к фазе — новая фаза начинает с чистой (иначе floor
         // прошлой фазы зря задрал бы модель повторного ревью следующей).
         st.reviewModelFloor = null;
@@ -7080,7 +7087,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // #93: журнал сдачи прошлой фазы снимается — кроме попытки, дошедшей до деплоя: её
         // барьер ставится ДО перехода и обязан пережить его той же записью (#165).
         if (!(st.submitStages ?? []).some((r) => r.stage === 'deploy')) st.submitStages = [];
-        saveState(st);
+        saveStateFn(st);
     }
 
     // #165: барьер красного пост-мердж деплоя. Отдельной функцией (#88), а не телом
@@ -7972,7 +7979,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             handleCrashedCoderSessionFn = handleCrashedCoderSession,
             phaseMergedFn = adapters.taskSource.isPhaseMerged,
             mergedPhasePrFn = adapters.taskSource.mergedPullRequestNumber,
-            advancePhaseFn = advancePhase,
+            advancePhaseFn = (st, idx, phases) => advancePhase(st, idx, phases, saveStateFn),
             tryMergePhaseFn = tryMergePhase,
             closeMilestoneByTitleFn = adapters.taskSource.closeMilestone,
             syncProjectBoardFn = adapters.taskSource.syncBoard,
@@ -9871,6 +9878,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 // `session-unpushed` после правок, упавшая чини-сессия гейта), оставляет
                 // коммиты локально, а рестарт ведёт в следующий этап или сразу в гейт — тот
                 // увидел бы локальный ref впереди головы PR и встал на `head-diverged`.
+                // Исключение #284 ниже: маркер прерванной чини-сессии сначала возвращает в ревью.
                 // Остаток здесь не коммитится: дерево упавшей сессии разбирает её этап.
                 if (
                     (state.submitted || subDone('pr')) &&
@@ -9879,6 +9887,27 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     })
                 )
                     break;
+
+                // #284: маркер пережил обрыв между запуском чини-сессии и записью её итога.
+                // Решение принимаем только ПОСЛЕ довоза пуша: сдвинувшаяся голова могла уйти
+                // на форж, хотя ответ раннеру не доехал. Нечитаемая голова не останавливает
+                // самолечение: ревью от сохранённой базы (или полное) шире пропуска, а сетевой
+                // сбой чтения не должен навсегда закрыть путь к зелёному гейту.
+                if (state.healInFlight != null) {
+                    const headBefore = state.healInFlight.headBefore;
+                    const headAfter = branchHeadShaFn(phase.branch);
+                    if (headBefore === null || headAfter === null || headAfter !== headBefore) {
+                        state.submitted = false;
+                        state.reviewOfFixes = null;
+                        logFn(
+                            headBefore === null
+                                ? '🔁 Рестарт после прерванной чини-сессии — полное ревью перед гейтом.'
+                                : `🔁 Рестарт после прерванной чини-сессии — ревью от ${headBefore.slice(0, 7)} перед гейтом.`,
+                        );
+                    }
+                    state.healInFlight = null;
+                    saveStateFn(state);
+                }
 
                 // M6: рестарт после красного гейта не дублирует PR/ревью/правки — сразу гейт.
                 if (state.submitted) {
@@ -12284,16 +12313,16 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     // ЗАПУЩЕННУЮ сессию, а не на отказ проводки.
                     if (!placeOnPhaseBranch('чини-сессия гейта')) break;
                     state.gateHeals = healsDone + 1;
-                    // #276: ревью после чини-сессии идёт от HEAD ДО неё — база пишется до
-                    // запуска, чтобы пережить рестарт между сессией и ревью. HEAD не
-                    // прочитался — база не ставится, ревью остаётся полным (шире, не уже).
-                    // Рестарт после упавшей чини-сессии базу НЕ перезаписывает (`??=`): она
-                    // остаётся прежней, ревью шире, не уже. `=` сузил бы его до коммитов
-                    // последней сессии, и правки упавших выпали бы из ревью.
+                    // #276/#284: база и маркер пишутся ОДНОЙ записью до запуска. Каждая
+                    // прерванная попытка сначала проходит ревью, поэтому новая попытка вправе
+                    // перезаписать базу своим HEAD. HEAD не прочитался или не полный sha —
+                    // сознательно идём дальше с null: рестарт и итог дадут ПОЛНОЕ ревью,
+                    // а остановка самолечения из-за сетевого сбоя чтения была бы дороже.
                     const healHead = branchHeadShaFn(phase.branch);
-                    if (healHead !== null && FULL_SHA_RE.test(healHead)) {
-                        state.healReviewBase ??= healHead;
-                    }
+                    const headBefore =
+                        healHead !== null && FULL_SHA_RE.test(healHead) ? healHead : null;
+                    state.healReviewBase = headBefore;
+                    state.healInFlight = { headBefore };
                     saveStateFn(state);
                     // #376 доп.скоуп: эскалация heal-сессий гейта «с дешёвой на сильную» —
                     // после modelRouting.healEscalation.afterAttempts НЕУДАЧНЫХ heal-попыток
@@ -12386,6 +12415,27 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         })
                     )
                         break;
+                    // #284: любой более ранний выход оставляет маркер на диске — рестарт
+                    // разберёт его после довоза пуша. Здесь исход известен: новая голова или
+                    // успех требуют ревью. Падение без сдвига головы снимает маркер только на
+                    // доказанно чистом дереве, чтобы не повторять #269 ревью пустого диффа.
+                    // Грязное или нечитаемое дерево — неразрешённый остаток: маркер и база
+                    // остаются до общего коммита рестартом, после которого новая голова идёт
+                    // в ревью от исходной базы.
+                    const unresolvedHealLeftover =
+                        healCode !== 0 && !ensureCleanFn('чини-сессия гейта');
+                    const headAfterHeal = branchHeadShaFn(phase.branch);
+                    if (
+                        healCode === 0 ||
+                        headBefore === null ||
+                        headAfterHeal === null ||
+                        headAfterHeal !== headBefore
+                    ) {
+                        state.submitted = false;
+                        state.reviewOfFixes = null;
+                    }
+                    if (!unresolvedHealLeftover) state.healInFlight = null;
+                    saveStateFn(state);
                     if (healCode !== 0) {
                         // Fail-closed как у шагов сдачи (H2): упавшая чини-сессия не должна
                         // молча зациклить гейт — но счётчик уже потрачен, рестарт продолжит.

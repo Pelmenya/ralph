@@ -27,7 +27,7 @@
 
 import { isPlainObject } from './config-profile.ts';
 
-export type TReloadPhase = { milestone: string; branch: string };
+export type TReloadPhase = { milestone: string; branch: string; reviewBase?: string };
 
 export type TPhaseReload =
     | {
@@ -75,6 +75,9 @@ function phaseProblem(phases: unknown): string | null {
                 return `phases[${i}].${key} = ${JSON.stringify(v)} — ожидалась непустая строка`;
             }
         }
+        if ('reviewBase' in p && typeof p.reviewBase !== 'string') {
+            return `phases[${i}].reviewBase = ${JSON.stringify(p.reviewBase)} — ожидалась строка`;
+        }
         const m = p.milestone as string;
         if (seen.has(m)) return `веха "${m}" стоит в phases дважды`;
         seen.add(m);
@@ -119,6 +122,7 @@ export function reconcilePhases({
     const phases = (fresh.phases as Array<Record<string, unknown>>).map((p) => ({
         milestone: p.milestone as string,
         branch: p.branch as string,
+        ...(typeof p.reviewBase === 'string' ? { reviewBase: p.reviewBase } : {}),
     }));
 
     const index = phases.findIndex((p) => p.milestone === currentMilestone);

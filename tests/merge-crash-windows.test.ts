@@ -561,10 +561,10 @@ describe('#88 переход фазы снимает метку начатого
             path.join(import.meta.dirname, '..', 'core', 'orchestrator.ts'),
             'utf8',
         );
-        const fn = source.slice(source.indexOf('function advancePhase(st: RalphState'));
+        const fn = source.slice(source.indexOf('function advancePhase('));
         const body = fn.slice(0, fn.indexOf('\n    }\n'));
         const clear = body.indexOf('st.mergeInFlight = null;');
         expect(clear).toBeGreaterThan(-1);
-        expect(body.indexOf('saveState(st);')).toBeGreaterThan(clear);
+        expect(body.indexOf('saveStateFn(st);')).toBeGreaterThan(clear);
     });
 });

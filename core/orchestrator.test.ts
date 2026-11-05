@@ -7470,6 +7470,8 @@ describe('runLoop — основной while-цикл: итерации коде
             },
             advancePhaseFn: (st: FakeState, idx: number, phases: Array<{ milestone: string }>) => {
                 st.milestone = phases[idx + 1]?.milestone ?? (null as never);
+                st.count = 0;
+                st.submitted = false;
             },
         });
 
@@ -7502,6 +7504,70 @@ describe('runLoop — основной while-цикл: итерации коде
             expect(logs.join('\n')).toMatch(
                 /🗂 Список фаз перечитан: добавлено "M1b", следующая — "M1b"\./,
             );
+        });
+
+        it('reviewBase следующей фазы доходит до ревью после перечитывания', () => {
+            const reviewBase = 'a'.repeat(40);
+            const logs: string[] = [];
+            const visited: string[] = [];
+            const prompts: string[] = [];
+            const state = mkState();
+            const cfg = validCfg({ active: true, phases: PHASES_OLD.map((p) => ({ ...p })) });
+            const running = { ...cfg, phases: PHASES_OLD };
+            const phaseDiffFilesFn = vi.fn(() => ['core/a.ts']);
+            const reviewDiffContextFn = vi.fn(() => '\n<дифф>');
+            runLoop(
+                cfg,
+                ctx(state),
+                deps(logs, {
+                    ...boundary(cfg, state, visited),
+                    phaseMergedFn: () => false,
+                    tryMergePhaseFn: () => 'merged',
+                    findOpenPrFn: () => ({ number: 7, url: 'u' }),
+                    pickReviewModelFn: () => 'claude-rev',
+                    runClaudeFn: (prompt: string) => {
+                        prompts.push(prompt);
+                        return 0;
+                    },
+                    applySessionRequestsFn: () => ({
+                        applied: 1,
+                        failed: false,
+                        closedIssues: [],
+                        prFindings: [{ comment: '⚪ [nit] сводка: замечаний нет' }],
+                        prBlocked: false,
+                    }),
+                    phaseDiffFilesFn,
+                    reviewDiffContextFn,
+                    reloadPhasesFn: (current: string) =>
+                        reconcilePhases({
+                            running,
+                            fresh: {
+                                ...cfg,
+                                phases: [
+                                    PHASES_OLD[0],
+                                    { ...PHASES_NEW[1], reviewBase },
+                                    PHASES_NEW[2],
+                                ],
+                            },
+                            currentMilestone: current,
+                        }),
+                }),
+            );
+
+            expect(visited).toEqual(['M1', 'M1b']);
+            expect(phaseDiffFilesFn).toHaveBeenCalledWith('feature/m1', {});
+            expect(phaseDiffFilesFn).toHaveBeenCalledWith('feature/m1b', { base: reviewBase });
+            expect(reviewDiffContextFn).toHaveBeenCalledWith(
+                'feature/m1b',
+                expect.objectContaining({ base: reviewBase }),
+            );
+            expect(
+                prompts.some(
+                    (p) =>
+                        p.includes('Найди последний открытый PR из ветки feature/m1b') &&
+                        p.includes('Весь PR заново НЕ пересматривай'),
+                ),
+            ).toBe(true);
         });
 
         it.each([
@@ -8908,6 +8974,332 @@ describe('runLoop — основной while-цикл: итерации коде
                     state: mkState({ submitted: false, healReviewBase: 'e'.repeat(40) }),
                 });
                 expect(r.state.healReviewBase ?? null).toBeNull();
+            });
+        });
+
+        describe('healInFlight — прерванная чини-сессия обязана пройти ревью', () => {
+            const A = 'a'.repeat(40);
+            const B = 'b'.repeat(40);
+            const C = 'c'.repeat(40);
+
+            const runHeal = (
+                state: FakeState,
+                options: {
+                    healCode?: number;
+                    headFn?: () => string | null;
+                    ensureCleanFn?: (where: string) => boolean;
+                    commitLeftoversFn?: (where: string) => boolean;
+                    gateResults?: Array<'red-checks' | 'merged'>;
+                    killOnHealPush?: boolean;
+                    savedStates?: FakeState[];
+                    failIntents?: boolean;
+                    failHealPush?: boolean;
+                    detachAfterHeal?: boolean;
+                    failPlace?: boolean;
+                } = {},
+            ) => {
+                const prompts: string[] = [];
+                const saved: FakeState[] = [];
+                const events: string[] = [];
+                let lastSession = '';
+                let gateCalls = 0;
+                let pushCalls = 0;
+                const gateResults = [...(options.gateResults ?? ['red-checks'])];
+                const phaseDiffFilesFn = vi.fn(() => ['core/a.ts']);
+                const runClaudeFn = vi.fn<RunClaudeFake>((prompt) => {
+                    prompts.push(prompt);
+                    lastSession = prompt.includes('Гейт мерджа фазы упал на чеке')
+                        ? 'heal'
+                        : prompt.includes('code review')
+                          ? 'review'
+                          : 'other';
+                    return lastSession === 'heal' ? (options.healCode ?? 0) : 0;
+                });
+                runLoop(
+                    validCfg({ gateHealAttempts: 3 }),
+                    ctx(state),
+                    deps([], {
+                        openIssuesFn: () => [],
+                        allOpenIssuesFn: () => [],
+                        phaseMergedFn: () => false,
+                        findOpenPrFn: () => ({ number: 7, labels: [] }),
+                        pickReviewModelFn: () => 'claude-rev',
+                        phaseDiffFilesFn,
+                        runClaudeFn,
+                        branchHeadShaFn: () => (options.headFn ? options.headFn() : A),
+                        ensureCleanFn: options.ensureCleanFn ?? (() => true),
+                        commitLeftoversFn: options.commitLeftoversFn ?? (() => true),
+                        saveStateFn: (s: FakeState) => {
+                            saved.push(JSON.parse(JSON.stringify(s)) as FakeState);
+                            options.savedStates?.push(saved.at(-1)!);
+                        },
+                        pushSessionCommitsFn: () => {
+                            pushCalls += 1;
+                            if (pushCalls === 2 && options.killOnHealPush) {
+                                throw new Error('kill after heal push');
+                            }
+                            if (pushCalls === 2 && options.failHealPush) {
+                                return {
+                                    kind: 'failed' as const,
+                                    why: 'ответ потерян',
+                                    local: B,
+                                    remote: A,
+                                };
+                            }
+                            return { kind: 'in-sync' as const };
+                        },
+                        applySessionRequestsFn: () => ({
+                            applied: 1,
+                            failed: options.failIntents === true && lastSession === 'heal',
+                            closedIssues: [],
+                            prFindings: lastSession === 'review' ? [{ comment: 'сводка' }] : [],
+                            prBlocked: false,
+                        }),
+                        checkOnPhaseBranchFn: () =>
+                            options.detachAfterHeal
+                                ? { ok: false, sha: B, message: 'коммит вне веток' }
+                                : { ok: true, sha: B },
+                        ensurePhaseBranchFn: () =>
+                            options.failPlace
+                                ? { kind: 'diverged' as const, sha: A, reason: 'коммит вне веток' }
+                                : {
+                                      kind: 'fast-forwarded' as const,
+                                      branch: 'feature/m1',
+                                      sha: A,
+                                  },
+                        tryMergePhaseFn: () => {
+                            gateCalls += 1;
+                            return gateResults.shift() ?? 'merged';
+                        },
+                        getLastRedCheck: () => ({
+                            name: 'test',
+                            cmd: 'npm run test',
+                            excerpt: 'boom',
+                        }),
+                        pushEventFn: (message: string) => {
+                            events.push(message);
+                            return false;
+                        },
+                    }),
+                );
+                return {
+                    state,
+                    prompts,
+                    saved,
+                    events,
+                    phaseDiffFilesFn,
+                    gateCalls: () => gateCalls,
+                    pushCalls: () => pushCalls,
+                };
+            };
+
+            it('healInFlight: запушенная и упавшая сессия → рестарт в ревью от базы, не в гейт', () => {
+                const state = mkState({ submitted: true, gateHeals: 0 });
+                const heads = [A, B];
+                let reads = 0;
+                const headFn = () => heads[Math.min(reads++, heads.length - 1)];
+                const first = runHeal(state, { healCode: 1, headFn });
+                const disk = first.saved.at(-1)!;
+                const restart = runHeal(disk, {
+                    healCode: 1,
+                    headFn: () => B,
+                    gateResults: ['merged'],
+                });
+
+                expect(restart.prompts.filter((p) => p.includes('code review'))).toHaveLength(1);
+                expect(restart.phaseDiffFilesFn).toHaveBeenCalledWith('feature/m1', { base: A });
+                expect(restart.gateCalls(), restart.events.join('\n')).toBe(1);
+                expect(restart.saved.some((s) => s.submitted === false)).toBe(true);
+                expect(disk.healInFlight ?? null).toBeNull();
+            });
+
+            it('healInFlight: обрыв после пуша до записи итога → рестарт из state в ревью', () => {
+                const state = mkState({ submitted: true, gateHeals: 0 });
+                const heads = [A, B];
+                let reads = 0;
+                const saved: FakeState[] = [];
+                expect(() => {
+                    runHeal(state, {
+                        headFn: () => heads[Math.min(reads++, heads.length - 1)],
+                        killOnHealPush: true,
+                        savedStates: saved,
+                    });
+                }).toThrow('kill after heal push');
+                const disk = saved.at(-1)!;
+                expect(disk.healInFlight).toEqual({ headBefore: A });
+
+                const restart = runHeal(disk, { headFn: () => B, gateResults: ['merged'] });
+
+                expect(restart.prompts.filter((p) => p.includes('code review'))).toHaveLength(1);
+                expect(restart.phaseDiffFilesFn).toHaveBeenCalledWith('feature/m1', { base: A });
+                expect(restart.gateCalls()).toBe(1);
+                expect(disk.healInFlight ?? null).toBeNull();
+            });
+
+            it('healInFlight: HEAD null → B → C, первая попытка прервана → полное ревью, не база B', () => {
+                const state = mkState({ submitted: true, gateHeals: 0 });
+                const saved: FakeState[] = [];
+                expect(() => {
+                    runHeal(state, {
+                        healCode: 1,
+                        headFn: () => null,
+                        killOnHealPush: true,
+                        savedStates: saved,
+                    });
+                }).toThrow('kill after heal push');
+                const disk = saved.at(-1)!;
+                let restartReads = 0;
+                const restart = runHeal(disk, {
+                    healCode: 1,
+                    headFn: () => (restartReads++ === 0 ? B : C),
+                });
+
+                expect(restart.prompts.filter((p) => p.includes('code review'))).toHaveLength(1);
+                expect(restart.phaseDiffFilesFn).toHaveBeenCalledWith('feature/m1', {});
+                expect(restart.gateCalls(), restart.events.join('\n')).toBe(1);
+                expect(restart.saved.some((s) => s.healReviewBase === C)).toBe(true);
+                expect(restart.saved.some((s) => s.healReviewBase === B)).toBe(false);
+            });
+
+            it('healInFlight: сессия упала без пуша → рестарт в гейт, пустого ревью нет', () => {
+                const state = mkState({ submitted: true, gateHeals: 0 });
+                const first = runHeal(state, { healCode: 1, headFn: () => A });
+                const disk = first.saved.at(-1)!;
+                const restart = runHeal(disk, {
+                    healCode: 1,
+                    headFn: () => A,
+                    gateResults: ['merged'],
+                });
+
+                expect(restart.prompts.some((p) => p.includes('code review'))).toBe(false);
+                expect(restart.gateCalls()).toBe(1);
+                expect(disk.submitted).toBe(true);
+            });
+
+            it('healInFlight: code 1 + только dirty tree + restart → коммит остатка и ревью от A', () => {
+                const state = mkState({ submitted: true, gateHeals: 0 });
+                const first = runHeal(state, {
+                    healCode: 1,
+                    headFn: () => A,
+                    ensureCleanFn: (where) => where !== 'чини-сессия гейта',
+                });
+                const disk = first.saved.at(-1)!;
+                expect(disk.healInFlight).toEqual({ headBefore: A });
+                expect(disk.healReviewBase).toBe(A);
+
+                let head = A;
+                const commitLeftoversFn = vi.fn((where: string) => {
+                    expect(where).toBe('итерация фазы "M1"');
+                    head = B;
+                    return true;
+                });
+                const restart = runHeal(disk, {
+                    healCode: 1,
+                    headFn: () => head,
+                    ensureCleanFn: (where) => where !== 'итерация фазы "M1"',
+                    commitLeftoversFn,
+                    gateResults: ['merged'],
+                });
+
+                expect(commitLeftoversFn).toHaveBeenCalledTimes(1);
+                expect(restart.pushCalls()).toBeGreaterThan(0);
+                expect(restart.prompts.filter((p) => p.includes('code review'))).toHaveLength(1);
+                expect(restart.phaseDiffFilesFn).toHaveBeenCalledWith('feature/m1', { base: A });
+                expect(restart.gateCalls(), restart.events.join('\n')).toBe(1);
+                expect(restart.saved.some((s) => s.submitted === false)).toBe(true);
+                expect(disk.healInFlight ?? null).toBeNull();
+            });
+
+            it('healInFlight: нечитаемый git status после падения не снимает маркер', () => {
+                const commitLeftoversFn = vi.fn(() => true);
+                const first = runHeal(mkState({ submitted: true, gateHeals: 0 }), {
+                    healCode: 1,
+                    headFn: () => A,
+                    ensureCleanFn: (where) => where !== 'чини-сессия гейта',
+                    commitLeftoversFn,
+                });
+                const disk = first.saved.at(-1)!;
+
+                expect(disk.healInFlight).toEqual({ headBefore: A });
+                expect(disk.healReviewBase).toBe(A);
+                expect(commitLeftoversFn).not.toHaveBeenCalled();
+            });
+
+            it.each(['intents', 'push'] as const)(
+                'healInFlight: ранний стоп %s после коммита → довоз и ревью на рестарте',
+                (earlyStop) => {
+                    const state = mkState({ submitted: true, gateHeals: 0 });
+                    const first = runHeal(state, {
+                        failIntents: earlyStop === 'intents',
+                        failHealPush: earlyStop === 'push',
+                    });
+                    const disk = first.saved.at(-1)!;
+                    const restart = runHeal(disk, { headFn: () => B, gateResults: ['merged'] });
+
+                    expect(restart.pushCalls()).toBeGreaterThan(0);
+                    expect(restart.prompts.filter((p) => p.includes('code review'))).toHaveLength(
+                        1,
+                    );
+                    expect(restart.phaseDiffFilesFn).toHaveBeenCalledWith('feature/m1', {
+                        base: A,
+                    });
+                    expect(restart.gateCalls()).toBe(1);
+                },
+            );
+
+            it('healInFlight: стоп стража с коммитом вне веток → маркер жив, рестарт не идёт в гейт', () => {
+                const state = mkState({ submitted: true, gateHeals: 0 });
+                const first = runHeal(state, { detachAfterHeal: true });
+                const disk = first.saved.at(-1)!;
+                expect(disk.healInFlight).toEqual({ headBefore: A });
+
+                const restart = runHeal(disk, { failPlace: true, gateResults: ['merged'] });
+
+                expect(restart.gateCalls()).toBe(0);
+                expect(restart.events.join('\n')).toContain('main-conflict');
+                expect(disk.healInFlight).toEqual({ headBefore: A });
+            });
+
+            it('healInFlight: state прежней ревизии без поля продолжает сдачу прежним путём', () => {
+                const state = mkState({ submitted: true, gateHeals: 0 });
+                delete state.healInFlight;
+                const restart = runHeal(state, { gateResults: ['merged'] });
+
+                expect(restart.gateCalls()).toBe(1);
+                expect(restart.prompts.some((p) => p.includes('code review'))).toBe(false);
+                expect(restart.events.some((m) => m.includes('⛔'))).toBe(false);
+            });
+
+            it('healInFlight: advancePhase снимает маркер вместе с базой ревью', () => {
+                const saved: FakeState[] = [];
+                const state = mkState({
+                    submitted: true,
+                    healInFlight: { headBefore: A },
+                    healReviewBase: A,
+                });
+                runLoop(
+                    validCfg({
+                        phases: [
+                            { milestone: 'M1', branch: 'feature/m1' },
+                            { milestone: 'M2', branch: 'feature/m2' },
+                        ],
+                    }),
+                    ctx(state),
+                    deps([], {
+                        phaseMergedFn: () => true,
+                        advancePhaseFn: undefined,
+                        saveStateFn: (s: FakeState) => {
+                            saved.push(JSON.parse(JSON.stringify(s)) as FakeState);
+                        },
+                    }),
+                );
+
+                const transitioned = saved.filter((s) => s.milestone === 'M2');
+                expect(transitioned).toHaveLength(1);
+                expect(transitioned[0]).toMatchObject({
+                    healInFlight: null,
+                    healReviewBase: null,
+                });
             });
         });
 
@@ -10714,7 +11106,7 @@ describe('runLoop — основной while-цикл: итерации коде
             ctx(mkState({ submitted: true, gateHeals: 0 })),
             deps([], { ...healDeps(order, 1), pushEventFn, commitLeftoversFn }),
         );
-        expect(order).toEqual(['push', 'gate', 'session', 'push']);
+        expect(order).toEqual(['push', 'gate', 'session', 'push', 'clean:чини-сессия гейта']);
         expect(commitLeftoversFn).not.toHaveBeenCalledWith('чини-сессия гейта');
         const stops = pushEventFn.mock.calls.map((c) => String(c[0]));
         expect(stops.some((m) => /чини-сессия гейта .* упала/.test(m))).toBe(true);

@@ -31,6 +31,51 @@ describe('reconcilePhases (#221)', () => {
         );
     });
 
+    it('reviewBase переносится из свежей строки, а без поля ключ не появляется', () => {
+        const reviewBase = 'a'.repeat(40);
+        const withBase = reconcilePhases({
+            running: base(),
+            fresh: base({
+                phases: [
+                    { milestone: 'M1', branch: 'feature/m1' },
+                    { milestone: 'M2', branch: 'feature/m2', reviewBase },
+                ],
+            }),
+            currentMilestone: 'M1',
+        });
+        if (withBase.kind !== 'ok') throw new Error('ожидался ok');
+        expect(withBase.phases[1]).toEqual({
+            milestone: 'M2',
+            branch: 'feature/m2',
+            reviewBase,
+        });
+
+        const withoutBase = reconcilePhases({
+            running: base(),
+            fresh: base(),
+            currentMilestone: 'M1',
+        });
+        if (withoutBase.kind !== 'ok') throw new Error('ожидался ok');
+        expect(withoutBase.phases[1]).not.toHaveProperty('reviewBase');
+    });
+
+    it('reviewBase не строкой — отказ перечитывания с именем поля', () => {
+        const r = reconcilePhases({
+            running: base(),
+            fresh: base({
+                phases: [
+                    { milestone: 'M1', branch: 'feature/m1' },
+                    { milestone: 'M2', branch: 'feature/m2', reviewBase: 5 },
+                ],
+            }),
+            currentMilestone: 'M1',
+        });
+        expect(r).toMatchObject({
+            kind: 'refused',
+            reason: expect.stringMatching(/phases\[1\]\.reviewBase/),
+        });
+    });
+
     it('без изменений — «добавлено ничего», убранная фаза названа', () => {
         const same = reconcilePhases({ running: base(), fresh: base(), currentMilestone: 'M1' });
         if (same.kind !== 'ok') throw new Error('ожидался ok');

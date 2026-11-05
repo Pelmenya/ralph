@@ -110,6 +110,27 @@ describe('inspectState — версия схемы и форма state', () => {
         });
     });
 
+    it.each([null, { headBefore: null }, { headBefore: 'a'.repeat(40) }])(
+        'healInFlight: годная форма %j принимается',
+        (healInFlight) => {
+            const r = inspectState(JSON.stringify({ ...v2, healInFlight }));
+            expect(r.status).toBe('ok');
+            if (r.status !== 'ok') return;
+            expect(r.state.healInFlight).toEqual(healInFlight);
+        },
+    );
+
+    it.each([[], 'pending', {}, { headBefore: 7 }, { headBefore: undefined }])(
+        'healInFlight: неверная форма %j — state повреждён',
+        (healInFlight) => {
+            const r = inspectState(JSON.stringify({ ...v2, healInFlight }));
+            expect(r).toMatchObject({
+                status: 'corrupt',
+                reason: expect.stringMatching(/healInFlight/),
+            });
+        },
+    );
+
     it('годная refusalSeries сохраняется при чтении v2', () => {
         const refusalSeries = {
             milestone: 'M1',

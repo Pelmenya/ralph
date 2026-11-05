@@ -93,6 +93,9 @@ export type RalphState = {
     // #276: HEAD ветки до чини-сессии гейта — база ревью её правки. Снимают advancePhase и
     // засчитанное ревью; переживает рестарт между чини-сессией и ревью.
     healReviewBase?: string | null;
+    // #284: чини-сессия начата, но итог ещё не записан. На рестарте маркер не даёт
+    // запушенному коммиту попасть в гейт мимо ревью; отсутствие поля — маркера нет.
+    healInFlight?: THealInFlight | null;
     // #93: журнал этапов сдачи фазы (submit-journal.ts). `submitted`, `deployBlock` и
     // `reviewOfFixes.arbitrated` выше — его проекции: у state, прошедшего
     // `attachSubmitJournal`, они аксессоры, и на диск ложится журнал, а не поля.
@@ -102,6 +105,7 @@ export type RalphState = {
 };
 
 export type TMergeInFlight = { milestone: string; pr: number; sha: string | null };
+export type THealInFlight = { headBefore: string | null };
 
 // Исход чтения state с диска (задача 80). `raw` — разобранный JSON там, где он разобрался:
 // --reset достаёт из него барьер деплоя, даже когда форма в целом не прошла проверку.
@@ -239,6 +243,17 @@ export function inspectState(text: string): TStateInspection {
             return bad(
                 'mergeInFlight без строковой milestone, числового pr и sha строкой или null',
             );
+        }
+    }
+    const hf = raw.healInFlight;
+    if (hf !== undefined && hf !== null) {
+        const h = hf as Record<string, unknown>;
+        if (
+            typeof hf !== 'object' ||
+            Array.isArray(hf) ||
+            (h.headBefore !== null && typeof h.headBefore !== 'string')
+        ) {
+            return bad('healInFlight без headBefore строкой или null');
         }
     }
     let refusalSeries: ReturnType<typeof parseRefusalSeries> | undefined;
