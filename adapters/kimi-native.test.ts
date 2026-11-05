@@ -115,7 +115,8 @@ describe('дом CLI', () => {
 });
 
 describe('вход до первой сессии — по дому CLI, без сети', () => {
-    const CONFIG = 'default_model = "kimi-code/kimi-for-coding"\n';
+    const CONFIG =
+        'default_model = "kimi-code/kimi-for-coding"\n[models."kimi-code/kimi-for-coding"]\n';
 
     it('модель и ключи на месте — проблем нет', () => {
         expect(kimiNativeAuthProblems({ configToml: CONFIG, credentialFiles: ['k.json'] })).toEqual(
@@ -160,10 +161,100 @@ describe('вход до первой сессии — по дому CLI, без 
     it('ключи с отступом под таблицей — тоже вход и модель, а не ложное «входа нет»', () => {
         expect(
             kimiNativeAuthProblems({
-                configToml: '  default_model = "m"\n[providers.x]\n    api_key = "sk-test"\n',
+                configToml:
+                    '  default_model = "m"\n[models."m"]\n[providers.x]\n    api_key = "sk-test"\n',
                 credentialFiles: [],
             }),
         ).toEqual([]);
+    });
+
+    it('алиас из requiredModels проходит только со своей таблицей', () => {
+        expect(
+            kimiNativeAuthProblems({
+                configToml: '  [models."fast"]  \n',
+                credentialFiles: ['k'],
+                model: 'configured',
+                requiredModels: ['fast'],
+            }),
+        ).toEqual([]);
+        const missing = kimiNativeAuthProblems({
+            configToml: '',
+            credentialFiles: ['k'],
+            model: 'configured',
+            requiredModels: ['fast'],
+        });
+        expect(missing).toHaveLength(1);
+        expect(missing[0]).toContain('fast');
+    });
+
+    it('комментарий, одинарные кавычки и похожий алиас таблицей не считаются', () => {
+        const requiredModels = ['k.x', 'k[a]'];
+        const missing = kimiNativeAuthProblems({
+            configToml: '# [models."k.x"]\n[models.\'k.x\']\n[models."kix"]\n[models."ka"]\n',
+            credentialFiles: ['k'],
+            model: 'configured',
+            requiredModels,
+        });
+        expect(missing).toHaveLength(2);
+        expect(missing.join('\n')).toContain('k.x');
+        expect(missing.join('\n')).toContain('k[a]');
+        expect(
+            kimiNativeAuthProblems({
+                configToml: '[models."k.x"]\n[models."k[a]"]\n',
+                credentialFiles: ['k'],
+                model: 'configured',
+                requiredModels,
+            }),
+        ).toEqual([]);
+    });
+
+    it('default_model без явной model тоже обязан иметь таблицу', () => {
+        const missing = kimiNativeAuthProblems({
+            configToml: 'default_model = "from-default"\n',
+            credentialFiles: ['k'],
+        });
+        expect(missing).toHaveLength(1);
+        expect(missing[0]).toContain('from-default');
+        expect(
+            kimiNativeAuthProblems({
+                configToml: 'default_model = "from-default"\n[models."from-default"]\n',
+                credentialFiles: ['k'],
+            }),
+        ).toEqual([]);
+    });
+
+    it('алиасы без дублей, проблемы — в порядке первого появления', () => {
+        const problems = kimiNativeAuthProblems({
+            configToml: '',
+            credentialFiles: ['k'],
+            model: 'configured',
+            requiredModels: ['second', 'first', 'second', 'third', 'first'],
+        });
+        expect(problems).toHaveLength(3);
+        expect(problems[0]).toContain('second');
+        expect(problems[1]).toContain('first');
+        expect(problems[2]).toContain('third');
+    });
+
+    it('один алиас из requiredModels и default_model даёт одну проблему', () => {
+        const problems = kimiNativeAuthProblems({
+            configToml: 'default_model = "same"\n',
+            credentialFiles: ['k'],
+            requiredModels: ['same', 'same'],
+        });
+        expect(problems).toHaveLength(1);
+        expect(problems[0]).toContain('same');
+    });
+
+    it('непрочитанный config.toml — прежний отказ раньше разбора алиасов', () => {
+        expect(
+            kimiNativeAuthProblems({
+                configToml: null,
+                credentialFiles: ['k'],
+                model: 'configured',
+                requiredModels: ['missing'],
+            }),
+        ).toEqual(['config.toml дома Kimi Code не прочитан — CLI не настроен: `kimi login`']);
     });
 });
 

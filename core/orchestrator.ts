@@ -847,6 +847,9 @@ export type RalphConfig = {
     modelRouting?: {
         labels?: Record<string, ModelRouteEntry | undefined>;
         default?: ModelRouteEntry;
+        // Маршрут ревью и правок текущей карточки: применяется в reviewCard и fixCard
+        // и уже участвует во всех проверках старта.
+        cardReview?: ModelRouteEntry;
         // Доп.скоуп #376: кросс-провайдерный фолбэк при API-лимите основного рантайма —
         // ОДИН пробный запуск через этот маршрут ДО цикла ожидания (apiLimitMaxWaits).
         // Не задан — поведение прежнее (сразу ждём сброс лимита текущего провайдера).
@@ -1114,8 +1117,9 @@ export type RalphConfig = {
     //   home — дом CLI человека (конфиг и вход). Не задан — `KIMI_CODE_HOME`, затем
     //           `~/.kimi-code` от `HOME` окружения раннера, как ищет сам CLI.
     //   status — только "experimental" и обязателен, когда рантайм достижим: песочницы, которой
-    //           docs/harness-adapters.md требует от kimi-native, нет (ревью Фазы 16b), и маршрут
-    //           modelRouting в него — отказ старта (`checkExperimentalRuntimes`).
+    //           docs/harness-adapters.md требует от kimi-native, нет (ревью Фазы 16b). Маршрут
+    //           в другой рантайм — отказ старта; маршрут в статический kimi-native меняет только
+    //           модель и допускается (`checkExperimentalRuntimes`).
     // Форму секции проверяет резолв конфига: незнакомый ключ и не-строка — стоп.
     kimiNativeRuntime?: {
         status?: string;
@@ -3631,9 +3635,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
         }
     }
 
-    // #120: готовность kimi-native до выбора задачи — бинарь отвечает на `--version`, и вход
-    // есть: модель задана, ключи в доме CLI лежат. Отказ называет причину; сеть не трогается
-    // (протухший токен узнает первая сессия исходом `auth`, и петля встанет «вход отвергнут»).
+    // #120: готовность kimi-native до выбора задачи — бинарь отвечает на `--version`, вход
+    // есть, а каждый достижимый алиас модели объявлен в config.toml. Отказ называет причину;
+    // сеть не трогается (протухший токен узнает первая сессия исходом `auth`, и петля встанет
+    // «вход отвергнут»).
     function checkKimiNativeAvailable({
         probeFn = (bin: string) => probeRuntimeBinaryOnce(bin),
         readFileFn = (p: string) => fs.readFileSync(p, 'utf-8'),
@@ -3666,10 +3671,17 @@ export function createOrchestrator(env: OrchestratorEnv) {
         } catch {
             credentialFiles = [];
         }
+        const requiredModels = [
+            cfg?.kimiNativeRuntime?.model,
+            ...reachableRuntimes(cfg)
+                .routes.filter((route) => route.provider === 'kimi-native')
+                .map((route) => route.model),
+        ].filter((model): model is string => typeof model === 'string');
         const problems = kimiNativeAuthProblems({
             configToml,
             credentialFiles,
             model: cfg?.kimiNativeRuntime?.model,
+            requiredModels,
         });
         if (problems.length > 0) {
             throw new Error(`Kimi Code не авторизован (${home}): ${problems.join('; ')}`);
@@ -7266,8 +7278,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
     }
 
     // Рантаймы, достижимые из конфига: статический `adapters.coderRuntime` плюс провайдеры
-    // маршрутов modelRouting (labels/default/apiLimitFallback/healEscalation.route). Один
-    // набор на две проверки старта — резолв ключей в preflight и пробу готовности (#44):
+    // маршрутов modelRouting (labels/default/cardReview/apiLimitFallback/healEscalation.route).
+    // Один набор на две проверки старта — резолв ключей в preflight и пробу готовности (#44):
     // разъехавшись, они проверяли бы разные рантаймы, и фолбэк на непроверенный всплыл бы
     // посреди ночи.
     function reachableRuntimes(
@@ -7281,7 +7293,12 @@ export function createOrchestrator(env: OrchestratorEnv) {
         const entries: (ModelRouteEntry | undefined)[] = [];
         if (routing) {
             if (routing.labels) entries.push(...Object.values(routing.labels));
-            entries.push(routing.default, routing.apiLimitFallback, routing.healEscalation?.route);
+            entries.push(
+                routing.default,
+                routing.cardReview,
+                routing.apiLimitFallback,
+                routing.healEscalation?.route,
+            );
         }
         const routes = entries
             .map((e) => resolveModelRoute(e, fallbackProvider))
@@ -7356,11 +7373,13 @@ export function createOrchestrator(env: OrchestratorEnv) {
         });
     }
 
-    // #121: экспериментальный рантайм не назначается ни на одну роль. Маршрут modelRouting —
-    // это и есть назначение: метка сложности, фолбэк лимита, эскалация лечения. Маршрут,
-    // который приводит в эксперимент (явным provider или статическим рантаймом у записи без
-    // provider), — отказ до выбора задачи. Статический `adapters.coderRuntime` — эксперимент
-    // оператора: статус назван в конфиге дословно, и старт говорит это строкой в логе.
+    // #121: маршрут modelRouting, который меняет рантайм, назначает эксперимент ролью —
+    // меткой сложности, фолбэком лимита или эскалацией лечения, и отвергается до выбора задачи.
+    // У статически выбранного kimi-native маршрут в тот же provider меняет только модель:
+    // runKimiNativeOnce применяет её флагом -m, поэтому это не назначение роли. OpenCode такого
+    // послабления не получает: runOpencodeOnce модель маршрута игнорирует.
+    // Статический `adapters.coderRuntime` — эксперимент оператора: статус назван в конфиге
+    // дословно, и старт говорит это строкой в логе.
     //
     // Экспериментов два, и причины у них разные. OpenCode — допуска профиля по canary (Фаза 17)
     // нет. kimi-native — песочницы, которой `docs/harness-adapters.md` требует от него, нет
@@ -7374,6 +7393,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             section: 'opencodeRuntime' | 'kimiNativeRuntime';
             status: string;
             why: string;
+            appliesRouteModel?: true;
         }
     > = {
         opencode: {
@@ -7387,6 +7407,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             section: 'kimiNativeRuntime',
             status: KIMI_NATIVE_STATUS,
             why: 'песочницы, которой docs/harness-adapters.md требует от него, нет — сессия идёт на хосте',
+            appliesRouteModel: true,
         },
     };
 
@@ -7401,7 +7422,13 @@ export function createOrchestrator(env: OrchestratorEnv) {
         const { providers, routes } = reachableRuntimes(cfg, selected);
         for (const [runtime, exp] of Object.entries(EXPERIMENTAL_RUNTIMES)) {
             if (!providers.has(runtime)) continue;
-            if (routes.some((r) => r.provider === runtime)) {
+            if (
+                routes.some(
+                    (r) =>
+                        r.provider === runtime &&
+                        !(exp.appliesRouteModel && r.provider === selected),
+                )
+            ) {
                 failFn(
                     `Маршрут modelRouting ведёт в ${exp.title} — это назначение роли (метка, фолбэк, ` +
                         `эскалация), а статус ${runtime} — "${exp.status}": ${exp.why}. Назови в маршрутах ` +
@@ -7423,8 +7450,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
             }
             logFn(
                 `🧪 Рантайм ${runtime} — ЭКСПЕРИМЕНТАЛЬНЫЙ (${exp.section}.status: "${exp.status}", ` +
-                    `модель ${String(section?.model ?? 'по умолчанию CLI')}): ${exp.why}; резервом и ` +
-                    'ролью не назначается — прогон идёт как эксперимент оператора.',
+                    `модель ${String(section?.model ?? 'по умолчанию CLI')}): ${exp.why}; смена ` +
+                    'рантайма маршрутом запрещена — прогон идёт как эксперимент оператора.',
             );
         }
     }
@@ -9150,10 +9177,14 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         );
                     };
                     const reviewCard = (head: string, files: string[]): TCardStepResult => {
+                        const cardRoute = resolveModelRoute(
+                            cfg.modelRouting?.cardReview,
+                            adapterSelection.coderRuntime,
+                        );
                         const reviewModel = pickReviewModelFn(phase.milestone, phase.branch, {
                             files,
                         });
-                        if (!reviewModel || reviewModel === 'none') {
+                        if (cardRoute === null && (!reviewModel || reviewModel === 'none')) {
                             return stop(
                                 'card-unreviewed',
                                 `для карточки #${card.issue} не выбрана модель ревью`,
@@ -9192,7 +9223,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         });
                         const reviewFallback = pickReviewFallbackModel(cfg);
                         logFn(
-                            `🔍 Ревью карточки #${card.issue} моделью ${reviewModel} на ${head} (фолбэк: ${reviewFallback && reviewFallback !== 'none' ? reviewFallback : 'нет'})`,
+                            `🔍 Ревью карточки #${card.issue} моделью ${cardRoute?.model ?? reviewModel} на ${head}${!cardRoute || cardRoute.provider === 'claude' ? ` (фолбэк: ${reviewFallback && reviewFallback !== 'none' ? reviewFallback : 'нет'})` : ''}`,
                         );
                         for (let attempt = 0; ; attempt += 1) {
                             if (card.sessions >= cardReviewConfig.maxSessions)
@@ -9205,11 +9236,21 @@ export function createOrchestrator(env: OrchestratorEnv) {
                             const reviewCode = runClaudeFn(
                                 reviewPrompt,
                                 {
-                                    model: reviewModel,
+                                    model: cardRoute?.model ?? reviewModel,
                                     maxTurns: positiveIntOrDefault(cfg.review?.maxTurns, maxTurns),
                                     fallbackModel: reviewFallback,
+                                    ...(cardRoute?.model && cardRoute.provider !== 'claude'
+                                        ? { modelProvider: cardRoute.provider }
+                                        : {}),
                                 },
                                 {
+                                    ...(cardRoute
+                                        ? {
+                                              runClaudeOnceFn: coderRuntimeRunFor(
+                                                  cardRoute.provider,
+                                              ),
+                                          }
+                                        : {}),
                                     onOutput: (_text: string, end: SessionEndReason) => {
                                         reviewEnd = end;
                                     },
@@ -9276,7 +9317,11 @@ export function createOrchestrator(env: OrchestratorEnv) {
                                 'верни карточку в очередь или разбери её дифф руками, затем перезапусти loop',
                             );
                         }
-                        const route = pickRouteFn(issue);
+                        const route =
+                            resolveModelRoute(
+                                cfg.modelRouting?.cardReview,
+                                adapterSelection.coderRuntime,
+                            ) ?? pickRouteFn(issue);
                         const findingsContext = JSON.stringify(card.findings, null, 2);
                         const prompt = buildCardFixPrompt({
                             issue: card.issue,

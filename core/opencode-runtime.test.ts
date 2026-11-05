@@ -544,6 +544,7 @@ describe('checkExperimentalRuntimes — статус «эксперимента�
         for (const routing of [
             { labels: { 'complexity:low': { provider: 'opencode', model: 'prov/m' } } },
             { apiLimitFallback: { provider: 'opencode', model: 'prov/m' } },
+            { cardReview: { provider: 'opencode', model: 'prov/m' } },
             { healEscalation: { afterAttempts: 1, route: { provider: 'opencode', model: 'p/m' } } },
         ]) {
             const { fails } = check({ modelRouting: routing });
@@ -557,6 +558,42 @@ describe('checkExperimentalRuntimes — статус «эксперимента�
         const { fails } = check(
             { opencodeRuntime: EXPERIMENT, modelRouting: { default: { model: 'prov/m' } } },
             'opencode',
+        );
+        expect(fails[0]).toMatch(/Маршрут modelRouting ведёт в OpenCode/);
+    });
+
+    it('статический opencode с явным маршрутом в себя — тоже роль, отказ', () => {
+        const { fails } = check(
+            {
+                opencodeRuntime: EXPERIMENT,
+                modelRouting: { default: { provider: 'opencode', model: 'prov/m' } },
+            },
+            'opencode',
+        );
+        expect(fails[0]).toMatch(/Маршрут modelRouting ведёт в OpenCode/);
+    });
+
+    it('статический kimi-native принимает default и labels с маршрутом в себя', () => {
+        for (const modelRouting of [
+            { default: { provider: 'kimi-native', model: 'k/m' } },
+            { labels: { 'complexity:low': { provider: 'kimi-native', model: 'k/m' } } },
+        ]) {
+            const { fails } = check(
+                { kimiNativeRuntime: { status: 'experimental' }, modelRouting },
+                'kimi-native',
+            );
+            expect(fails, JSON.stringify(modelRouting)).toEqual([]);
+        }
+    });
+
+    it('статический kimi-native не принимает маршрут в другой экспериментальный рантайм', () => {
+        const { fails } = check(
+            {
+                kimiNativeRuntime: { status: 'experimental' },
+                opencodeRuntime: EXPERIMENT,
+                modelRouting: { default: { provider: 'opencode', model: 'prov/m' } },
+            },
+            'kimi-native',
         );
         expect(fails[0]).toMatch(/Маршрут modelRouting ведёт в OpenCode/);
     });

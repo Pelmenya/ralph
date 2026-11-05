@@ -246,16 +246,26 @@ describe('ревью карточки: крах и рестарт', () => {
         const disk = diskOf(card({ pending: { role: 'review', head: A, saved: false } }), {
             requests: '{"kind":"card-block","issue":7,"comment":"старый блок"}\n',
         });
-        const process = runProcess(disk);
+        const process = runProcess(disk, {
+            config: {
+                adapters: { coderRuntime: 'kimi-native' },
+                modelRouting: {
+                    cardReview: { provider: 'kimi-native', model: 'card-reviewer' },
+                },
+            },
+        });
         expect(disk.quarantined).toEqual([
             '{"kind":"card-block","issue":7,"comment":"старый блок"}\n',
         ]);
         expect(process.runClaudeFn).toHaveBeenCalledTimes(1);
         expect(process.runClaudeFn.mock.calls[0][1]).toMatchObject({
-            model: 'reviewer',
+            model: 'card-reviewer',
+            modelProvider: 'kimi-native',
             fallbackModel: 'reviewer',
             maxTurns: 80,
         });
+        const deps = process.runClaudeFn.mock.calls[0][2] as Record<string, unknown>;
+        expect(deps.runClaudeOnceFn).toBe(ralph.coderRuntimeRunFor('kimi-native'));
         expect(disk.state.cardReview).toMatchObject({
             failedSessions: 1,
             rounds: 1,
@@ -543,19 +553,51 @@ describe('ревью карточки: крах и рестарт', () => {
         expect(disk.state.cardReview).toMatchObject({ rounds: 1, verdict: 'clean' });
     });
 
-    it('16. модель none: стоп до pending, счётчики прежние', () => {
-        const disk = diskOf(card({ sessions: 2, failedSessions: 1 }));
-        const process = runProcess(disk, {
-            over: { pickReviewModelFn: () => 'none' },
-        });
-        expect(process.runClaudeFn).not.toHaveBeenCalled();
-        expect(disk.state.cardReview).toMatchObject({
-            sessions: 2,
-            failedSessions: 1,
-            pending: null,
-        });
-        expect(process.logs.join('\n')).toContain('card-unreviewed');
-    });
+    it.each(['none', undefined])(
+        '16. модель %s без cardReview: стоп до pending, счётчики прежние',
+        (legacyModel) => {
+            const disk = diskOf(card({ sessions: 2, failedSessions: 1 }));
+            const process = runProcess(disk, {
+                over: { pickReviewModelFn: () => legacyModel },
+            });
+            expect(process.runClaudeFn).not.toHaveBeenCalled();
+            expect(disk.state.cardReview).toMatchObject({
+                sessions: 2,
+                failedSessions: 1,
+                pending: null,
+            });
+            expect(process.logs.join('\n')).toContain('card-unreviewed');
+        },
+    );
+
+    it.each([
+        { reviewDefault: 'none', legacyModel: 'none' },
+        { reviewDefault: undefined, legacyModel: undefined },
+    ])(
+        'явный cardReview самодостаточен при review.default=$reviewDefault и pickReviewModelFn=$legacyModel',
+        ({ reviewDefault, legacyModel }) => {
+            const process = runProcess(diskOf(card()), {
+                config: {
+                    adapters: { coderRuntime: 'kimi-native' },
+                    review: {
+                        cardReview: true,
+                        ...(reviewDefault === undefined ? {} : { default: reviewDefault }),
+                    },
+                    modelRouting: {
+                        cardReview: { provider: 'kimi-native', model: 'card-reviewer' },
+                    },
+                },
+                over: { pickReviewModelFn: () => legacyModel },
+            });
+            expect(process.runClaudeFn).toHaveBeenCalledTimes(1);
+            expect(process.runClaudeFn.mock.calls[0][1]).toMatchObject({
+                model: 'card-reviewer',
+                modelProvider: 'kimi-native',
+            });
+            const deps = process.runClaudeFn.mock.calls[0][2] as Record<string, unknown>;
+            expect(deps.runClaudeOnceFn).toBe(ralph.coderRuntimeRunFor('kimi-native'));
+        },
+    );
 
     it('17. saveBatchFn кодера бросил: попытка стоп, вторая сессия не запускается', () => {
         const disk = diskOf(null);
@@ -719,6 +761,100 @@ describe('ревью карточки: исходы вердикта', () => {
             'journal',
         ]);
         expect(disk.writes[0]).toContain('комментарий кодера');
+    });
+});
+
+describe('ревью карточки: модель', () => {
+    it('статический kimi-native: cardReview в kimi-native задаёт модель, провайдер и функцию рантайма', () => {
+        const process = runProcess(diskOf(card()), {
+            config: {
+                adapters: { coderRuntime: 'kimi-native' },
+                modelRouting: {
+                    cardReview: { provider: 'kimi-native', model: 'card-reviewer' },
+                },
+            },
+        });
+        expect(process.runClaudeFn).toHaveBeenCalledTimes(1);
+        expect(process.runClaudeFn.mock.calls[0][1]).toMatchObject({
+            model: 'card-reviewer',
+            modelProvider: 'kimi-native',
+        });
+        const deps = process.runClaudeFn.mock.calls[0][2] as Record<string, unknown>;
+        expect(deps.runClaudeOnceFn).toBe(ralph.coderRuntimeRunFor('kimi-native'));
+        const reviewLog = process.logs.find((line) => line.includes('🔍 Ревью карточки'));
+        expect(reviewLog).toContain('моделью card-reviewer');
+        expect(reviewLog).not.toContain('фолбэк');
+    });
+
+    it('статический kimi-native: cardReview в claude задаёт модель без modelProvider и функцию Claude', () => {
+        const process = runProcess(diskOf(card()), {
+            config: {
+                adapters: { coderRuntime: 'kimi-native' },
+                modelRouting: {
+                    cardReview: { provider: 'claude', model: 'card-reviewer-claude' },
+                },
+            },
+        });
+        expect(process.runClaudeFn).toHaveBeenCalledTimes(1);
+        const options = process.runClaudeFn.mock.calls[0][1];
+        expect(options.model).toBe('card-reviewer-claude');
+        expect(options.fallbackModel).toBe('reviewer');
+        expect(options).not.toHaveProperty('modelProvider');
+        const deps = process.runClaudeFn.mock.calls[0][2] as Record<string, unknown>;
+        expect(deps.runClaudeOnceFn).toBe(ralph.coderRuntimeRunFor('claude'));
+        const reviewLog = process.logs.find((line) => line.includes('🔍 Ревью карточки'));
+        expect(reviewLog).toContain('моделью card-reviewer-claude');
+        expect(reviewLog).toContain('(фолбэк: reviewer)');
+    });
+
+    it('без cardReview ревью сохраняет модель роли и не подменяет функцию рантайма', () => {
+        const process = runProcess(diskOf(card()));
+        const options = process.runClaudeFn.mock.calls[0][1];
+        expect(options.model).toBe('reviewer');
+        expect(options).not.toHaveProperty('modelProvider');
+        const deps = process.runClaudeFn.mock.calls[0][2] as Record<string, unknown>;
+        expect(deps.runClaudeOnceFn).toBeUndefined();
+    });
+
+    it('без cardReview правки сохраняют маршрут кодера', () => {
+        const process = runProcess(diskOf(reviewed({ sessions: 3 })));
+        expect(process.runClaudeFn).toHaveBeenCalledTimes(1);
+        expect(process.runClaudeFn.mock.calls[0][1]).toMatchObject({ model: 'coder' });
+        expect(process.runClaudeFn.mock.calls[0][1]).not.toHaveProperty('modelProvider');
+        const deps = process.runClaudeFn.mock.calls[0][2] as Record<string, unknown>;
+        expect(deps.runClaudeOnceFn).toBe(ralph.coderRuntimeRunFor('claude'));
+    });
+
+    it('кодер идёт по своему маршруту, а ревью и правки — по cardReview', () => {
+        const config = {
+            adapters: { coderRuntime: 'kimi-native' },
+            modelRouting: {
+                cardReview: { provider: 'kimi-native', model: 'card-reviewer' },
+            },
+        };
+        const pickRouteFn = vi.fn(() => ({ provider: 'kimi-native', model: 'coder-route' }));
+        const coder = runProcess(diskOf(null), { config, over: { pickRouteFn } });
+        const review = runProcess(diskOf(card()), { config, over: { pickRouteFn } });
+        const fix = runProcess(diskOf(reviewed({ sessions: 3 })), {
+            config,
+            over: { pickRouteFn },
+        });
+        for (const process of [coder, review, fix]) {
+            expect(process.runClaudeFn).toHaveBeenCalledTimes(1);
+            const deps = process.runClaudeFn.mock.calls[0][2] as Record<string, unknown>;
+            expect(deps.runClaudeOnceFn).toBe(ralph.coderRuntimeRunFor('kimi-native'));
+        }
+        expect(coder.runClaudeFn.mock.calls[0][1]).toMatchObject({
+            model: 'coder-route',
+            modelProvider: 'kimi-native',
+        });
+        for (const process of [review, fix]) {
+            expect(process.runClaudeFn.mock.calls[0][1]).toMatchObject({
+                model: 'card-reviewer',
+                modelProvider: 'kimi-native',
+            });
+        }
+        expect(pickRouteFn).toHaveBeenCalledTimes(1);
     });
 });
 

@@ -829,6 +829,7 @@ export type TRuntimeSelection = {
     modelRouting?: {
         labels?: Record<string, unknown>;
         default?: unknown;
+        cardReview?: unknown;
         apiLimitFallback?: unknown;
         healEscalation?: unknown;
     };
@@ -861,7 +862,7 @@ export function harnessRoutes(
         if (provider !== fallback)
             out.push(route(`modelRouting.labels.${label} → '${provider}'`, provider));
     }
-    for (const key of ['default', 'apiLimitFallback'] as const) {
+    for (const key of ['default', 'apiLimitFallback', 'cardReview'] as const) {
         if (routing[key] === undefined) continue;
         const provider = providerOf(routing[key]);
         if (provider !== fallback) out.push(route(`modelRouting.${key} → '${provider}'`, provider));

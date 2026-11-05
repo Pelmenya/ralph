@@ -666,6 +666,23 @@ describe('#376 modelRouting провайдер-осведомлён — fail-clo
         ).toThrow(/неизвестный провайдер/);
     });
 
+    it('cardReview валидируется той же схемой записи маршрута', () => {
+        expect(
+            resolveProfile(
+                withRouting({ cardReview: { provider: 'kimi-native', model: 'k/m' } }),
+                'playground',
+                boom,
+            ).modelRouting.cardReview,
+        ).toEqual({ provider: 'kimi-native', model: 'k/m' });
+        expect(() =>
+            resolveProfile(
+                withRouting({ cardReview: { provider: 'bogus', model: 'x' } }),
+                'playground',
+                boom,
+            ),
+        ).toThrow(/modelRouting\.cardReview\.provider.*неизвестный провайдер/);
+    });
+
     it('healEscalation (доп.скоуп): afterAttempts обязан быть положительным числом', () => {
         expect(() =>
             resolveProfile(
@@ -790,6 +807,16 @@ describe('#376 modelRouting провайдер-осведомлён — fail-clo
                     boom,
                 ),
             ).toThrow(/provider обязателен.*≠ 'claude'/s);
+        });
+
+        it('голая строка cardReview при статическом не-claude → стоп с путём записи', () => {
+            expect(() =>
+                resolveProfile(
+                    withAdapters({ cardReview: 'k/m' }, 'kimi-native'),
+                    'playground',
+                    boom,
+                ),
+            ).toThrow(/modelRouting\.cardReview — голая строка-модель/);
         });
 
         it('все записи с явным provider → проходит', () => {

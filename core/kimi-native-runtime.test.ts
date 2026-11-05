@@ -371,7 +371,8 @@ describe('spawnKimiNative — граница процесса', () => {
 });
 
 describe('checkKimiNativeAvailable — отказ до выбора задачи с причиной', () => {
-    const CONFIG = 'default_model = "kimi-code/kimi-for-coding"\n';
+    const CONFIG =
+        'default_model = "kimi-code/kimi-for-coding"\n[models."kimi-code/kimi-for-coding"]\n';
     const deps = (over: Record<string, unknown> = {}) => ({
         probeFn: vi.fn(),
         readFileFn: () => CONFIG,
@@ -449,6 +450,131 @@ describe('checkKimiNativeAvailable — отказ до выбора задачи
         expect(fails[0]).toMatch(
             /Кодер-рантайм недоступен \(kimi-native\): Kimi Code не авторизован/,
         );
+    });
+
+    it('опечатка в modelRouting.default — отказ готовности с именем алиаса', () => {
+        const cfg = {
+            kimiNativeRuntime: { model: 'runtime' },
+            modelRouting: { default: { provider: 'kimi-native', model: 'default-typo' } },
+        };
+        expect(() =>
+            build().checkKimiNativeAvailable(
+                deps({ cfg, readFileFn: () => '[models."runtime"]\n' }),
+            ),
+        ).toThrow(/default-typo/);
+    });
+
+    it('шаг старта: нет алиаса именно у cardReview — прогон остановлен', () => {
+        const rt = build();
+        const cfg = {
+            adapters: { coderRuntime: 'kimi-native' },
+            kimiNativeRuntime: { model: 'runtime' },
+            modelRouting: {
+                default: { provider: 'kimi-native', model: 'default' },
+                cardReview: { provider: 'kimi-native', model: 'review-missing' },
+            },
+        };
+        const fails: string[] = [];
+        rt.checkCoderRuntimes(cfg as never, {
+            failFn: (m: string) => void fails.push(m),
+            logFn: () => {},
+            checkRuntimeFn: (provider: string) => {
+                if (provider === 'kimi-native') {
+                    rt.checkKimiNativeAvailable(
+                        deps({
+                            cfg,
+                            readFileFn: () => '[models."runtime"]\n[models."default"]\n',
+                        }),
+                    );
+                }
+            },
+        });
+        expect(fails).toHaveLength(1);
+        expect(fails[0]).toContain('review-missing');
+    });
+
+    it('целевой конфиг: алиасы готовы, а -m различает кодера, ревью/правки карточки и роли сдачи', () => {
+        const rt = build();
+        const cfg = {
+            adapters: { coderRuntime: 'kimi-native' },
+            kimiNativeRuntime: { status: 'experimental', model: 'Highspeed' },
+            modelRouting: {
+                default: { provider: 'kimi-native', model: 'ordinary-model' },
+                labels: {
+                    'complexity:low': { provider: 'kimi-native', model: 'cheap-model' },
+                },
+                cardReview: { provider: 'kimi-native', model: 'card-reviewer' },
+            },
+        };
+        const failures: string[] = [];
+        rt.checkExperimentalRuntimes(cfg as never, {
+            selected: 'kimi-native',
+            failFn: (message: string) => void failures.push(message),
+            logFn: () => {},
+        });
+        expect(failures).toEqual([]);
+        rt.checkKimiNativeAvailable(
+            deps({
+                cfg,
+                readFileFn: () =>
+                    '[models."Highspeed"]\n[models."ordinary-model"]\n' +
+                    '[models."cheap-model"]\n[models."card-reviewer"]\n',
+            }),
+        );
+
+        rt.setConfigForTests(cfg as never);
+        const issue = { number: 7, title: 'карточка', labels: [] };
+        const coderRoute = {
+            provider: rt.pickRuntime(issue),
+            model: rt.pickModel(issue),
+        };
+        const cardRoute = rt.resolveModelRoute(cfg.modelRouting.cardReview, 'kimi-native');
+        expect(coderRoute).toEqual({ provider: 'kimi-native', model: 'ordinary-model' });
+        expect(cardRoute).toEqual({ provider: 'kimi-native', model: 'card-reviewer' });
+        if (cardRoute === null) throw new Error('cardReview не разрешился');
+        const sessions = [
+            ['кодер', coderRoute],
+            ['ревью карточки', cardRoute],
+            ['правки карточки', cardRoute],
+        ] as const;
+        for (const [prompt, route] of sessions) {
+            rt.runKimiNativeOnce(
+                prompt,
+                {
+                    model: route.model,
+                    modelProvider: route.provider,
+                    maxTurns: 20,
+                },
+                spawnReturning({}) as unknown as SpawnSyncFn,
+                VERSION,
+                {
+                    homeFn: () => null,
+                    writePromptFn: () => {},
+                    removePromptFn: () => {},
+                    isDirFn: () => false,
+                    sessionTree: null,
+                },
+            );
+        }
+        rt.runKimiNativeOnce(
+            'ревью фазы',
+            { model: 'claude-reviewer', maxTurns: 80 },
+            spawnReturning({}) as unknown as SpawnSyncFn,
+            VERSION,
+            {
+                homeFn: () => null,
+                writePromptFn: () => {},
+                removePromptFn: () => {},
+                isDirFn: () => false,
+                sessionTree: null,
+            },
+        );
+        const sessionLogs = logs.filter((line) => line.includes('▶ kimi-native'));
+        expect(sessionLogs).toHaveLength(4);
+        expect(sessionLogs[0]).toContain('-m ordinary-model');
+        expect(sessionLogs[1]).toContain('-m card-reviewer');
+        expect(sessionLogs[2]).toContain('-m card-reviewer');
+        expect(sessionLogs[3]).toContain('-m Highspeed');
     });
 
     it('реестр: checkAvailable kimi-native — это проверка входа, а не голый --version', () => {

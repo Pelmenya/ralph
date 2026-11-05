@@ -322,6 +322,7 @@ describe('харнесс рантайма: guard обязан быть дока�
                 labels: { 'complexity:high': { provider: 'openai', model: 'm' }, a: 'haiku' },
                 default: { provider: 'kimi', model: 'k' },
                 apiLimitFallback: { provider: 'openai', model: 'm' },
+                cardReview: { provider: 'openai', model: 'm' },
             },
         });
         expect(routes.map((r) => `${r.where} ${r.harness}`)).toEqual([
@@ -329,6 +330,7 @@ describe('харнесс рантайма: guard обязан быть дока�
             "modelRouting.labels.complexity:high → 'openai' codex",
             "modelRouting.default → 'kimi' claude-code",
             "modelRouting.apiLimitFallback → 'openai' codex",
+            "modelRouting.cardReview → 'openai' codex",
         ]);
         expect(unguardedRoutes(routes)).toEqual([]);
     });

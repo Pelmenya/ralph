@@ -466,10 +466,11 @@ export function createConfigProfile(env: ConfigProfileEnv) {
     // объект { provider, model } (явный выбор провайдера кодер-рантайма). provider
     // сверяется ПРОТИВ РЕЕСТРА (CODER_RUNTIME_PROVIDERS), а не принимается любой строкой —
     // иначе опечатка вида "kimy" тихо укатилась бы на дефолтный рантайм (инвариант №1).
-    // Используется для modelRouting.labels[*]/default/apiLimitFallback/healEscalation.route —
-    // один валидатор на все четыре места, схема одинаковая. Имя `assertValid*` (а не
-    // `describe*`) отражает роль: функция ВАЛИДИРУЕТ (true / результат failFn), а не
-    // форматирует описание — консистентно с соседями assertValidHaltBeforeDeploy/…
+    // Используется для modelRouting.labels[*]/default/cardReview/apiLimitFallback/
+    // healEscalation.route — один валидатор на все пять мест, схема одинаковая. Имя
+    // `assertValid*` (а не `describe*`) отражает роль: функция ВАЛИДИРУЕТ (true / результат
+    // failFn), а не форматирует описание — консистентно с соседями
+    // assertValidHaltBeforeDeploy/…
     //
     // requireProvider (ревью-blocker): когда статический adapters.coderRuntime ≠ 'claude',
     // безпровайдерная запись (голая строка ИЛИ объект без provider) означает «модель для
@@ -531,11 +532,11 @@ export function createConfigProfile(env: ConfigProfileEnv) {
     }
 
     // Fail-closed на схеме modelRouting целиком (#376): labels/default читает КАЖДЫЙ
-    // кодер-запуск (pickModel/pickRuntime, orchestrator.ts), apiLimitFallback/healEscalation —
-    // доп.скоуп кросс-провайдерного фолбэка и эскалации heal-сессий гейта. Невалидная
-    // комбинация провайдер/модель ловится здесь, на старте, а не в момент диспетчеризации
-    // кодер-сессии посреди ночного прогона. Возврат: true — валиден; иначе результат failFn
-    // (мягкий failFn пробрасываем наверх).
+    // кодер-запуск (pickModel/pickRuntime, orchestrator.ts), cardReview объявляет модель
+    // ревью карточки, apiLimitFallback/healEscalation — доп.скоуп кросс-провайдерного
+    // фолбэка и эскалации heal-сессий гейта. Невалидная комбинация провайдер/модель ловится
+    // здесь, на старте, а не в момент диспетчеризации кодер-сессии посреди ночного прогона.
+    // Возврат: true — валиден; иначе результат failFn (мягкий failFn пробрасываем наверх).
     function assertValidModelRouting(
         cfg: Record<string, unknown>,
         profileName: string,
@@ -566,6 +567,13 @@ export function createConfigProfile(env: ConfigProfileEnv) {
             entryOpts,
         );
         if (defaultOk !== true) return defaultOk;
+        const cardReviewOk = assertValidModelRouteEntry(
+            'modelRouting.cardReview',
+            routing.cardReview,
+            failFn,
+            entryOpts,
+        );
+        if (cardReviewOk !== true) return cardReviewOk;
         if (routing.labels !== undefined) {
             if (!isPlainObject(routing.labels)) {
                 return failFn(
@@ -970,8 +978,8 @@ export function createConfigProfile(env: ConfigProfileEnv) {
         const sectionsOk = assertValidRuntimeSections(merged, wanted, failFn);
         if (sectionsOk !== true) return sectionsOk; // мягкий failFn — наверх как есть
         // #376: modelRouting провайдер-осведомлён — валидируем схему целиком (labels/
-        // default/apiLimitFallback/healEscalation) до того, как раннер начнёт резолвить
-        // провайдера по label'ам issue.
+        // default/cardReview/apiLimitFallback/healEscalation) до того, как раннер начнёт
+        // резолвить провайдера по label'ам issue.
         const routingOk = assertValidModelRouting(merged, wanted, failFn);
         if (routingOk !== true) return routingOk; // мягкий failFn — наверх как есть
         // Политики обработки находок и оба порога — fail-closed: заданный мусор валит старт,

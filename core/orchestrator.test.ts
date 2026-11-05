@@ -2291,6 +2291,21 @@ describe('pickModel/pickRuntime — provider-aware роутинг по label iss
         expect(runtime.pickRuntime(issue)).toBe('openai');
     });
 
+    it('в одном конфиге метка ведёт на свою модель, а карточка без неё — на default', () => {
+        const runtime = routingRuntime({
+            default: { provider: 'kimi-native', model: 'ordinary-model' },
+            labels: {
+                'complexity:low': { provider: 'kimi-native', model: 'cheap-model' },
+            },
+        });
+        const labelled = issueWithLabels(['complexity:low']);
+        const unlabelled = issueWithLabels([]);
+        expect(runtime.pickModel(labelled)).toBe('cheap-model');
+        expect(runtime.pickRuntime(labelled)).toBe('kimi-native');
+        expect(runtime.pickModel(unlabelled)).toBe('ordinary-model');
+        expect(runtime.pickRuntime(unlabelled)).toBe('kimi-native');
+    });
+
     it('modelRouting не задан вовсе → pickModel = config.model, pickRuntime = дефолтный провайдер', () => {
         const runtime = buildRuntime();
         runtime.setConfigForTests({
@@ -10274,6 +10289,68 @@ describe('runLoop — основной while-цикл: итерации коде
             expect(prompts[fixAt]).toContain(plan.steps[0].do);
         });
 
+        it('маршруты кодера и cardReview не меняют рантайм ролей сдачи', () => {
+            let applications = 0;
+            let head = 1;
+            const runClaudeFn = vi.fn<RunClaudeFake>((prompt, _opts, d) => {
+                if (prompt.includes('Ты планировщик правок')) {
+                    emitOutput(d, planOutput, 0);
+                } else if (prompt.includes('Разбери замечания code review')) {
+                    head++;
+                }
+                return 0;
+            });
+            runPlannerPath(
+                {
+                    runClaudeFn,
+                    branchHeadShaFn: () => head.toString(16).repeat(40),
+                    phaseDiffFilesFn: () => ['core/x.ts'],
+                    applySessionRequestsFn: () => ({
+                        applied: 1,
+                        failed: false,
+                        closedIssues: [],
+                        prFindings:
+                            ++applications === 1 || applications === 3 ? reviewFindings : [],
+                        prBlocked: false,
+                    }),
+                },
+                {},
+                {
+                    config: {
+                        fixReviewAttempts: 1,
+                        adapters: { coderRuntime: 'kimi-native' },
+                        modelRouting: {
+                            default: { provider: 'kimi-native', model: 'ordinary-model' },
+                            labels: {
+                                'complexity:low': {
+                                    provider: 'kimi-native',
+                                    model: 'cheap-model',
+                                },
+                            },
+                            cardReview: { provider: 'kimi-native', model: 'card-reviewer' },
+                        },
+                    },
+                },
+            );
+            const markers = [
+                'проведи детальное code review',
+                'Ты планировщик правок',
+                'Разбери замечания code review',
+                'отревьюй ИМЕННО ЭТИ ПРАВКИ',
+                'Ты независимый арбитр',
+            ];
+            expect(runClaudeFn).toHaveBeenCalledTimes(markers.length);
+            for (const marker of markers) {
+                expect(runClaudeFn.mock.calls.some(([prompt]) => prompt.includes(marker))).toBe(
+                    true,
+                );
+            }
+            for (const [, options, sessionDeps] of runClaudeFn.mock.calls) {
+                expect(options).not.toHaveProperty('modelProvider');
+                expect(sessionDeps?.runClaudeOnceFn).toBeUndefined();
+            }
+        });
+
         it('планировщик получает review.fallback, а не общий fallbackModel', () => {
             const { runClaudeFn } = runPlannerPath(
                 {},
@@ -12897,7 +12974,13 @@ describe('runLoop — основной while-цикл: итерации коде
         runLoop(
             validCfg({
                 gateHealAttempts: 5,
+                adapters: { coderRuntime: 'kimi-native' },
                 modelRouting: {
+                    default: { provider: 'kimi-native', model: 'ordinary-model' },
+                    labels: {
+                        'complexity:low': { provider: 'kimi-native', model: 'cheap-model' },
+                    },
+                    cardReview: { provider: 'kimi-native', model: 'card-reviewer' },
                     healEscalation: {
                         afterAttempts: 2,
                         route: { provider: 'kimi', model: 'kimi-k2-0711-preview' },
@@ -12921,6 +13004,7 @@ describe('runLoop — основной while-цикл: итерации коде
         expect(state.gateHeals).toBe(1);
         const [, opts, depsOverride] = runClaudeFn.mock.calls[0];
         expect(opts.model).toBe('claude-coder'); // cfg.model, без эскалации
+        expect(opts).not.toHaveProperty('modelProvider');
         // healRoute===null → runClaudeOnceFn:undefined — реальный runClaude сам упал бы
         // на дефолт adapters.coderRuntime.run (деструктуризация); мок фиксирует именно
         // «override не передан», не разворачивая дефолт за него.

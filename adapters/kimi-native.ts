@@ -29,8 +29,9 @@
 //     каталогу, автообновление и окружение CLI раннера — `kimi-home.ts` (#196);
 //   • ПЕСОЧНИЦЫ НЕТ, а `docs/harness-adapters.md` требует её от `kimi-native`. Поэтому до
 //     неё рантайм — эксперимент оператора, как OpenCode (`KIMI_NATIVE_STATUS`): статус назван
-//     в конфиге дословно, маршрут `modelRouting` в него (метка, фолбэк лимита, эскалация) —
-//     отказ старта. Ночную сессию фолбэком на хост без песочницы раннер не отдаёт.
+//     в конфиге дословно, смена рантайма маршрутом `modelRouting` — отказ старта. Маршрут в
+//     уже статический kimi-native меняет только модель и разрешён; ночную сессию сменой
+//     рантайма на хост без песочницы раннер не отдаёт.
 //
 // TS-модуль без билд-шага (erasable-only), без побочек.
 
@@ -164,6 +165,10 @@ export function kimiSessionConfig(humanToml: string, hooks: readonly GuardHook[]
  * Готов ли вход до первой сессии — по дому CLI, без запроса в сеть. Две причины, обе сняты
  * живьём: без модели CLI отвечает «No model configured», без ключей — «provider … has no
  * credential configured». Ключ в самом конфиге (`api_key` провайдера) — тоже вход.
+ * Каждый алиас из requiredModels обязан иметь свою таблицу `[models."<алиас>"]`: опечатка
+ * иначе всплывала бы падением сессии. Таблица ищется точным сравнением обрезанных строк,
+ * поэтому метасимволы в алиасе ничего не расширяют, а комментарий объявлением не считается.
+ * Без явной model так же проверяется default_model — модель, которую CLI возьмёт без -m.
  * Протухший токен отсюда не виден: его сессия кончит исходом `auth`, и петля встанет с
  * «вход отвергнут».
  */
@@ -171,21 +176,35 @@ export function kimiNativeAuthProblems({
     configToml,
     credentialFiles,
     model,
+    requiredModels = [],
 }: {
     configToml: string | null;
     credentialFiles: readonly string[];
     model?: string;
+    requiredModels?: readonly string[];
 }): string[] {
     if (configToml === null) {
         return ['config.toml дома Kimi Code не прочитан — CLI не настроен: `kimi login`'];
     }
     const out: string[] = [];
-    const hasDefault = /^[ \t]*default_model\s*=\s*["'][^"']+["']/m.test(configToml);
-    if (!hasDefault && !model) {
+    const defaultModel = /^[ \t]*default_model\s*=\s*["']([^"']+)["']/m.exec(configToml);
+    if (!defaultModel && !model) {
         out.push(
             'модель не задана: ни `default_model` в config.toml, ни kimiNativeRuntime.model — ' +
                 'CLI ответил бы «No model configured»',
         );
+    }
+    const aliases = [...requiredModels];
+    if (!model && defaultModel) aliases.push(defaultModel[1]);
+    const configLines = configToml.split('\n').map((line) => line.trim());
+    for (const alias of new Set(aliases)) {
+        const table = `[models."${alias}"]`;
+        if (!configLines.includes(table)) {
+            out.push(
+                `модель "${alias}" не объявлена в config.toml: нет строки \`${table}\` — ` +
+                    'CLI остановился бы на неизвестном алиасе',
+            );
+        }
     }
     const hasApiKey = /^[ \t]*api_key\s*=\s*["'][^"']+["']/m.test(configToml);
     if (credentialFiles.length === 0 && !hasApiKey) {
