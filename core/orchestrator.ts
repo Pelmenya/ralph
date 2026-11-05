@@ -301,6 +301,7 @@ import type {
     RunOptions,
     RuntimeCapabilities,
     RunResult,
+    SessionEnd,
     SessionEndReason,
     TaskSourceAdapter,
 } from '../adapters/adapters.ts';
@@ -311,6 +312,7 @@ import {
     classifyClaudeSessionEnd,
     classifyCodexSessionEnd,
     classifyKimiNativeSessionEnd,
+    isKimiProviderApiFailure,
     classifyOpencodeSessionEnd,
 } from '../adapters/session-end.ts';
 // #120: Kimi Code родным харнессом — argv, дом CLI, вход и разбор stream-json.
@@ -324,6 +326,7 @@ import {
     kimiSourceHome,
     kimiStreamText,
 } from '../adapters/kimi-native.ts';
+import { kimiResetWaitMs } from '../adapters/kimi-usage.ts';
 import { codexHumanHome, codexIsolationProblems, codexSessionEnv } from '../adapters/codex-home.ts';
 import { kimiIsolationProblems, kimiSessionEnv } from '../adapters/kimi-home.ts';
 // #121: OpenCode — экспериментальный третий харнесс: argv, конфиг эксперимента, модель, текст.
@@ -3487,6 +3490,12 @@ export function createOrchestrator(env: OrchestratorEnv) {
         spawnFn: typeof spawnSync = spawnSync,
         env?: NodeJS.ProcessEnv,
         attempt: TAttemptContext = unreadAttemptContext('kimi-native'),
+        resetWaitFn: (confirmed: boolean) => number | undefined = (confirmed) =>
+            kimiResetWaitMs({
+                home: kimiSourceHome(config?.kimiNativeRuntime?.home, process.env),
+                confirmed,
+                logFn: log,
+            }),
     ): RunResult {
         if (spawnFn === spawnSync) guardSideEffect('spawnKimiNative(kimi)');
         const raw = spawnFn(KIMI_NATIVE_BIN, cmdArgs, {
@@ -3508,13 +3517,24 @@ export function createOrchestrator(env: OrchestratorEnv) {
         if (stderr) process.stderr.write(stderr);
         const { result, logLines } = resolveSpawnResult('kimi', res, output, timeoutMs);
         for (const line of logLines) log(line);
-        const end = classifyKimiNativeSessionEnd({
+        const classified = classifyKimiNativeSessionEnd({
             code: result.code,
             stdout: stdoutRaw,
             stderr,
             signal: res.signal ?? null,
             failureKind: result.failureKind,
         });
+        // Строка отказа срока не несёт, а запасные ожидания короче 5-часового окна. Неопознанный
+        // отказ провайдера сверяется тем же запросом: упор с незнакомой формулировкой иначе стал бы
+        // `unknown`, и петля жгла бы итерации о закрытое окно. Только на отказе — не на каждой сессии.
+        const askUsage =
+            classified.endReason === 'api-limit' ||
+            (classified.endReason === 'unknown' && isKimiProviderApiFailure(stderr));
+        const retryAfterMs = askUsage
+            ? resetWaitFn(classified.endReason !== 'api-limit')
+            : undefined;
+        const end: SessionEnd =
+            retryAfterMs === undefined ? classified : { endReason: 'api-limit', retryAfterMs };
         recordAttempt({
             runtime: 'kimi-native',
             code: result.code,

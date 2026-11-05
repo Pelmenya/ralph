@@ -303,8 +303,8 @@ export function classifyCodexSessionEnd(input: SessionEndInput): SessionEnd {
 //
 // Квота подписки у Kimi — тоже 429, но код CLI для неё `provider.api_error`, а не
 // `provider.rate_limit`: его различает только формулировка, и она взята из списка самого
-// CLI (`KIMI_QUOTA_EXHAUSTED_MESSAGE_PATTERNS`). Время сброса CLI в строку не кладёт —
-// `retryAfterMs` нет, ядро возьмёт `apiLimitFallbackWaitMin`.
+// CLI (`KIMI_QUOTA_EXHAUSTED_MESSAGE_PATTERNS`). Время сброса CLI в строку не кладёт, а эта
+// функция чистая: срок раннер добирает отдельно, из API лимитов (`kimi-usage.ts`).
 //
 // Срок раннера Kimi переживает по-своему: SIGTERM он ловит, прибирается и выходит кодом 143
 // (`signalExitCode`: 130 — SIGINT, 129 — SIGHUP), так что сигнала у spawnSync нет. Эти коды —
@@ -317,6 +317,15 @@ const KIMI_AUTH_RE =
     /^(provider\.auth_error:|No model configured|provider \S+ has no credential configured)/;
 const KIMI_QUOTA_RE =
     /exceeded your current (?:token )?quota|check your account balance|insufficient balance|recharge your account|please recharge|account (?:is )?in arrears/i;
+
+/**
+ * Отказ провайдера без признака лимита. Квоту CLI узнаёт и по коду ошибки, но в строку отказа
+ * кладёт только текст, а его формулировок мы не знаем: разобрать такой случай словами нельзя,
+ * и раннер сверяет его с состоянием квоты (`kimi-usage.ts`).
+ */
+export function isKimiProviderApiFailure(stderr: string): boolean {
+    return KIMI_FAILURE_RE.exec(stderr)?.[1]?.startsWith('provider.api_error:') === true;
+}
 
 export function classifyKimiNativeSessionEnd(input: SessionEndInput): SessionEnd {
     if (input.signal || KIMI_SIGNAL_EXIT_CODES.has(input.code)) return { endReason: 'timeout' };

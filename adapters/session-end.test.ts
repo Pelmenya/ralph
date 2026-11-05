@@ -70,7 +70,14 @@ const SPAWN_OF: Record<string, (stdout: string, stderr: string, c: TCase) => unk
     openai: (stdout, stderr, c) =>
         ralph.spawnCodex(['exec'], 'промпт', 1000, spawnFake(c, stdout, stderr)),
     'kimi-native': (stdout, stderr, c) =>
-        ralph.spawnKimiNative(['-p', 'указатель'], 1000, spawnFake(c, stdout, stderr)),
+        ralph.spawnKimiNative(
+            ['-p', 'указатель'],
+            1000,
+            spawnFake(c, stdout, stderr),
+            undefined,
+            undefined,
+            () => undefined,
+        ),
     opencode: (stdout, stderr, c) =>
         ralph.spawnOpencode(['run'], 'промпт', 1000, spawnFake(c, stdout, stderr)),
 };

@@ -354,6 +354,72 @@ describe('spawnKimiNative — граница процесса', () => {
         );
     });
 
+    describe('срок сброса из API лимитов', () => {
+        const failed = (line: string) =>
+            spawnReturning({
+                status: 1,
+                stderr: `error: failed to run prompt: ${line}\n`,
+            }) as unknown as SpawnSyncFn;
+        const spawn = (line: string, resetWaitFn: (confirmed: boolean) => number | undefined) =>
+            build().spawnKimiNative(
+                ['-p', 'x'],
+                1000,
+                failed(line),
+                undefined,
+                undefined,
+                resetWaitFn,
+            );
+        const QUOTA = 'provider.api_error: You exceeded your current quota';
+
+        it('упор: срок из API уходит ядру', () => {
+            const res = spawn(QUOTA, () => 3_600_000);
+            expect(res.endReason).toBe('api-limit');
+            expect(res.retryAfterMs).toBe(3_600_000);
+        });
+
+        it('упор без срока — api-limit без retryAfterMs, ядро возьмёт запасной', () => {
+            const res = spawn(QUOTA, () => undefined);
+            expect(res.endReason).toBe('api-limit');
+            expect(res).not.toHaveProperty('retryAfterMs');
+        });
+
+        it('незнакомая формулировка при исчерпанном окне — упор, а не unknown', () => {
+            const res = spawn('provider.api_error: reached organization TPD', () => 60_000);
+            expect(res.endReason).toBe('api-limit');
+            expect(res.retryAfterMs).toBe(60_000);
+        });
+
+        it('узнанный упор спрашивает срок, неопознанный — доказательство', () => {
+            const resetWaitFn = vi.fn((_confirmed: boolean) => undefined);
+            spawn(QUOTA, resetWaitFn);
+            expect(resetWaitFn).toHaveBeenLastCalledWith(false);
+            spawn('provider.api_error: Bad gateway', resetWaitFn);
+            expect(resetWaitFn).toHaveBeenLastCalledWith(true);
+        });
+
+        it('незнакомая формулировка при открытом окне — исход остаётся unknown', () => {
+            const res = spawn('provider.api_error: Bad gateway', () => undefined);
+            expect(res.endReason).toBe('unknown');
+            expect(res).not.toHaveProperty('retryAfterMs');
+        });
+
+        it('прочие отказы и успех API лимитов не спрашивают', () => {
+            const resetWaitFn = vi.fn(() => 1);
+            expect(spawn('loop.max_steps_exceeded: x', resetWaitFn).endReason).toBe('turn-limit');
+            expect(spawn('что-то неизвестное', resetWaitFn).endReason).toBe('unknown');
+            const ok = build().spawnKimiNative(
+                ['-p', 'x'],
+                1000,
+                spawnReturning({}) as unknown as SpawnSyncFn,
+                undefined,
+                undefined,
+                resetWaitFn,
+            );
+            expect(ok.endReason).toBe('completed');
+            expect(resetWaitFn).not.toHaveBeenCalled();
+        });
+    });
+
     it('бинаря нет — отказ запуска, исход unknown', () => {
         const rt = build();
         const res = rt.spawnKimiNative(
