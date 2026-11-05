@@ -19,6 +19,8 @@ export type TStopReason =
     | 'gate-tool-failure'
     | 'review-dispute'
     | 'review-no-verdict'
+    | 'card-unreviewed'
+    | 'card-review-limit'
     | 'fix-plan'
     | 'phase-too-large'
     | 'review-base'
@@ -66,6 +68,8 @@ export const REASON_TITLES: Record<TStopReason, string> = {
     'gate-tool-failure': 'чек упал на инструменте, а не на коде',
     'review-dispute': 'спор ревью',
     'review-no-verdict': 'ревью без вердикта',
+    'card-unreviewed': 'карточка не может быть закрыта без ревью',
+    'card-review-limit': 'исчерпан бюджет ревью карточки',
     'fix-plan': 'отказ планировщика правок',
     'phase-too-large': 'ветка фазы слишком велика для ревью',
     'review-base': 'база ревью фазы недействительна',

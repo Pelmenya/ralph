@@ -164,6 +164,117 @@ describe('inspectState — версия схемы и форма state', () => {
         });
     });
 
+    describe('cardReview и cardHistory', () => {
+        const headA = 'a'.repeat(40);
+        const headB = 'b'.repeat(40);
+        const startedAt = '2026-11-05T10:00:00.000Z';
+        const finding = {
+            id: 'F1',
+            severity: 'blocker',
+            comment: 'потерян отказ',
+            anchor: { path: 'core/a.ts', line: 42 },
+            round: 1,
+            head: headA,
+            status: 'open',
+            test: null,
+            note: null,
+        };
+        const cardReview = {
+            issue: 7,
+            milestone: 'M1',
+            firstHead: headA,
+            closeComment: '',
+            rounds: 2,
+            sessions: 5,
+            failedSessions: 1,
+            lastReviewedHead: headB,
+            verdict: 'findings',
+            findings: [finding],
+            pending: { role: 'fix', head: headB, saved: true },
+            closing: headB,
+            limitHead: headB,
+            startedAt,
+        };
+        const cardRecord = {
+            issue: 7,
+            milestone: 'M1',
+            outcome: 'blocked',
+            head: headB,
+            verdict: 'findings',
+            lastReviewedHead: headB,
+            rounds: 2,
+            sessions: 5,
+            failedSessions: 1,
+            findings: [finding],
+            startedAt,
+            finishedAt: '2026-11-05T10:00:12.000Z',
+        };
+
+        it('state без cardReview и cardHistory остаётся v2 без миграции', () => {
+            const r = inspectState(JSON.stringify(v2));
+            expect(r).toMatchObject({
+                status: 'ok',
+                migrated: false,
+                foundVersion: STATE_SCHEMA_VERSION,
+            });
+            if (r.status !== 'ok') return;
+            expect(r.state.schemaVersion).toBe(STATE_SCHEMA_VERSION);
+            expect(r.state).not.toHaveProperty('cardReview');
+            expect(r.state).not.toHaveProperty('cardHistory');
+        });
+
+        it.each([
+            ['cardReview не объект', { cardReview: 'pending' }, 'cardReview'],
+            [
+                'cardReview с коротким sha',
+                { cardReview: { ...cardReview, firstHead: 'abc' } },
+                'firstHead',
+            ],
+            [
+                'cardReview с отрицательным счётчиком',
+                { cardReview: { ...cardReview, rounds: -1 } },
+                'rounds',
+            ],
+            [
+                'cardReview с неизвестным статусом',
+                {
+                    cardReview: {
+                        ...cardReview,
+                        findings: [{ ...finding, status: 'deferred' }],
+                    },
+                },
+                'status',
+            ],
+            ['cardHistory не массив', { cardHistory: {} }, 'cardHistory'],
+            [
+                'cardHistory с stop',
+                { cardHistory: [{ ...cardRecord, outcome: 'stop' }] },
+                'outcome',
+            ],
+            [
+                'cardHistory closed без головы',
+                { cardHistory: [{ ...cardRecord, outcome: 'closed', head: null }] },
+                'head',
+            ],
+        ])('%s → corrupt с именем поля', (_name, over, field) => {
+            const r = inspectState(JSON.stringify({ ...v2, ...over }));
+            expect(r).toMatchObject({
+                status: 'corrupt',
+                reason: expect.stringMatching(new RegExp(field)),
+            });
+        });
+
+        it('полный cardReview и cardHistory переживают JSON круговой проход', () => {
+            const r = inspectState(
+                JSON.stringify({ ...v2, cardReview, cardHistory: [cardRecord] }),
+            );
+            expect(r.status).toBe('ok');
+            if (r.status !== 'ok') return;
+            expect(r.state.cardReview).toEqual(cardReview);
+            expect(r.state.cardHistory).toEqual([cardRecord]);
+        });
+    });
+
     it('годный v1 — проверенная миграция в v2', () => {
         const r = inspectState(JSON.stringify(v1));
         expect(r).toMatchObject({ status: 'ok', migrated: true });

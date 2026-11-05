@@ -95,6 +95,8 @@ export const STOP_ROLES: Record<TStopReason, 'barrier' | 'paired' | 'loop'> = {
     'review-dispute': 'paired',
     // Ревью без вердикта, планировщик и неподтверждённая метка ловятся ДО гейта: строки его нет.
     'review-no-verdict': 'barrier',
+    'card-unreviewed': 'barrier',
+    'card-review-limit': 'barrier',
     'fix-plan': 'barrier',
     'phase-too-large': 'barrier',
     // #275: битая база в конфиге — ошибка настройки петли, не пойманное плохое изменение.

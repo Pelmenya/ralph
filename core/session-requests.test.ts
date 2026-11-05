@@ -407,6 +407,97 @@ describe('parseSessionRequests — разбор намерений кодер-с
     });
 });
 
+describe('#291 намерения ревью карточки', () => {
+    it('разбирает находку, блок и отчёт о правке', () => {
+        const raw = [
+            line({
+                kind: 'card-comment',
+                issue: 7,
+                comment: '🟠 [major] закрытие теряет находку',
+                path: 'core/a.ts',
+                line: 42,
+            }),
+            line({ kind: 'card-block', issue: 7, comment: 'нельзя закрывать' }),
+            line({ kind: 'card-fix', issue: 7, finding: 'F1', test: 'держит находку' }),
+        ].join('\n');
+        expect(parseSessionRequests(raw, opts)).toEqual([
+            {
+                kind: 'card-comment',
+                issue: 7,
+                comment: '🟠 [major] закрытие теряет находку',
+                anchor: { path: 'core/a.ts', line: 42 },
+            },
+            { kind: 'card-block', issue: 7, comment: 'нельзя закрывать' },
+            { kind: 'card-fix', issue: 7, finding: 'F1', test: 'держит находку' },
+        ]);
+    });
+
+    it('card-comment без якоря — сводка, но серьёзность обязательна у обеих форм', () => {
+        expect(
+            parseSessionRequests(
+                line({ kind: 'card-comment', issue: 7, comment: '⚪ [nit] чисто' }),
+                opts,
+            ),
+        ).toEqual([{ kind: 'card-comment', issue: 7, comment: '⚪ [nit] чисто' }]);
+        for (const comment of ['без разметки', '[major] без эмодзи']) {
+            expect(() =>
+                parseSessionRequests(
+                    line({ kind: 'card-comment', issue: 7, comment, path: 'a.ts', line: 1 }),
+                    opts,
+                ),
+            ).toThrow(/серьёзност/i);
+            expect(() =>
+                parseSessionRequests(line({ kind: 'card-comment', issue: 7, comment }), opts),
+            ).toThrow(/серьёзност/i);
+        }
+    });
+
+    it.each(['🔴 [blocker] итог', '🟠 [major] итог'])(
+        'сводка с тегом blocker/major без места — отказ: %s',
+        (comment) => {
+            expect(() =>
+                parseSessionRequests(line({ kind: 'card-comment', issue: 7, comment }), opts),
+            ).toThrow(/находка без места/i);
+        },
+    );
+
+    it.each([
+        [{ kind: 'card-comment', issue: '7', comment: '⚪ [nit] x' }, /номер карточки/i],
+        [{ kind: 'card-block', issue: 0, comment: 'x' }, /номер карточки/i],
+        [{ kind: 'card-fix', issue: 7, finding: 'F1', test: '' }, /test|тест/i],
+        [{ kind: 'card-fix', issue: 7, finding: 'F1', test: '   ' }, /test|тест/i],
+        [{ kind: 'card-fix', issue: 7, finding: 'F1', test: 'x'.repeat(301) }, /300/],
+        [{ kind: 'card-fix', issue: 7, finding: '1', test: 'x' }, /finding|F\\d/i],
+        [{ kind: 'card-fix', issue: 7, finding: 'F-1', test: 'x' }, /finding|F\\d/i],
+        [{ kind: 'card-fix', issue: 7, finding: 'X1', test: 'x' }, /finding|F\\d/i],
+    ])('НЕГАТИВНЫЙ: домен значений отвергается', (request, reason) => {
+        expect(() => parseSessionRequests(line(request), opts)).toThrow(reason);
+    });
+
+    it('card-fix принимает test длиной ровно 300 символов', () => {
+        const request = { kind: 'card-fix', issue: 7, finding: 'F12', test: 'x'.repeat(300) };
+        expect(parseSessionRequests(line(request), opts)).toEqual([request]);
+    });
+
+    it('якорь card-comment переживает serialize → parse без потери места', () => {
+        const [parsed] = parseSessionRequests(
+            line({
+                kind: 'card-comment',
+                issue: 7,
+                comment: '🟡 [minor] здесь',
+                path: 'core/a.ts',
+                line: 42,
+                side: 'LEFT',
+            }),
+            opts,
+        );
+        expect(parseSessionRequests(serializeSessionRequest(parsed), opts)).toEqual([parsed]);
+        expect(parsed).toMatchObject({
+            anchor: { path: 'core/a.ts', line: 42, side: 'LEFT' },
+        });
+    });
+});
+
 // #64: хвост неприменённого батча пишется на диск и читается СЛЕДУЮЩИМ прогоном тем же
 // парсером. Пока хвост сериализовался наивным JSON.stringify, он уезжал в нормализованной
 // форме (`anchor: {path, line}`), которой парсер не понимает, — якорь молча терялся, и

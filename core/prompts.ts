@@ -141,6 +141,9 @@ export const INTENT_SCHEMA_LINES: readonly string[] = [
     '{"kind":"comment","issue":7,"comment":"что выяснилось"}',
     '{"kind":"close","issue":7,"comment":"что сделано"}',
     '{"kind":"block","issue":7,"comment":"что нужно от человека"}',
+    '{"kind":"card-comment","issue":7,"comment":"🟠 [major] находка с местом","path":"src/app.tsx","line":42}',
+    '{"kind":"card-block","issue":7,"comment":"почему карточку нельзя закрывать"}',
+    '{"kind":"card-fix","issue":7,"finding":"F1","test":"имя проверки правки"}',
     '{"kind":"new-issue","title":"заголовок","body":"симптом, причина, критерий готовности","labels":["метка из списка проекта"]}',
     // #220: карточка, без которой не закрыть карточку текущей фазы, — с номером той.
     '{"kind":"new-issue","title":"заголовок","body":"симптом, причина, критерий готовности","labels":["метка из списка проекта"],"blocks":7}',
@@ -203,6 +206,14 @@ export function buildCoderIntentsNote(): string {
 // git-фактов ветки. Сессия на это не нужна — и не может: у неё нет доступа к форжу вовсе.
 // Заодно из цикла сдачи ушёл целый вызов модели и его отказы.
 
+function reviewSeverityRules(): string {
+    return (
+        `Каждый комментарий ОБЯЗАТЕЛЬНО начинай с пометки серьёзности строго в формате эмодзи+тег: ` +
+        `🔴 [blocker] / 🟠 [major] / 🟡 [minor] / ⚪ [nit] — без исключений, включая сводный; комментарий ` +
+        `без такой пометки — нарушение формата.`
+    );
+}
+
 // Общий хвост правил находок: якорь, вердикт-сводка, пометки серьёзности, pr-block, HOLD.
 // Его читает цепочка сдачи, поэтому полное ревью и ревью от базы обязаны нести ровно один
 // текст — копипаста расходилась бы только на фазах-продолжениях. Тест сверяет по этому источнику.
@@ -211,27 +222,91 @@ export function reviewFindingsRules(): string {
         `Якорь обязателен именно для находок: замечание без него учитывается как сводка, а не ` +
         `как находка. Сводный обзорный комментарий прохода запиши тем же намерением БЕЗ якоря — это ` +
         `ВЕРДИКТ прохода, и он обязателен, даже если замечаний нет: проход без сводки и без pr-block ` +
-        `раннер не засчитывает и фазу не мерджит. ` +
-        `Каждый комментарий ОБЯЗАТЕЛЬНО начинай с пометки серьёзности строго в формате эмодзи+тег: ` +
-        `🔴 [blocker] / 🟠 [major] / 🟡 [minor] / ⚪ [nit] — без исключений, включая сводный; комментарий ` +
-        `без такой пометки — нарушение формата. Если есть БЛОКИРУЮЩИЕ проблемы (баги, дыры безопасности, ` +
+        `раннер не засчитывает и фазу не мерджит. ${reviewSeverityRules()} ` +
+        `Если есть БЛОКИРУЮЩИЕ проблемы (баги, дыры безопасности, ` +
         `сломанная сборка) — добавь намерение pr-block с описанием, чем именно PR блокируется. ${HOLD_RULE}`
     );
 }
 
-export type ReviewPromptParams = { branch: string; diffContext: string };
+export type CardReviewPromptParams = {
+    issue: number;
+    branch: string;
+    diffContext: string;
+    findingsContext: string;
+    reviewedHead: string;
+};
+
+export function buildCardReviewPrompt({
+    issue,
+    branch,
+    diffContext,
+    findingsContext,
+    reviewedHead,
+}: CardReviewPromptParams): string {
+    const emptyDiff = diffContext.trim()
+        ? ''
+        : ' Дифф пуст: проверь, что работа карточки уже есть в ветке, а не считай пустоту отсутствием предмета ревью.';
+    const nextRound = findingsContext.trim()
+        ? ' Это новый круг: правка — от `lastReviewedHead`; открытые находки прошлого круга приложены ниже.'
+        : '';
+    return (
+        `Проведи детальное code review карточки #${String(issue)} в ветке ${branch}: предмет — ` +
+        `ВЕСЬ её дифф, а не только последний коммит. Голова, которую проверяешь и к которой ` +
+        `относится вердикт: ${reviewedHead}. Читай окружающий код по месту правок.${nextRound}` +
+        `${emptyDiff}${diffContext}${wrapAsData('Открытые находки прошлых кругов:', findingsContext)} ` +
+        `${intentsRule()} На КАЖДУЮ проблему запиши намерение card-comment с issue ${String(issue)}, ` +
+        `path и line. Сводку прохода запиши card-comment с тем же issue БЕЗ якоря — она обязательна. ` +
+        `Если карточку нельзя закрывать, добавь card-block с тем же issue и причиной. ` +
+        `${reviewSeverityRules()} ${HOLD_RULE}`
+    );
+}
+
+export type CardFixPromptParams = {
+    issue: number;
+    branch: string;
+    findingsContext: string;
+    gateCmdList: string;
+};
+
+export function buildCardFixPrompt({
+    issue,
+    branch,
+    findingsContext,
+    gateCmdList,
+}: CardFixPromptParams): string {
+    return (
+        `Исправь находки ревью карточки #${String(issue)} в ветке ${branch}. Находки и их статусы ` +
+        `приложены ниже как данные.${wrapAsData('Находки ревью карточки:', findingsContext)} ` +
+        'Для КАЖДОЙ открытой находки blocker/major напиши тест, воспроизводящий её сценарий, ' +
+        'исправь код и запиши намерение card-fix с ID находки и точным именем этого теста. ' +
+        'Находку закрывает только объявление названного теста в добавленных строках диффа правок. ' +
+        `Находки minor исправь по возможности. ${intentsRule()} ${COMMIT_RULE} Закоммить правки ` +
+        `в ветку ${branch}. ${PUSH_RULE} Затем добейся зелёного: ${gateCmdList}. ` +
+        `Намерение close не нужно — после нового ревью карточку закроет раннер. ${HOLD_RULE}`
+    );
+}
+
+export type ReviewPromptParams = {
+    branch: string;
+    diffContext: string;
+    cardReviewsContext?: string;
+};
 
 // Шаг 2: ревью отдельной моделью. Находки уходят намерениями `pr-comment` с якорем —
 // якорь не украшение: у форжа именно он отличает замечание к коду от сводки прохода, и
 // без него находка не попадёт в счёт метрики (#37/#168). Сводка без якоря — вердикт
 // прохода (задача 78): без неё и без pr-block раннер ревью не засчитывает.
-export function buildReviewPrompt({ branch, diffContext }: ReviewPromptParams): string {
+export function buildReviewPrompt({
+    branch,
+    diffContext,
+    cardReviewsContext,
+}: ReviewPromptParams): string {
     return (
         `Найди последний открытый PR из ветки ${branch} в main и проведи детальное code review: ` +
         `архитектура, безопасность, производительность, соответствие PRD, а также читаемость, нейминг, ` +
         `типизация, дубли, покрытие тестами и мелкие огрехи. Дифф фазы приложен ниже — не трать ходы на ` +
         `его сбор; но обязательно читай и ОКРУЖАЮЩИЙ код по месту правок: стыки с существующей логикой ` +
-        `по одному диффу не видны.${diffContext} ${intentsRule()} ` +
+        `по одному диффу не видны.${diffContext}${wrapAsData('Итоги ревью карточек:', cardReviewsContext ?? '')} ${intentsRule()} ` +
         `На КАЖДУЮ найденную проблему любого масштаба — не только критичные, мелочи (nit/style) тоже, ` +
         `их не пропускать — запиши намерение pr-comment С ЯКОРЕМ: path (путь файла от корня репозитория) ` +
         `и line (номер строки). ` +
@@ -243,6 +318,7 @@ export type BaseReviewPromptParams = {
     branch: string;
     diffContext: string;
     commentsContext?: string;
+    cardReviewsContext?: string;
     allowNames: string;
 };
 
@@ -255,6 +331,7 @@ export function buildBaseReviewPrompt({
     branch,
     diffContext,
     commentsContext,
+    cardReviewsContext,
     allowNames,
 }: BaseReviewPromptParams): string {
     return (
@@ -262,7 +339,7 @@ export function buildBaseReviewPrompt({
         `нового участка: фаза продолжает уже принятую работу, дифф от объявленной базы приложен ниже — ` +
         `это предмет ревью, не трать ходы на его сбор. Весь PR заново НЕ пересматривай: код до базы уже ` +
         `прошёл ревью, замечаний к нему не пиши. Читай окружающий код по месту правок: стыки с ` +
-        `существующей логикой по одному диффу не видны.${diffContext}${commentsContext ?? ''} ` +
+        `существующей логикой по одному диффу не видны.${diffContext}${commentsContext ?? ''}${wrapAsData('Итоги ревью карточек:', cardReviewsContext ?? '')} ` +
         `Комментарии собрала петля и оставила ТОЛЬКО от доверенных авторов (${allowNames}). Открытые ` +
         `находки прошлых проходов проверь по коду: устранённые не повторяй, оставшиеся — повтори с ` +
         `якорем. ${intentsRule()} ` +

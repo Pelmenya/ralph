@@ -35,6 +35,12 @@ import {
     type TSubmitRecord,
 } from './submit-journal.ts';
 import { parseRefusalSeries } from './refusal-series.ts';
+import {
+    parseCardHistory,
+    parseCardProgress,
+    type TCardProgress,
+    type TCardRecord,
+} from './card-review.ts';
 
 // Формат ralph.state.json — контракт (критерий #359). milestone === null означает «все
 // фазы пройдены» (см. phaseIndexOf/advancePhase в ralph.js). Остальные поля — счётчики
@@ -96,6 +102,10 @@ export type RalphState = {
     // #284: чини-сессия начата, но итог ещё не записан. На рестарте маркер не даёт
     // запушенному коммиту попасть в гейт мимо ревью; отсутствие поля — маркера нет.
     healInFlight?: THealInFlight | null;
+    // S2f: прогресс и завершённые записи ревью текущей карточки. Поля опциональны, поэтому
+    // схема остаётся v2; с диска они приходят только через строгие parseCard* выше.
+    cardReview?: TCardProgress | null;
+    cardHistory?: TCardRecord[];
     // #93: журнал этапов сдачи фазы (submit-journal.ts). `submitted`, `deployBlock` и
     // `reviewOfFixes.arbitrated` выше — его проекции: у state, прошедшего
     // `attachSubmitJournal`, они аксессоры, и на диск ложится журнал, а не поля.
@@ -264,6 +274,22 @@ export function inspectState(text: string): TStateInspection {
             return bad((e as Error).message);
         }
     }
+    let cardReview: ReturnType<typeof parseCardProgress> | undefined;
+    if (raw.cardReview !== undefined) {
+        try {
+            cardReview = parseCardProgress(raw.cardReview);
+        } catch (e) {
+            return bad((e as Error).message);
+        }
+    }
+    let cardHistory: ReturnType<typeof parseCardHistory> | undefined;
+    if (raw.cardHistory !== undefined) {
+        try {
+            cardHistory = parseCardHistory(raw.cardHistory);
+        } catch (e) {
+            return bad((e as Error).message);
+        }
+    }
     let stages: TSubmitRecord[] = [];
     if (!legacy) {
         if (raw.submitStages === undefined) return bad('submitStages отсутствует');
@@ -277,7 +303,12 @@ export function inspectState(text: string): TStateInspection {
     // аксессорами (`attachSubmitJournal`), и форма журнала после них проверяется тем же
     // разбором, что у v2 с диска. Молча принят не будет ни один файл, который v2 отверг бы.
     const { submitStages: _drop, ...rest } = raw;
-    const normalized = refusalSeries !== undefined ? { ...rest, refusalSeries } : { ...rest };
+    const normalized = {
+        ...rest,
+        ...(refusalSeries !== undefined ? { refusalSeries } : {}),
+        ...(cardReview !== undefined ? { cardReview } : {}),
+        ...(cardHistory !== undefined ? { cardHistory } : {}),
+    };
     const base = legacy ? normalized : { ...normalized, submitStages: stages };
     let state: RalphState;
     try {

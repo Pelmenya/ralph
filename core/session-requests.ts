@@ -18,6 +18,7 @@
 import { checkIssueFormat, describeFormatViolations, type TIssueFormat } from './issue-format.ts';
 import { MERGE_TRANSIENT_RE } from './merge-retry.ts';
 import { formatStopMessage } from './stop-message.ts';
+import { severityOf } from './review-of-fixes.ts';
 import { LIVE_PROBE_CASES } from '../adapters/live-probe-cases.ts';
 
 // Что сессия имеет право попросить. Список ЗАКРЫТЫЙ и намеренно короткий: снятие `hold`,
@@ -26,6 +27,11 @@ import { LIVE_PROBE_CASES } from '../adapters/live-probe-cases.ts';
 // шва и тестом, а не строкой в этот union.
 export type TSessionRequest =
     | { kind: 'comment' | 'close' | 'block'; issue: number; comment: string }
+    // #291: находки и вердикт ревью карточки адресованы ей, а не ещё не созданному PR.
+    // Отчёт fix связывает исправление с номером находки и названием проверки.
+    | { kind: 'card-comment'; issue: number; comment: string; anchor?: TRequestAnchor }
+    | { kind: 'card-block'; issue: number; comment: string }
+    | { kind: 'card-fix'; issue: number; finding: string; test: string }
     // #220: `blocks` — номер карточки ТЕКУЩЕЙ фазы, которую новая блокирует. С ним карточка
     // едет в веху фазы, а не во Входящие: без неё фазу не закрыть, и сортировка вахтой
     // утром означала бы ночь на брейкере. Принадлежность вехе разбор не знает (он чистый) —
@@ -63,11 +69,18 @@ const DIFF_SIDES: readonly string[] = ['LEFT', 'RIGHT'];
 // новую, ставит блокер на PR. Именно они опасны при сорвавшейся сессии (штампует их
 // пачками), и предел на них остаётся жёстким.
 // `live-probe` — тоже мутация: проба тратит квоту ключа и пишет комментарий в карточку.
-const MUTATION_KINDS = ['close', 'block', 'new-issue', 'pr-block', 'live-probe'] as const;
+const MUTATION_KINDS = [
+    'close',
+    'block',
+    'new-issue',
+    'pr-block',
+    'live-probe',
+    'card-block',
+] as const;
 // Комментарии ничего не закрывают, не блокируют и не создают сущностей — это текст в
 // ленте PR или карточки. Судить о сорвавшейся сессии по их числу — как судить о буйстве
-// по количеству сказанных слов.
-const COMMENT_KINDS = ['comment', 'pr-comment'] as const;
+// по количеству сказанных слов. Отчёт card-fix тоже идёт в state, а не меняет её напрямую.
+const COMMENT_KINDS = ['comment', 'pr-comment', 'card-comment', 'card-fix'] as const;
 
 // Предохранитель от сорвавшейся сессии: десятки мутаций, наделанных за одну итерацию,
 // разгребаются дороже, чем один отказ с внятной причиной.
@@ -141,11 +154,13 @@ const MAX_TITLE = 200;
 const MAX_BODY = 20_000;
 
 const ISSUE_KINDS = ['comment', 'close', 'block'] as const;
+const CARD_KINDS = ['card-comment', 'card-block', 'card-fix'] as const;
 const PR_KINDS = ['pr-comment', 'pr-block'] as const;
 // Все виды, которые разбор принимает. Отдельной константой — по ней тест сверяет схему в
 // промптах (#217): новый вид без строки схемы краснеет, а не уезжает в промпт молча.
 export const SESSION_REQUEST_KINDS: readonly string[] = [
     ...ISSUE_KINDS,
+    ...CARD_KINDS,
     'new-issue',
     ...PR_KINDS,
     'live-probe',
@@ -456,6 +471,54 @@ export function parseSessionRequests(
             }
             return issue;
         }
+        if (kind === 'card-comment') {
+            const comment = text(req['comment'], no, 'комментарий', MAX_COMMENT, 'comment-text');
+            const place = anchor(req, no);
+            const severity = severityOf(comment);
+            if (severity === null) {
+                fail(
+                    no,
+                    'находка card-comment без серьёзности не оценивается: начни текст с эмодзи и тега severity',
+                    'card-comment-severity',
+                );
+            }
+            if (!place.anchor && (severity === 'blocker' || severity === 'major')) {
+                fail(
+                    no,
+                    'находка без места: сводка card-comment с тегом blocker или major требует якорь path+line',
+                    'card-comment-anchor',
+                );
+            }
+            return {
+                kind: 'card-comment' as const,
+                issue: issueNumber(req['issue'], no),
+                comment,
+                ...place,
+            };
+        }
+        if (kind === 'card-block') {
+            return {
+                kind: 'card-block' as const,
+                issue: issueNumber(req['issue'], no),
+                comment: text(req['comment'], no, 'комментарий', MAX_COMMENT, 'comment-text'),
+            };
+        }
+        if (kind === 'card-fix') {
+            const finding = req['finding'];
+            if (typeof finding !== 'string' || !/^F\d+$/.test(finding)) {
+                fail(
+                    no,
+                    `finding должен иметь форму F\\d+ (F1, F2, …), пришло ${JSON.stringify(finding)}`,
+                    'card-fix-finding',
+                );
+            }
+            return {
+                kind: 'card-fix' as const,
+                issue: issueNumber(req['issue'], no),
+                finding,
+                test: text(req['test'], no, 'имя теста (test)', 300, 'card-fix-test'),
+            };
+        }
         // #45: комментарий в PR фазы. Замечание ревью без текста — потерянная находка,
         // поэтому `comment` обязателен так же, как у намерений по карточкам.
         if (kind === 'pr-comment') {
@@ -495,7 +558,7 @@ export function parseSessionRequests(
     const { mutations, comments } = classifySessionRequests(requests);
     if (mutations.length > MAX_MUTATION_REQUESTS) {
         throw new Error(
-            `Запрос сессии: ${String(mutations.length)} мутаций (close/block/new-issue/pr-block/live-probe) — ` +
+            `Запрос сессии: ${String(mutations.length)} мутаций (close/block/new-issue/pr-block/live-probe/card-block) — ` +
                 `больше предела ${String(MAX_MUTATION_REQUESTS)}. Батч отвергнут целиком: столько мутаций ` +
                 'за одну итерацию похоже на сорвавшуюся сессию. ' +
                 `Разбивка по классам: ${String(requests.length)} намерений — ${breakdownByKind(requests)}.`,
@@ -511,7 +574,7 @@ export function parseSessionRequests(
     }
     if (comments.length > MAX_COMMENT_REQUESTS) {
         throw new Error(
-            `Запрос сессии: ${String(comments.length)} комментариев (comment/pr-comment) — ` +
+            `Запрос сессии: ${String(comments.length)} комментариев (comment/pr-comment/card-comment/card-fix) — ` +
                 `больше предела ${String(MAX_COMMENT_REQUESTS)}. Батч отвергнут целиком. ` +
                 `Разбивка по классам: ${String(requests.length)} намерений — ${breakdownByKind(requests)}.`,
         );
@@ -632,7 +695,7 @@ export function quarantinePath(
  * запись и чтение обязаны сходиться, иначе round-trip врёт.
  */
 export function serializeSessionRequest(req: TSessionRequest): string {
-    if (req.kind === 'pr-comment' && req.anchor) {
+    if ((req.kind === 'pr-comment' || req.kind === 'card-comment') && req.anchor) {
         const { anchor, ...rest } = req;
         return JSON.stringify({
             ...rest,
@@ -916,7 +979,9 @@ export function reconcileInFlight(
     try {
         const found = list(req.issue).some((b) => carriesIntentMark(b, id));
         if (!found) return { verdict: 'landed', landed: 'none' };
-        return { verdict: 'landed', landed: req.kind === 'comment' ? 'all' : 'comment' };
+        const commentOnly =
+            req.kind === 'comment' || req.kind === 'card-comment' || req.kind === 'card-block';
+        return { verdict: 'landed', landed: commentOnly ? 'all' : 'comment' };
     } catch (e) {
         return unread(e);
     }

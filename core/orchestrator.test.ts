@@ -53,6 +53,7 @@ import type { ReviewComment } from '../adapters/adapters.ts';
 import type { DeployOutcome } from './deploy-check.ts';
 import type { RalphState } from './state-lock.ts';
 import type { RalphConfig } from './orchestrator.ts';
+import { cardRecordOf, newCardProgress, type TCardBatch } from './card-review.ts';
 import {
     COMMENT_NOTICE_THRESHOLD,
     IN_FLIGHT_PREFIX,
@@ -3715,6 +3716,15 @@ describe('preflight — валидация конфига/среды и подг
         ...overrides,
     });
 
+    it('review.maxCardReviewRounds: 0 останавливает старт с именем ключа', () => {
+        expect(() =>
+            preflight(
+                validCfg({ review: { cardReview: true, maxCardReviewRounds: 0 } }),
+                okDeps({ loadStateFn: fakeState }),
+            ),
+        ).toThrow(/review\.maxCardReviewRounds = 0/);
+    });
+
     // ── Канон, задача 27: заданный скрипт потребителя ищется до первой итерации ──
     // Валидатор конфига проверяет ФОРМУ пути (задача 23), а мир — не его предмет. Опечатка
     // в самом пути вероятнее опечатки в имени ключа, и стоила бы она дороже: обе обёртки
@@ -4803,6 +4813,803 @@ describe('runLoop — основной while-цикл: итерации коде
         maxIterations: 10,
         maxTurns: 200,
         ...o,
+    });
+
+    it('выключенная cardReview снимает запись до первого прохода с предупреждением', () => {
+        const logs: string[] = [];
+        const state = mkState({
+            cardReview: newCardProgress({
+                issue: 7,
+                milestone: 'M1',
+                firstHead: 'a'.repeat(40),
+                startedAt: '2026-11-05T10:00:00.000Z',
+            }),
+        });
+        const saveStateFn = vi.fn();
+        runLoop(validCfg(), ctx(state), deps(logs, { phaseIndexOfFn: () => 99, saveStateFn }));
+        expect(state.cardReview).toBeNull();
+        expect(saveStateFn).toHaveBeenCalledTimes(1);
+        expect(saveStateFn).toHaveBeenCalledWith(state);
+        expect(logs.join('\n')).toMatch(/⚠.*cardReview/);
+    });
+
+    it('dry-run при выключенной cardReview не меняет state и не сохраняет его', () => {
+        const state = mkState({
+            deployBlock: null,
+            reviewOfFixes: null,
+            cardReview: newCardProgress({
+                issue: 7,
+                milestone: 'M1',
+                firstHead: 'a'.repeat(40),
+                startedAt: '2026-11-05T10:00:00.000Z',
+            }),
+        });
+        const before = structuredClone(state);
+        const saveStateFn = vi.fn();
+        runLoop(
+            validCfg(),
+            ctx(state),
+            deps([], { dry: true, phaseIndexOfFn: () => 99, saveStateFn }),
+        );
+        expect(state).toEqual(before);
+        expect(saveStateFn).not.toHaveBeenCalled();
+    });
+
+    it('review.maxCardReviewRounds: 0 останавливает runLoop до первой сессии', () => {
+        const runClaudeFn = vi.fn();
+        expect(() =>
+            runLoop(
+                validCfg({ review: { cardReview: true, maxCardReviewRounds: 0 } }),
+                ctx(mkState()),
+                deps([], { runClaudeFn }),
+            ),
+        ).toThrow(/review\.maxCardReviewRounds = 0/);
+        expect(runClaudeFn).not.toHaveBeenCalled();
+    });
+
+    describe('ревью карточки: шаг цикла', () => {
+        const A = 'a'.repeat(40);
+        const B = 'b'.repeat(40);
+        const C = 'c'.repeat(40);
+        const STARTED_AT = '2026-11-05T10:00:00.000Z';
+        const cardCfg = () => validCfg({ review: { cardReview: true, default: 'reviewer' } });
+        const card = (over: Record<string, unknown> = {}) => ({
+            ...newCardProgress({ issue: 7, milestone: 'M1', firstHead: A, startedAt: STARTED_AT }),
+            ...over,
+        });
+        const cleanBatch: TCardBatch = {
+            deferredClose: null,
+            summary: '⚪ [nit] чисто',
+            blocked: null,
+            findings: [],
+            fixes: [],
+        };
+        const noFindings: TCardBatch = {
+            deferredClose: null,
+            summary: null,
+            blocked: null,
+            findings: [],
+            fixes: [],
+        };
+
+        it('запрос закрытия оставляет карточку открытой и следующей сессией запускает ревью всего диффа', () => {
+            const state = mkState();
+            const logs: string[] = [];
+            let open = true;
+            let headCalls = 0;
+            const prompts: string[] = [];
+            const roles: string[] = [];
+            const phaseDiffFilesFn = vi.fn(() => ['core/a.ts']);
+            const runClaudeFn = vi.fn((prompt: string) => {
+                prompts.push(prompt);
+                return 0;
+            });
+            const applySessionRequestsFn = vi.fn((options: Record<string, unknown>) => {
+                const stage = options.cardStage as {
+                    role: string;
+                    saveBatchFn?: (batch: typeof cleanBatch) => void;
+                };
+                roles.push(stage.role);
+                if (stage.role === 'coder') {
+                    stage.saveBatchFn?.({ ...noFindings, deferredClose: 'сделано' });
+                } else if (stage.role === 'review') {
+                    stage.saveBatchFn?.(cleanBatch);
+                } else if (stage.role === 'closing') {
+                    open = false;
+                }
+                return { applied: 0, failed: false, closedIssues: [] };
+            });
+            runLoop(
+                cardCfg(),
+                ctx(state),
+                deps(logs, {
+                    phaseIndexOfFn: () => (state.cardReview == null && !open ? 99 : 0),
+                    openIssuesFn: () => (open ? [{ number: 7, title: 'карточка' }] : []),
+                    allOpenIssuesFn: () => (open ? [{ number: 7, title: 'карточка' }] : []),
+                    getIssueFn: () => ({ number: 7, title: 'карточка', body: 'тело', open }),
+                    shFn: () => (headCalls++ === 0 ? A : B),
+                    branchHeadShaFn: () => B,
+                    pickReviewModelFn: () => 'reviewer',
+                    phaseDiffFilesFn,
+                    reviewDiffContextFn: () => '\n<дифф карточки>',
+                    runClaudeFn,
+                    applySessionRequestsFn,
+                    writeSessionRequestsFn: () => {},
+                }),
+            );
+            expect(open).toBe(false);
+            expect(roles).toEqual(['coder', 'review', 'closing']);
+            expect(prompts).toHaveLength(2);
+            expect(prompts[1]).toContain('дифф карточки');
+            expect(prompts[1]).toContain(B);
+            expect(phaseDiffFilesFn).toHaveBeenCalledWith('feature/m1', { base: A });
+            expect(state.cardHistory?.[0]).toMatchObject({ outcome: 'closed', head: B, rounds: 1 });
+            expect(logs.join('\n')).toContain(
+                '📊 Карточка #7: исход closed, кругов 1, сессий 2 (упавших 0)',
+            );
+        });
+
+        it('чистый вердикт на X при голове Y не закрывает карточку и начинает новый круг', () => {
+            const state = mkState({
+                cardReview: card({
+                    closeComment: 'сделано',
+                    verdict: 'clean',
+                    lastReviewedHead: A,
+                    rounds: 1,
+                    sessions: 2,
+                }),
+            });
+            const runClaudeFn = vi.fn(() => 0);
+            const applySessionRequestsFn = vi.fn((options: Record<string, unknown>) => {
+                const stage = options.cardStage as {
+                    role: string;
+                    saveBatchFn?: (batch: typeof cleanBatch) => void;
+                };
+                expect(stage.role).toBe('review');
+                stage.saveBatchFn?.(cleanBatch);
+                return { applied: 0, failed: false, closedIssues: [] };
+            });
+            runLoop(
+                cardCfg(),
+                ctx(state),
+                deps([], {
+                    once: true,
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn: () => [{ number: 7, title: 'карточка' }],
+                    shFn: () => B,
+                    branchHeadShaFn: () => B,
+                    pickReviewModelFn: () => 'reviewer',
+                    phaseDiffFilesFn: () => ['core/a.ts'],
+                    reviewDiffContextFn: () => '<дифф>',
+                    runClaudeFn,
+                    applySessionRequestsFn,
+                }),
+            );
+            expect(runClaudeFn).toHaveBeenCalledTimes(1);
+            expect(state.cardReview).toMatchObject({
+                verdict: 'clean',
+                lastReviewedHead: B,
+                rounds: 2,
+                closing: null,
+            });
+        });
+
+        it('чистый вердикт на текущей голове после рестарта закрывается без новой сессии', () => {
+            const state = mkState({
+                cardReview: card({
+                    closeComment: 'сделано',
+                    verdict: 'clean',
+                    lastReviewedHead: B,
+                    rounds: 2,
+                    sessions: 4,
+                }),
+            });
+            const runClaudeFn = vi.fn(() => 0);
+            const writes: string[] = [];
+            let open = true;
+            runLoop(
+                cardCfg(),
+                ctx(state),
+                deps([], {
+                    once: true,
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn: () => (open ? [{ number: 7, title: 'карточка' }] : []),
+                    allOpenIssuesFn: () => (open ? [{ number: 7, title: 'карточка' }] : []),
+                    getIssueFn: () => ({ number: 7, title: 'карточка', body: 'тело', open }),
+                    shFn: () => B,
+                    branchHeadShaFn: () => B,
+                    runClaudeFn,
+                    writeSessionRequestsFn: (text: string) => writes.push(text),
+                    applySessionRequestsFn: () => {
+                        open = false;
+                        return { applied: 1, failed: false, closedIssues: [7] };
+                    },
+                }),
+            );
+            expect(runClaudeFn).not.toHaveBeenCalled();
+            expect(writes).toHaveLength(1);
+            expect(writes[0]).toContain('"kind":"close"');
+            expect(writes[0]).toContain('"comment":"сделано"');
+            expect(state.cardReview).toBeNull();
+            expect(state.cardHistory?.[0]).toMatchObject({ outcome: 'closed', head: B, rounds: 2 });
+        });
+
+        it.each([
+            ['null', null, {}],
+            ['короткая', 'abc', {}],
+            ['Error', new Error('git лёг'), {}],
+            ['дифф null', B, { files: null }],
+            ['git diff бросил', B, { diffError: true }],
+        ])(
+            'нечитаемая голова или дифф (%s) — стоп без сессии и записи state',
+            (_name, head, mode) => {
+                const state = mkState({
+                    cardReview: card({ closeComment: 'сделано', sessions: 1 }),
+                });
+                const before = JSON.stringify(state.cardReview);
+                const saveStateFn = vi.fn();
+                const runClaudeFn = vi.fn(() => 0);
+                const logs: string[] = [];
+                runLoop(
+                    cardCfg(),
+                    ctx(state),
+                    deps(logs, {
+                        once: true,
+                        phaseIndexOfFn: () => 0,
+                        openIssuesFn: () => [{ number: 7, title: 'карточка' }],
+                        shFn: () => {
+                            if (head instanceof Error) throw head;
+                            return head;
+                        },
+                        branchHeadShaFn: () => B,
+                        pickReviewModelFn: () => 'reviewer',
+                        phaseDiffFilesFn: () =>
+                            'files' in mode && mode.files === null ? null : ['core/a.ts'],
+                        reviewDiffContextFn: () => {
+                            if ('diffError' in mode && mode.diffError)
+                                throw new Error('git diff лёг');
+                            return '<дифф>';
+                        },
+                        saveStateFn,
+                        runClaudeFn,
+                    }),
+                );
+                expect(runClaudeFn).not.toHaveBeenCalled();
+                expect(saveStateFn).not.toHaveBeenCalled();
+                expect(JSON.stringify(state.cardReview)).toBe(before);
+                expect(logs.join('\n')).toContain('card-unreviewed');
+            },
+        );
+
+        it('карточка с меньшим номером появилась посреди работы — кодер продолжает текущую', () => {
+            const state = mkState({ cardReview: card({ sessions: 1 }) });
+            const picked: number[] = [];
+            const runClaudeFn = vi.fn(() => 0);
+            runLoop(
+                cardCfg(),
+                ctx(state),
+                deps([], {
+                    once: true,
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn: () => [
+                        { number: 3, title: 'новая' },
+                        { number: 7, title: 'текущая' },
+                    ],
+                    getIssueFn: (number: number) => ({ number, title: 'карточка', body: 'тело' }),
+                    pickRouteFn: (issue: { number: number }) => {
+                        picked.push(issue.number);
+                        return { provider: 'claude', model: 'coder' };
+                    },
+                    runClaudeFn,
+                }),
+            );
+            expect(picked).toEqual([7]);
+            expect(runClaudeFn).toHaveBeenCalledTimes(1);
+        });
+
+        describe('ревью карточки: правки и предел', () => {
+            const openFinding = () => ({
+                id: 'F1',
+                severity: 'blocker' as const,
+                comment: 'потерян отказ',
+                anchor: { path: 'core/a.ts', line: 42 },
+                round: 1,
+                head: A,
+                status: 'open' as const,
+                test: null,
+                note: null,
+            });
+            const reviewedWithFinding = (over: Record<string, unknown> = {}) =>
+                card({
+                    closeComment: 'сделано',
+                    verdict: 'findings',
+                    lastReviewedHead: A,
+                    rounds: 1,
+                    sessions: 2,
+                    findings: [openFinding()],
+                    ...over,
+                });
+            const limitCfg = () =>
+                validCfg({
+                    review: {
+                        cardReview: true,
+                        default: 'reviewer',
+                        maxCardReviewRounds: 3,
+                        maxCardSessions: 6,
+                    },
+                });
+
+            it('1. findings ниже предела запускают fix с находками из state, не меняя lastReviewedHead', () => {
+                const state = mkState({ cardReview: reviewedWithFinding() });
+                const prompts: string[] = [];
+                let requests: string | null = null;
+                const applySessionRequestsFn = vi.fn((options: Record<string, unknown>) => {
+                    const stage = options.cardStage as {
+                        role: string;
+                        saveBatchFn?: (batch: TCardBatch) => void;
+                    };
+                    expect(stage.role).toBe('fix');
+                    stage.saveBatchFn?.({
+                        ...noFindings,
+                        fixes: [{ finding: 'F1', test: 'отказ' }],
+                    });
+                    return { applied: 0, failed: false, closedIssues: [] };
+                });
+                runLoop(
+                    limitCfg(),
+                    ctx(state),
+                    deps([], {
+                        once: true,
+                        phaseIndexOfFn: () => 0,
+                        openIssuesFn: () => [{ number: 7, title: 'карточка' }],
+                        shFn: (cmd: string) =>
+                            cmd === 'git diff aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa..HEAD'
+                                ? "+    it('отказ', () => {})"
+                                : A,
+                        branchHeadShaFn: () => A,
+                        readSessionRequestsFn: () => requests,
+                        runClaudeFn: (prompt: string) => {
+                            prompts.push(prompt);
+                            requests =
+                                '{"kind":"card-fix","issue":7,"finding":"F1","test":"отказ"}\n';
+                            return 0;
+                        },
+                        applySessionRequestsFn,
+                    }),
+                );
+                expect(prompts).toHaveLength(1);
+                expect(prompts[0]).toContain('F1');
+                expect(prompts[0]).toContain('потерян отказ');
+                expect(state.cardReview).toMatchObject({
+                    sessions: 3,
+                    lastReviewedHead: A,
+                    pending: null,
+                    findings: [{ id: 'F1', status: 'fixed', test: 'отказ' }],
+                });
+            });
+
+            it('2. новая голова после правок ведёт в ревью всего диффа со списком находок', () => {
+                const state = mkState({ cardReview: reviewedWithFinding() });
+                const prompts: string[] = [];
+                const phaseDiffFilesFn = vi.fn(() => ['core/a.ts']);
+                runLoop(
+                    limitCfg(),
+                    ctx(state),
+                    deps([], {
+                        once: true,
+                        phaseIndexOfFn: () => 0,
+                        openIssuesFn: () => [{ number: 7, title: 'карточка' }],
+                        shFn: () => B,
+                        branchHeadShaFn: () => B,
+                        pickReviewModelFn: () => 'reviewer',
+                        phaseDiffFilesFn,
+                        reviewDiffContextFn: () => '<весь дифф карточки>',
+                        runClaudeFn: (prompt: string) => {
+                            prompts.push(prompt);
+                            return 0;
+                        },
+                        applySessionRequestsFn: (options: Record<string, unknown>) => {
+                            const stage = options.cardStage as {
+                                role: string;
+                                saveBatchFn?: (batch: TCardBatch) => void;
+                            };
+                            expect(stage.role).toBe('review');
+                            stage.saveBatchFn?.(cleanBatch);
+                            return { applied: 0, failed: false, closedIssues: [] };
+                        },
+                    }),
+                );
+                expect(prompts).toHaveLength(1);
+                expect(prompts[0]).toContain('<весь дифф карточки>');
+                expect(prompts[0]).toContain('F1');
+                expect(phaseDiffFilesFn).toHaveBeenCalledWith('feature/m1', { base: A });
+                expect(state.cardReview).toMatchObject({ lastReviewedHead: B, rounds: 2 });
+            });
+
+            it('3. на пределе кругов fix не запускается: блок и стоп идут сразу после последнего ревью', () => {
+                const state = mkState({
+                    cardReview: reviewedWithFinding({ rounds: 3, sessions: 3 }),
+                });
+                const runClaudeFn = vi.fn(() => 0);
+                const writes: string[] = [];
+                let labelReads = 0;
+                const logs: string[] = [];
+                runLoop(
+                    limitCfg(),
+                    ctx(state),
+                    deps(logs, {
+                        once: true,
+                        phaseIndexOfFn: () => 0,
+                        openIssuesFn: () => [{ number: 7, title: 'карточка' }],
+                        allOpenIssuesFn: () => [
+                            {
+                                number: 7,
+                                title: 'карточка',
+                                labels: labelReads++ > 0 ? [{ name: 'blocked' }] : [],
+                            },
+                        ],
+                        shFn: () => A,
+                        branchHeadShaFn: () => A,
+                        runClaudeFn,
+                        writeSessionRequestsFn: (text: string) => writes.push(text),
+                        applySessionRequestsFn: () => ({
+                            applied: 1,
+                            failed: false,
+                            closedIssues: [],
+                        }),
+                    }),
+                );
+                expect(runClaudeFn).not.toHaveBeenCalled();
+                expect(writes).toHaveLength(1);
+                expect(writes[0]).toContain('"kind":"block"');
+                expect(writes[0]).toContain('core/a.ts:42');
+                expect(state.cardHistory).toHaveLength(1);
+                expect(state.cardHistory?.[0]).toMatchObject({ outcome: 'blocked', head: A });
+                expect(state.cardReview).toMatchObject({ limitHead: A, rounds: 3 });
+                expect(logs.join('\n')).toContain('card-review-limit');
+                expect(logs.join('\n')).toContain(
+                    '📊 Карточка #7: исход blocked, кругов 3, сессий 3 (упавших 0)',
+                );
+            });
+
+            it('7. fix без коммитов повторяется до maxCardSessions, затем предел без новой сессии', () => {
+                const state = mkState({ cardReview: reviewedWithFinding({ sessions: 4 }) });
+                const runClaudeFn = vi.fn(() => 0);
+                let labelReads = 0;
+                runLoop(
+                    limitCfg(),
+                    ctx(state),
+                    deps([], {
+                        phaseIndexOfFn: () => 0,
+                        openIssuesFn: () => [{ number: 7, title: 'карточка' }],
+                        allOpenIssuesFn: () => [
+                            {
+                                number: 7,
+                                title: 'карточка',
+                                labels: labelReads++ > 0 ? [{ name: 'blocked' }] : [],
+                            },
+                        ],
+                        shFn: () => A,
+                        branchHeadShaFn: () => A,
+                        runClaudeFn,
+                        applySessionRequestsFn: (options: Record<string, unknown>) => {
+                            const stage = options.cardStage as
+                                | { role: string; saveBatchFn?: (batch: TCardBatch) => void }
+                                | undefined;
+                            stage?.saveBatchFn?.(noFindings);
+                            return { applied: 0, failed: false, closedIssues: [] };
+                        },
+                        writeSessionRequestsFn: () => {},
+                    }),
+                );
+                expect(runClaudeFn).toHaveBeenCalledTimes(2);
+                expect(state.cardReview).toMatchObject({
+                    sessions: 6,
+                    lastReviewedHead: A,
+                    limitHead: A,
+                    findings: [{ status: 'open', note: 'правка не назвала тест' }],
+                });
+                expect(state.cardHistory).toHaveLength(1);
+            });
+
+            it('8. повтор предела на той же голове не дублирует историю и намерение block', () => {
+                const state = mkState({
+                    cardReview: reviewedWithFinding({ rounds: 3, sessions: 3 }),
+                });
+                const writes: string[] = [];
+                let labels: Array<{ name: string }> = [];
+                const options = {
+                    once: true,
+                    phaseIndexOfFn: () => 0,
+                    openIssuesFn: () => [{ number: 7, title: 'карточка' }],
+                    allOpenIssuesFn: () => [{ number: 7, title: 'карточка', labels }],
+                    getIssueFn: () => ({ number: 7, title: 'карточка', body: 'тело', open: true }),
+                    shFn: () => A,
+                    branchHeadShaFn: () => A,
+                    writeSessionRequestsFn: (text: string) => {
+                        writes.push(text);
+                        labels = [{ name: 'blocked' }];
+                    },
+                    applySessionRequestsFn: () => ({
+                        applied: 1,
+                        failed: false,
+                        closedIssues: [],
+                    }),
+                };
+                runLoop(limitCfg(), ctx(state), deps([], options));
+                const firstLogs = state.cardHistory;
+                runLoop(limitCfg(), ctx(state), deps([], options));
+                expect(writes).toHaveLength(1);
+                expect(state.cardHistory).toEqual(firstLogs);
+                expect(state.cardHistory).toHaveLength(1);
+                expect(state.cardReview).toMatchObject({ limitHead: A, rounds: 3 });
+            });
+        });
+    });
+
+    describe('ревью карточки: сдача и контекст', () => {
+        const A = 'a'.repeat(40);
+        const B = 'b'.repeat(40);
+        const STARTED_AT = '2026-11-05T10:00:00.000Z';
+        const FINISHED_AT = '2026-11-05T10:01:00.000Z';
+        const cardCfg = () => validCfg({ review: { cardReview: true, default: 'reviewer' } });
+        const done = (over: Record<string, unknown> = {}) => ({
+            ...cardRecordOf(
+                {
+                    ...newCardProgress({
+                        issue: 7,
+                        milestone: 'M1',
+                        firstHead: A,
+                        startedAt: STARTED_AT,
+                    }),
+                    closeComment: 'сделано',
+                    verdict: 'clean',
+                    lastReviewedHead: A,
+                    rounds: 1,
+                    sessions: 2,
+                },
+                'closed',
+                A,
+                FINISHED_AT,
+            ),
+            ...over,
+        });
+
+        it('стадия выключена → прежняя сдача без сверки истории', () => {
+            const createPrFn = vi.fn(() => 7);
+            runLoop(
+                validCfg(),
+                ctx(mkState({ cardHistory: [done({ verdict: 'findings' })] })),
+                deps([], { createPrFn }),
+            );
+            expect(createPrFn).toHaveBeenCalledTimes(1);
+        });
+
+        it('closed с ревью не своей головы → card-unreviewed с номером, PR не заведён', () => {
+            const logs: string[] = [];
+            const createPrFn = vi.fn(() => 7);
+            runLoop(
+                cardCfg(),
+                ctx(mkState({ cardHistory: [done({ lastReviewedHead: B })] })),
+                deps(logs, { createPrFn }),
+            );
+            expect(createPrFn).not.toHaveBeenCalled();
+            expect(logs.join('\n')).toMatch(/card-unreviewed[\s\S]*#7/);
+            expect(logs.join('\n')).toContain('разбери карточку и перезапусти loop');
+        });
+
+        it.each([
+            ['чистый вердикт своей головы', [done()]],
+            ['внешнее закрытие человеком', [done({ outcome: 'closed-external' })]],
+            ['пустая история прежней ревизии', undefined],
+            ['пустой список истории', []],
+        ])('%s → сдача идёт', (_name, cardHistory) => {
+            const createPrFn = vi.fn(() => 7);
+            runLoop(
+                cardCfg(),
+                ctx(mkState({ cardHistory: cardHistory as never })),
+                deps([], { createPrFn }),
+            );
+            expect(createPrFn).toHaveBeenCalledTimes(1);
+        });
+
+        it('две записи одной карточки проверяются обе, запись чужой вехи не мешает', () => {
+            const createPrFn = vi.fn(() => 7);
+            const logs: string[] = [];
+            runLoop(
+                cardCfg(),
+                ctx(
+                    mkState({
+                        cardHistory: [
+                            done(),
+                            done({ verdict: 'findings' }),
+                            done({ milestone: 'M0', verdict: 'findings' }),
+                        ],
+                    }),
+                ),
+                deps(logs, { createPrFn }),
+            );
+            expect(createPrFn).not.toHaveBeenCalled();
+            expect(logs.join('\n')).toContain('card-unreviewed');
+        });
+
+        it('фаза уже смерджена, истории нет → сверка не мешает переходу', () => {
+            const logs: string[] = [];
+            const advancePhaseFn = vi.fn();
+            const createPrFn = vi.fn(() => 7);
+            runLoop(
+                cardCfg(),
+                ctx(mkState()),
+                deps(logs, { phaseMergedFn: () => true, advancePhaseFn, createPrFn }),
+            );
+            expect(advancePhaseFn).toHaveBeenCalledTimes(1);
+            expect(createPrFn).not.toHaveBeenCalled();
+            expect(logs.join('\n')).not.toContain('card-unreviewed');
+        });
+
+        it('полное ревью фазы получает итоги карточек данными, предмет остаётся весь дифф', () => {
+            const prompts: string[] = [];
+            runLoop(
+                cardCfg(),
+                ctx(mkState({ cardHistory: [done({ outcome: 'closed-external' })] })),
+                deps([], {
+                    pickReviewModelFn: () => 'reviewer',
+                    findOpenPrFn: () => ({ number: 7, url: 'u' }),
+                    reviewDiffContextFn: () => '\n<весь дифф фазы>',
+                    runClaudeFn: (prompt: string) => {
+                        prompts.push(prompt);
+                        return 1;
+                    },
+                }),
+            );
+            expect(prompts).toHaveLength(1);
+            expect(prompts[0]).toContain('<весь дифф фазы>');
+            expect(prompts[0]).toContain('Итоги ревью карточек:');
+            expect(prompts[0]).toContain('<<<ДАННЫЕ_НАЧАЛО>>>');
+            expect(prompts[0]).toContain('Карточка #7: исход closed-external');
+            expect(prompts[0]).toContain(A);
+        });
+
+        it('ревью фазы от базы тоже получает итоги, не меняя предмет участка', () => {
+            const prompts: string[] = [];
+            const cfg = validCfg({
+                review: { cardReview: true, default: 'reviewer' },
+                phases: [{ milestone: 'M1', branch: 'feature/m1', reviewBase: A }],
+            });
+            runLoop(
+                cfg,
+                ctx(mkState({ cardHistory: [done()] })),
+                deps([], {
+                    pickReviewModelFn: () => 'reviewer',
+                    findOpenPrFn: () => ({ number: 7, url: 'u' }),
+                    prCommentsFn: () => [],
+                    reviewDiffContextFn: () => '\n<дифф от базы>',
+                    runClaudeFn: (prompt: string) => {
+                        prompts.push(prompt);
+                        return 1;
+                    },
+                }),
+            );
+            expect(prompts).toHaveLength(1);
+            expect(prompts[0]).toContain('Весь PR заново НЕ пересматривай');
+            expect(prompts[0]).toContain('<дифф от базы>');
+            expect(prompts[0]).toContain('Итоги ревью карточек:');
+            expect(prompts[0]).toContain('Карточка #7: исход closed');
+        });
+
+        it('close из правок фазы выбывает при включённой стадии, карточка не закрыта', () => {
+            const logs: string[] = [];
+            const closed: number[] = [];
+            const prompts: string[] = [];
+            let requests: string | null = null;
+            let fixSeen = false;
+            const applySessionRequestsFn = (options: Record<string, unknown>) => {
+                if (requests?.includes('"kind":"close"')) {
+                    return ralph.applySessionRequests({
+                        ...(options as Parameters<typeof ralph.applySessionRequests>[0]),
+                        readFn: () => requests,
+                        writeFn: (text: string) => {
+                            requests = text;
+                        },
+                        removeFn: () => {
+                            requests = null;
+                        },
+                        taskSource: {
+                            commentOnIssue: () => {},
+                            closeIssue: (issue: number) => closed.push(issue),
+                        } as never,
+                    });
+                }
+                return {
+                    applied: 1,
+                    failed: false,
+                    closedIssues: [],
+                    prFindings: [
+                        {
+                            comment: '🟠 [major] нужна правка',
+                            anchor: { path: 'core/a.ts', line: 1 },
+                        },
+                        { comment: '⚪ [nit] сводка прохода' },
+                    ],
+                    prBlocked: false,
+                };
+            };
+            runLoop(
+                cardCfg(),
+                ctx(mkState()),
+                deps(logs, {
+                    findOpenPrFn: () => ({ number: 7, url: 'u' }),
+                    prCommentsFn: () => [],
+                    pickReviewModelFn: () => 'reviewer',
+                    applySessionRequestsFn,
+                    runClaudeFn: (prompt: string) => {
+                        prompts.push(prompt);
+                        if (prompt.includes('Разбери замечания code review')) {
+                            fixSeen = true;
+                            requests = `${JSON.stringify({ kind: 'close', issue: 7, comment: 'готово' })}\n`;
+                        }
+                        return 0;
+                    },
+                    pushSessionCommitsFn: () =>
+                        fixSeen
+                            ? { kind: 'failed', local: A, remote: A, why: 'стоп после правок' }
+                            : { kind: 'in-sync' as const },
+                }),
+            );
+            expect(prompts.some((prompt) => prompt.includes('Разбери замечания code review'))).toBe(
+                true,
+            );
+            expect(closed).toEqual([]);
+            expect(logs.join('\n')).toContain('роль cardStage не задана');
+        });
+
+        it('head-diverged при непустой записи печатает одну метрику stop', () => {
+            const logs: string[] = [];
+            const progress = {
+                ...newCardProgress({
+                    issue: 7,
+                    milestone: 'M1',
+                    firstHead: A,
+                    startedAt: STARTED_AT,
+                }),
+                closeComment: 'сделано',
+                verdict: 'clean' as const,
+                lastReviewedHead: B,
+                rounds: 1,
+                sessions: 2,
+            };
+            runLoop(
+                cardCfg(),
+                ctx(mkState({ cardReview: progress })),
+                deps(logs, {
+                    once: true,
+                    openIssuesFn: () => [{ number: 7, title: 'карточка' }],
+                    shFn: () => A,
+                    branchHeadShaFn: () => B,
+                }),
+            );
+            expect(logs.join('\n')).toContain('head-diverged');
+            expect(logs.filter((line) => line.includes('📊 Карточка #7: исход stop'))).toHaveLength(
+                1,
+            );
+        });
+
+        it('мягкая остановка при непустой записи метрики stop не даёт', () => {
+            const logs: string[] = [];
+            const progress = newCardProgress({
+                issue: 7,
+                milestone: 'M1',
+                firstHead: A,
+                startedAt: STARTED_AT,
+            });
+            runLoop(
+                cardCfg(),
+                ctx(mkState({ cardReview: progress })),
+                deps(logs, { stopRequestedFn: () => true }),
+            );
+            expect(logs.join('\n')).toContain('мягкая остановка');
+            expect(logs.join('\n')).not.toContain('📊 Карточка #7: исход stop');
+        });
     });
 
     it('фаза не резолвится (все пройдены) → лог «все фазы завершены» и выход', () => {
@@ -9411,6 +10218,37 @@ describe('runLoop — основной while-цикл: итерации коде
                 { milestone: 'M1', branch: 'feature/m1' },
             ]);
             expect(state.fixPlans).toBe(0);
+        });
+
+        it('advancePhase снимает cardReview и cardHistory одной записью state', () => {
+            const progress = newCardProgress({
+                issue: 7,
+                milestone: 'M1',
+                firstHead: 'a'.repeat(40),
+                startedAt: '2026-11-05T10:00:00.000Z',
+            });
+            const state = mkState({
+                cardReview: progress,
+                cardHistory: [
+                    {
+                        ...progress,
+                        outcome: 'blocked' as const,
+                        head: progress.firstHead,
+                        finishedAt: '2026-11-05T10:00:12.000Z',
+                    },
+                ],
+            });
+            const saveStateFn = vi.fn();
+            buildRuntime({ ...FLAGS_OFF, dry: true }).advancePhase(
+                state as RalphState,
+                0,
+                [{ milestone: 'M1', branch: 'feature/m1' }],
+                saveStateFn,
+            );
+            expect(state.cardReview).toBeNull();
+            expect(state.cardHistory).toEqual([]);
+            expect(saveStateFn).toHaveBeenCalledTimes(1);
+            expect(saveStateFn).toHaveBeenCalledWith(state);
         });
 
         it('ревью с находками → планировщик до правок, решение плана — в их промпте', () => {
@@ -16543,6 +17381,51 @@ describe('reviewDiffContext — дифф в промпт ревью (#133)', () 
             logFn: () => {},
         });
         expect(ctx).toBe('');
+    });
+
+    it('strict: отказ базы и git diff — исключение, а не деградация до списка файлов', () => {
+        expect(() =>
+            reviewDiffContext('feature/x', {
+                shFn: () => 'дифф',
+                logFn: () => {},
+                base: 'не sha',
+                files: ['core/a.ts'],
+                strict: true,
+            }),
+        ).toThrow(/Небезопасная база/);
+        expect(() =>
+            reviewDiffContext('feature/x', {
+                shFn: () => {
+                    throw new Error('git diff лёг');
+                },
+                logFn: () => {},
+                files: ['core/a.ts'],
+                strict: true,
+            }),
+        ).toThrow('git diff лёг');
+        expect(() =>
+            reviewDiffContext('feature/x', {
+                shFn: () => {
+                    throw new Error('fetch лёг');
+                },
+                logFn: () => {},
+                files: null,
+                strict: true,
+            }),
+        ).toThrow(/дифф|файлы/i);
+    });
+
+    it('strict: пустой список файлов — законный пустой дифф без вызова git', () => {
+        const shFn = vi.fn(() => 'не должно вызываться');
+        expect(
+            reviewDiffContext('feature/x', {
+                shFn,
+                logFn: () => {},
+                files: [],
+                strict: true,
+            }),
+        ).toBe('');
+        expect(shFn).not.toHaveBeenCalled();
     });
 
     it('имя ветки уходит в git заквотированным (диф-чтение) и argv-элементом (fetch)', () => {

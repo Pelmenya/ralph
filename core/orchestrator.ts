@@ -79,6 +79,24 @@ import type {
 } from './config-profile.ts';
 import { createStateLock } from './state-lock.ts';
 import type { RalphState } from './state-lock.ts';
+import {
+    applyCardFixBatch,
+    applyCardReviewBatch,
+    buildCardBatch,
+    cardIntentAction,
+    cardRecordOf,
+    cardSubmitProblem,
+    decideCardStep,
+    filterCardRequests,
+    formatCardLimitPacket,
+    formatCardMetrics,
+    formatCardReviewsContext,
+    isFullSha,
+    newCardProgress,
+    resolveCardReview,
+    type TCardStage,
+} from './card-review.ts';
+export type { TCardBatch, TCardRole, TCardStage } from './card-review.ts';
 import { createTunnelCheck } from './tunnel-check.ts';
 import { createWorktreeManager } from './worktree.ts';
 import { ensurePhaseBranch, checkOnPhaseBranch, type TPhaseBranchResult } from './phase-branch.ts';
@@ -188,6 +206,8 @@ import {
     buildIntentRepairPrompt,
     buildReReviewPrompt,
     buildBaseReviewPrompt,
+    buildCardFixPrompt,
+    buildCardReviewPrompt,
     buildReviewPrompt,
 } from './prompts.ts';
 import { extractFixPlan, formatFixPlan, validateFixPlan, type TFixPlan } from './fix-plan.ts';
@@ -859,6 +879,11 @@ export type RalphConfig = {
         // #274: предел изменённых строк ветки фазы (вставки + удаления) перед ревью.
         // Целое ≥ 1, дефолт MAX_PHASE_DIFF_LINES; превышение — стоп `phase-too-large`.
         maxPhaseDiffLines?: unknown;
+        // S2f: ревью диффа карточки перед её закрытием. Пределы задаются только вместе
+        // со стадией; форму и несовместимые сочетания проверяет resolveCardReview.
+        cardReview?: unknown;
+        maxCardReviewRounds?: unknown;
+        maxCardSessions?: unknown;
         // #625: сильнейшая модель для независимого арбитра — последней ступени лестницы
         // ревью правок. Не задана — берётся вершина modelStrength (сильнейшая известная
         // планке), поднятая до reviewModelFloor. Смысл ключа в том, чтобы арбитром можно
@@ -4107,6 +4132,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         repairFn,
         orphanPrFn,
         liveProbeFn,
+        cardStage,
         secretEnvNamesFn = () => adapters.taskSource.secretEnvNames(),
     }: {
         cfg: RalphConfig;
@@ -4163,6 +4189,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
             verdict: string;
             comment: string;
         };
+        // #291: роль определяет, что исполняется, а что сначала ложится в state одним батчем.
+        cardStage?: TCardStage;
         secretEnvNamesFn?: () => readonly string[];
     }): {
         applied: number;
@@ -4197,6 +4225,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 prFindings: [],
                 prBlocked: false,
             };
+        const cardReviewEnabled = resolveCardReview(cfg.review).enabled;
 
         // #86: метка начатого намерения — раннер убит между эффектом и записью «применено»
         // либо эффект бросил после ушедшего запроса. Проверяется ДО разбора: парсер отверг
@@ -4233,6 +4262,13 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 return unknown(`начатое намерение не разобралось: ${(e as Error).message}`);
             }
             if (!startedReq) return unknown('строки намерения за меткой нет');
+            const startedAction = cardIntentAction(startedReq, cardReviewEnabled, cardStage);
+            if (startedAction.kind === 'drop' || startedAction.kind === 'orphan') {
+                return unknown(
+                    `начатая строка запрещена текущей стадией: ${startedAction.why}; ` +
+                        `строка ${entry.started} оставлена под меткой`,
+                );
+            }
             // Комментарий `close`/`block` лёг по записи самого раннера — сверять нечего,
             // повтор доводит только статус.
             const r: TReconcile =
@@ -4438,6 +4474,24 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 prBlocked: false,
             };
         }
+
+        // #291: сначала снимаем то, что роль не вправе исполнить. Только оставшийся список
+        // даёт prFindings/applied; close кодера и card-fix идут в state через saveBatchFn.
+        const parsedStarted = resume === null ? undefined : requests[0];
+        const cardFilter = filterCardRequests(requests, cardReviewEnabled, cardStage);
+        requests = cardFilter.requests;
+        let cardBatchOnly = cardFilter.batchOnly;
+        const stageDropped: TDroppedIntent[] = cardFilter.dropped;
+        const stageOrphaned = cardFilter.orphaned;
+        for (const { req, why } of cardFilter.removed) {
+            logFn(
+                `🧹 Намерение ${describeRequest(req)} снято стадией ревью карточки: ${why}. ` +
+                    `Строка: ${serializeSessionRequest(req)}`,
+            );
+        }
+        // Начатое, разрешённое только как запись в state, уже обработано фильтром. Его id не
+        // должен перейти к следующей строке хвоста: она получит собственный идентификатор.
+        if (resume !== null && requests[0] !== parsedStarted) resume = null;
 
         // #65: чьи карточки петля закрыла САМА. Списки issue у форжа согласуются с
         // задержкой, и очередь, прочитанная через секунды после закрытия, отдаёт карточку
@@ -4654,13 +4708,45 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 if (res.verdict !== 'PASS') notPassed.add(r.issue);
                 return { kind: 'comment', issue: r.issue, comment: res.comment.slice(0, 9_000) };
             });
-            requests = converted.filter((r) => {
+            const keepAfterProbe = (r: TSessionRequest): boolean => {
                 if (r.kind !== 'close' || !notPassed.has(r.issue)) return true;
                 const what = `#${String(r.issue)}: живая проба не дала PASS`;
                 probeHeld.push({ kind: 'close', what });
                 logFn(`⛔ Закрытие ${what} — карточка остаётся открытой.`);
                 return false;
-            });
+            };
+            requests = converted.filter(keepAfterProbe);
+            cardBatchOnly = cardBatchOnly.filter(keepAfterProbe);
+            writeFn(`${requests.map(serializeSessionRequest).join('\n')}\n`);
+        }
+        // Итог роли фиксируется ДО первого эффекта и до снятия строк из файла: после обрыва
+        // pending.saved различает принятый батч и неизвестный исход сессии.
+        if (cardReviewEnabled && cardStage?.saveBatchFn) {
+            const batch = buildCardBatch(requests, cardBatchOnly, cardStage);
+            try {
+                cardStage.saveBatchFn(batch);
+            } catch (e) {
+                const message = (e as Error).message;
+                pushEventFn(
+                    `⛔ Ralph: итог ревью карточки не сохранился в state — ${message}. ` +
+                        'Ни одного эффекта форжа не выполнено; батч намерений оставлен для повтора.',
+                    cfg,
+                    { logFn },
+                );
+                return {
+                    applied: 0,
+                    failed: true,
+                    closedIssues,
+                    prFindings,
+                    prBlocked,
+                    dropped: stageDropped,
+                    outcomeUnknown: true,
+                };
+            }
+        }
+        // При новом (не начатом) батче отфильтрованный остаток ложится на диск одной записью.
+        // Пустой остаток снимет общее завершение removeFn; начатую строку пишет журнал #86.
+        if (cardFilter.removed.length > 0 && resume === null) {
             writeFn(`${requests.map(serializeSessionRequest).join('\n')}\n`);
         }
         // Подсказка про лимит форжа — одна на все ветки отказа (ревью #612): человек,
@@ -4945,10 +5031,14 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     // Пробы преобразованы в комментарии до цикла (#219); дошедшая сюда —
                     // дефект раннера, и исполнять её мимо исполнителя нельзя.
                     throw new Error('живая проба дошла до применения непреобразованной');
+                } else if (req.kind === 'card-fix') {
+                    // Отчёт правки живёт только в TCardBatch; фильтр стадии снимает его до
+                    // эффектов. Дошедший сюда обошёл фильтр, и молчаливая потеря недопустима.
+                    throw new Error('card-fix дошёл до эффектов мимо фильтра стадии карточки');
                 } else {
-                    // Комментарий несут все три вида: и «закрой», и «заблокируй» обязаны
-                    // объяснить человеку, что произошло. Сверка нашла его на форже (#94) —
-                    // доводится только статус: закрытие и метка идемпотентны, комментарий нет.
+                    // Намерения по карточке несут объяснение человеку. Сверка нашла его на
+                    // форже (#94) — доводится только статус: закрытие и метка идемпотентны,
+                    // комментарий нет. У card-comment/card-block статусного эффекта нет.
                     if (!commentLanded) {
                         send();
                         taskSource.commentOnIssue(req.issue, markIssue(req.comment));
@@ -5187,7 +5277,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // Номер только называется, эффекта на нём нет: петля в чужой PR не пишет.
         // `pr-block` громче строки лога: блок означал «не мерджить», и человек обязан
         // узнать, что он не дошёл, — PR мог уйти в main с известным блокером.
-        if (orphaned.length > 0) {
+        const allOrphaned = [...stageOrphaned, ...orphaned];
+        if (allOrphaned.length > 0) {
             let orphanPr: number | null = null;
             try {
                 orphanPr = orphanPrFn ? orphanPrFn() : null;
@@ -5196,7 +5287,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             }
             const where = orphanPr !== null ? `PR #${String(orphanPr)}` : 'PR не определён';
             logFn(
-                `🧹 Отброшено PR-намерений вне цикла сдачи: ${String(orphaned.length)} (${where}) — ` +
+                `🧹 Отброшено PR-намерений вне цикла сдачи: ${String(allOrphaned.length)} (${where}) — ` +
                     'хвост сдачи пережил мердж своего PR; остальные намерения батча применяются.',
             );
             // Тело блока допускает до 20 000 символов, а уведомление уходит в мессенджер:
@@ -5208,7 +5299,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     ? `${line.slice(0, ORPHAN_BLOCK_GIST_MAX)}…`
                     : line;
             };
-            const blocks = orphaned.filter(
+            const blocks = allOrphaned.filter(
                 (r): r is Extract<TSessionRequest, { kind: 'pr-block' }> => r.kind === 'pr-block',
             );
             if (blocks.length > 0) {
@@ -5238,7 +5329,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 closedIssues,
                 prFindings,
                 prBlocked,
-                dropped: [...probeHeld, ...dropped],
+                dropped: [...probeHeld, ...stageDropped, ...dropped],
             };
         }
         return {
@@ -5247,7 +5338,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             closedIssues,
             prFindings,
             prBlocked,
-            dropped: [...probeHeld, ...dropped],
+            dropped: [...probeHeld, ...stageDropped, ...dropped],
         };
     }
 
@@ -5257,6 +5348,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
         if (req.kind === 'new-issue') return `new-issue «${req.title}»`;
         if (req.kind === 'pr-comment') {
             return req.anchor ? `pr-comment ${anchorPlace(req.anchor)}` : 'pr-comment (сводка)';
+        }
+        if (req.kind === 'card-comment') {
+            const where = req.anchor ? ` ${anchorPlace(req.anchor)}` : ' (сводка)';
+            return `card-comment #${String(req.issue)}${where}`;
         }
         if (req.kind === 'pr-block') return 'pr-block';
         return `${req.kind} #${String(req.issue)}`;
@@ -6062,6 +6157,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             // #625: база диффа. Не задана — изменения фазы (как было). Задана — изменения
             // ПРАВОК от этого sha: предмет второго прохода ревью.
             base,
+            strict = false,
         }: {
             shFn?: ShFn;
             runArgvFn?: ShArgvFn;
@@ -6069,12 +6165,20 @@ export function createOrchestrator(env: OrchestratorEnv) {
             limit?: number;
             files?: string[] | null;
             base?: string;
+            strict?: boolean;
         } = {},
     ): string {
-        if (base !== undefined && !safeBase(base, { logFn })) return '';
+        if (base !== undefined && !safeBase(base, { logFn })) {
+            if (strict) throw new Error(`Небезопасная база диффа карточки: ${base}`);
+            return '';
+        }
         const files =
             known !== undefined ? known : phaseDiffFiles(branch, { shFn, runArgvFn, logFn, base });
-        if (!files || !files.length) return '';
+        if (!files) {
+            if (strict) throw new Error('список файлов диффа карточки не прочитался');
+            return '';
+        }
+        if (!files.length) return '';
 
         let diff = '';
         try {
@@ -6082,6 +6186,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 `git -c core.quotePath=false diff --no-renames ${shq(diffRange(branch, base))}`,
             );
         } catch (e) {
+            if (strict) throw e;
             logFn(`⚠ Не смог получить текст диффа для промпта ревью: ${(e as Error).message}`);
         }
 
@@ -7084,6 +7189,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // той же записью, что и переход: переживи она его — следующая фаза встала бы у гейта
         // на `merge-unknown` с номером чужого PR.
         st.mergeInFlight = null;
+        // S2f: дифф и история карточки относятся к прошлой фазе; сброс — той же записью.
+        st.cardReview = null;
+        st.cardHistory = [];
         // #93: журнал сдачи прошлой фазы снимается — кроме попытки, дошедшей до деплоя: её
         // барьер ставится ДО перехода и обязан пережить его той же записью (#165).
         if (!(st.submitStages ?? []).some((r) => r.stage === 'deploy')) st.submitStages = [];
@@ -7435,6 +7543,11 @@ export function createOrchestrator(env: OrchestratorEnv) {
         resolveMaxSameRefusal(cfg, failFn);
         resolveMaxFixPlans(cfg, failFn);
         resolveMaxPhaseDiffLines(cfg, failFn);
+        try {
+            resolveCardReview(cfg.review);
+        } catch (e) {
+            failFn((e as Error).message);
+        }
         resolveMaxProgressUnknown(cfg, failFn);
         // Задача 95: порог диска, ротация логов сессий и тарифы — тем же ранним отказом:
         // опечатка выключила бы порог молча, а тариф строкой дал бы NaN в стоимости попытки.
@@ -7889,6 +8002,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         checkOnPhaseBranchFn?: typeof checkOnPhaseBranch;
         // Снятие устаревших намерений при отказе стража: побочка по fs, поэтому швом.
         readSessionRequestsFn?: typeof readSessionRequests;
+        writeSessionRequestsFn?: typeof writeSessionRequests;
         removeSessionRequestsFn?: typeof removeSessionRequests;
         // #124: карантин батча, отвергнутого разбором после кодер-сессии.
         quarantineSessionRequestsFn?: typeof quarantineSessionRequests;
@@ -8035,6 +8149,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             ensurePhaseBranchFn = ensurePhaseBranch,
             checkOnPhaseBranchFn = checkOnPhaseBranch,
             readSessionRequestsFn = readSessionRequests,
+            writeSessionRequestsFn = writeSessionRequests,
             removeSessionRequestsFn = removeSessionRequests,
             quarantineSessionRequestsFn = quarantineSessionRequests,
             // #88: запрос мягкой остановки. Дефолт «запроса нет», а боевое чтение файла
@@ -8104,6 +8219,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         const maxPhaseDiffLines = resolveMaxPhaseDiffLines(cfg, (msg) => {
             throw new Error(msg);
         });
+        const cardReviewConfig = resolveCardReview(cfg.review);
         const persistRefusalOutcome = refusalOutcomePersister(state, saveStateFn, logFn);
         // `intentsNote` — что последний батч намерений по карточке сказал о себе: вероятная
         // причина круга для диагноза брейкера, `null` — батч прошёл чисто.
@@ -8119,6 +8235,12 @@ export function createOrchestrator(env: OrchestratorEnv) {
         const issueFormat = resolveIssueFormat(cfg, (msg) => {
             throw new Error(msg);
         });
+        // S2f: выключенная стадия не должна воскресить старый дифф при повторном включении.
+        if (!dry && !cardReviewConfig.enabled && state.cardReview != null) {
+            logFn('⚠ review.cardReview выключен: снимаю state.cardReview прошлого запуска.');
+            state.cardReview = null;
+            saveStateFn(state);
+        }
         let progressUnknown = 0;
 
         // Задача 79: метка blocked, от которой зависит мердж, ставится с чтением ПОСЛЕ
@@ -8469,6 +8591,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
             } else resumeAttempt = { ...loaded, resumeStage: loaded.resumeStage };
         }
 
+        let softStopped = false;
+        let cardMetricLogged: RalphState['cardReview'] = null;
         while (true) {
             const idx = phaseIndexOfFn(state);
             const phase = cfg.phases[idx];
@@ -8493,6 +8617,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             // от того, записал ли его последний шаг. Запрос снимается ДО пуша: иначе
             // следующий запуск встал бы на том же файле, не сделав ни шага.
             if (stopRequestedFn()) {
+                softStopped = true;
                 // C1: dry-run только называет запрос и встаёт. Ни state, ни сам запрос он не
                 // трогает: файл адресован живой петле, и снятый здесь он до неё не дошёл бы.
                 if (dry) {
@@ -8907,8 +9032,559 @@ export function createOrchestrator(env: OrchestratorEnv) {
             const stageDone = (st: TCoderStage): boolean =>
                 resumeAt !== null && CODER_STAGES.indexOf(resumeAt) > CODER_STAGES.indexOf(st);
 
+            if (cardReviewConfig.enabled && resumeAt === null && !dry) {
+                type TCardStepResult = 'ordinary' | 'stop' | 'again';
+                const runCardStep = (
+                    card: NonNullable<RalphState['cardReview']>,
+                ): TCardStepResult => {
+                    const stop = (
+                        reason: TStopReason,
+                        diagnosis: string,
+                        question: string,
+                    ): TCardStepResult => {
+                        pushEventFn(
+                            `⛔ Ralph: ${formatStopMessage({ reason, diagnosis, question })}`,
+                            cfg,
+                            { logFn },
+                        );
+                        return 'stop';
+                    };
+                    const saveBatch: NonNullable<TCardStage['saveBatchFn']> = (batch) => {
+                        Object.assign(card, applyCardReviewBatch(card, batch));
+                        saveStateFn(state);
+                    };
+                    const applyIntents = (
+                        role: TCardStage['role'] | undefined,
+                        saveBatchFn?: TCardStage['saveBatchFn'],
+                    ) =>
+                        applySessionRequestsFn({
+                            cfg,
+                            currentMilestone: phase.milestone,
+                            dry,
+                            logFn,
+                            pushEventFn,
+                            cardStage:
+                                role === undefined
+                                    ? undefined
+                                    : { issue: card.issue, role, saveBatchFn },
+                            quarantineFn: () => quarantineSessionRequestsFn(nowFn()),
+                            orphanPrFn: () => {
+                                const prev = idx > 0 ? cfg.phases[idx - 1] : undefined;
+                                return prev ? mergedPhasePrFn(prev) : null;
+                            },
+                            liveProbeFn: (probe: { cli: string; case: string }) =>
+                                liveProbeForIntentFn(probe, {
+                                    rawConfig: cfg.liveProbe,
+                                    productRoot: cfg.rootsResolved?.productRoot ?? null,
+                                    executionRoot: cfg.rootsResolved?.executionRoot ?? null,
+                                    logFn,
+                                }),
+                        });
+                    const readClosed = (): boolean | null => {
+                        try {
+                            const stillOpen = allOpenIssuesFn(phase.milestone).some(
+                                (issue) => issue.number === card.issue,
+                            );
+                            const details = getIssueFn(card.issue);
+                            if (details.open === undefined) {
+                                stop(
+                                    'forge-unreadable',
+                                    `статус карточки #${card.issue} неизвестен: ответ форжа не содержит open`,
+                                    'проверь адаптер форжа и перезапусти loop — неизвестный статус не подтверждает закрытие',
+                                );
+                                return null;
+                            }
+                            return !stillOpen && details.open === false;
+                        } catch (e) {
+                            stop(
+                                'forge-unreadable',
+                                `статус карточки #${card.issue} не прочитался: ${(e as Error).message}`,
+                                'проверь доступ к форжу и перезапусти loop — закрытие без чтения статуса не подтверждается',
+                            );
+                            return null;
+                        }
+                    };
+                    const finish = (
+                        outcome: Parameters<typeof cardRecordOf>[1],
+                        head: string | null,
+                    ): void => {
+                        const record = cardRecordOf(
+                            card,
+                            outcome,
+                            head,
+                            new Date(nowFn()).toISOString(),
+                        );
+                        state.cardHistory = [...(state.cardHistory ?? []), record];
+                        state.cardReview = null;
+                        saveStateFn(state);
+                        logFn(formatCardMetrics(record));
+                        cardMetricLogged = card;
+                        closedThisRun.add(card.issue);
+                    };
+                    const closeCard = (head: string): TCardStepResult => {
+                        card.closing = head;
+                        saveStateFn(state);
+                        const raw = readSessionRequestsFn();
+                        if (raw === null || raw.trim() === '') {
+                            writeSessionRequestsFn(
+                                `${serializeSessionRequest({
+                                    kind: 'close',
+                                    issue: card.issue,
+                                    comment: card.closeComment ?? '',
+                                })}\n`,
+                            );
+                        }
+                        const intents = applyIntents('closing');
+                        if (intents.failed) return 'stop';
+                        const closed = readClosed();
+                        if (closed === null) return 'stop';
+                        if (closed) {
+                            finish('closed', head);
+                            return 'again';
+                        }
+                        const why = (intents.dropped ?? []).map((intent) => intent.what).join('; ');
+                        return stop(
+                            'card-unreviewed',
+                            `закрытие карточки #${card.issue} на голове ${head} не подтверждено форжем${why ? `: ${why}` : ''}`,
+                            'проверь причину отказа форжа и карточку руками; closing оставлен в state, новая строка close без рестарта не пишется',
+                        );
+                    };
+                    const reviewCard = (head: string, files: string[]): TCardStepResult => {
+                        const reviewModel = pickReviewModelFn(phase.milestone, phase.branch, {
+                            files,
+                        });
+                        if (!reviewModel || reviewModel === 'none') {
+                            return stop(
+                                'card-unreviewed',
+                                `для карточки #${card.issue} не выбрана модель ревью`,
+                                'назначь модель ревью в конфиге и перезапусти loop — закрытие без ревьюера запрещено',
+                            );
+                        }
+                        let diffContext: string;
+                        try {
+                            diffContext = reviewDiffContextFn(phase.branch, {
+                                files,
+                                limit: positiveIntOrDefault(
+                                    cfg.review?.diffLimit,
+                                    REVIEW_DIFF_LIMIT,
+                                ),
+                                base: card.firstHead,
+                                strict: true,
+                            });
+                        } catch (e) {
+                            return stop(
+                                'card-unreviewed',
+                                `текст диффа карточки #${card.issue} от ${card.firstHead} до ${head} не прочитался: ${(e as Error).message}`,
+                                'проверь базу карточки и доступ git к origin, затем перезапусти loop',
+                            );
+                        }
+                        const findingsContext = JSON.stringify(
+                            card.findings.filter((finding) => finding.status === 'open'),
+                            null,
+                            2,
+                        );
+                        const reviewPrompt = buildCardReviewPrompt({
+                            issue: card.issue,
+                            branch: phase.branch,
+                            diffContext,
+                            findingsContext,
+                            reviewedHead: head,
+                        });
+                        const reviewFallback = pickReviewFallbackModel(cfg);
+                        logFn(
+                            `🔍 Ревью карточки #${card.issue} моделью ${reviewModel} на ${head} (фолбэк: ${reviewFallback && reviewFallback !== 'none' ? reviewFallback : 'нет'})`,
+                        );
+                        for (let attempt = 0; ; attempt += 1) {
+                            if (card.sessions >= cardReviewConfig.maxSessions)
+                                return limitCard(head);
+                            if (!placeOnPhaseBranch(`ревью карточки #${card.issue}`)) return 'stop';
+                            card.sessions += 1;
+                            card.pending = { role: 'review', head, saved: false };
+                            saveStateFn(state);
+                            let reviewEnd = 'completed' as SessionEndReason;
+                            const reviewCode = runClaudeFn(
+                                reviewPrompt,
+                                {
+                                    model: reviewModel,
+                                    maxTurns: positiveIntOrDefault(cfg.review?.maxTurns, maxTurns),
+                                    fallbackModel: reviewFallback,
+                                },
+                                {
+                                    onOutput: (_text: string, end: SessionEndReason) => {
+                                        reviewEnd = end;
+                                    },
+                                },
+                            );
+                            if (!guardAfterSession(`ревью карточки #${card.issue}`)) return 'stop';
+                            if (reviewCode !== 0) {
+                                const raw = readSessionRequestsFn();
+                                if (raw !== null && raw.trim() !== '') {
+                                    quarantineSessionRequestsFn(nowFn());
+                                }
+                                card.failedSessions += 1;
+                                card.pending = null;
+                                saveStateFn(state);
+                                if (card.sessions >= cardReviewConfig.maxSessions)
+                                    return limitCard(head);
+                                return stop(
+                                    'review-no-verdict',
+                                    `ревью карточки #${card.issue} упало с кодом ${reviewCode}; его вывод и сводка не приняты, батч снят в карантин`,
+                                    'проверь вывод сессии и перезапусти loop — ревью начнётся заново на той же голове',
+                                );
+                            }
+                            const intents = applyIntents('review', saveBatch);
+                            const accepted = card.pending?.saved === true;
+                            if (accepted) {
+                                if (intents.failed) return 'stop';
+                                card.pending = null;
+                                saveStateFn(state);
+                                return 'again';
+                            }
+                            card.failedSessions += 1;
+                            card.pending = null;
+                            saveStateFn(state);
+                            if (card.sessions >= cardReviewConfig.maxSessions)
+                                return limitCard(head);
+                            const proxyRetry =
+                                reviewEnd === 'interrupted' &&
+                                (intents.applied ?? 0) === 0 &&
+                                intents.rejected === undefined;
+                            if (proxyRetry && attempt < MODEL_PROXY_RETRIES) {
+                                const waitMs = modelProxyRetryWaitMs(attempt + 1);
+                                logFn(
+                                    `⚠ Ревью карточки #${card.issue} без вердикта из-за обрыва модели. ` +
+                                        `Повтор через ${Math.round(waitMs / 1000)}с (попытка ${attempt + 2} из ${MODEL_PROXY_RETRIES + 1}).`,
+                                );
+                                sleepFn(waitMs);
+                                continue;
+                            }
+                            return stop(
+                                'review-no-verdict',
+                                intents.rejected
+                                    ? `батч ревью карточки #${card.issue} отвергнут разбором: ${intents.rejected.quarantined ?? 'карантин не удался'}`
+                                    : `ревью карточки #${card.issue} завершилось без card-comment-сводки и card-block`,
+                                'посмотри вывод ревью в логе и перезапусти loop — без вердикта карточка остаётся открытой',
+                            );
+                        }
+                    };
+                    const fixCard = (head: string): TCardStepResult => {
+                        const issue = issues.find((candidate) => candidate.number === card.issue);
+                        if (!issue) {
+                            return stop(
+                                'card-unreviewed',
+                                `карточка #${card.issue} исчезла из очереди перед правками`,
+                                'верни карточку в очередь или разбери её дифф руками, затем перезапусти loop',
+                            );
+                        }
+                        const route = pickRouteFn(issue);
+                        const findingsContext = JSON.stringify(card.findings, null, 2);
+                        const prompt = buildCardFixPrompt({
+                            issue: card.issue,
+                            branch: phase.branch,
+                            findingsContext,
+                            gateCmdList: gateChecksFor(cfg.profileName, cfg)
+                                .map(([, cmd]) => cmd)
+                                .join(', '),
+                        });
+                        if (!placeOnPhaseBranch(`правки карточки #${card.issue}`)) return 'stop';
+                        card.sessions += 1;
+                        card.pending = { role: 'fix', head, saved: false };
+                        saveStateFn(state);
+                        const code = runClaudeFn(
+                            prompt,
+                            {
+                                model: route.model ?? cfg.model,
+                                maxTurns,
+                                ...(route.model && route.provider !== 'claude'
+                                    ? { modelProvider: route.provider }
+                                    : {}),
+                            },
+                            { runClaudeOnceFn: coderRuntimeRunFor(route.provider) },
+                        );
+                        if (!guardAfterSession(`правки карточки #${card.issue}`)) return 'stop';
+                        if (code !== 0) {
+                            const raw = readSessionRequestsFn();
+                            if (raw !== null && raw.trim() !== '') {
+                                quarantineSessionRequestsFn(nowFn());
+                            }
+                            card.failedSessions += 1;
+                            card.pending = null;
+                            saveStateFn(state);
+                            if (!pushAfterSession(`правки карточки #${card.issue}`)) return 'stop';
+                            return 'again';
+                        }
+                        if (!pushAfterSession(`правки карточки #${card.issue}`)) return 'stop';
+                        const diffOf = (pendingHead: string): string => {
+                            if (!isFullSha(pendingHead)) {
+                                throw new Error(
+                                    `pending.head — ожидался полный SHA, получено ${pendingHead}`,
+                                );
+                            }
+                            return shFn(`git diff ${pendingHead}..HEAD`);
+                        };
+                        const saveFixBatch: NonNullable<TCardStage['saveBatchFn']> = (batch) => {
+                            Object.assign(
+                                card,
+                                applyCardFixBatch(card, batch.fixes, diffOf, logFn),
+                            );
+                            if (card.pending === null || card.pending.role !== 'fix') {
+                                throw new Error('итог правок карточки без pending роли fix');
+                            }
+                            card.pending.saved = true;
+                            saveStateFn(state);
+                        };
+                        const raw = readSessionRequestsFn();
+                        if (raw === null || raw.trim() === '') {
+                            saveFixBatch({
+                                deferredClose: null,
+                                summary: null,
+                                blocked: null,
+                                findings: [],
+                                fixes: [],
+                            });
+                            card.pending = null;
+                            saveStateFn(state);
+                            return 'again';
+                        }
+                        const intents = applyIntents('fix', saveFixBatch);
+                        if (intents.failed || intents.outcomeUnknown) return 'stop';
+                        if (card.pending?.saved === true) {
+                            card.pending = null;
+                            saveStateFn(state);
+                        }
+                        return 'again';
+                    };
+                    const limitCard = (head: string): TCardStepResult => {
+                        const question =
+                            'разбери находки: закрой карточку руками либо подними `review.maxCardReviewRounds` или `review.maxCardSessions`, сними `blocked` и перезапусти loop';
+                        const limitStop = (details = '') =>
+                            stop(
+                                'card-review-limit',
+                                `${formatCardLimitPacket(card, head)}${details ? `\n${details}` : ''}`,
+                                question,
+                            );
+                        const raw = readSessionRequestsFn();
+                        if (raw !== null && raw.trim() !== '') {
+                            return limitStop(
+                                'файл намерений непуст: чужой хвост не применяется как пакет предела, block не записан',
+                            );
+                        }
+                        if (card.limitHead !== head) {
+                            card.limitHead = head;
+                            const record = cardRecordOf(
+                                card,
+                                'blocked',
+                                head,
+                                new Date(nowFn()).toISOString(),
+                            );
+                            state.cardHistory = [...(state.cardHistory ?? []), record];
+                            saveStateFn(state);
+                            logFn(formatCardMetrics(record));
+                            cardMetricLogged = card;
+                        }
+                        const hasBlockedLabel = (): boolean => {
+                            const current = allOpenIssuesFn(phase.milestone).find(
+                                (candidate) => candidate.number === card.issue,
+                            );
+                            return (
+                                current?.labels?.some((label) => label.name === 'blocked') === true
+                            );
+                        };
+                        let labelled: boolean;
+                        try {
+                            labelled = hasBlockedLabel();
+                        } catch (e) {
+                            return stop(
+                                'forge-unreadable',
+                                `метки карточки #${card.issue} перед пределом не прочитались: ${(e as Error).message}`,
+                                'проверь доступ к форжу и перезапусти loop',
+                            );
+                        }
+                        if (!labelled) {
+                            writeSessionRequestsFn(
+                                `${serializeSessionRequest({
+                                    kind: 'block',
+                                    issue: card.issue,
+                                    comment: formatCardLimitPacket(card, head),
+                                })}\n`,
+                            );
+                            const intents = applyIntents(undefined);
+                            if (intents.failed) return 'stop';
+                            const dropped = (intents.dropped ?? [])
+                                .map((intent) => intent.what)
+                                .join('; ');
+                            if (dropped) {
+                                return limitStop(`метка не легла: ${dropped}`);
+                            }
+                            try {
+                                labelled = hasBlockedLabel();
+                            } catch (e) {
+                                return stop(
+                                    'forge-unreadable',
+                                    `метки карточки #${card.issue} после block не прочитались: ${(e as Error).message}`,
+                                    'проверь доступ к форжу и перезапусти loop',
+                                );
+                            }
+                            if (!labelled) {
+                                return limitStop(
+                                    'метка не легла: повторное чтение не видит blocked',
+                                );
+                            }
+                        }
+                        return limitStop();
+                    };
+
+                    if (card.milestone !== phase.milestone) {
+                        logFn(
+                            `⚠ state.cardReview относится к другой вехе (${card.milestone}, текущая ${phase.milestone}) — запись снята.`,
+                        );
+                        state.cardReview = null;
+                        saveStateFn(state);
+                        return 'ordinary';
+                    }
+                    if (card.pending !== null) {
+                        if (!card.pending.saved) {
+                            const raw = readSessionRequestsFn();
+                            if (raw !== null && raw.trim() !== '') {
+                                quarantineSessionRequestsFn(nowFn());
+                            }
+                            card.failedSessions += 1;
+                            card.pending = null;
+                            saveStateFn(state);
+                        } else {
+                            const role = card.pending.role;
+                            const intents = applyIntents(role);
+                            if (intents.failed) return 'stop';
+                            card.pending = null;
+                            saveStateFn(state);
+                        }
+                    } else if (card.closing === null) {
+                        const raw = readSessionRequestsFn();
+                        const exhaustedBeforeDecision =
+                            card.sessions >= cardReviewConfig.maxSessions ||
+                            (card.closeComment !== null &&
+                                card.rounds >= cardReviewConfig.maxRounds);
+                        if (raw !== null && raw.trim() !== '' && !exhaustedBeforeDecision) {
+                            const intents = applyIntents('coder', saveBatch);
+                            if (intents.failed) return 'stop';
+                        }
+                    }
+                    if (!issues.some((issue) => issue.number === card.issue)) {
+                        const closed = readClosed();
+                        if (closed === null) return 'stop';
+                        if (closed) {
+                            finish(
+                                card.closing === null ? 'closed-external' : 'closed',
+                                card.closing,
+                            );
+                            return 'ordinary';
+                        }
+                        if (card.limitHead !== null) {
+                            return stop(
+                                'card-review-limit',
+                                `карточка #${card.issue} вне очереди на голове ${card.limitHead}, а её находки не разобраны`,
+                                'закрой карточку руками после разбора либо верни её в очередь; следующая карточка вехи не берётся',
+                            );
+                        }
+                        let currentHead: unknown = null;
+                        try {
+                            currentHead = shFn('git rev-parse HEAD').trim();
+                        } catch {
+                            currentHead = null;
+                        }
+                        if (currentHead === card.firstHead && card.closeComment === null) {
+                            state.cardReview = null;
+                            saveStateFn(state);
+                            return 'ordinary';
+                        }
+                        return stop(
+                            'card-unreviewed',
+                            `карточка #${card.issue} вне очереди, а её коммиты непроверены`,
+                            'верни карточку в очередь или закрой её руками после разбора диффа; следующая карточка не строится поверх непроверенной',
+                        );
+                    }
+                    if (
+                        card.closeComment === null &&
+                        card.closing === null &&
+                        card.sessions < cardReviewConfig.maxSessions
+                    ) {
+                        return 'ordinary';
+                    }
+                    if (!pushAfterSession(`ревью карточки #${card.issue}`)) return 'stop';
+                    let head: unknown;
+                    try {
+                        head = shFn('git rev-parse HEAD').trim();
+                    } catch {
+                        head = null;
+                    }
+                    const originHead = branchHeadShaFn(phase.branch);
+                    if (!isFullSha(head) || !isFullSha(originHead)) {
+                        return stop(
+                            'card-unreviewed',
+                            `голова карточки #${card.issue} не прочиталась: локальный HEAD ${String(head)}, origin/${phase.branch} ${String(originHead)}`,
+                            'проверь git и origin, затем перезапусти loop — ни сессия, ни закрытие на нечитаемой голове не выполняются',
+                        );
+                    }
+                    if (head !== originHead) {
+                        return stop(
+                            'head-diverged',
+                            `локальный HEAD ${head} и origin/${phase.branch} ${originHead} разошлись перед ревью карточки #${card.issue}`,
+                            'сведи локальную ветку с origin без --force и перезапусти loop — закрытие по другой голове запрещено',
+                        );
+                    }
+                    if (card.closing !== null) {
+                        if (card.closing === head) return closeCard(head);
+                        const raw = readSessionRequestsFn();
+                        if (inFlightEntry(raw) === null) {
+                            removeSessionRequestsFn();
+                            card.closing = null;
+                            saveStateFn(state);
+                        } else {
+                            return stop(
+                                'card-unreviewed',
+                                `начатое закрытие карточки #${card.issue} относится к голове ${card.closing}, текущая голова ${head}; исход старого эффекта неизвестен`,
+                                'разбери состояние карточки и файл намерений руками; state и in-flight close сохранены, закрытие новой головы по старому ревью запрещено',
+                            );
+                        }
+                    }
+                    const files = phaseDiffFilesFn(phase.branch, { base: card.firstHead });
+                    if (files === null) {
+                        return stop(
+                            'card-unreviewed',
+                            `дифф карточки #${card.issue} от базы ${card.firstHead} не прочитался`,
+                            'проверь базу и ветку в git, затем перезапусти loop — ревью без диффа не запускается',
+                        );
+                    }
+                    const decision = decideCardStep(
+                        card,
+                        {
+                            maxRounds: cardReviewConfig.maxRounds,
+                            maxSessions: cardReviewConfig.maxSessions,
+                        },
+                        head,
+                    );
+                    if (decision === 'coder') return 'ordinary';
+                    if (decision === 'fix') return fixCard(head);
+                    if (decision === 'limit') return limitCard(head);
+                    if (decision === 'close') return closeCard(head);
+                    return reviewCard(head, files);
+                };
+                const card = state.cardReview ?? null;
+                if (card !== null) {
+                    const result = runCardStep(card);
+                    if (result === 'stop') break;
+                    if (result === 'again') {
+                        if (once) break;
+                        continue;
+                    }
+                }
+            }
+
             if (issues.length > 0) {
-                const next = resumedIssue ?? issues[0];
+                const next =
+                    resumedIssue ??
+                    issues.find((i) => i.number === state.cardReview?.issue) ??
+                    issues[0];
                 // Фаза 10: второй эшелон формата после preflight (карточка появилась посреди
                 // прогона либо не прочиталась на старте) — по телу, которое уйдёт в промпт.
                 const body = nextIssueBody({
@@ -8956,6 +9632,66 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 }
                 if (issueStreak !== null && issueStreak.issue === next.number) issueStreak.count++;
                 else issueStreak = { issue: next.number, count: 1, intentsNote: null };
+                if (cardReviewConfig.enabled && !dry) {
+                    let card = state.cardReview ?? null;
+                    if (resumeAt !== null && card === null) {
+                        pushEventFn(
+                            `⛔ Ralph: ${formatStopMessage({
+                                reason: 'card-unreviewed',
+                                diagnosis: `у продолжаемой попытки Issue #${next.number} нет state.cardReview — стадию включили посреди попытки`,
+                                question:
+                                    'выключи review.cardReview и доведи попытку либо разбери её журнал руками, затем перезапусти loop',
+                            })}`,
+                            cfg,
+                            { logFn },
+                        );
+                        break;
+                    }
+                    if (resumeAt === null) {
+                        if (card === null) {
+                            let firstHead: unknown;
+                            try {
+                                firstHead = shFn('git rev-parse HEAD').trim();
+                            } catch {
+                                firstHead = null;
+                            }
+                            if (!isFullSha(firstHead)) {
+                                pushEventFn(
+                                    `⛔ Ralph: ${formatStopMessage({
+                                        reason: 'card-unreviewed',
+                                        diagnosis: `база карточки #${next.number} неизвестна: локальный HEAD не прочитался как полный SHA`,
+                                        question:
+                                            'проверь git дерева раннера и перезапусти loop — кодер-сессия без известной базы не запускается',
+                                    })}`,
+                                    cfg,
+                                    { logFn },
+                                );
+                                break;
+                            }
+                            card = newCardProgress({
+                                issue: next.number,
+                                milestone: phase.milestone,
+                                firstHead,
+                                startedAt: new Date(nowFn()).toISOString(),
+                            });
+                            state.cardReview = card;
+                        }
+                        if (card.issue !== next.number || card.milestone !== phase.milestone) {
+                            pushEventFn(
+                                `⛔ Ralph: ${formatStopMessage({
+                                    reason: 'card-unreviewed',
+                                    diagnosis: `state.cardReview относится к карточке #${card.issue} вехи "${card.milestone}", а выбрана #${next.number} вехи "${phase.milestone}"`,
+                                    question:
+                                        'доведи или сними прежнюю запись ревью карточки руками и перезапусти loop — две карточки в одном диффе не смешиваются',
+                                })}`,
+                                cfg,
+                                { logFn },
+                            );
+                            break;
+                        }
+                    }
+                    if (card !== null && !stageDone('session')) card.sessions += 1;
+                }
                 // #92: итерацию продолжаемой попытки уже посчитал прошлый процесс. Попытка
                 // начинается ДО счёта: убитый между ними процесс недосчитает одну итерацию,
                 // а не посчитает её дважды.
@@ -9081,6 +9817,11 @@ export function createOrchestrator(env: OrchestratorEnv) {
                     }
                     code = resumedCode;
                 } else {
+                    if (
+                        cardReviewConfig.enabled &&
+                        !placeOnPhaseBranch(`кодер-сессия Issue #${next.number}`)
+                    )
+                        break;
                     if (!journal('начало сессии', () => stageJournal.start('session'))) break;
                     code = runClaudeFn(
                         prompt,
@@ -9097,6 +9838,13 @@ export function createOrchestrator(env: OrchestratorEnv) {
                             },
                         },
                     );
+                }
+                if (code !== 0 && !stageDone('session') && cardReviewConfig.enabled && !dry) {
+                    const card = state.cardReview;
+                    if (card !== null && card !== undefined && card.issue === next.number) {
+                        card.failedSessions += 1;
+                        saveStateFn(state);
+                    }
                 }
                 // Задача 11, вторая половина: страж ПОСЛЕ сессии. Постановка до спавна
                 // снимает причину уйти в detached HEAD, но не запрещает уйти самой.
@@ -9205,12 +9953,33 @@ export function createOrchestrator(env: OrchestratorEnv) {
                             executionRoot: cfg.rootsResolved?.executionRoot ?? null,
                             logFn,
                         });
+                    const coderCardStage: TCardStage | undefined = cardReviewConfig.enabled
+                        ? {
+                              issue: next.number,
+                              role: 'coder',
+                              saveBatchFn: (batch) => {
+                                  const card = state.cardReview;
+                                  if (
+                                      card === null ||
+                                      card === undefined ||
+                                      card.issue !== next.number
+                                  ) {
+                                      throw new Error(
+                                          `нет state.cardReview для итога кодера Issue #${next.number}`,
+                                      );
+                                  }
+                                  state.cardReview = applyCardReviewBatch(card, batch);
+                                  saveStateFn(state);
+                              },
+                          }
+                        : undefined;
                     const intents = applySessionRequestsFn({
                         cfg,
                         currentMilestone: phase.milestone,
                         dry,
                         logFn,
                         pushEventFn,
+                        cardStage: coderCardStage,
                         quarantineFn: () => quarantineSessionRequestsFn(nowFn()),
                         // #226: хвост PR-намерений здесь — от сдачи прошлой фазы; её PR
                         // называется в строке отброшенного, эффекта на нём нет.
@@ -9441,6 +10210,25 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         { logFn },
                     );
                     break;
+                }
+                if (cardReviewConfig.enabled && !merged) {
+                    const problem = cardSubmitProblem(
+                        state.cardReview ?? null,
+                        state.cardHistory ?? [],
+                        phase.milestone,
+                    );
+                    if (problem !== null) {
+                        pushEventFn(
+                            `⛔ Ralph: ${formatStopMessage({
+                                reason: 'card-unreviewed',
+                                diagnosis: `сдача фазы "${phase.milestone}": ${problem}`,
+                                question: 'разбери карточку и перезапусти loop',
+                            })}`,
+                            cfg,
+                            { logFn },
+                        );
+                        break;
+                    }
                 }
                 if (merged) {
                     // H1: и в ЭТОМ пути обязательно обновление дерева раннера — после ручного
@@ -10163,6 +10951,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
                             limit: positiveIntOrDefault(cfg.review?.diffLimit, REVIEW_DIFF_LIMIT),
                             ...baseOpt,
                         });
+                        const cardReviewsContext = cardReviewConfig.enabled
+                            ? formatCardReviewsContext(state.cardHistory ?? [], phase.milestone)
+                            : '';
                         let reviewPrompt: string;
                         if (reviewBase !== undefined) {
                             // #275: открытые находки PR — часть предмета ревью от базы.
@@ -10178,10 +10969,15 @@ export function createOrchestrator(env: OrchestratorEnv) {
                                 branch: phase.branch,
                                 diffContext,
                                 commentsContext: baseComments,
+                                cardReviewsContext,
                                 allowNames: cfg.authorAllowlist.join(', '),
                             });
                         } else {
-                            reviewPrompt = buildReviewPrompt({ branch: phase.branch, diffContext });
+                            reviewPrompt = buildReviewPrompt({
+                                branch: phase.branch,
+                                diffContext,
+                                cardReviewsContext,
+                            });
                         }
                         let reviewCode = 0;
                         // Фаза 16: исход прохода от адаптера, а не его вывод: «сбой прокси» —
@@ -12513,6 +13309,30 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 pushEventFn(catchAllMsg, cfg, { logFn });
                 break;
             }
+        }
+
+        // Стоп — событие, а не новая запись истории: повтор после рестарта снова его считает.
+        // Выход на активацию возвращается выше и сюда не доходит, мягкий стоп помечен флагом.
+        const stoppedCard = state.cardReview;
+        if (
+            cardReviewConfig.enabled &&
+            !dry &&
+            !softStopped &&
+            stoppedCard != null &&
+            stoppedCard !== cardMetricLogged
+        ) {
+            logFn(
+                formatCardMetrics(
+                    cardRecordOf(
+                        stoppedCard,
+                        'stop',
+                        stoppedCard.closing ??
+                            stoppedCard.limitHead ??
+                            stoppedCard.lastReviewedHead,
+                        new Date(nowFn()).toISOString(),
+                    ),
+                ),
+            );
         }
 
         function stopOnRefusalSeries(phase: Phase, next: Issue): boolean {
