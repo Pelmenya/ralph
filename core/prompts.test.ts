@@ -243,6 +243,27 @@ describe('промпты сессий: подстановка параметро
         expect(prompt).not.toContain('запрос закрытия');
     });
 
+    // Первое живое ревью карточки поставило сводке 🟠 [major]: промпт требовал сводку без якоря и
+    // пометку у каждого комментария, а тег не называл. Разбор такой батч отвергает, и петля стояла.
+    it('пометка сводки из промпта проходит разбор, сводка с major — нет', () => {
+        const prompt = buildCardReviewPrompt({
+            issue: 7,
+            branch: BRANCH,
+            diffContext: '<дифф>',
+            findingsContext: '',
+            reviewedHead: 'b'.repeat(40),
+        });
+        const tag = /БЕЗ якоря и с пометкой (\S+ \[\w+\])/.exec(prompt)?.[1];
+        expect(tag).toBe('⚪ [nit]');
+        const summary = (comment: string): string =>
+            JSON.stringify({ kind: 'card-comment', issue: 7, comment });
+        const opts = { labelAllowlist: ['x'] };
+        expect(() => parseSessionRequests(summary(`${tag} итог`), opts)).not.toThrow();
+        expect(() => parseSessionRequests(summary('🟠 [major] итог'), opts)).toThrow(
+            /находка без места/i,
+        );
+    });
+
     it('пустой дифф карточки не отменяет ревью: проверяется, что её работа уже в ветке', () => {
         const prompt = buildCardReviewPrompt({
             issue: 7,

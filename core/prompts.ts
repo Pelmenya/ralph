@@ -255,7 +255,9 @@ export function buildCardReviewPrompt({
         `относится вердикт: ${reviewedHead}. Читай окружающий код по месту правок.${nextRound}` +
         `${emptyDiff}${diffContext}${wrapAsData('Открытые находки прошлых кругов:', findingsContext)} ` +
         `${intentsRule()} На КАЖДУЮ проблему запиши намерение card-comment с issue ${String(issue)}, ` +
-        `path и line. Сводку прохода запиши card-comment с тем же issue БЕЗ якоря — она обязательна. ` +
+        `path и line. Сводку прохода запиши card-comment с тем же issue БЕЗ якоря и с пометкой ⚪ [nit] — ` +
+        `она обязательна. Сводка — итог, а не находка: 🔴 и 🟠 без path и line разбор отвергнет вместе ` +
+        `со всем батчем, поэтому blocker и major пиши только отдельными находками с якорем. ` +
         `Если карточку нельзя закрывать, добавь card-block с тем же issue и причиной. ` +
         `${reviewSeverityRules()} ${HOLD_RULE}`
     );
