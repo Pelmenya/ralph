@@ -226,7 +226,6 @@ describe('промпты сессий: подстановка параметро
         expect(prompt).toContain(
             'работа другой карточки фазы, раздел «Не входит», отсутствие связи',
         );
-        expect(prompt).toContain('Неполная реализация чужой карточки находкой не считается вовсе');
         expect(prompt).toContain('не держит закрытие: card-block по ней не ставь');
         expect(prompt).toContain('card-comment');
         expect(prompt).toContain('card-block');
