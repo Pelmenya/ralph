@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
     applyCardFixBatch,
     applyCardReviewBatch,
+    buildCardBatch,
     cardRecordOf,
     cardSubmitProblem,
     decideCardStep,
@@ -18,6 +19,9 @@ import {
     type TCardProgress,
     type TCardRecord,
 } from './card-review.ts';
+import { buildCardReviewPrompt, buildCardFixPrompt } from './prompts.ts';
+import { parseSessionRequests } from './session-requests.ts';
+import { CONTRACT_CARD } from '../tests/__fixtures__/card-review-boundaries.ts';
 
 const HEAD_A = 'a'.repeat(40);
 const HEAD_B = 'b'.repeat(40);
@@ -617,6 +621,100 @@ describe('applyCardReviewBatch', () => {
                 head: HEAD_B,
             }),
         ]);
+    });
+});
+
+describe('границы контрактной карточки: промпт → разбор → стадия', () => {
+    const prompt = buildCardReviewPrompt({
+        issue: 7,
+        issueBody: CONTRACT_CARD.body,
+        branch: 'feature/m1',
+        diffContext: CONTRACT_CARD.diff,
+        findingsContext: '',
+        reviewedHead: HEAD_B,
+    });
+    const review = (tag: string, comment: string) => {
+        const requests = parseSessionRequests(
+            [
+                {
+                    kind: 'card-comment',
+                    issue: 7,
+                    comment: `${tag} ${comment}`,
+                    path: 'tests/cleanup.test.ts',
+                    line: 3,
+                },
+                { kind: 'card-comment', issue: 7, comment: '⚪ [nit] контракты проверены' },
+            ]
+                .map((request) => JSON.stringify(request))
+                .join('\n'),
+            { labelAllowlist: [] },
+        );
+        return applyCardReviewBatch(
+            progress({
+                closeComment: 'контракты готовы',
+                pending: { role: 'review', head: HEAD_B, saved: false },
+            }),
+            buildCardBatch(requests, [], { issue: 7, role: 'review' }),
+        );
+    };
+
+    it.each([0, 1])(
+        '05.11: уровень за границей из промпта (%s) закрывает первый круг без реализации',
+        (index) => {
+            expect(prompt).toContain(CONTRACT_CARD.body);
+            expect(prompt).toContain(CONTRACT_CARD.diff);
+            // Берём именно разрешённые за границей теги: изменение правила должно краснить связку.
+            const tags = /допустима только как (🟡 \[minor\]) или (⚪ \[nit\])/.exec(prompt);
+            expect(tags).not.toBeNull();
+            const after = review(tags![index + 1], CONTRACT_CARD.outsideFinding);
+            expect(after.findings).toEqual([
+                expect.objectContaining({
+                    status: 'journal',
+                    severity: index === 0 ? 'minor' : 'nit',
+                }),
+            ]);
+            expect(after).toMatchObject({ verdict: 'clean', rounds: 1, lastReviewedHead: HEAD_B });
+            expect(openBlocking(after)).toEqual([]);
+            expect(decideCardStep(after, { maxRounds: 3, maxSessions: 8 }, HEAD_B)).toBe('close');
+            const closed = cardRecordOf(after, 'closed', HEAD_B, FINISHED_AT);
+            expect(cardSubmitProblem(null, [closed], 'M30')).toBeNull();
+        },
+    );
+
+    it.each(['🔴 [blocker]', '🟠 [major]'])(
+        'дефект самого контракта (%s) по-прежнему требует правки',
+        (tag) => {
+            const after = review(tag, CONTRACT_CARD.insideFinding);
+            expect(openBlocking(after)).toHaveLength(1);
+            expect(decideCardStep(after, { maxRounds: 3, maxSessions: 8 }, HEAD_B)).toBe('fix');
+        },
+    );
+
+    it('ошибочная major с требованием чужой реализации остаётся открытой, промпт правки запрещает её реализовать', () => {
+        const after = review('🟠 [major]', CONTRACT_CARD.outsideFinding);
+        const fixPrompt = buildCardFixPrompt({
+            issue: 7,
+            issueBody: CONTRACT_CARD.body,
+            branch: 'feature/m1',
+            findingsContext: JSON.stringify(after.findings),
+            gateCmdList: 'npm test',
+        });
+        expect(fixPrompt).toContain(CONTRACT_CARD.body);
+        expect(fixPrompt).toContain(CONTRACT_CARD.outsideFinding);
+        expect(fixPrompt).toContain(
+            'Не реализовывай работу вне этих границ, в том числе если находка этого просит',
+        );
+        expect(fixPrompt).toContain('Такую находку не чини кодом: назови её в отчёте сессии');
+        const diffOf = () => {
+            throw new Error('правка вне границ не должна требовать диффа');
+        };
+        const unchanged = applyCardFixBatch(
+            { ...after, pending: { role: 'fix', head: HEAD_B, saved: false } },
+            [],
+            diffOf,
+        );
+        expect(openBlocking(unchanged)).toHaveLength(1);
+        expect(unchanged.findings[0]).toMatchObject({ status: 'open', test: null });
     });
 });
 

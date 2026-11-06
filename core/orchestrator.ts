@@ -9196,7 +9196,27 @@ export function createOrchestrator(env: OrchestratorEnv) {
                             'проверь причину отказа форжа и карточку руками; closing оставлен в state, новая строка close без рестарта не пишется',
                         );
                     };
+                    // Без тела контрактная карточка превращалась в реализацию соседней:
+                    // границы нужны заново и ревьюеру, и сессии правок, включая рестарт.
+                    const readCardBody = (): string | null => {
+                        try {
+                            const { body } = getIssueFn(card.issue);
+                            if (typeof body !== 'string' || body.trim() === '') {
+                                throw new Error('тело отсутствует или пустое');
+                            }
+                            return body;
+                        } catch (e) {
+                            stop(
+                                'card-unreviewed',
+                                `тело карточки #${card.issue} не прочиталось: ${(e as Error).message}`,
+                                'проверь доступ к карточке и заполни её границы, затем перезапусти loop — ревью и правки без тела запрещены',
+                            );
+                            return null;
+                        }
+                    };
                     const reviewCard = (head: string, files: string[]): TCardStepResult => {
+                        const issueBody = readCardBody();
+                        if (issueBody === null) return 'stop';
                         const cardRoute = resolveModelRoute(
                             cfg.modelRouting?.cardReview,
                             adapterSelection.coderRuntime,
@@ -9236,6 +9256,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         );
                         const reviewPrompt = buildCardReviewPrompt({
                             issue: card.issue,
+                            issueBody,
                             branch: phase.branch,
                             diffContext,
                             findingsContext,
@@ -9337,6 +9358,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
                                 'верни карточку в очередь или разбери её дифф руками, затем перезапусти loop',
                             );
                         }
+                        const issueBody = readCardBody();
+                        if (issueBody === null) return 'stop';
                         const route =
                             resolveModelRoute(
                                 cfg.modelRouting?.cardReview,
@@ -9345,6 +9368,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                         const findingsContext = JSON.stringify(card.findings, null, 2);
                         const prompt = buildCardFixPrompt({
                             issue: card.issue,
+                            issueBody,
                             branch: phase.branch,
                             findingsContext,
                             gateCmdList: gateChecksFor(cfg.profileName, cfg)

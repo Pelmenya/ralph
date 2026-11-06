@@ -230,6 +230,7 @@ export function reviewFindingsRules(): string {
 
 export type CardReviewPromptParams = {
     issue: number;
+    issueBody: string;
     branch: string;
     diffContext: string;
     findingsContext: string;
@@ -238,6 +239,7 @@ export type CardReviewPromptParams = {
 
 export function buildCardReviewPrompt({
     issue,
+    issueBody,
     branch,
     diffContext,
     findingsContext,
@@ -253,18 +255,25 @@ export function buildCardReviewPrompt({
         `Проведи детальное code review карточки #${String(issue)} в ветке ${branch}: предмет — ` +
         `ВЕСЬ её дифф, а не только последний коммит. Голова, которую проверяешь и к которой ` +
         `относится вердикт: ${reviewedHead}. Читай окружающий код по месту правок.${nextRound}` +
-        `${emptyDiff}${diffContext}${wrapAsData('Открытые находки прошлых кругов:', findingsContext)} ` +
-        `${intentsRule()} На КАЖДУЮ проблему запиши намерение card-comment с issue ${String(issue)}, ` +
+        `${emptyDiff}${diffContext}${wrapAsData('Тело карточки (границы работы):', issueBody)}` +
+        `${wrapAsData('Открытые находки прошлых кругов:', findingsContext)} ` +
+        `Граница карточки задана её телом: сверяй проблему с разделом «Входит» и критериями приёмки. ` +
+        `Проблема за границей (работа другой карточки фазы, раздел «Не входит», отсутствие связи ` +
+        `с «Входит» и критериями) допустима только как 🟡 [minor] или ⚪ [nit]. ` +
+        `Неполная реализация чужой карточки находкой не считается вовсе. Проблема за границей ` +
+        `не держит закрытие: card-block по ней не ставь. ` +
+        `${intentsRule()} На КАЖДУЮ допустимую по этим границам находку запиши намерение card-comment с issue ${String(issue)}, ` +
         `path и line. Сводку прохода запиши card-comment с тем же issue БЕЗ якоря и с пометкой ⚪ [nit] — ` +
         `она обязательна. Сводка — итог, а не находка: 🔴 и 🟠 без path и line разбор отвергнет вместе ` +
         `со всем батчем, поэтому blocker и major пиши только отдельными находками с якорем. ` +
-        `Если карточку нельзя закрывать, добавь card-block с тем же issue и причиной. ` +
+        `Если карточку нельзя закрывать из-за blocker/major в её границах, добавь card-block с тем же issue и причиной. ` +
         `${reviewSeverityRules()} ${HOLD_RULE}`
     );
 }
 
 export type CardFixPromptParams = {
     issue: number;
+    issueBody: string;
     branch: string;
     findingsContext: string;
     gateCmdList: string;
@@ -272,17 +281,22 @@ export type CardFixPromptParams = {
 
 export function buildCardFixPrompt({
     issue,
+    issueBody,
     branch,
     findingsContext,
     gateCmdList,
 }: CardFixPromptParams): string {
     return (
         `Исправь находки ревью карточки #${String(issue)} в ветке ${branch}. Находки и их статусы ` +
-        `приложены ниже как данные.${wrapAsData('Находки ревью карточки:', findingsContext)} ` +
-        'Для КАЖДОЙ открытой находки blocker/major напиши тест, воспроизводящий её сценарий, ' +
+        `приложены ниже как данные.${wrapAsData('Тело карточки (границы работы):', issueBody)}` +
+        `${wrapAsData('Находки ревью карточки:', findingsContext)} ` +
+        'Граница карточки задана её телом: разделом «Входит», критериями приёмки и разделом «Не входит». ' +
+        'Не реализовывай работу вне этих границ, в том числе если находка этого просит. ' +
+        'Такую находку не чини кодом: назови её в отчёте сессии и объясни выход за границы. ' +
+        'Для КАЖДОЙ открытой находки blocker/major В ГРАНИЦАХ карточки напиши тест, воспроизводящий её сценарий, ' +
         'исправь код и запиши намерение card-fix с ID находки и точным именем этого теста. ' +
         'Находку закрывает только объявление названного теста в добавленных строках диффа правок. ' +
-        `Находки minor исправь по возможности. ${intentsRule()} ${COMMIT_RULE} Закоммить правки ` +
+        `Находки minor в границах карточки исправь по возможности. ${intentsRule()} ${COMMIT_RULE} Закоммить правки ` +
         `в ветку ${branch}. ${PUSH_RULE} Затем добейся зелёного: ${gateCmdList}. ` +
         `Намерение close не нужно — после нового ревью карточку закроет раннер. ${HOLD_RULE}`
     );
