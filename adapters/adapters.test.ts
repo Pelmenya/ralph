@@ -76,6 +76,10 @@ function makeFakeTaskSource(seed: {
                 .slice()
                 .sort((a, b) => a.number - b.number),
         listAllOpenIssues: (milestone) => (seed.issues?.[milestone] ?? []).slice(),
+        findOpenIssue: (title) =>
+            Object.values(seed.issues ?? {})
+                .flat()
+                .find((issue) => issue.title === title) ?? null,
         // #39: у фейка «карточки любого статуса» = наличие ключа в seed.issues. Ключ
         // есть, а массив пуст — milestone заведён без задач, фаза не начата.
         hasAnyIssues: (milestone) => (seed.issues?.[milestone] ?? []).length > 0,

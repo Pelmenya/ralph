@@ -60,12 +60,14 @@ export function loopSessionContext({
     humanRoot,
     sessionTree,
     coreSha,
+    cliRoot,
     sessionIdFn = randomUUID,
     surfacesFn = () => protectedSurfacesOf(HARNESS_REGISTRY),
 }: {
     humanRoot: string | null;
     sessionTree: string | null;
     coreSha: string;
+    cliRoot?: string;
     sessionIdFn?: () => string;
     surfacesFn?: () => ProtectedSurfaces;
 }): TSessionContextBuild {
@@ -75,6 +77,7 @@ export function loopSessionContext({
         ...(typeof sessionTree === 'string' && path.isAbsolute(sessionTree)
             ? []
             : ['roots.execution']),
+        ...(cliRoot === undefined || path.isAbsolute(cliRoot) ? [] : ['cliRoot']),
     ];
     if (missing.length > 0) {
         return {
@@ -100,7 +103,10 @@ export function loopSessionContext({
         loop: true,
         coreRevision: coreSha,
         roots: { consumer: consumer as string, execution: sessionTree as string },
-        protectedSurfaces,
+        protectedSurfaces: {
+            ...protectedSurfaces,
+            absolute: [...new Set([...protectedSurfaces.absolute, ...(cliRoot ? [cliRoot] : [])])],
+        },
     };
     return { ok: true, context, value: JSON.stringify(context) };
 }

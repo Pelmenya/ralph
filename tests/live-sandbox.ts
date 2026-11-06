@@ -15,7 +15,7 @@
 //
 // Что настоящее и что фейк. Настоящие: диск, `git` (репозиторий, worktree, детач на
 // origin/main), сам раннер целиком — от чтения конфига до монитора и цикла. Фейки — ровно
-// два процесса, которые ходят наружу контура: форж (`gh`) и кодер (`claude`), оба шимами в
+// три внешних процесса: форж (`gh`), кодер (`claude`) и реестр версий (`npm`), все шимами в
 // PATH. Подменять их через DI нечем: `main()` коллабораторов не принимает, и именно поэтому
 // её ветки до сих пор ничем не были покрыты.
 //
@@ -28,6 +28,10 @@ import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { coreIsRepoRoot } from './core-repo.ts';
 import { INTENTS_BEGIN, INTENTS_END } from '../core/session-requests.ts';
+import { buildManifest, formatManifest, INSTALL_MANIFEST } from '../core/core-install.ts';
+import { HARNESS_REGISTRY } from '../adapters/harness-registry.ts';
+import { RUNTIME_IDENTITIES } from '../adapters/runtime-profile.ts';
+import { registryNpmShim } from './npm-shim.ts';
 
 /** Каталог продукта — то самое дерево, чистоту которого сторожит барьер. */
 export const PRODUCT_ROOT = path.resolve(import.meta.dirname, '..');
@@ -246,9 +250,9 @@ esac
  * исполняла бы сценарий кодера — писала промпт и подсунутые файлы, — и барьеры «кодер не
  * запускался» и «запись поймана ровно один раз» краснели бы на самой пробе.
  */
-function coderShim(sb: LiveSandbox, extra: string): string {
+function coderShim(sb: LiveSandbox, extra: string, version = '0.0.0 (sandbox)'): string {
     return `#!/bin/sh
-if [ "$1" = "--version" ]; then echo "0.0.0 (sandbox)"; exit 0; fi
+if [ "$1" = "--version" ]; then echo "${version}"; exit 0; fi
 SANDBOX_PRODUCT_ROOT="${sb.productRoot}"
 cat > "${sb.root}/coder-prompt.txt"
 ${extra}
@@ -337,6 +341,25 @@ export function buildLiveSandbox({
     }
     fs.writeFileSync(path.join(root, 'bin', 'gh'), forgeShim(sb), { mode: 0o755 });
     fs.writeFileSync(path.join(root, 'bin', 'claude'), coderShim(sb, coderScript), { mode: 0o755 });
+    fs.writeFileSync(path.join(root, 'bin', 'npm'), registryNpmShim(), { mode: 0o755 });
+
+    // Живой старт сверяет закреплённую копию до пробы PATH. Кладём её с манифестом заранее:
+    // установка не ходит в npm, а свежесть #264 читает тот же shim реестра. Ответ
+    // `--version` совпадает с описанием: #261 спрашивает его перед каждой сессией.
+    const harness = RUNTIME_IDENTITIES.claude.harness;
+    const loaded = HARNESS_REGISTRY.packages.get(harness);
+    if (!loaded) throw new Error(`пакет ${harness} для песочницы не принят`);
+    const copy = path.join(sb.runtimeDir, 'cli', harness, loaded.descriptor.cliVersion);
+    const copyBin = path.join(copy, loaded.pkg.distribution.bin);
+    fs.mkdirSync(path.dirname(copyBin), { recursive: true });
+    fs.writeFileSync(
+        copyBin,
+        coderShim(sb, coderScript, `${loaded.descriptor.cliVersion} (Claude Code)`),
+        {
+            mode: 0o755,
+        },
+    );
+    fs.writeFileSync(path.join(copy, INSTALL_MANIFEST), formatManifest(buildManifest(copy)));
 
     const home = path.join(root, 'home');
     git(root, home, 'init', '--quiet', '--bare', path.join(root, 'origin.git'));

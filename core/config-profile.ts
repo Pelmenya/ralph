@@ -34,6 +34,7 @@ import {
 import { productRootFromLock } from './core-install.ts';
 import { kimiNativeConfigProblems } from '../adapters/kimi-native.ts';
 import { opencodeSectionShapeProblems } from '../adapters/opencode.ts';
+import { cliLauncherProblems } from './cli-launch.ts';
 
 // fail() боевой уходит в process.exit(1); тестовый failFn может вернуть значение или
 // бросить — поэтому возврат unknown, а не never (мягкий результат пробрасывается наверх).
@@ -250,6 +251,7 @@ export function createConfigProfile(env: ConfigProfileEnv) {
         const problems = [
             ...kimiNativeConfigProblems(cfg.kimiNativeRuntime),
             ...opencodeSectionShapeProblems(cfg.opencodeRuntime),
+            ...cliLauncherProblems(cfg.cliLauncher),
         ];
         if (problems.length === 0) return true;
         return failFn(

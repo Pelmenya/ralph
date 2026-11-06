@@ -27,10 +27,30 @@ describe('каталог живых проб', () => {
         for (const cases of Object.values(LIVE_PROBE_CASES)) expect(cases).not.toContain('offline');
     });
 
-    it('у каждого CLI каталога есть маршрут ключа в стенд', () => {
-        for (const cli of Object.keys(LIVE_PROBE_CASES)) {
-            expect(LIVE_PROBE_CLI_KEY_ENV[cli]).toMatch(/^[A-Z_]+$/);
-        }
+    it.each(['codex', 'kimi', 'opencode'])(
+        '%s: guard на событии, пути, поиск и MCP объявлены',
+        (cli) => {
+            expect(LIVE_PROBE_CASES[cli]).toEqual(
+                expect.arrayContaining([
+                    'unknown-tool',
+                    'symlink-env',
+                    'symlink-parent',
+                    'move-dir',
+                    'search-root',
+                    'search-glob',
+                    'search-deep-glob',
+                    'search-clean',
+                    'mcp-write',
+                    'mcp-env-param',
+                    'mcp-read',
+                ]),
+            );
+            expect(LIVE_PROBE_CLI_KEY_ENV[cli]).toBeUndefined();
+        },
+    );
+
+    it('живой ключ нужен только Claude Code; остальные идут на фиктивном провайдере', () => {
+        expect(LIVE_PROBE_CLI_KEY_ENV.claude).toMatch(/^[A-Z_]+$/);
         expect(LOOP_KEY_ENVS).toContain('CLAUDE_CODE_OAUTH_TOKEN');
     });
 });

@@ -30,6 +30,30 @@ describe('вердикт пробы стенда', () => {
     );
 });
 
+describe('короткая сессия отчёта', () => {
+    it('объявлена пробой и требует маркер вывода без ошибок CLI', () => {
+        expect(stand).toContain('probe_short-session()');
+        const probe = stand.match(/^probe_short-session\(\) \{[\s\S]*?^\}/m)?.[0] ?? '';
+        expect(probe).toContain('ralph-stand-ok');
+        expect(probe).toContain('result short-session PASS');
+        expect(probe).toContain('result short-session FAIL');
+        expect(probe).toContain('STAND_FAKE_PROVIDER');
+    });
+});
+
+describe('пробы guard на событии у каждого CLI', () => {
+    it.each(['paths_probe', 'mcp_probe', 'probe_unknown-tool'])(
+        '%s не заменяет отсутствие регистрации на SKIP у трёх CLI',
+        (name) => {
+            const probe =
+                stand.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, 'm'))?.[0] ?? '';
+            expect(probe).not.toBe('');
+            expect(probe).not.toContain('SKIP');
+            expect(probe).not.toContain('[ "$CLI" != claude ]');
+        },
+    );
+});
+
 describe('судья пробы session-context', () => {
     const probe = stand.match(/^probe_session-context\(\) \{[\s\S]*?^\}/m)?.[0] ?? '';
     const judgeStart = probe.indexOf('    out=$(');

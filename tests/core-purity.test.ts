@@ -11,7 +11,7 @@ import { describe, expect, it } from 'vitest';
 import { existsSync, readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { basename, dirname, join, resolve, sep } from 'node:path';
-import { denyNamePattern, traceFindings } from './project-traces.ts';
+import { denyNamePattern, traceFindings } from '../shared/project-traces.ts';
 // Стриппер комментариев — общий с `seam-defaults`: граница «код vs комментарий»
 // одна на все сканы, и чинить её надо в одном месте.
 import { stripComments } from './strip-comments.ts';

@@ -9,8 +9,10 @@ import { describe, it, expect, vi } from 'vitest';
 // #55: тесты примитивов форжа теперь в `adapters/github-forge-commands.test.ts` и ходят
 // через фабрику адаптера, а не через ре-экспорт ralph.js — потому здесь нет ни импорта
 // entry, ни @ts-expect-error к нему.
+import { harnessDescriptorPath, standFixturePath } from '../adapters/harness-registry.ts';
 import type { GateEnv } from './gate.ts';
 import { classifyCheckFailure, createGateRunner, resolveGatePolicy } from './gate.ts';
+import { PROTECTED_PATHS } from './protected-paths.ts';
 
 const SHA = 'a'.repeat(40);
 const OTHER_SHA = 'b'.repeat(40);
@@ -1960,6 +1962,22 @@ describe('tryMergePhase — защищаемые пути (#139)', () => {
         expect(stop).toContain('.ralph/core.lock (.ralph/core.lock)');
         expect(stop).toContain('.github/workflows/ci.yml (.github/**)');
         expect(stop).not.toContain('src/a.ts');
+    });
+
+    it('S3b.15: PR смены версии CLI под ship — гейт не мерджит описание и снимок стенда', () => {
+        const descriptor = harnessDescriptorPath('codex');
+        const fixture = standFixturePath('codex', '2.0.0');
+        const mask = PROTECTED_PATHS.find(
+            (entry) => entry.path === harnessDescriptorPath('claude-code'),
+        )?.pattern;
+        const { res, merge, stop, kind } = guardedMerge({
+            changedFilesFn: () => [descriptor, fixture],
+        });
+        expect(res).toBe('protected-paths');
+        expect(kind).toBe('hits');
+        expect(merge).not.toHaveBeenCalled();
+        expect(stop).toContain(`${descriptor} (${mask})`);
+        expect(stop).toContain(`${fixture} (${mask})`);
     });
 
     it('доменный PR — мердж, файлы спрошены по проверенной голове', () => {

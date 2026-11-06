@@ -38,7 +38,7 @@ type FakeServer = {
     pulls?: unknown[];
     prSource?: { sha?: unknown } | null;
     // Страницы для проверки пагинации: массив ответов подряд.
-    issuePages?: Array<{ issues: unknown[]; next_page_token?: string }>;
+    issuePages?: unknown[];
     // #46: ответ площадки на создание PR (несёт slug и status).
     createdPull?: unknown;
     // #37: лента комментариев PR (форма — как у площадки: author.slug, anchor у inline).
@@ -202,6 +202,33 @@ describe('фильтр статусов issue — шесть значений п
         });
         adapter.listAllOpenIssues(MILESTONE);
         expect(issuesQuery(calls)).not.toContain('inProgress');
+    });
+});
+
+describe('findOpenIssue — точный заголовок без привязки к вехе', () => {
+    it('возвращает одну карточку или null, а неоднозначность отклоняет', () => {
+        const { adapter, calls } = build({
+            issuePages: [{ issues: [issue(1), issue(2)], next_page_token: '' }],
+        });
+        expect(adapter.findOpenIssue('задача 1')?.number).toBe(1);
+        expect(adapter.findOpenIssue('другая')).toBeNull();
+        expect(issuesQuery(calls)).toContain('status in (open, in_progress, paused)');
+        expect(issuesQuery(calls)).not.toContain('milestone_slug');
+
+        const ambiguous = build({
+            issuePages: [{ issues: [issue(1), issue(1)], next_page_token: '' }],
+        }).adapter;
+        expect(() => ambiguous.findOpenIssue('задача 1')).toThrow(/несколько открытых/);
+    });
+
+    it.each([
+        ['отсутствующий issues', {}],
+        ['немассивный issues', { issues: {} }],
+    ])('%s отклоняется, а не превращается в подтверждённое отсутствие', (_name, page) => {
+        for (const issuePages of [[page], [{ issues: [], next_page_token: 'next' }, page]]) {
+            const { adapter } = build({ issuePages });
+            expect(() => adapter.findOpenIssue('задача 1')).toThrow(/без массива `issues`/);
+        }
     });
 });
 

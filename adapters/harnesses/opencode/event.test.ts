@@ -1,18 +1,13 @@
 // Нормализатор OpenCode (#192) на сырых событиях стенда 1.19.4 и на отказах разбора. Фикстура
 // стенда держит и выводы о CLI: каждое событие дошло до плагина, запрещённое отменено, а перечень
 // инструментов описания покрывает то, что CLI отдал модели.
-import { readFileSync } from 'node:fs';
-import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { parseHarnessDescriptor, type HarnessDescriptor } from '../descriptor.ts';
+import { readStandFixture } from '../stand-fixture.test-helper.ts';
 import { OPENCODE_HOOK_FIELDS, normalizeOpencodeEvent } from './event.ts';
 import { kitScriptProblems } from '../stand-scrub.ts';
 
 const DIR = import.meta.dirname;
-const descriptor = parseHarnessDescriptor(
-    JSON.parse(readFileSync(path.join(DIR, 'descriptor.json'), 'utf-8')),
-    'opencode',
-);
 type PluginEvent = {
     ctx: { directory: string; worktree: string };
     input: Record<string, unknown>;
@@ -27,9 +22,7 @@ type StandEvent = {
     toolError: string | null;
     tree: string;
 };
-const FX = JSON.parse(
-    readFileSync(path.join(DIR, '..', '__fixtures__', 'opencode-1.19.4-stand.json'), 'utf-8'),
-) as {
+const { descriptor: rawDescriptor, fixture: FX } = readStandFixture<{
     cliVersion: string;
     kit: Record<string, unknown> & { 'drive.sh': string };
     sessionHomeKit: Record<string, unknown>;
@@ -37,7 +30,8 @@ const FX = JSON.parse(
     inventory: {
         models: Record<string, Record<string, { properties: string[]; required: string[] }>>;
     };
-};
+}>(DIR, 'opencode', '1.19.4');
+const descriptor = parseHarnessDescriptor(rawDescriptor, 'opencode');
 const event = (id: string): StandEvent => {
     const found = FX.events.find((e) => e.id === id);
     if (!found) throw new Error(`нет события стенда ${id}`);
@@ -73,8 +67,8 @@ describe('фикстура стенда', () => {
         expect(text).not.toMatch(/(?<![\w.-])\/(root|home|tmp|usr\/lib)\//);
     });
 
-    it('версия описания совпадает со стендом; каждое событие дошло до плагина ровно раз', () => {
-        expect(descriptor.cliVersion).toBe(FX.cliVersion);
+    it('исторический снимок 1.19.4 адресован явно; каждое событие дошло до плагина', () => {
+        expect(FX.cliVersion).toBe('1.19.4');
         for (const e of FX.events) {
             expect(e.pluginEvents, e.id).toHaveLength(1);
             const [p] = e.pluginEvents;

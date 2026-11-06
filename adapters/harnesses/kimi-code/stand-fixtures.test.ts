@@ -2,16 +2,13 @@
 // окружением и `mcp.json` дома от сборщика канона (`adapters/kimi-home.ts`). Каждый отказ сверки
 // изоляции стоит в паре с контрольным прогоном, где тот же канал открыт после сборщика, —
 // иначе «сервер не поднялся» могло бы значить «сервер не поднялся бы никогда».
-import { readFileSync } from 'node:fs';
-import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { KIMI_NO_AUTO_UPDATE_ENV, KIMI_SESSION_MCP, KIMI_TRUST_ENV } from '../../kimi-home.ts';
+import { readStandFixture } from '../stand-fixture.test-helper.ts';
 import { kitScriptProblems } from '../stand-scrub.ts';
 
 const DIR = import.meta.dirname;
-const FX = JSON.parse(
-    readFileSync(path.join(DIR, '..', '__fixtures__', 'kimi-code-2.3.2-stand.json'), 'utf-8'),
-);
+const { fixture: FX } = readStandFixture(DIR, 'kimi-code', '2.3.2');
 type TRun = {
     id: string;
     source: string;
@@ -39,7 +36,8 @@ describe('фикстура дома сессии — сырая, с источн
     it('каждый прогон — CLI 2.3.2, карточка #196, сессия дошла до конца', () => {
         for (const e of FX.sessionHome as TRun[]) {
             expect(e.cliVersion, e.id).toBe(FX.cliVersion);
-            expect(e.source, e.id).toMatch(/Kimi Code 2\.3\.2.*карточка #196/);
+            expect(e.source, e.id).toContain(`Kimi Code ${FX.cliVersion}`);
+            expect(e.source, e.id).toContain('карточка #196');
             expect(e.exit, e.id).toBe('exit=0');
         }
     });

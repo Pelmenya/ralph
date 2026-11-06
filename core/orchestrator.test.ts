@@ -5918,6 +5918,37 @@ describe('runLoop — основной while-цикл: итерации коде
         expect(openIssuesFn).not.toHaveBeenCalled();
     });
 
+    it('#264: канарейка идёт на границе итерации до сессии, а в dry не запускается', () => {
+        const order: string[] = [];
+        const runCliCanaryFn = vi.fn(() => {
+            order.push('canary');
+            return { ran: false, outcomes: [] };
+        });
+        const runClaudeFn = vi.fn<RunClaudeFake>(() => {
+            order.push('session');
+            return 0;
+        });
+        runLoop(
+            validCfg(),
+            ctx(mkState()),
+            deps([], {
+                once: true,
+                phaseIndexOfFn: () => 0,
+                openIssuesFn: () => [{ number: 5, title: 'задача', labels: [] }],
+                runCliCanaryFn,
+                runClaudeFn,
+            }),
+        );
+        expect(order).toEqual(['canary', 'session']);
+        runCliCanaryFn.mockClear();
+        runLoop(
+            validCfg(),
+            ctx(mkState()),
+            deps([], { dry: true, phaseIndexOfFn: () => 99, runCliCanaryFn }),
+        );
+        expect(runCliCanaryFn).not.toHaveBeenCalled();
+    });
+
     // #88: мягкая остановка. Запрос приходит посреди шага — во время сессии, — а петля
     // слышит его только на границе: шаг доводится целиком (намерения сессии применены,
     // счётчик записан), state сохраняется, и в чат уходит строка об остановке.
@@ -20909,33 +20940,6 @@ describe('codexSessionFor: барьер, недоверие и дом Codex пе
     });
 });
 
-// Ревью Фазы 16c: версия CLI, с которой снято описание пакета, не сверялась, а перечни полей
-// строгие — автообновление CLI блокировало бы каждый вызов, и старт этого не видел.
-describe('версия CLI против описания пакета — строка ⚠ один раз на версию', () => {
-    it('расхождение названо однажды, совпадение и «не прочиталась» — молчат', () => {
-        const registry = {
-            packages: new Map([['h', { descriptor: { cliVersion: '1.0.0' } }]]),
-            problems: new Map(),
-        } as never;
-        const lines: string[] = [];
-        const warn = (v: string) =>
-            ralph.warnCliVersionDrift('h', v, { logFn: (m: string) => lines.push(m), registry });
-        warn('1.0.0');
-        warn('unknown');
-        warn('1.1.0');
-        warn('1.1.0');
-        expect(lines).toHaveLength(1);
-        expect(lines[0]).toMatch(/^⚠ описание пакета «h» снято с CLI 1\.0\.0, исполняется 1\.1\.0/);
-    });
-
-    it('проводка: версия перед сессией сверяется с описанием', () => {
-        const src = fs.readFileSync(path.join(import.meta.dirname, 'orchestrator.ts'), 'utf-8');
-        const start = src.indexOf('    function sessionCliVersion(');
-        const body = src.slice(start, src.indexOf('\n    }\n', start));
-        expect(body).toMatch(/driftFn\(id\.harness, v\.version\)/);
-    });
-});
-
 // #215: сверка инвентаря MCP перед сессией — диагноз строкой ⚠, ни стопа, ни разрешения.
 describe('инвентарь MCP перед сессией — диагноз дрейфа', () => {
     const run = (res: unknown, root: string | null = '/path/to/app') => {
@@ -21816,5 +21820,207 @@ describe('#217: переспрос намерений при отказе раз
                 endReason: 'unknown',
             });
         });
+    });
+});
+
+describe('#261: сессии исполняют только закреплённые копии CLI', () => {
+    const bins = new Map([
+        ['claude-code', '/state/cli/claude-code/2.1.312/bin/claude.exe'],
+        ['codex', '/state/cli/codex/0.163.0/bin/codex.js'],
+        ['kimi-code', '/state/cli/kimi-code/2.3.2/dist/main.mjs'],
+        ['opencode', '/state/cli/opencode/1.19.4/bin/opencode.exe'],
+    ]);
+    const launchers = {
+        'claude-code': '/opt/claude-launcher',
+        codex: '/opt/codex-launcher',
+        'kimi-code': '/opt/kimi-launcher',
+        opencode: '/opt/opencode-launcher',
+    };
+
+    beforeEach(() => {
+        vi.spyOn(console, 'log').mockImplementation(() => {});
+        vi.spyOn(fs, 'appendFileSync').mockImplementation(() => {});
+        vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+        vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    });
+    afterEach(() => vi.restoreAllMocks());
+
+    function pinnedRuntime(cfg: RalphConfig = REAL_CONFIG) {
+        const runtime = buildRuntime();
+        runtime.setConfigForTests(cfg);
+        runtime.checkCliCopies(cfg, {
+            root: '/state/cli',
+            prepareFn: () => ({ ok: true, bins }),
+        });
+        return runtime;
+    }
+
+    function okSpawn() {
+        return vi.fn<SpawnFake>(() => ({ status: 0, stdout: '', stderr: '', signal: null }));
+    }
+
+    it('PATH с другой версией не используется: spawn получает путь копии', () => {
+        const runtime = pinnedRuntime();
+        const spawnFn = okSpawn();
+        runtime.spawnClaude(['-p'], 'x', 1000, spawnFn as unknown as SpawnSyncFn);
+        expect(spawnFn).toHaveBeenCalledWith(
+            bins.get('claude-code'),
+            expect.any(Array),
+            expect.anything(),
+        );
+    });
+
+    it('обёртка из конфига исполняет копию у каждого харнесса', () => {
+        const runtime = pinnedRuntime({ ...REAL_CONFIG, cliLauncher: launchers });
+        const spawnFn = okSpawn();
+        const spawn = spawnFn as unknown as SpawnSyncFn;
+        runtime.spawnClaude(['-p'], 'x', 1000, spawn);
+        runtime.spawnCodex(['exec'], 'x', 1000, spawn);
+        runtime.spawnKimiNative(['-p', 'x'], 1000, spawn);
+        runtime.spawnOpencode(['run'], 'x', 1000, spawn);
+
+        const expected = [
+            ['claude-code', launchers['claude-code']],
+            ['codex', launchers.codex],
+            ['kimi-code', launchers['kimi-code']],
+            ['opencode', launchers.opencode],
+        ] as const;
+        expect(spawnFn.mock.calls.map((call) => [call[0], call[1][0]])).toEqual(
+            expected.map(([harness, launcher]) => [launcher, bins.get(harness)]),
+        );
+    });
+
+    it('смена системного CLI между попытками не меняет ни путь, ни версию копии', () => {
+        const runtime = pinnedRuntime();
+        const emitFn = vi.fn();
+        const readFn = vi.fn(() => ({ version: '0.163.0' }));
+        const noteFn = (bin: string, version: { version: string }) =>
+            runtime.noteCliVersion(bin, version, { emitFn, logFn: () => {} });
+        runtime.sessionCliVersion('openai', readFn, noteFn);
+        runtime.sessionCliVersion('openai', readFn, noteFn);
+        expect(readFn).toHaveBeenCalledTimes(2);
+        expect(readFn).toHaveBeenNthCalledWith(1, bins.get('codex'), expect.any(Function));
+        expect(readFn).toHaveBeenNthCalledWith(2, bins.get('codex'), expect.any(Function));
+        expect(emitFn).not.toHaveBeenCalledWith('cli-version-changed', expect.anything());
+    });
+
+    it('общий cliLauncher не делит пробу между разными копиями, но дедуплицирует claude/kimi', () => {
+        const runtime = pinnedRuntime({
+            ...REAL_CONFIG,
+            cliLauncher: {
+                ...launchers,
+                'claude-code': '/opt/shared-launcher',
+                codex: '/opt/shared-launcher',
+            },
+        });
+        const spawnFn = okSpawn();
+        const spawn = spawnFn as unknown as SpawnSyncFn;
+        runtime.probeRuntimeLaunch('claude', spawn);
+        runtime.probeRuntimeLaunch('openai', spawn);
+        runtime.probeRuntimeLaunch('kimi', spawn);
+
+        expect(spawnFn).toHaveBeenCalledTimes(2);
+        expect(spawnFn.mock.calls.map((call) => [call[0], call[1]])).toEqual([
+            ['/opt/shared-launcher', [bins.get('claude-code'), '--version']],
+            ['/opt/shared-launcher', [bins.get('codex'), '--version']],
+        ]);
+    });
+
+    it('готовность не запускает системный CLI: отсутствующий или несовместимый PATH не нужен', () => {
+        for (const [runtimeName, harness] of [
+            ['claude', 'claude-code'],
+            ['openai', 'codex'],
+            ['kimi-native', 'kimi-code'],
+            ['opencode', 'opencode'],
+        ] as const) {
+            const runtime = pinnedRuntime();
+            const spawnFn = okSpawn();
+            runtime.probeRuntimeLaunch(runtimeName, spawnFn as unknown as SpawnSyncFn);
+            expect(spawnFn).toHaveBeenCalledWith(
+                bins.get(harness),
+                ['--version'],
+                expect.anything(),
+            );
+        }
+    });
+
+    it('проверка канала Codex тоже идёт через закреплённую копию', () => {
+        const runtime = pinnedRuntime();
+        const spawnFn = vi.fn(() => ({
+            status: 0,
+            stdout: 'Logged in using ChatGPT',
+            stderr: '',
+            signal: null,
+        }));
+        runtime.assertCodexLoginChannel(
+            spawnFn as unknown as SpawnSyncFn,
+            {},
+            (message: string): never => {
+                throw new Error(message);
+            },
+            'chatgpt',
+        );
+        expect(spawnFn).toHaveBeenCalledWith(
+            bins.get('codex'),
+            ['login', 'status'],
+            expect.anything(),
+        );
+    });
+
+    it('системный CLI новее описания не останавливает старт: первая сессия — на копии', () => {
+        const runtime = pinnedRuntime();
+        runtime.checkCoderRuntimes(REAL_CONFIG, {
+            checkRuntimeFn: () => {
+                runtime.probeRuntimeBinary(
+                    'claude',
+                    vi.fn(() => ({
+                        status: 0,
+                        stdout: '2.4.0 (Claude Code)',
+                        stderr: '',
+                        signal: null,
+                    })) as unknown as SpawnSyncFn,
+                );
+            },
+        });
+        const readFn = vi.fn(() => ({ version: '2.1.312' }));
+        runtime.sessionCliVersion('claude', readFn);
+        const spawnFn = okSpawn();
+        runtime.spawnClaude(['-p'], 'x', 1000, spawnFn as unknown as SpawnSyncFn);
+        expect(readFn).toHaveBeenCalledWith(bins.get('claude-code'), expect.any(Function));
+        expect(spawnFn).toHaveBeenCalledWith(
+            bins.get('claude-code'),
+            expect.any(Array),
+            expect.anything(),
+        );
+    });
+
+    it('отказ подготовки копии не оставляет обхода через PATH', () => {
+        const runtime = buildRuntime();
+        runtime.setConfigForTests(REAL_CONFIG);
+        runtime.checkCliCopies(REAL_CONFIG, {
+            root: '/state/cli',
+            failFn: () => {},
+            prepareFn: () => ({
+                ok: false,
+                code: 'install-failed',
+                harness: 'claude-code',
+                version: '2.1.312',
+                reason: 'npm failed',
+            }),
+        });
+        const spawnFn = okSpawn();
+        expect(() =>
+            runtime.spawnClaude(['-p'], 'x', 1000, spawnFn as unknown as SpawnSyncFn),
+        ).toThrow(/claude-code.*не подготовлена/);
+        expect(spawnFn).not.toHaveBeenCalled();
+    });
+
+    it('без корня копий подготовка тоже закрывает запуск', () => {
+        const runtime = buildRuntime();
+        runtime.setConfigForTests(REAL_CONFIG);
+        runtime.checkCliCopies(REAL_CONFIG, { failFn: () => {} });
+        expect(() =>
+            runtime.spawnCodex(['exec'], 'x', 1000, okSpawn() as unknown as SpawnSyncFn),
+        ).toThrow(/codex.*не подготовлена/);
     });
 });

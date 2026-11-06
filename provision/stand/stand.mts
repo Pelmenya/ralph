@@ -20,9 +20,15 @@
  *   node provision/stand/stand.mts check [--human-home <дом>]
  *   node provision/stand/stand.mts exec --stand <каталог> --cli <имя> [--allow host:port]…
  *        [--cli-bin <бинарь CLI>] [--ro <путь>]… [--bind <файл>:<путь в стенде>]…
- *        [--pass-env <ИМЯ>]…
+ *        [--pass-env <ИМЯ>]… [--no-egress]
  *        [--upstream-proxy http://host:port | --upstream-proxy-env <ИМЯ>] -- <команда…>
+ *   node provision/stand/stand.mts report --harness <имя> --version <версия>
+ *        --cli-bin <копия CLI> --report <файл JSON>
  *   `--cli-bin` — бинарь CLI: что от него едет внутрь, решает правило CLI (`cliBinary`).
+ *   `--no-egress` — без адресов провайдера, egress-журнала, прокси и моста; для регистрации
+ *   субъекта, которой сеть не нужна. Не совместим с `--allow`, `--tcp` и upstream-прокси.
+ *   `report` сам поднимает фиктивный провайдер хоста и зовёт `exec` с `--tcp`/`--bridge-port`:
+ *   кандидат исполняется только в изоляции, отчёт пишется на хосте после вердиктов проб.
  *   `--upstream-proxy` — прокси хоста, через который прокси стенда выходит к провайдеру
  *   (`egress.mts`); без него соединение с провайдером прямое. Адрес с кредами — только
  *   `--upstream-proxy-env`: argv процесса виден любому пользователю хоста, окружение — нет.
@@ -51,6 +57,7 @@ import {
     openJournal,
     parseUpstreamProxy,
     startEgressProxy,
+    startTcpForward,
     upstreamFromEnv,
     type TUpstreamProxy,
 } from './egress.mts';
@@ -332,20 +339,56 @@ const CLI_RELEASE_COMPANIONS: Readonly<Record<string, string>> = {
 /**
  * Что едет внутрь от бинаря CLI: `ro` — путь на чтение, `pathDir` — каталог в начало PATH
  * внутри. Обычно — сам файл по реальному пути (почему файлом — докблок `extraReadOnly`), PATH
- * не трогается. CLI с соседом по релизу — каталог релиза, и он же на PATH: симлинк из дома
- * человека (`~/.local/bin`) внутри не виден, а имя CLI должно найти тот бинарь, рядом с
- * которым лежит сосед.
+ * не трогается. Установленная раннером npm-копия едет целиком: её точка входа читает package.json
+ * и зависимости из общего node_modules, а монтирование одного main.mjs роняло её до --version.
+ * CLI с соседом по релизу получает его каталог на PATH: симлинк из дома человека
+ * (`~/.local/bin`) внутри не виден, а имя CLI должно найти тот бинарь, рядом с которым лежит сосед.
  */
+function findReleaseDir(root: string, cli: string, companion: string, depth = 0): string | null {
+    if (existsSync(join(root, cli)) && existsSync(join(root, companion))) return root;
+    if (depth >= 8) return null;
+    let entries;
+    try {
+        entries = readdirSync(root, { withFileTypes: true });
+    } catch {
+        return null;
+    }
+    for (const entry of entries) {
+        if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+        const found = findReleaseDir(join(root, entry.name), cli, companion, depth + 1);
+        if (found) return found;
+    }
+    return null;
+}
+
+function installedCopyRoot(real: string): string | null {
+    let root = dirname(real);
+    while (true) {
+        if (
+            real.startsWith(join(root, 'node_modules') + '/') &&
+            existsSync(join(root, '.ralph-manifest'))
+        )
+            return root;
+        const parent = dirname(root);
+        if (parent === root) return null;
+        root = parent;
+    }
+}
+
 export function cliBinary(cli: string, bin: string): { ro: string; pathDir: string | null } {
     const real = realpathSync(bin);
+    const copy = installedCopyRoot(real);
     const companion = CLI_RELEASE_COMPANIONS[cli];
-    if (!companion) return { ro: real, pathDir: null };
+    if (!companion) return { ro: copy ?? real, pathDir: null };
     const dir = dirname(real);
-    if (!existsSync(join(dir, companion)))
+    const release = existsSync(join(dir, companion))
+        ? dir
+        : findReleaseDir(copy ?? dirname(dirname(dir)), cli, companion);
+    if (!release)
         throw new Error(
             `stand exec: рядом с ${real} нет ${companion} — без него ${cli} внутри не исполнит ни одного вызова`,
         );
-    return { ro: dir, pathDir: dir };
+    return { ro: copy ?? release, pathDir: release };
 }
 
 /**
@@ -628,23 +671,29 @@ export function parseExecArgs(
 ): {
     stand: string;
     cli: string;
+    noEgress: boolean;
     allow: string[];
     ro: string[];
     pathDirs: string[];
     binds: { src: string; dst: string }[];
     passEnv: string[];
     upstream: TUpstreamProxy | null;
+    tcp: { host: string; port: number } | null;
+    bridgePort: number | null;
     command: string[];
 } {
     const out = {
         stand: '',
         cli: '',
+        noEgress: false,
         allow: [] as string[],
         ro: [] as string[],
         pathDirs: [] as string[],
         binds: [] as { src: string; dst: string }[],
         passEnv: [] as string[],
         upstream: null as TUpstreamProxy | null,
+        tcp: null as { host: string; port: number } | null,
+        bridgePort: null as number | null,
         command: [] as string[],
     };
     let cliBin: string | null = null;
@@ -655,6 +704,10 @@ export function parseExecArgs(
             out.command = argv.slice(i + 1);
             break;
         }
+        if (a === '--no-egress') {
+            out.noEgress = true;
+            continue;
+        }
         if (v === undefined) throw new Error(`stand exec: у ${a} нет значения`);
         i++;
         if (a === '--stand') out.stand = resolve(v);
@@ -663,7 +716,18 @@ export function parseExecArgs(
         else if (a === '--ro') out.ro.push(v);
         else if (a === '--cli-bin') cliBin = v;
         else if (a === '--pass-env') out.passEnv.push(v);
-        else if (a === '--upstream-proxy') {
+        else if (a === '--tcp') {
+            const match = /^127\.0\.0\.1:(\d{1,5})$/.exec(v);
+            const port = Number(match?.[1]);
+            if (!match || !Number.isInteger(port) || port < 1 || port > 65535)
+                throw new Error('stand exec: --tcp только 127.0.0.1:<порт> loopback-провайдера');
+            out.tcp = { host: '127.0.0.1', port };
+        } else if (a === '--bridge-port') {
+            const port = Number(v);
+            if (!Number.isInteger(port) || port < 1 || port > 65535)
+                throw new Error(`stand exec: --bridge-port не порт: ${v}`);
+            out.bridgePort = port;
+        } else if (a === '--upstream-proxy') {
             out.upstream = parseUpstreamProxy(v);
             if (out.upstream.auth)
                 throw new Error(
@@ -683,6 +747,14 @@ export function parseExecArgs(
     if (!(out.cli in PROVIDER_ADDRESSES))
         throw new Error(`stand exec: незнакомый CLI «${out.cli}»`);
     if (out.command.length === 0) throw new Error('stand exec: нет команды после --');
+    if (out.tcp && out.bridgePort === null)
+        throw new Error('stand exec: --tcp требует --bridge-port');
+    if (!out.tcp && out.bridgePort !== null)
+        throw new Error('stand exec: --bridge-port требует --tcp');
+    if (out.tcp && (out.upstream || out.allow.length > 0))
+        throw new Error('stand exec: --tcp не совместим с --allow и upstream-прокси');
+    if (out.noEgress && (out.allow.length > 0 || out.tcp || out.upstream))
+        throw new Error('stand exec: --no-egress не совместим с --allow, --tcp и upstream-прокси');
     if (cliBin !== null) {
         const b = cliBinary(out.cli, cliBin);
         out.ro.push(b.ro);
@@ -695,23 +767,25 @@ async function execInStand(argv: readonly string[]): Promise<number> {
     const a = parseExecArgs(argv);
     mkdirSync(a.stand, { recursive: true });
     const layout = layoutStand(a.stand);
-    const allow = [...PROVIDER_ADDRESSES[a.cli], ...a.allow];
+    const allow = a.noEgress || a.tcp ? [] : [...PROVIDER_ADDRESSES[a.cli], ...a.allow];
     const passEnv: Record<string, string> = {};
     for (const n of a.passEnv) {
         const v = process.env[n];
         if (v === undefined) throw new Error(`stand exec: --pass-env ${n}, но переменной нет`);
         passEnv[n] = v;
     }
-    const port = 18000 + (process.pid % 1000);
+    const port = a.bridgePort ?? 18000 + (process.pid % 1000);
     // Журнал открыт до старта команды: изнутри его имя пишется, а прокси пишет по дескриптору
-    // (почему — докблок `egress.mts`).
-    const journal = allow.length > 0 ? openJournal(layout.egressJournal) : null;
-    const proxy = journal
-        ? startEgressProxy(layout.egressSocket, allow, {
-              ...(a.upstream ? { upstream: a.upstream } : {}),
-              journalFn: journal.write,
-          })
-        : null;
+    // (почему — докблок `egress.mts`). TCP отчёта ведёт только к провайдеру хоста и журнала не имеет.
+    const journal = !a.tcp && allow.length > 0 ? openJournal(layout.egressJournal) : null;
+    const proxy = a.tcp
+        ? startTcpForward(layout.egressSocket, a.tcp)
+        : journal
+          ? startEgressProxy(layout.egressSocket, allow, {
+                ...(a.upstream ? { upstream: a.upstream } : {}),
+                journalFn: journal.write,
+            })
+          : null;
     const inner = proxy
         ? [
               process.execPath,
@@ -727,7 +801,7 @@ async function execInStand(argv: readonly string[]): Promise<number> {
         env: standEnv(layout, {
             path: [...a.pathDirs, process.env.PATH ?? '/usr/bin:/bin'].join(':'),
             passEnv,
-            proxyPort: proxy ? port : undefined,
+            proxyPort: !a.tcp && proxy ? port : undefined,
         }),
         ro: a.ro,
         binds: a.binds,
@@ -793,9 +867,25 @@ if (import.meta.main) {
                 process.exit(2);
             },
         );
+    } else if (mode === 'report') {
+        import('./report.mts')
+            .then(async ({ parseReportArgs, runStandReport }) => {
+                const args = parseReportArgs(rest);
+                const report = await runStandReport(args);
+                process.stdout.write(`отчёт: ${args.report}\n`);
+                if (report.infrastructure) return 2;
+                return report.probes.every((p) => p.verdict === 'PASS') ? 0 : 1;
+            })
+            .then(
+                (code) => process.exit(code),
+                (e) => {
+                    process.stderr.write(`${(e as Error).message}\n`);
+                    process.exit(2);
+                },
+            );
     } else {
         process.stderr.write(
-            'stand: check [--human-home <дом>] | exec --stand <каталог> --cli <имя> … -- <команда…>\n',
+            'stand: check [--human-home <дом>] | exec --stand <каталог> --cli <имя> … -- <команда…> | report --harness <имя> --version <версия> --cli-bin <копия> --report <файл>\n',
         );
         process.exit(2);
     }

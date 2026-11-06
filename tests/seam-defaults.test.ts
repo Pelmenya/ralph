@@ -31,6 +31,7 @@ const FORGE_PARAMS = [
     'checkAuthFn',
     'openIssuesFn',
     'allOpenIssuesFn',
+    'findOpenIssueFn',
     'hasAnyIssuesFn',
     'milestoneLabelsFn',
     'getIssueFn',

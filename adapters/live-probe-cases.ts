@@ -8,15 +8,27 @@
  * (функция `probe_<case>`), а не команда. Произвольная строка от сессии превратилась бы в
  * исполнение с ключом пробы.
  *
- * CLI здесь только те, чей ключ пробы раннер умеет передать в стенд одной переменной
- * окружения (`LIVE_PROBE_CLI_KEY_ENV`). У Kimi Code стенд берёт ключи ссылками на дом
- * человека, у OpenCode адрес провайдера выбирается конфигом, у Codex вход ключом из env в
- * живую не проверен — их пробы добавляются вместе с проверенным маршрутом ключа, а до тех
- * пор `live-probe` для них — отказ разбора, а не проба без авторизации.
+ * Claude Code идёт к живому провайдеру отдельным ключом (`LIVE_PROBE_CLI_KEY_ENV`). Codex,
+ * Kimi Code и OpenCode идут на фиктивный провайдер стенда без ключа; маршрут их живого ключа
+ * остаётся отдельной работой и здесь не объявляется.
  *
  * Проба `offline` исключена: она гоняет CLI вне изоляции ОС, а раннер запускает стенд
  * только с `STAND_ISOLATE=1`.
  */
+
+const EVENT_GUARD_PROBES = [
+    'unknown-tool',
+    'symlink-env',
+    'symlink-parent',
+    'move-dir',
+    'search-root',
+    'search-glob',
+    'search-deep-glob',
+    'search-clean',
+    'mcp-write',
+    'mcp-env-param',
+    'mcp-read',
+] as const;
 
 /** Сценарии `install-stand.sh` по CLI — согласованность с `probe_*` сверяет тест. */
 export const LIVE_PROBE_CASES: Readonly<Record<string, readonly string[]>> = {
@@ -25,20 +37,13 @@ export const LIVE_PROBE_CASES: Readonly<Record<string, readonly string[]>> = {
         'override',
         'crash',
         'merge',
-        'unknown-tool',
-        'symlink-env',
-        'symlink-parent',
-        'move-dir',
-        'search-root',
-        'search-glob',
-        'search-deep-glob',
-        'search-clean',
-        'mcp-write',
-        'mcp-env-param',
-        'mcp-read',
+        ...EVENT_GUARD_PROBES,
         'project-hook',
         'project-mcp',
     ],
+    codex: EVENT_GUARD_PROBES,
+    kimi: EVENT_GUARD_PROBES,
+    opencode: EVENT_GUARD_PROBES,
 };
 
 /** Переменная, которой CLI внутри стенда получает ключ пробы. */

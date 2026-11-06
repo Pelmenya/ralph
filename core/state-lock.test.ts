@@ -359,6 +359,45 @@ describe('loadState — state с диска через инжектирован�
         });
     });
 
+    it('срок и итоги канарейки читаются из state; битая форма отвергается', () => {
+        const base = {
+            schemaVersion: 2,
+            count: 0,
+            milestone: 'M1',
+            submitStages: [],
+            cliCanaryLastRunAt: 1_000,
+            cliCanaryOutcomes: {
+                'codex@2.0.0': {
+                    harness: 'codex',
+                    pinnedVersion: '1.0.0',
+                    latestVersion: '2.0.0',
+                    verdict: 'green',
+                },
+            },
+            cliCanaryHandledOutcomes: { 'codex@2.0.0:green': true },
+        };
+        expect(inspectState(JSON.stringify(base))).toMatchObject({
+            status: 'ok',
+            state: {
+                cliCanaryLastRunAt: 1_000,
+                cliCanaryOutcomes: base.cliCanaryOutcomes,
+                cliCanaryHandledOutcomes: base.cliCanaryHandledOutcomes,
+            },
+        });
+        for (const patch of [
+            { cliCanaryLastRunAt: 'вчера' },
+            { cliCanaryOutcomes: [] },
+            { cliCanaryOutcomes: { 'codex@2.0.0': { verdict: 'unknown' } } },
+            { cliCanaryHandledOutcomes: [] },
+            { cliCanaryHandledOutcomes: { 'codex@2.0.0:green': false } },
+        ]) {
+            expect(inspectState(JSON.stringify({ ...base, ...patch }))).toMatchObject({
+                status: 'corrupt',
+                reason: expect.stringMatching(/cliCanary/),
+            });
+        }
+    });
+
     it('нет файла (ENOENT) → штатный defaultState первой фазы', () => {
         const { loadState, defaultState } = createStateLock(makeEnv({ readFile: noFile }));
         expect(loadState()).toEqual(defaultState());

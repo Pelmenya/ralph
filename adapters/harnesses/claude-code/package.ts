@@ -88,8 +88,13 @@ function guardRegistration(settings: unknown): GuardRegistration {
 }
 
 export const harnessPackage: HarnessPackage = {
-    interfaceVersion: 1,
+    interfaceVersion: 2,
     harness: HARNESS,
+    distribution: {
+        registry: 'npm',
+        package: '@anthropic-ai/claude-code',
+        bin: 'node_modules/@anthropic-ai/claude-code/bin/claude.exe',
+    },
     guardRegistration,
     // Путь своего нормализатора регистрация получает от сборки настроек (`guardAdapterValue`).
     guardInput: 'event',

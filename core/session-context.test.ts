@@ -78,6 +78,17 @@ describe('loopSessionContext — контекст, который раннер �
         expect(built.ok && parseSessionContext(built.value).error).toBeNull();
     });
 
+    it('корень копий CLI — абсолютная защищаемая поверхность', () => {
+        const built = loopSessionContext({
+            humanRoot: null,
+            sessionTree: '/path/to/app',
+            coreSha: '',
+            cliRoot: '/state/cli',
+            surfacesFn: () => ({ tree: [], homes: [], absolute: [] }),
+        });
+        expect(built.ok && built.context.protectedSurfaces.absolute).toEqual(['/state/cli']);
+    });
+
     it.each([
         ['нет дерева сессии', null, null, /roots\.consumer и roots\.execution/],
         ['дерево сессии относительное', null, 'app', /roots\.consumer и roots\.execution/],
@@ -126,7 +137,12 @@ describe('живая петля на Claude Code под контекстом с�
         return d;
     };
 
-    const built = loopSessionContext({ humanRoot: null, sessionTree: CANON, coreSha: '' });
+    const built = loopSessionContext({
+        humanRoot: null,
+        sessionTree: CANON,
+        coreSha: '',
+        cliRoot: '/state/cli',
+    });
     if (!built.ok) throw new Error(built.reason);
     /** Env сессии петли без `roots`, как его собирает раннер (`withSkillGuard`). */
     const LOOP = { [SESSION_CONTEXT_ENV]: built.value, RALPH_SKILL_GUARD: 'on' };
@@ -210,6 +226,18 @@ describe('живая петля на Claude Code под контекстом с�
                 status: 0,
                 stderr: '',
             });
+        }
+    });
+
+    it('запись, перенос и удаление копии CLI блокируются кодом config-surface', () => {
+        for (const call of [
+            { tool_name: 'Write', tool_input: { file_path: '/state/cli/example/file' } },
+            { tool_name: 'Bash', tool_input: { command: 'mv /state/cli/example /tmp/example' } },
+            { tool_name: 'Bash', tool_input: { command: 'rm -rf /state/cli/example' } },
+        ]) {
+            const r = guard(call, LOOP);
+            expect(r.status).toBe(2);
+            expect(reasonCodeOf(r.stderr)).toEqual({ code: 'config-surface' });
         }
     });
 

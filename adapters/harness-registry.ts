@@ -47,6 +47,12 @@ export const HARNESSES_DIR = path.join(import.meta.dirname, 'harnesses');
 export const PACKAGE_MODULE = 'package.ts';
 export const PACKAGE_DESCRIPTOR = 'descriptor.json';
 
+/** Относительные пути для PR смены версии: ядро получает их через реестр, а не знает layout пакетов. */
+export const harnessDescriptorPath = (harness: string): string =>
+    path.posix.join('adapters', 'harnesses', harness, PACKAGE_DESCRIPTOR);
+export const standFixturePath = (harness: string, version: string): string =>
+    path.posix.join('adapters', 'harnesses', '__fixtures__', `${harness}-${version}-stand.json`);
+
 /**
  * Харнесс, в чьём формате раннер собирает настройки сессии (`core/session-settings.ts`):
  * из них строятся регистрации остальных пакетов. Знание о формате — здесь, у адаптеров, а не
@@ -92,6 +98,32 @@ const defaultListDirs = (dir: string) =>
 
 const PACKAGE_FUNCTIONS = ['guardRegistration', 'matcherCovers', 'hookPayload'] as const;
 const PLUGIN_FUNCTIONS = ['source', 'read', 'event'] as const;
+const DISTRIBUTION_KEYS = new Set(['registry', 'package', 'bin']);
+
+function distributionProblems(raw: unknown): string[] {
+    if (!isRecord(raw)) return [`${PACKAGE_MODULE}: distribution не объект`];
+    const problems: string[] = [];
+    for (const key of Object.keys(raw)) {
+        if (!DISTRIBUTION_KEYS.has(key)) {
+            problems.push(`${PACKAGE_MODULE}: distribution: незнакомый ключ ${key}`);
+        }
+    }
+    if (raw.registry !== 'npm') {
+        problems.push(`${PACKAGE_MODULE}: distribution.registry не npm`);
+    }
+    if (typeof raw.package !== 'string' || raw.package.trim() === '') {
+        problems.push(`${PACKAGE_MODULE}: distribution.package не непустая строка`);
+    }
+    if (
+        typeof raw.bin !== 'string' ||
+        raw.bin.trim() === '' ||
+        path.isAbsolute(raw.bin) ||
+        raw.bin.split(/[\\/]/).includes('..')
+    ) {
+        problems.push(`${PACKAGE_MODULE}: distribution.bin не относительный путь внутри установки`);
+    }
+    return problems;
+}
 
 /**
  * Проблемы одной пробы состава пакета. Запрещённое ждёт код ПРАВИЛА из перечня, как у
@@ -122,7 +154,7 @@ export function harnessPackageProblems(raw: unknown, name: string): string[] {
                 `(реестр знает ${HARNESS_INTERFACE_VERSION})`,
         ];
     }
-    const problems: string[] = [];
+    const problems: string[] = [...distributionProblems(raw.distribution)];
     if (raw.harness !== name) {
         problems.push(
             `${PACKAGE_MODULE}: harness ${JSON.stringify(raw.harness)} не равен имени каталога «${name}»`,
@@ -319,26 +351,24 @@ export function protectedSurfacesOf(registry: HarnessRegistry): ProtectedSurface
 
 /** Реестр процесса: пакеты грузятся один раз, при первом импорте модуля. */
 /**
- * Расхождение фактической версии CLI с той, с которой снято описание пакета (`cliVersion`).
- * Перечни полей описания строгие, а CLI обновляется сам: новое поле конверта после
- * автообновления — `unknown-field` на каждом вызове, петля жжёт итерации до брейкера, а
- * стартовая проба этого не видит — её синтетический вход несёт пять полей. До сверки
- * описания стендом (Фаза 16f) расхождение называется строкой, а не молчит. `null` — версии
- * совпали, пакета нет или версия не прочиталась (о нечитаемой говорит журнал попытки).
+ * Версия исполняемой копии против `cliVersion` описания (#261). Это отказ до сессии, а не
+ * диагноз: перечни полей сняты с конкретной версии, и запуск другой жёг бы итерации на
+ * `unknown-field`. Нечтение тоже отказ — равенство в этом случае не доказано.
  */
-export function cliVersionDrift(
+export function cliVersionProblem(
     registry: HarnessRegistry,
     harness: string,
     actual: string,
     unknownVersion: string,
+    unknownReason?: string,
 ): string | null {
     const expected = registry.packages.get(harness)?.descriptor.cliVersion;
-    if (expected === undefined || actual === unknownVersion || actual === expected) return null;
-    return (
-        `описание пакета «${harness}» снято с CLI ${expected}, исполняется ${actual}: перечни ` +
-        'полей строгие, и новое поле входа заблокирует каждый вызов кодом unknown-field — ' +
-        'сверь описание с этой версией (до стенда Фазы 16f сверки нет)'
-    );
+    if (expected === undefined) return `описание пакета «${harness}» не принято реестром`;
+    if (actual === unknownVersion) {
+        return `версия CLI ${harness} не прочиталась: ${unknownReason ?? 'причина не названа'}`;
+    }
+    if (actual === expected) return null;
+    return `CLI ${harness}: ожидалась версия ${expected} из описания пакета, получена ${actual}`;
 }
 
 export const HARNESS_REGISTRY: HarnessRegistry = await discoverHarnessPackages();

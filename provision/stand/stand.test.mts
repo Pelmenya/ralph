@@ -12,7 +12,7 @@ import {
     writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import {
     ESCAPE_PROBE_SOURCE,
     HUMAN_CLI_HOMES,
@@ -34,6 +34,8 @@ import {
     standEnv,
     type TEscapeTarget,
 } from './stand.mts';
+import { startTcpForward } from './egress.mts';
+import { startFakeProvider } from './fake-provider.mts';
 
 const cleanups: string[] = [];
 afterEach(() => {
@@ -161,6 +163,31 @@ describe('раскладка и окружение стенда', () => {
         expect(() => cliBinary('codex', join(d, 'local', 'codex'))).toThrow(/codex-code-mode-host/);
     });
 
+    it('npm-копия едет с package.json и зависимостями; Codex получает native-каталог на PATH', () => {
+        const d = tmp('ralph-npm-bin.');
+        const copy = join(d, 'copy');
+        const kimi = join(copy, 'node_modules', '@scope', 'kimi');
+        mkdirSync(join(kimi, 'dist'), { recursive: true });
+        mkdirSync(join(copy, 'node_modules', 'dependency'), { recursive: true });
+        writeFileSync(join(copy, '.ralph-manifest'), '');
+        writeFileSync(join(kimi, 'package.json'), '{}');
+        writeFileSync(join(kimi, 'dist', 'main.mjs'), '');
+        writeFileSync(join(copy, 'node_modules', 'dependency', 'index.js'), '');
+        expect(cliBinary('kimi', join(kimi, 'dist', 'main.mjs'))).toEqual({
+            ro: copy,
+            pathDir: null,
+        });
+
+        const codexJs = join(copy, 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
+        const native = join(copy, 'node_modules', '@openai', 'codex-native', 'bin');
+        mkdirSync(dirname(codexJs), { recursive: true });
+        mkdirSync(native, { recursive: true });
+        writeFileSync(codexJs, '');
+        writeFileSync(join(native, 'codex'), '');
+        writeFileSync(join(native, 'codex-code-mode-host'), '');
+        expect(cliBinary('codex', codexJs)).toEqual({ ro: copy, pathDir: native });
+    });
+
     it('install-stand.sh везёт бинарь CLI в стенд только через --cli-bin (#231)', () => {
         const sh = readFileSync(join(import.meta.dirname, '..', 'install-stand.sh'), 'utf-8');
         // Вызов exec — до ` -- `: строки продолжения склеены, чтобы флаги следующей строки
@@ -169,7 +196,13 @@ describe('раскладка и окружение стенда', () => {
             (m) => m[1],
         );
         expect(calls.length).toBeGreaterThanOrEqual(2);
-        for (const c of calls) {
+        const registration = calls.filter((c) => c.includes('--stand "$reg"'));
+        expect(registration).toHaveLength(1);
+        for (const c of registration) {
+            expect(c).not.toContain('--cli-bin');
+            expect(c).not.toContain('STAND_ISOLATE_ARGS');
+        }
+        for (const c of calls.filter((c) => !registration.includes(c))) {
             expect(c).toMatch(/--cli-bin "\$\(?(bin|command -v "\$BIN"\))"/);
             expect(c).not.toMatch(/--ro "\$(bin|\(command)/);
         }
@@ -311,6 +344,54 @@ describe('раскладка и окружение стенда', () => {
         expect(() =>
             parseExecArgs([...base, '--upstream-proxy-env', 'NONE', '--', 'x'], {}),
         ).toThrow(/NONE для upstream не задана/);
+    });
+
+    it('разбор exec: внешний фиктивный провайдер — только TCP на loopback и названный порт моста', () => {
+        const a = parseExecArgs([
+            '--stand',
+            '/s',
+            '--cli',
+            'claude',
+            '--tcp',
+            '127.0.0.1:19001',
+            '--bridge-port',
+            '19002',
+            '--',
+            'x',
+        ]);
+        expect(a).toMatchObject({
+            tcp: { host: '127.0.0.1', port: 19001 },
+            bridgePort: 19002,
+        });
+        expect(() =>
+            parseExecArgs(['--stand', '/s', '--cli', 'kimi', '--tcp', 'example.com:80', '--', 'x']),
+        ).toThrow(/loopback/);
+        expect(() =>
+            parseExecArgs(['--stand', '/s', '--cli', 'kimi', '--bridge-port', '19002', '--', 'x']),
+        ).toThrow(/--tcp/);
+    });
+
+    it('разбор exec: --no-egress не совместим ни с одним способом открыть сеть', () => {
+        const base = ['--stand', '/s', '--cli', 'claude', '--no-egress'];
+        expect(parseExecArgs([...base, '--', 'x'])).toMatchObject({
+            noEgress: true,
+            allow: [],
+            upstream: null,
+            tcp: null,
+        });
+        expect(parseExecArgs(['--stand', '/s', '--cli', 'claude', '--', 'x']).noEgress).toBe(false);
+        for (const args of [
+            ['--allow', 'example.com:443'],
+            ['--tcp', '127.0.0.1:19001', '--bridge-port', '19002'],
+            ['--upstream-proxy', 'http://proxy.example.com:3128'],
+            ['--upstream-proxy-env', 'UP'],
+        ]) {
+            expect(() =>
+                parseExecArgs([...base, ...args, '--', 'x'], {
+                    UP: 'http://proxy.example.com:3128',
+                }),
+            ).toThrow(/--no-egress/);
+        }
     });
 
     it('check: --human-home без значения — отказ словами, без него — HOME', () => {
@@ -504,10 +585,10 @@ describe('изоляция ОС на живых namespace', () => {
     beforeAll(() => {
         avail = isolationAvailable();
     });
-    const live = (name: string, fn: () => void) =>
-        it(name, (ctx) => {
+    const live = (name: string, fn: () => void | Promise<void>) =>
+        it(name, async (ctx) => {
             if (!avail.ok) ctx.skip(avail.reason);
-            fn();
+            await fn();
         });
 
     live(
@@ -580,6 +661,114 @@ describe('изоляция ОС на живых namespace', () => {
                 .trim()
                 .split(/\s+/),
         ).toEqual(['lo']);
+    });
+
+    live('exec --no-egress не поднимает loopback-мост, который обычный Claude exec создаёт', () => {
+        const source = `
+            const fs = require('node:fs');
+            const listeners = ['/proc/net/tcp', '/proc/net/tcp6'].flatMap((file) =>
+                fs.readFileSync(file, 'utf8').trim().split('\\n').slice(1)
+                    .filter((line) => line.trim().split(/\\s+/)[3] === '0A'));
+            fs.writeFileSync(process.argv[1], JSON.stringify({
+                proxy: process.env.HTTPS_PROXY ?? null,
+                listeners: listeners.length,
+            }));
+        `;
+        const probe = (noEgress: boolean) => {
+            const root = join(tmp('ralph-no-egress.'), 'stand');
+            const report = join(root, 'work', 'network.json');
+            const result = spawnSync(
+                process.execPath,
+                [
+                    join(import.meta.dirname, 'stand.mts'),
+                    'exec',
+                    '--stand',
+                    root,
+                    '--cli',
+                    'claude',
+                    ...(noEgress ? ['--no-egress'] : []),
+                    '--',
+                    process.execPath,
+                    '-e',
+                    source,
+                    report,
+                ],
+                {
+                    encoding: 'utf8',
+                    timeout: 30_000,
+                    env: {
+                        PATH: process.env.PATH ?? '/usr/bin:/bin',
+                        HOME: root,
+                        TMPDIR: tmpdir(),
+                    },
+                },
+            );
+            expect(result.status, result.stderr).toBe(0);
+            return {
+                journal: join(root, 'journal', 'egress.jsonl'),
+                network: JSON.parse(readFileSync(report, 'utf8')),
+            };
+        };
+
+        const ordinary = probe(false);
+        expect(ordinary.network.proxy).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+        expect(ordinary.network.listeners).toBeGreaterThan(0);
+        expect(existsSync(ordinary.journal)).toBe(true);
+
+        const closed = probe(true);
+        expect(closed.network).toEqual({ proxy: null, listeners: 0 });
+        expect(existsSync(closed.journal)).toBe(false);
+    });
+
+    live('внешний фиктивный провайдер отвечает в изоляцию через TCP-мост', async () => {
+        const host = tmp('ralph-provider.');
+        const journal = join(host, 'provider.jsonl');
+        const provider = await startFakeProvider({
+            cli: 'kimi',
+            probe: 'auto',
+            journal,
+            port: 0,
+        });
+        const l = layoutStand(tmp('ralph-stand.'), []);
+        const forward = startTcpForward(l.egressSocket, {
+            host: '127.0.0.1',
+            port: provider.port,
+        });
+        if (!forward.listening) await new Promise<void>((res) => forward.once('listening', res));
+        const bridgePort = 19000 + (process.pid % 1000);
+        const response = join(l.work, 'response.txt');
+        const source = `
+            fetch('http://127.0.0.1:${bridgePort}/v1/chat/completions', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ messages: [{ role: 'user', content: 'Reply with exactly ralph-stand-ok' }] }),
+            }).then((r) => r.text()).then((text) =>
+                require('node:fs').writeFileSync(process.argv[1], text));
+        `;
+        const cmd = isolatedCommand(
+            l,
+            [
+                process.execPath,
+                join(import.meta.dirname, 'egress.mts'),
+                'bridge',
+                l.egressSocket,
+                String(bridgePort),
+                '--',
+                process.execPath,
+                '-e',
+                source,
+                response,
+            ],
+            { env: standEnv(l, { path: '/usr/bin:/bin' }) },
+        );
+        try {
+            expect(await runChild(cmd)).toBe(0);
+            expect(readFileSync(response, 'utf8')).toContain('ralph-stand-ok');
+            expect(readFileSync(journal, 'utf8')).toContain('chat/completions');
+        } finally {
+            await provider.close();
+            await new Promise<void>((res) => forward.close(() => res()));
+        }
     });
 
     live('свои IPC, UTS и cgroup: пространства имён внутри — не хоста', () => {

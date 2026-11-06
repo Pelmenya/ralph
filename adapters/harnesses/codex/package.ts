@@ -39,8 +39,13 @@ export function codexRegistrationFromArgs(argv: readonly string[]): GuardRegistr
 }
 
 export const harnessPackage: HarnessPackage = {
-    interfaceVersion: 1,
+    interfaceVersion: 2,
     harness: HARNESS,
+    distribution: {
+        registry: 'npm',
+        package: '@openai/codex',
+        bin: 'node_modules/@openai/codex/bin/codex' + '.js',
+    },
     guardRegistration: (_settings: unknown, guardHooks: readonly GuardHook[] = []) =>
         codexRegistrationFromArgs(codexGuardArgs(guardHooks)),
     // Нормализатор разбирает `apply_patch` в запись, удаление и перенос (#189), и guard судит

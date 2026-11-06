@@ -20,6 +20,7 @@ import {
     redactProxyUrl,
     startBridge,
     startEgressProxy,
+    startTcpForward,
     upstreamFromEnv,
 } from './egress.mts';
 
@@ -115,6 +116,17 @@ describe('прокси выхода стенда', () => {
             },
             { verdict: 'allow', target: 'provider.example.com:443' },
         ]);
+    });
+
+    it('TCP к внешнему фиктивному провайдеру перекладывает байты без HTTP CONNECT', async () => {
+        const upstream = createServer((s) => s.on('data', () => s.end('pong')));
+        upstream.listen(0, '127.0.0.1');
+        await listening(upstream);
+        const upPort = (upstream.address() as any).port;
+        const sock = join(tmp(), 'tcp.sock');
+        const proxy = startTcpForward(sock, { host: '127.0.0.1', port: upPort });
+        await listening(proxy);
+        expect(await ask({ path: sock }, 'ping')).toBe('pong');
     });
 
     it('upstream-прокси: адрес http://host:port, креды — заголовком, иное — отказ', () => {

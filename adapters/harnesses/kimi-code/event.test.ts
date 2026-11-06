@@ -1,17 +1,12 @@
 // Нормализатор Kimi Code (#191) на сырых событиях стенда 2.3.2 и на отказах разбора. Фикстура
 // стенда держит и выводы о CLI: каждое событие дошло до хука, запрещённое заблокировано, а
 // перечень инструментов описания покрывает то, что CLI отдал модели.
-import { readFileSync } from 'node:fs';
-import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { parseHarnessDescriptor, type HarnessDescriptor } from '../descriptor.ts';
+import { readStandFixture } from '../stand-fixture.test-helper.ts';
 import { KIMI_MCP_NAME_MAX, kimiMcpToolName, normalizeKimiEvent } from './event.ts';
 
 const DIR = import.meta.dirname;
-const descriptor = parseHarnessDescriptor(
-    JSON.parse(readFileSync(path.join(DIR, 'descriptor.json'), 'utf-8')),
-    'kimi-code',
-);
 type StandEvent = {
     id: string;
     call: { name: string; arguments: Record<string, unknown> };
@@ -20,13 +15,12 @@ type StandEvent = {
     tree: string;
     advertised?: string[];
 };
-const FX = JSON.parse(
-    readFileSync(path.join(DIR, '..', '__fixtures__', 'kimi-code-2.3.2-stand.json'), 'utf-8'),
-) as {
+const { descriptor: rawDescriptor, fixture: FX } = readStandFixture<{
     cliVersion: string;
     events: StandEvent[];
     inventory: { tools: Record<string, { properties: string[]; required: string[] }> };
-};
+}>(DIR, 'kimi-code', '2.3.2');
+const descriptor = parseHarnessDescriptor(rawDescriptor, 'kimi-code');
 const event = (id: string): StandEvent => FX.events.find((e) => e.id === id) as StandEvent;
 const stand = (id: string) => JSON.parse(event(id).hookStdin[0]);
 const ops = (raw: unknown, d: HarnessDescriptor = descriptor) =>
@@ -49,8 +43,8 @@ const envelope = (tool_name: string, tool_input: unknown) => ({
 });
 
 describe('фикстура стенда', () => {
-    it('версия описания совпадает со стендом; каждое событие дошло до хука ровно раз', () => {
-        expect(descriptor.cliVersion).toBe(FX.cliVersion);
+    it('исторический снимок 2.3.2 адресован явно; каждое событие дошло до хука', () => {
+        expect(FX.cliVersion).toBe('2.3.2');
         for (const e of FX.events) {
             expect(e.hookStdin, e.id).toHaveLength(1);
             expect(stand(e.id).tool_name, e.id).toBe(e.call.name);

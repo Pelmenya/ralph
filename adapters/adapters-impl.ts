@@ -203,6 +203,7 @@ export type GithubTaskSourceFns = {
     checkAuth: () => void;
     openIssues: (milestone: string) => Issue[];
     allOpenIssues: (milestone: string) => Issue[];
+    findOpenIssue: (title: string) => Issue | null;
     hasAnyIssues: (milestone: string) => boolean;
     milestoneOpen: (title: string) => boolean;
     milestoneLabels: (milestone: string) => string[];
@@ -264,6 +265,7 @@ export function createGithubTaskSource(fns: GithubTaskSourceFns): TaskSourceAdap
         reviewProtectsPaths: false,
         listReadyIssues: fns.openIssues,
         listAllOpenIssues: fns.allOpenIssues,
+        findOpenIssue: fns.findOpenIssue,
         hasAnyIssues: fns.hasAnyIssues,
         isMilestoneOpen: fns.milestoneOpen,
         listMilestoneLabels: fns.milestoneLabels,

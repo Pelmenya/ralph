@@ -898,9 +898,9 @@ describe('live-probe: разбор (#219)', () => {
             ...o,
         });
 
-    it('пара из каталога разбирается', () => {
-        expect(parseSessionRequests(probe({}), OPTS)).toEqual([
-            { kind: 'live-probe', issue: 219, cli: 'claude', case: 'unknown-tool' },
+    it.each(['claude', 'codex', 'kimi', 'opencode'])('пара из каталога разбирается: %s', (cli) => {
+        expect(parseSessionRequests(probe({ cli }), OPTS)).toEqual([
+            { kind: 'live-probe', issue: 219, cli, case: 'unknown-tool' },
         ]);
     });
 
@@ -922,14 +922,14 @@ describe('live-probe: разбор (#219)', () => {
     it('незнакомый cli — тот же класс с парой из запроса', () => {
         let thrown: unknown;
         try {
-            parseSessionRequests(probe({ cli: 'codex' }), OPTS);
+            parseSessionRequests(probe({ cli: 'unknown-cli' }), OPTS);
         } catch (e) {
             thrown = e;
         }
 
         expect(thrown).toBeInstanceOf(UnknownLiveProbeError);
         const error = thrown as UnknownLiveProbeError;
-        expect(error.cli).toBe('codex');
+        expect(error.cli).toBe('unknown-cli');
         expect(error.probeCase).toBe('unknown-tool');
         expect(error.message).toMatch(/cli пробы .* не из каталога/);
     });
@@ -957,7 +957,7 @@ describe('live-probe: разбор (#219)', () => {
     it.each([
         [{ case: 'rm-everything' }, /case пробы "rm-everything" не из каталога claude/],
         [{ case: 'offline' }, /case пробы "offline"/],
-        [{ cli: 'codex' }, /cli пробы "codex" не из каталога/],
+        [{ cli: 'unknown-cli' }, /cli пробы "unknown-cli" не из каталога/],
         [{ cli: 'claude; printenv' }, /cli пробы/],
         [{ command: 'printenv' }, /лишнее: command/],
         [{ args: ['x'] }, /лишнее: args/],

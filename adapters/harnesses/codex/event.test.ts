@@ -1,18 +1,12 @@
 // Нормализатор Codex (#189) на сырых событиях стенда 0.163.0 (#188) и на отказах разбора.
-import { readFileSync } from 'node:fs';
-import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { parseHarnessDescriptor } from '../descriptor.ts';
+import { readStandFixture } from '../stand-fixture.test-helper.ts';
 import { normalizeCodexEvent } from './event.ts';
 
 const DIR = import.meta.dirname;
-const descriptor = parseHarnessDescriptor(
-    JSON.parse(readFileSync(path.join(DIR, 'descriptor.json'), 'utf-8')),
-    'codex',
-);
-const FX = JSON.parse(
-    readFileSync(path.join(DIR, '..', '__fixtures__', 'codex-0.163.0-stand.json'), 'utf-8'),
-);
+const { descriptor: rawDescriptor, fixture: FX } = readStandFixture(DIR, 'codex', '0.163.0');
+const descriptor = parseHarnessDescriptor(rawDescriptor, 'codex');
 const stand = (id: string): unknown[] =>
     FX.events.find((e: { id: string }) => e.id === id).hookStdin.map((s: string) => JSON.parse(s));
 const ops = (raw: unknown) => normalizeCodexEvent(descriptor, raw).operations;

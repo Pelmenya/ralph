@@ -205,6 +205,12 @@ function buildFakeTaskSource(): { adapter: TaskSourceAdapter; calls: string[] } 
             if (allOpenThrows) throw new Error('gh issue list упал');
             return milestone === MILESTONE ? ISSUES.slice() : [];
         },
+        findOpenIssue: (title) => {
+            if (issuesThrow) throw new Error('форж не отдал карточки');
+            const matches = ISSUES.filter((issue) => issue.title === title);
+            if (matches.length > 1) throw new Error('неоднозначный заголовок');
+            return matches[0] ?? null;
+        },
         // #39: карточки ЛЮБОГО статуса. У фикстуры они есть только у MILESTONE; в
         // EMPTY_MILESTONE их нет ни открытых, ни закрытых. Отказ — СВОИМ флагом, не общим
         // с listAllOpenIssues: связанные флаги делают зелёный негативный тест
@@ -440,6 +446,8 @@ function buildRealTaskSource(): { adapter: TaskSourceAdapter; gateEnv: GateEnv }
             if (allOpenThrows) throw new Error('gh issue list упал');
             return milestone === MILESTONE ? ISSUES.slice() : [];
         },
+        findOpenIssue: (title: string): Issue | null =>
+            ralph.findOpenIssue(title, { forgeJsonFn: (cmd: string) => forgeJsonImpl(cmd) }),
         // #39: в отличие от соседних openIssues/allOpenIssues — БОЕВАЯ функция с
         // собственным DI-хуком на чтение gh. Новый метод шва писался уже под контракт,
         // поэтому «боевой» флейвор здесь честно боевой, а не фейк.
@@ -618,6 +626,19 @@ function registerTaskSourceContract(
             const { adapter } = build();
             (adapter as unknown as TaskSourceHook).__setAllOpenThrows(true);
             expect(() => adapter.listAllOpenIssues(MILESTONE)).toThrow();
+        });
+
+        it('findOpenIssue ищет точный заголовок, отдаёт null и не скрывает отказ', () => {
+            const { adapter } = build();
+            const hook = adapter as unknown as TaskSourceHook;
+            hook.__setForgeJson?.(() => ISSUES);
+            expect(adapter.findOpenIssue('первый')?.number).toBe(10);
+            expect(adapter.findOpenIssue('несуществующий')).toBeNull();
+            hook.__setIssuesThrow?.(true);
+            hook.__setForgeJson?.(() => {
+                throw new Error('форж не отдал карточки');
+            });
+            expect(() => adapter.findOpenIssue('первый')).toThrow();
         });
 
         // #39: «в milestone нет НИ ОДНОЙ карточки» ≠ «все карточки закрыты». Первое —
@@ -1176,8 +1197,9 @@ function buildSourcecraftTaskSource(): { adapter: TaskSourceAdapter; calls: stri
             if (issuesThrow) throw new Error('SourceCraft: issues упал');
             // Карточки — только на ПРАВИЛЬНЫЙ slug в QL-фильтре; на что угодно другое
             // (включая имя фазы) сервер отдаёт пусто.
-            const hit = decodeURIComponent(path).includes(`milestone_slug="${MILESTONE_SLUG}"`);
-            return { issues: hit ? scIssues : [] };
+            const query = decodeURIComponent(path);
+            const hit = query.includes(`milestone_slug="${MILESTONE_SLUG}"`);
+            return { issues: hit || !query.includes('milestone_slug') ? scIssues : [] };
         }
         if (path.includes('/pulls?')) {
             if (pullsThrow) throw new Error('SourceCraft: список PR не отдался');

@@ -96,6 +96,13 @@ export type RalphState = {
     // #248: успешно разобранные планы правок текущей фазы. Отсутствие — ноль; поле живёт в
     // state, чтобы рестарт не возвращал незакрытому блокеру новый бюджет планирования.
     fixPlans?: number;
+    // #264: срок последней канарейки и последние итоги по ключу «харнесс@версия».
+    // Отсутствие полей означает «не запускалась»; итоги читает следующая стадия решений (#265).
+    cliCanaryLastRunAt?: number;
+    cliCanaryOutcomes?: Record<string, CliCanaryStoredOutcome>;
+    // #265: уже опубликованные исходы по ключу «харнесс@версия:итог». Отдельно от последних
+    // итогов: следующий суточный прогон очищает их, а дедупликация обязана переживать это.
+    cliCanaryHandledOutcomes?: Record<string, true>;
     // #276: HEAD ветки до чини-сессии гейта — база ревью её правки. Снимают advancePhase и
     // засчитанное ревью; переживает рестарт между чини-сессией и ревью.
     healReviewBase?: string | null;
@@ -117,6 +124,17 @@ export type RalphState = {
 export type TMergeInFlight = { milestone: string; pr: number; sha: string | null };
 export type THealInFlight = { headBefore: string | null };
 
+export type CliCanaryVerdict = 'fresh' | 'green' | 'drift' | 'red' | 'unchecked';
+export type CliCanaryStoredOutcome = {
+    harness: string;
+    pinnedVersion: string;
+    latestVersion: string;
+    verdict: CliCanaryVerdict;
+    reason?: string;
+    failedProbes?: { name: string; verdict: string; detail: string }[];
+    reports?: { pinned: unknown; candidate: unknown };
+};
+
 // Исход чтения state с диска (задача 80). `raw` — разобранный JSON там, где он разобрался:
 // --reset достаёт из него барьер деплоя, даже когда форма в целом не прошла проверку.
 export type TStateInspection =
@@ -134,7 +152,13 @@ export type TStateInspection =
 
 // Счётчики проверяются так же, как `count`: целое неотрицательное. `gateHeals: -1` или `1.5`
 // сравнивались бы с бюджетом лечения молча и давали бы лишнюю попытку или ни одной.
-const NUMBER_FIELDS = ['noProgress', 'gateHeals', 'blockedHeals', 'fixPlans'] as const;
+const NUMBER_FIELDS = [
+    'noProgress',
+    'gateHeals',
+    'blockedHeals',
+    'fixPlans',
+    'cliCanaryLastRunAt',
+] as const;
 const NULLABLE_STRING_FIELDS = [
     'reviewModelFloor',
     'lastReviewModel',
@@ -218,6 +242,45 @@ export function inspectState(text: string): TStateInspection {
     for (const k of NULLABLE_STRING_FIELDS) {
         if (raw[k] !== undefined && raw[k] !== null && typeof raw[k] !== 'string') {
             return bad(`${k} — не строка и не null`);
+        }
+    }
+    const canaryOutcomes = raw.cliCanaryOutcomes;
+    if (canaryOutcomes !== undefined) {
+        if (
+            typeof canaryOutcomes !== 'object' ||
+            canaryOutcomes === null ||
+            Array.isArray(canaryOutcomes)
+        ) {
+            return bad('cliCanaryOutcomes — не объект итогов по «харнесс@версия»');
+        }
+        for (const [key, value] of Object.entries(canaryOutcomes)) {
+            if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+                return bad(`cliCanaryOutcomes.${key} — не объект`);
+            }
+            const outcome = value as Record<string, unknown>;
+            if (
+                typeof outcome.harness !== 'string' ||
+                typeof outcome.pinnedVersion !== 'string' ||
+                typeof outcome.latestVersion !== 'string' ||
+                !['fresh', 'green', 'drift', 'red', 'unchecked'].includes(String(outcome.verdict))
+            ) {
+                return bad(`cliCanaryOutcomes.${key} — битый итог канарейки`);
+            }
+        }
+    }
+    const handledOutcomes = raw.cliCanaryHandledOutcomes;
+    if (handledOutcomes !== undefined) {
+        if (
+            typeof handledOutcomes !== 'object' ||
+            handledOutcomes === null ||
+            Array.isArray(handledOutcomes)
+        ) {
+            return bad('cliCanaryHandledOutcomes — не объект исходов по «харнесс@версия:итог»');
+        }
+        for (const [key, value] of Object.entries(handledOutcomes)) {
+            if (value !== true) {
+                return bad(`cliCanaryHandledOutcomes.${key} — не отметка true`);
+            }
         }
     }
     if (raw.reReviewPending !== undefined && typeof raw.reReviewPending !== 'boolean') {

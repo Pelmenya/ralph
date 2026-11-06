@@ -406,6 +406,17 @@ export function createSourcecraftTaskSource(deps: SourcecraftTaskSourceDeps): Ta
             return listIssues(milestone, 'status in (open, in_progress, paused)');
         },
 
+        findOpenIssue(title: string): Issue | null {
+            const filter = encodeURIComponent('status in (open, in_progress, paused)');
+            const matches = pageThrough(`${base}/issues?filter=${filter}`, 'issues', true)
+                .map(mapIssue)
+                .filter((issue) => issue.title === title);
+            if (matches.length > 1) {
+                throw new Error(`SourceCraft: несколько открытых карточек «${title}»`);
+            }
+            return matches[0] ?? null;
+        },
+
         // #65: статус вехи — свежим листингом, мимо кеша резолва. Кеш помнит адреса вехи,
         // и они не меняются; статус меняет сам раннер, закрывая веху сданной фазы, и
         // запомненный ответ держал бы закрытый том открытым до конца прогона. Статус в

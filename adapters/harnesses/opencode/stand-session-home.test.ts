@@ -2,15 +2,12 @@
 // окружением и настройками от сборщика канона (`adapters/opencode-home.ts`). Каждый отказ сверки
 // изоляции стоит в паре с контрольным прогоном, где тот же канал открыт после сборщика, — иначе
 // «плагин не загрузился» могло бы значить «плагин не загрузился бы никогда».
-import { readFileSync } from 'node:fs';
-import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { OPENCODE_DISABLE_PROJECT_CONFIG_ENV, XDG_CONFIG_HOME_ENV } from '../../opencode-home.ts';
+import { readStandFixture } from '../stand-fixture.test-helper.ts';
 
 const DIR = import.meta.dirname;
-const FX = JSON.parse(
-    readFileSync(path.join(DIR, '..', '__fixtures__', 'opencode-1.19.4-stand.json'), 'utf-8'),
-);
+const { fixture: FX } = readStandFixture(DIR, 'opencode', '1.19.4');
 type TRun = {
     id: string;
     source: string;
@@ -40,7 +37,8 @@ describe('фикстура сборщика — сырая, с источник�
     it('каждый прогон — CLI 1.19.4, карточка #197, сессия дошла до конца', () => {
         for (const e of FX.sessionHome as TRun[]) {
             expect(e.cliVersion, e.id).toBe(FX.cliVersion);
-            expect(e.source, e.id).toMatch(/OpenCode 1\.19\.4.*карточка #197/);
+            expect(e.source, e.id).toContain(`OpenCode ${FX.cliVersion}`);
+            expect(e.source, e.id).toContain('карточка #197');
             expect(e.exit, e.id).toBe('exit=0');
         }
     });

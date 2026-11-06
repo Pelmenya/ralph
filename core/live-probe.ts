@@ -27,9 +27,11 @@
  *   - значение ключа вычищается из всего, что уходит в карточку и лог, а его след в выводе
  *     означает FAIL пробы: ключ, напечатанный изнутри, уже вне стенда.
  *
- * Отказ (нет секции, нет ключа, нет установки) — отдельный исход `REFUSED` с названной
- * причиной: проба не пропускается молча и карточку не закрывает. Петля из-за пробы не встаёт —
- * это решение по карточке, а не по петле.
+ * Codex, Kimi Code и OpenCode идут на фиктивный провайдер стенда без ключа и секции `liveProbe`
+ * (#262); маршрут их живого ключа здесь не объявляется. У Claude Code отказ (нет секции, нет
+ * ключа, нет установки) — отдельный исход `REFUSED` с названной причиной: проба не пропускается
+ * молча и карточку не закрывает. Петля из-за пробы не встаёт — это решение по карточке, а не по
+ * петле.
  *
  * Находки стенда, ставшие частью исполнителя: CLI под root отказывает `bypassPermissions` без
  * признака `IS_SANDBOX=1` (#186), выход к провайдеру с хоста за прокси идёт цепочкой через
@@ -41,6 +43,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { join, relative, isAbsolute } from 'node:path';
 
 import {
+    LIVE_PROBE_CASES,
     LIVE_PROBE_CLI_KEY_ENV,
     LIVE_PROBE_CLI_ROUTE,
     LOOP_KEY_ENVS,
@@ -343,41 +346,51 @@ export function runLiveProbe({
         reason,
         tail: '',
     });
-    if (config === null)
+    const fakeProvider =
+        LIVE_PROBE_CASES[cli] !== undefined && LIVE_PROBE_CLI_KEY_ENV[cli] === undefined;
+    if (config === null && !fakeProvider)
         return refused(
             'секция liveProbe в конфиге потребителя не задана — переменная ключа пробы не названа',
         );
     // Ключ нормализуется один раз: тем же значением его получает стенд, ищет вычистка и
-    // сверяет совпадение с ключами петли.
-    const key = (env[config.keyEnv] ?? '').trim();
-    if (key === '')
+    // сверяет совпадение с ключами петли. У фиктивного провайдера ключа нет вовсе.
+    const key = fakeProvider ? '' : (env[config!.keyEnv] ?? '').trim();
+    if (!fakeProvider && key === '')
         return refused(
-            `ключ пробы не задан: переменная ${config.keyEnv} пуста в окружении раннера`,
+            `ключ пробы не задан: переменная ${config!.keyEnv} пуста в окружении раннера`,
         );
-    const same = LOOP_KEY_ENVS.filter((n) =>
-        (env[n] ?? '')
-            .split(',')
-            .map((v) => v.trim())
-            .includes(key),
-    );
+    const same = fakeProvider
+        ? []
+        : LOOP_KEY_ENVS.filter((n) =>
+              (env[n] ?? '')
+                  .split(',')
+                  .map((v) => v.trim())
+                  .includes(key),
+          );
     if (same.length > 0)
         return refused(
-            `ключ пробы из ${config.keyEnv} совпадает с ключом петли (${same.join(', ')}) — ` +
+            `ключ пробы из ${config!.keyEnv} совпадает с ключом петли (${same.join(', ')}) — ` +
                 'нужен отдельный ключ с ограниченной квотой',
         );
     const route = LIVE_PROBE_CLI_ROUTE[cli];
     const viaRoute =
-        config.baseUrl !== undefined || config.keyAs === 'auth-token' || config.model !== undefined;
+        config?.baseUrl !== undefined ||
+        config?.keyAs === 'auth-token' ||
+        config?.model !== undefined;
     if (viaRoute && route === undefined)
         return refused(`маршрута к провайдеру из liveProbe для CLI ${cli} нет`);
-    const cliKeyEnv =
-        config.keyAs === 'auth-token' ? route?.authTokenEnv : LIVE_PROBE_CLI_KEY_ENV[cli];
-    if (cliKeyEnv === undefined) return refused(`маршрута ключа пробы для CLI ${cli} нет`);
+    const cliKeyEnv = fakeProvider
+        ? undefined
+        : config!.keyAs === 'auth-token'
+          ? route?.authTokenEnv
+          : LIVE_PROBE_CLI_KEY_ENV[cli];
+    if (!fakeProvider && cliKeyEnv === undefined)
+        return refused(`маршрута ключа пробы для CLI ${cli} нет`);
     // Переменные маршрута — значения конфига человека, не ключ: едут в стенд именами `--pass-env`.
     const routeEnv: Record<string, string> = {};
-    if (route !== undefined && config.baseUrl !== undefined)
+    if (route !== undefined && config?.baseUrl !== undefined)
         routeEnv[route.baseUrlEnv] = config.baseUrl;
-    if (route !== undefined && config.model !== undefined)
+    if (route !== undefined && config?.model !== undefined)
         for (const n of route.modelEnvs) routeEnv[n] = config.model;
     if (productRoot === null || executionRoot === null)
         return refused(
@@ -390,7 +403,7 @@ export function runLiveProbe({
                 'стенд из ветки проверял бы сам себя',
         );
     let proxy: string | undefined;
-    if (config.upstreamProxyEnv !== undefined) {
+    if (config?.upstreamProxyEnv !== undefined) {
         proxy = env[config.upstreamProxyEnv];
         if (proxy === undefined || proxy.trim() === '')
             return refused(
@@ -408,12 +421,11 @@ export function runLiveProbe({
     // в процесс, исполняющий код ветки, не едут. Внутрь изоляции переменные проходят только
     // названными `--pass-env`.
     const isolateArgs = [
-        '--pass-env',
-        cliKeyEnv,
+        ...(cliKeyEnv === undefined ? [] : ['--pass-env', cliKeyEnv]),
         '--pass-env',
         'IS_SANDBOX',
         ...Object.keys(routeEnv).flatMap((n) => ['--pass-env', n]),
-        ...(config.baseUrl !== undefined ? ['--allow', baseUrlAddress(config.baseUrl)] : []),
+        ...(config?.baseUrl !== undefined ? ['--allow', baseUrlAddress(config.baseUrl)] : []),
         ...(proxy !== undefined ? ['--upstream-proxy-env', 'RALPH_PROBE_UPSTREAM'] : []),
     ];
     const standEnv: Record<string, string> = {
@@ -427,7 +439,7 @@ export function runLiveProbe({
         STAND_ISOLATE_ARGS: isolateArgs.join(' '),
         IS_SANDBOX: '1',
         ...routeEnv,
-        [cliKeyEnv]: key,
+        ...(fakeProvider ? { STAND_FAKE_PROVIDER: '1' } : { [cliKeyEnv!]: key }),
         ...(proxy !== undefined ? { RALPH_PROBE_UPSTREAM: proxy } : {}),
     };
     const script = join(productRoot, 'provision', 'install-stand.sh');
@@ -436,7 +448,7 @@ export function runLiveProbe({
         out = spawnFn(['bash', script, cli, probeCase], {
             env: standEnv,
             cwd: dir,
-            timeoutMs: config.timeoutMs ?? LIVE_PROBE_TIMEOUT_MS,
+            timeoutMs: config?.timeoutMs ?? LIVE_PROBE_TIMEOUT_MS,
         });
     } finally {
         try {
@@ -523,11 +535,10 @@ export function liveProbeForIntent(
     // Раннер ждёт стенд синхронно, до срока пробы без единой строки. Строка старта — с маркером
     // кодер-шага `🔄`: deadman читает его как долгий шаг, а не как тишину короткого.
     const minutes = Math.ceil((config?.timeoutMs ?? LIVE_PROBE_TIMEOUT_MS) / 60_000);
-    if (config !== null)
-        logFn(
-            `🔄 Живая проба ${probe.cli} ${probe.case} запущена — срок ${String(minutes)} мин, ` +
-                'раннер ждёт стенд.',
-        );
+    logFn(
+        `🔄 Живая проба ${probe.cli} ${probe.case} запущена — срок ${String(minutes)} мин, ` +
+            'раннер ждёт стенд.',
+    );
     const result = runFn({
         cli: probe.cli,
         probeCase: probe.case,

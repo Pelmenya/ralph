@@ -3,21 +3,15 @@
 // описанием пакета. Разбор 27.10 знал о `apply_patch`, code mode и MCP только «по доке», и
 // предел барьера Codex строился на утверждении, что хук зовётся одной оболочкой, — стенд его
 // опроверг. Здесь утверждение, которое проверено стендом, а не прочитано.
-import { readFileSync } from 'node:fs';
-import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { CODEX_DISABLE_TTY } from '../../harness-guard.ts';
 import { parseHarnessDescriptor } from '../descriptor.ts';
+import { readStandFixture } from '../stand-fixture.test-helper.ts';
 import { kitScriptProblems } from '../stand-scrub.ts';
 
 const DIR = import.meta.dirname;
-const FX = JSON.parse(
-    readFileSync(path.join(DIR, '..', '__fixtures__', 'codex-0.163.0-stand.json'), 'utf-8'),
-);
-const DESCRIPTOR = parseHarnessDescriptor(
-    JSON.parse(readFileSync(path.join(DIR, 'descriptor.json'), 'utf-8')),
-    'codex',
-);
+const { descriptor, fixture: FX } = readStandFixture(DIR, 'codex', '0.163.0');
+const DESCRIPTOR = parseHarnessDescriptor(descriptor, 'codex');
 
 type TEvent = { tool_name: string; tool_input: Record<string, unknown> } & Record<string, unknown>;
 const SECTIONS = [
@@ -38,14 +32,14 @@ const hookEvents = (id: string): TEvent[] =>
     byId('events', id).hookStdin.map((s: string) => JSON.parse(s));
 
 describe('фикстура стенда — сырая, у каждой записи источник и версия', () => {
-    it('не собранная, версия совпадает с описанием пакета', () => {
+    it('не собранная, историческая версия адресована явно', () => {
         expect(FX.assembled).toBe(false);
-        expect(FX.cliVersion).toBe(DESCRIPTOR.cliVersion);
+        expect(FX.cliVersion).toBe('0.163.0');
         for (const s of SECTIONS) {
             expect(FX[s].length).toBeGreaterThan(0);
             for (const e of FX[s]) {
-                expect(e.cliVersion, e.id).toBe('0.163.0');
-                expect(e.source, e.id).toMatch(/codex-cli 0\.163\.0/);
+                expect(e.cliVersion, e.id).toBe(FX.cliVersion);
+                expect(e.source, e.id).toContain(`codex-cli ${FX.cliVersion}`);
                 expect(e.caseScript, e.id).toEqual(expect.any(String));
             }
         }

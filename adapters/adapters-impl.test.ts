@@ -138,6 +138,7 @@ describe('createGithubTaskSource — раскладка функций форж�
         const ts: TaskSourceAdapter = createGithubTaskSource({
             openIssues: spy('openIssues', []) as never,
             allOpenIssues: spy('allOpenIssues', []) as never,
+            findOpenIssue: spy('findOpenIssue', null) as never,
             hasAnyIssues: spy('hasAnyIssues', true) as never,
             // false, а не true: маппер обязан отдать ответ как есть, и подмена вида
             // `?? true` видна только на закрытой вехе (#65).
@@ -224,6 +225,7 @@ describe('createGithubTaskSource — раскладка функций форж�
         const ts: TaskSourceAdapter = createGithubTaskSource({
             openIssues: (() => []) as never,
             allOpenIssues: (() => []) as never,
+            findOpenIssue: (() => null) as never,
             hasAnyIssues: (() => false) as never,
             milestoneOpen: (() => true) as never,
             milestoneLabels: (() => []) as never,
@@ -324,6 +326,7 @@ function fakeRegistries(): AdapterRegistries {
         checkAuth: () => {},
         openIssues: () => [],
         allOpenIssues: () => [],
+        findOpenIssue: () => null,
         hasAnyIssues: () => true,
         milestoneOpen: () => true,
         milestoneLabels: () => [],

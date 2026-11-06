@@ -52,8 +52,13 @@ const plugin: GuardPlugin = {
 };
 
 export const harnessPackage: HarnessPackage = {
-    interfaceVersion: 1,
+    interfaceVersion: 2,
     harness: HARNESS,
+    distribution: {
+        registry: 'npm',
+        package: 'opencode-ai',
+        bin: 'node_modules/opencode-ai/bin/opencode.exe',
+    },
     guardRegistration: (_settings: unknown, guardHooks: readonly GuardHook[] = []) =>
         opencodeRegistrationFromPlugin(opencodeGuardPlugin(guardHooks)),
     // Нормализатор знает `apply_patch`, `workdir` оболочки и `include` поиска (#192).

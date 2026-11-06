@@ -30,7 +30,7 @@
 // Язык описания не проверяется намеренно: он русский по конвенции, а определять язык
 // эвристикой — источник ложных отказов на именах и терминах.
 import { readFileSync } from 'node:fs';
-import { denyNamePattern, traceFindings } from './tests/project-traces.ts';
+import { denyNamePattern, traceFindings } from './shared/project-traces.ts';
 
 /** Типы конвенции. `style` — потому что петля им пользуется для правок формата. */
 export const TYPES = ['feat', 'fix', 'refactor', 'chore', 'docs', 'test', 'perf', 'ci', 'style'];

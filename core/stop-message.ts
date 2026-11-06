@@ -40,6 +40,7 @@ export type TStopReason =
     | 'forge-unreadable'
     | 'issue-format'
     | 'guard-probe'
+    | 'cli-version'
     | 'config-reload'
     | 'breaker'
     | 'deadman'
@@ -106,6 +107,8 @@ export const REASON_TITLES: Record<TStopReason, string> = {
     'issue-format': 'карточка не по формату потребителя',
     // Ревью Фазы 12: собранный settings сессии не прошёл пробу барьера посреди прогона.
     'guard-probe': 'барьер сессии не прошёл пробу',
+    // #261: исполняемая копия не подтвердила версию описания пакета — сессия не запускалась.
+    'cli-version': 'версия исполняемого CLI не совпала с закреплённой',
     // #221: конфиг, перечитанный на границе фаз, битый или потерял текущую фазу.
     'config-reload': 'конфиг на границе фаз отвергнут',
     breaker: 'circuit breaker',

@@ -368,10 +368,13 @@ import {
     type RuntimeProfile,
 } from '../adapters/runtime-profile.ts';
 import {
-    cliVersionDrift,
+    cliVersionProblem,
     HARNESS_REGISTRY,
+    harnessDescriptorPath,
+    standFixturePath,
     loopDeniedTools,
 } from '../adapters/harness-registry.ts';
+import { resolveCliLaunch } from './cli-launch.ts';
 import {
     checkMcpDrift,
     harnessMcpNames,
@@ -436,6 +439,9 @@ import {
     type TSessionSettingsDeps,
 } from './session-settings.ts';
 import { loopSessionContext, SESSION_CONTEXT_ENV } from './session-context.ts';
+import { formatCliCopyFailure, prepareCliCopies } from './cli-copies.ts';
+import { runCliCanary } from './cli-canary.ts';
+import { handleCliCanaryOutcomes } from './cli-canary-actions.ts';
 import {
     acquireRepoOwnership,
     canonicalRepoId,
@@ -834,6 +840,8 @@ export type RalphConfig = {
     // заякорен к `consumerRoot` (иначе база пути — «где случился chdir»).
     consumerScripts?: TConsumerScripts;
     consumerScriptsResolved?: TConsumerScriptsResolved | null;
+    // #261: необязательная обёртка хоста по имени харнесса; копия CLI — её первый аргумент.
+    cliLauncher?: Record<string, string>;
     phases: Phase[];
     prompt?: string;
     model?: string;
@@ -2050,22 +2058,24 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // что исполнилось. Разбор ответа — у адаптера (`adapters/runtime-profile.ts`): формат
     // строки версии — свойство CLI.
     //
-    // Не бросает никогда: версия — наблюдение, а не барьер. Отказ любого рода (сигнал, бинаря
-    // нет, ненулевой код, непохожий ответ) — `unknown` с причиной; готовность рантайма
-    // проверяет `checkAvailable`, а недоступный посреди прогона бинарь назовёт сам spawn сессии.
+    // Не бросает никогда: отказ любого рода возвращается `unknown` с причиной, а общая точка
+    // перед сессией превращает его в стоп. Обёртка получает копию первым аргументом — тем же
+    // вызовом версия проверяется у того исполняемого, который пойдёт в сессию (#261).
     function readCliVersion(
         bin: string,
         parse: (output: string) => CliVersion,
         spawnFn: typeof spawnSync = spawnSync,
+        launcher?: string,
     ): CliVersion {
-        if (spawnFn === spawnSync) guardSideEffect(`readCliVersion(${bin} --version)`);
+        const command = launcher ? `${launcher} ${bin}` : bin;
+        if (spawnFn === spawnSync) guardSideEffect(`readCliVersion(${command} --version)`);
         const unknown = (why: string): CliVersion => ({
             version: CLI_VERSION_UNKNOWN,
-            unknownReason: `\`${bin} --version\` ${why}`,
+            unknownReason: `\`${command} --version\` ${why}`,
         });
         let res: ReturnType<typeof spawnSync>;
         try {
-            res = spawnFn(bin, ['--version'], {
+            res = spawnFn(launcher ?? bin, launcher ? [bin, '--version'] : ['--version'], {
                 stdio: ['ignore', 'pipe', 'pipe'],
                 shell: false,
                 timeout: 30 * 1000,
@@ -2103,23 +2113,11 @@ export function createOrchestrator(env: OrchestratorEnv) {
         logFn(`🧩 Версия CLI \`${bin}\` сменилась между попытками: ${prev} → ${v.version}.`);
     }
 
-    // Ревью Фазы 16c: версия CLI, с которой снято описание пакета, не сверялась вовсе. Строка
-    // `⚠` — один раз на пару «харнесс, версия» за прогон: перед каждой сессией она тонула бы
-    // в логе, а смену версии посреди ночи всё равно назовёт заново.
-    const warnedCliDrift = new Set<string>();
-    function warnCliVersionDrift(
-        harness: string,
-        version: string,
-        {
-            logFn = log,
-            registry = HARNESS_REGISTRY,
-        }: { logFn?: LogFn; registry?: typeof HARNESS_REGISTRY } = {},
-    ): void {
-        const drift = cliVersionDrift(registry, harness, version, CLI_VERSION_UNKNOWN);
-        const key = `${harness}@${version}`;
-        if (drift === null || warnedCliDrift.has(key)) return;
-        warnedCliDrift.add(key);
-        logFn(`⚠ ${drift}`);
+    // Пути из #260 сохраняются до spawn. `undefined` остаётся только у низкоуровневых вызовов
+    // фабрики вне main(); боевой main() обязан пройти checkCliCopies и получает набор явно.
+    let cliCopyBins: ReadonlyMap<string, string> | undefined;
+    function cliLaunch(runtime: string, args: string[]) {
+        return resolveCliLaunch(runtime, cliCopyBins, config?.cliLauncher, args);
     }
 
     // #215: инвентарь MCP перед сессией — снимок дерева ЧЕЛОВЕКА (`consumerRoot`, прошёл ревью)
@@ -2235,16 +2233,23 @@ export function createOrchestrator(env: OrchestratorEnv) {
         for (const l of lines) logFn(l);
     }
 
-    // Версия перед сессией рантайма по его ключу реестра: прочитать, сверить с прошлой и с
-    // версией описания пакета. Это боевое умолчание параметра `cliVersionFn` у run*Once;
-    // тесты подменяют его целиком. Здесь же — сверка инвентаря MCP (`mcpDriftFn`, #215): это
-    // единственная точка «перед сессией», общая для всех рантаймов.
+    // Версия спрашивается тем же путём и той же обёрткой, которыми пойдёт сессия. Любое
+    // расхождение с описанием или нечтение — стоп до spawn; прежняя строка ⚠ здесь ушла (#261).
+    // Здесь же — сверка инвентаря MCP (`mcpDriftFn`, #215): общая точка перед всеми рантаймами.
     function sessionCliVersion(
         runtime: string,
         readFn: typeof readCliVersion = readCliVersion,
         noteFn: typeof noteCliVersion = noteCliVersion,
-        driftFn: typeof warnCliVersionDrift = warnCliVersionDrift,
+        problemFn: (harness: string, version: CliVersion) => string | null = (harness, version) =>
+            cliVersionProblem(
+                HARNESS_REGISTRY,
+                harness,
+                version.version,
+                CLI_VERSION_UNKNOWN,
+                version.unknownReason,
+            ),
         mcpDriftFn: () => void = () => warnMcpDrift(),
+        stop: TGuardStopDeps = {},
     ): CliVersion {
         mcpDriftFn();
         const id = RUNTIME_IDENTITIES[runtime];
@@ -2254,9 +2259,14 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 unknownReason: `рантайм '${runtime}' без записи в RUNTIME_IDENTITIES`,
             };
         }
-        const v = readFn(id.bin, id.parseVersion);
-        noteFn(id.bin, v);
-        driftFn(id.harness, v.version);
+        const launch = cliLaunch(runtime, ['--version']);
+        const launcher = launch.file === launch.bin ? undefined : launch.file;
+        const v = launcher
+            ? readFn(launch.bin, id.parseVersion, undefined, launcher)
+            : readFn(launch.bin, id.parseVersion);
+        const problem = problemFn(id.harness, v);
+        if (problem !== null) return stopOnCliVersion(problem, stop);
+        noteFn(launch.bin, v);
         return v;
     }
 
@@ -2329,7 +2339,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // MAX_ARG_STRLEN там нет. `stdio: ['pipe', …]` ставим ЯВНО, а не полагаемся на то,
         // что `input` молча перекроет 'ignore': молчаливая зависимость от перекрытия — то
         // самое место, где следующая правка опций spawn тихо оборвёт stdin.
-        const res = spawnFn('claude', cmdArgs, {
+        const launch = cliLaunch(runtimeName, cmdArgs);
+        const res = spawnFn(launch.file, launch.args, {
             stdio: ['pipe', 'pipe', 'pipe'],
             input: prompt,
             shell: false,
@@ -2397,6 +2408,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
         sessionTree: string;
         coreSha: string;
     } | null = null;
+    // Абсолютный корень закреплённых копий CLI: ставит main() до установки и контекста сессии.
+    let cliCopiesRoot: string | null = null;
 
     // Ревью Фазы 12: раскладка без `roots` контракта `RALPH_CORE_SHA` сессии не даёт (settings
     // не собирается), а барьер скиллов узнаёт петлю только по контракту (#132) — без этого
@@ -2466,6 +2479,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             humanRoot: roots?.humanRoot ?? null,
             sessionTree: tree,
             coreSha: roots?.coreSha ?? '',
+            cliRoot: cliCopiesRoot ?? undefined,
         });
         return built.ok ? built.value : stopOnGuardProbe(built.reason, stop);
     }
@@ -2525,6 +2539,34 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 question:
                     'почини хук ядра или настройки дерева человека, названные выше, ' +
                     'и перезапусти loop — сессия не запускалась',
+            })}`,
+            config,
+            { logFn: log },
+        );
+        return exitFn(1);
+    }
+
+    function stopOnCliVersion(reason: string, stop: TGuardStopDeps = {}): never {
+        const {
+            pushEventFn = pushEvent,
+            persistFn = persistBeforeStop,
+            exitFn = (code: number): never => process.exit(code),
+        } = stop;
+        let notSaved = '';
+        if (persistFn) {
+            try {
+                persistFn();
+            } catch (e) {
+                notSaved = ` State перед стопом не сохранён: ${(e as Error)?.message ?? String(e)}.`;
+            }
+        }
+        pushEventFn(
+            `⛔ Ralph: ${formatStopMessage({
+                reason: 'cli-version',
+                diagnosis: `${reason}${notSaved}`,
+                question:
+                    'почини закреплённую копию CLI или обёртку cliLauncher и перезапусти loop — ' +
+                    'сессия не запускалась',
             })}`,
             config,
             { logFn: log },
@@ -2961,9 +3003,13 @@ export function createOrchestrator(env: OrchestratorEnv) {
     //
     // Бросает Error с причиной — текст отказа от шва, рамку «кодер-рантайм недоступен»
     // ставит вызывающий (checkCoderRuntimes).
-    function probeRuntimeBinary(bin: string, spawnFn: typeof spawnSync = spawnSync): void {
+    function probeRuntimeBinary(
+        bin: string,
+        spawnFn: typeof spawnSync = spawnSync,
+        args: string[] = ['--version'],
+    ): void {
         if (spawnFn === spawnSync) guardSideEffect(`probeRuntimeBinary(${bin} --version)`);
-        const res = spawnFn(bin, ['--version'], {
+        const res = spawnFn(bin, args, {
             stdio: ['ignore', 'pipe', 'pipe'],
             shell: false,
             timeout: 30 * 1000,
@@ -2992,9 +3038,9 @@ export function createOrchestrator(env: OrchestratorEnv) {
         }
     }
 
-    // Успешная проба запоминается по имени бинаря: у claude и kimi бинарь один, и без памяти
-    // конфиг, где достижимы оба, ждал бы один и тот же `claude --version` дважды — до
-    // таймаута каждый. Запоминается только успех: отказ и так останавливает старт.
+    // Успешная проба запоминается по паре «исполняемый файл + копия»: у claude и kimi обе
+    // части совпадают, а общий wrapper разных копий не должен скрывать вторую проверку.
+    // Запоминается только успех: отказ и так останавливает старт.
     const probedRuntimeBinaries = new Set<string>();
     function probeRuntimeBinaryOnce(
         bin: string,
@@ -3003,6 +3049,13 @@ export function createOrchestrator(env: OrchestratorEnv) {
         if (probedRuntimeBinaries.has(bin)) return;
         probeFn(bin);
         probedRuntimeBinaries.add(bin);
+    }
+
+    function probeRuntimeLaunch(runtime: string, spawnFn: typeof spawnSync = spawnSync): void {
+        const launch = cliLaunch(runtime, ['--version']);
+        probeRuntimeBinaryOnce(JSON.stringify([launch.file, launch.bin]), () =>
+            probeRuntimeBinary(launch.file, spawnFn, launch.args),
+        );
     }
 
     // Тонкая обвязка над spawnSync для бинаря `codex` — сиблинг spawnClaude, НЕ рефактор его
@@ -3032,7 +3085,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
         attempt: TAttemptContext = unreadAttemptContext('openai'),
     ): RunResult {
         if (spawnFn === spawnSync) guardSideEffect('spawnCodex(codex)');
-        const res = spawnFn(CODEX_BIN, cmdArgs, {
+        const launch = cliLaunch('openai', cmdArgs);
+        const res = spawnFn(launch.file, launch.args, {
             stdio: ['pipe', 'pipe', 'pipe'],
             input: prompt,
             shell: false,
@@ -3195,7 +3249,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
         expected: 'chatgpt' | 'api',
     ): void {
         if (spawnFn === spawnSync) guardSideEffect('assertCodexLoginChannel(codex login status)');
-        const res = spawnFn(CODEX_BIN, ['login', 'status'], {
+        const launch = cliLaunch('openai', ['login', 'status']);
+        const res = spawnFn(launch.file, launch.args, {
             encoding: 'utf8',
             shell: false,
             env,
@@ -3498,7 +3553,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
             }),
     ): RunResult {
         if (spawnFn === spawnSync) guardSideEffect('spawnKimiNative(kimi)');
-        const raw = spawnFn(KIMI_NATIVE_BIN, cmdArgs, {
+        const launch = cliLaunch('kimi-native', cmdArgs);
+        const raw = spawnFn(launch.file, launch.args, {
             stdio: ['ignore', 'pipe', 'pipe'],
             shell: false,
             timeout: timeoutMs,
@@ -3660,7 +3716,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // сеть не трогается (протухший токен узнает первая сессия исходом `auth`, и петля встанет
     // «вход отвергнут»).
     function checkKimiNativeAvailable({
-        probeFn = (bin: string) => probeRuntimeBinaryOnce(bin),
+        probeFn = () => probeRuntimeLaunch('kimi-native'),
         readFileFn = (p: string) => fs.readFileSync(p, 'utf-8'),
         listDirFn = (p: string) => fs.readdirSync(p),
         cfg = config,
@@ -3737,7 +3793,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
         cwd: string | null = null,
     ): RunResult {
         if (spawnFn === spawnSync) guardSideEffect('spawnOpencode(opencode)');
-        const res = spawnFn(OPENCODE_BIN, cmdArgs, {
+        const launch = cliLaunch(OPENCODE_RUNTIME, cmdArgs);
+        const res = spawnFn(launch.file, launch.args, {
             stdio: ['pipe', 'pipe', 'pipe'],
             input: prompt,
             shell: false,
@@ -3872,10 +3929,11 @@ export function createOrchestrator(env: OrchestratorEnv) {
     // (`auth.json`, `XDG_DATA_HOME` человека). `RALPH_SKILL_GUARD` (`withSkillGuard`) конфиг CLI
     // не меняет.
     function checkOpencodeAvailable({
-        probeFn = (bin: string) => probeRuntimeBinaryOnce(bin),
+        probeFn = () => probeRuntimeLaunch(OPENCODE_RUNTIME),
         cliFn = (args: string[], env: NodeJS.ProcessEnv) => {
             guardSideEffect(`checkOpencodeAvailable(opencode ${args.join(' ')})`);
-            const r = spawnSync(OPENCODE_BIN, args, {
+            const launch = cliLaunch(OPENCODE_RUNTIME, args);
+            const r = spawnSync(launch.file, launch.args, {
                 encoding: 'utf-8',
                 stdio: ['ignore', 'pipe', 'pipe'],
                 timeout: 60_000,
@@ -6834,6 +6892,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         checkAuth,
         openIssues,
         allOpenIssues,
+        findOpenIssue,
         hasAnyIssues,
         milestoneOpen,
         milestoneLabels,
@@ -7021,6 +7080,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 checkAuth,
                 openIssues,
                 allOpenIssues,
+                findOpenIssue,
                 hasAnyIssues,
                 milestoneOpen,
                 milestoneLabels,
@@ -7093,7 +7153,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         coderRuntime: {
             claude: createCoderRuntime({
                 run: runClaudeOnce,
-                checkAvailable: () => probeRuntimeBinaryOnce('claude'),
+                checkAvailable: () => probeRuntimeLaunch('claude'),
                 capabilities: CLAUDE_CODE_CAPABILITIES,
             }),
             // #373 (фаза 6): Kimi через тот же `claude` + endpoint Moonshot (env-своп в
@@ -7101,7 +7161,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             // дефолт остаётся `claude` (ADAPTER_DEFAULTS) — Claude-путь не меняется.
             kimi: createCoderRuntime({
                 run: runKimiOnce,
-                checkAvailable: () => probeRuntimeBinaryOnce('claude'),
+                checkAvailable: () => probeRuntimeLaunch('kimi'),
                 capabilities: KIMI_CAPABILITIES,
             }),
             // #374 (фаза 6): OpenAI через ОТДЕЛЬНЫЙ `codex exec` (не поверх claude). Ключ
@@ -7109,7 +7169,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             // `claude` (ADAPTER_DEFAULTS) — Claude-путь не меняется.
             openai: createCoderRuntime({
                 run: runOpenAIOnce,
-                checkAvailable: () => probeRuntimeBinaryOnce(CODEX_BIN),
+                checkAvailable: () => probeRuntimeLaunch('openai'),
                 capabilities: CODEX_CAPABILITIES,
             }),
             // #120 (Фаза 16b): Kimi Code родным харнессом — свой бинарь `kimi`, рядом с
@@ -7369,6 +7429,45 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 return;
             }
             logFn(`✅ Кодер-рантайм готов: ${provider}`);
+        }
+    }
+
+    function checkCliCopies(
+        cfg: RalphConfig,
+        {
+            failFn = fail as FailFn,
+            logFn = log,
+            prepareFn = prepareCliCopies,
+            root: rootOverride,
+        }: {
+            failFn?: FailFn;
+            logFn?: LogFn;
+            prepareFn?: typeof prepareCliCopies;
+            root?: string;
+        } = {},
+    ): void {
+        const root = rootOverride ?? cliCopiesRoot;
+        if (root === null) {
+            cliCopyBins = new Map();
+            failFn('Старт отменён: main() не задал корень закреплённых копий CLI.');
+            return;
+        }
+        const prepared = prepareFn({
+            providers: reachableRuntimes(cfg).providers,
+            root,
+            readOnly: DRY,
+        });
+        if (!prepared.ok) {
+            cliCopyBins = new Map();
+            failFn(
+                `Старт отменён: ${formatCliCopyFailure(prepared)}. ` +
+                    'Сессия на системном бинаре из PATH не запускается.',
+            );
+            return;
+        }
+        cliCopyBins = prepared.bins;
+        for (const [harness, bin] of prepared.bins) {
+            logFn(`✅ Закреплённая копия CLI: ${harness} — ${bin}`);
         }
     }
 
@@ -8005,6 +8104,13 @@ export function createOrchestrator(env: OrchestratorEnv) {
         closeIssueFn?: (issue: number) => void;
         commentOnIssueFn?: (issue: number, body: string) => void;
         nowFn?: () => number;
+        // #264: боевую стадию передаёт main; умолчание не трогает реестр, диск и state в юнитах.
+        runCliCanaryFn?: (input: {
+            state: RalphState;
+            saveStateFn: typeof saveState;
+            logFn: LogFn;
+            nowFn: () => number;
+        }) => ReturnType<typeof runCliCanary>;
         // Задача 78: пауза перед повтором ревью, упавшего на прокси моделей. DI ради тестов:
         // настоящая пауза — минуты.
         sleepFn?: typeof sleep;
@@ -8160,6 +8266,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             // Время — параметр, а не `Date.now()` в теле: иначе тест на срок годности
             // недетерминирован (правило `tests/CLAUDE.md`).
             nowFn = () => Date.now(),
+            runCliCanaryFn = () => ({ ran: false, outcomes: [] }),
             sleepFn = sleep,
             recordFixReviewFindingsFn = recordFixReviewFindings as (
                 phase: Phase,
@@ -8744,6 +8851,10 @@ export function createOrchestrator(env: OrchestratorEnv) {
                 logFn('✋ HITL: одна итерация выполнена, стоп.');
                 break;
             }
+
+            // #264: стадия стоит только на границе, после терминальных выходов и до сессии.
+            // Суточный срок внутри неё переживает рестарт в state; dry не пишет и не ставит CLI.
+            if (!dry) runCliCanaryFn({ state, saveStateFn, logFn, nowFn });
 
             // #151: живость монитора проверяем на КАЖДОМ проходе цикла, не только в main()
             // на старте — иначе смерть сторожа посреди ночной фазы оставалась бы тишиной до
@@ -14366,6 +14477,11 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // Битое значение здесь не останавливает: его остановит preflight с причиной.
         setSessionLogsKeep(resolveObservability(config, () => {}).sessionLogsKeep);
 
+        // Копии живут в состоянии экземпляра, а не в неизменяемом дереве ревизии ядра.
+        cliCopiesRoot = roots
+            ? path.join(roots.runtimeDir, 'cli')
+            : path.resolve(LEGACY_DIR, 'cli');
+
         // Режим в лог первой строкой: разбирая утренний ralph.log, надо видеть, в каком
         // профиле шёл прогон, не сверяясь с историей команд.
         log(`⚙️  Профиль: ${config.profileName}`);
@@ -14386,6 +14502,8 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // Первым: это чтение конфига, а готовность поднимает процессы CLI — дешёвый отказ
         // раньше дорогого (ревью Фазы 16b).
         if (!RESET) checkExperimentalRuntimes(config);
+        // Dry не ставит отсутствующее, но сверяет существующие копии тем же манифестом.
+        if (!RESET) checkCliCopies(config);
         if (!RESET) checkCoderRuntimes(config);
         // #118: требования конфига к возможностям каждого достижимого рантайма — там же, до
         // worktree и выбора задачи. Чтение конфига и объявлений, ничего не пишет: в dry тоже.
@@ -14499,6 +14617,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             humanRoot: settingsRoots?.humanRoot ?? null,
             sessionTree,
             coreSha,
+            cliRoot: cliCopiesRoot ?? undefined,
         });
         if (!startContext.ok) fail(startContext.reason);
         ensureGuardHolds(sessionTree, {
@@ -14583,6 +14702,66 @@ export function createOrchestrator(env: OrchestratorEnv) {
             coreCheck.status === 'ok' && driftConsumer !== null
                 ? () => checkLockDrift(coreCheck.sha, driftConsumer)
                 : undefined;
+        const runCliCanaryStage = (input: {
+            state: RalphState;
+            saveStateFn: typeof saveState;
+            logFn: LogFn;
+            nowFn: () => number;
+        }) => {
+            const canaryRoot = roots
+                ? path.join(roots.runtimeDir, 'cli-canary')
+                : path.resolve(LEGACY_DIR, 'cli-canary');
+            return runCliCanary({
+                ...input,
+                canaryRoot,
+                pinnedBins: cliCopyBins ?? new Map(),
+                handleOutcomesFn: (outcomes) => {
+                    const backlogAddress = createBacklogAddress({
+                        candidates: backlogCandidates(config.review?.backlogMilestone),
+                        cap: positiveIntOrDefault(
+                            config.review?.backlogMilestoneCap,
+                            BACKLOG_MILESTONE_CAP,
+                        ),
+                        currentPhase: input.state.milestone ?? '',
+                        countOpenFn: (milestone) => {
+                            try {
+                                return adapters.taskSource.listAllOpenIssues(milestone).length;
+                            } catch {
+                                return null;
+                            }
+                        },
+                        isOpenFn: (milestone) => {
+                            try {
+                                return adapters.taskSource.isMilestoneOpen(milestone);
+                            } catch {
+                                return null;
+                            }
+                        },
+                        logFn: input.logFn,
+                        what: 'карточек канарейки CLI',
+                    });
+                    handleCliCanaryOutcomes({
+                        outcomes,
+                        state: input.state,
+                        consumerRoot: roots?.consumerRoot ?? sessionTree,
+                        canaryRoot,
+                        saveStateFn: input.saveStateFn,
+                        logFn: input.logFn,
+                        createIssueFn: adapters.taskSource.createIssue,
+                        createPullRequestFn: adapters.taskSource.createPullRequest,
+                        findOpenIssueFn: adapters.taskSource.findOpenIssue,
+                        findOpenPullRequestFn: adapters.taskSource.findOpenPullRequest,
+                        backlogAddressFn: backlogAddress,
+                        labels: Array.isArray(config.review?.backlogLabels)
+                            ? config.review.backlogLabels
+                            : [],
+                        runArgvFn: shArgv,
+                        descriptorPathFn: harnessDescriptorPath,
+                        standFixturePathFn: standFixturePath,
+                    });
+                },
+            });
+        };
         const exit = runLoop(config, ctx, {
             monitorConfigPath: runnerConfigPath,
             monitorExecutionRoot: sessionTree,
@@ -14590,6 +14769,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
             clearStopRequestFn: clearStopRequest,
             coreDriftFn,
             coreSha,
+            runCliCanaryFn: runCliCanaryStage,
             reloadPhasesFn: (milestone: string) =>
                 reloadPhasesFromConfig(runnerConfigPath, milestone, {
                     profileFlag,
@@ -14690,6 +14870,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // было нечем. Теперь контрактный сьют берёт их боевыми, как соседей ниже.
         openIssues,
         allOpenIssues,
+        findOpenIssue,
         hasAnyIssues,
         // #65: статус вехи — тоже с DI-хуком на чтение gh, контракт берёт её боевой.
         milestoneOpen,
@@ -14758,7 +14939,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         readCliVersion,
         noteCliVersion,
         sessionCliVersion,
-        warnCliVersionDrift,
+        checkCliCopies,
         warnMcpDrift,
         runClaude,
         subscriptionKeyRing,
@@ -14769,6 +14950,7 @@ export function createOrchestrator(env: OrchestratorEnv) {
         // контрактного теста «у каждой зарегистрированной реализации есть checkAvailable».
         probeRuntimeBinary,
         probeRuntimeBinaryOnce,
+        probeRuntimeLaunch,
         checkCoderRuntimes,
         checkRuntimeCapabilities,
         adapterRegistries,

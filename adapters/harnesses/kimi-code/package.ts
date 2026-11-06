@@ -38,8 +38,13 @@ export function kimiRegistrationFromToml(toml: string): GuardRegistration {
 }
 
 export const harnessPackage: HarnessPackage = {
-    interfaceVersion: 1,
+    interfaceVersion: 2,
     harness: HARNESS,
+    distribution: {
+        registry: 'npm',
+        package: '@moonshot-ai/kimi-code',
+        bin: 'node_modules/@moonshot-ai/kimi-code/dist/main' + '.mjs',
+    },
     guardRegistration: (_settings: unknown, guardHooks: readonly GuardHook[] = []) =>
         kimiRegistrationFromToml(kimiHooksToml(guardHooks)),
     // Нормализатор знает `path` файловых инструментов и `cwd` оболочки (#191).

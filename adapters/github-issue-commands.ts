@@ -162,6 +162,21 @@ export function createGithubIssueCommands(env: GithubIssueCommandsEnv) {
         return issues;
     }
 
+    function findOpenIssue(
+        title: string,
+        { forgeJsonFn = forgeJson }: { forgeJsonFn?: ForgeJsonFn } = {},
+    ): Issue | null {
+        const issues = forgeJsonFn<Issue[]>(
+            `gh issue list --state open --json number,title,labels,author,createdAt --limit ${String(ISSUE_LIST_LIMIT)}`,
+        );
+        assertNotTruncated(issues.length, title, 'Поиск карточки по заголовку');
+        const matches = issues.filter((issue) => issue.title === title);
+        if (matches.length > 1) {
+            throw new Error(`Несколько открытых карточек с точным заголовком «${title}»`);
+        }
+        return matches[0] ?? null;
+    }
+
     // C5 (#39): были ли у фазы задачи ВООБЩЕ — `--state all`, то есть вместе с закрытыми.
     // Открытых нет и у сделанной фазы, и у той, которую не начинали; закрытые — то
     // единственное, чем эти два состояния различаются снаружи.
@@ -415,6 +430,7 @@ export function createGithubIssueCommands(env: GithubIssueCommandsEnv) {
         checkAuth,
         openIssues,
         allOpenIssues,
+        findOpenIssue,
         hasAnyIssues,
         milestoneOpen,
         milestoneLabels,

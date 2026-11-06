@@ -219,6 +219,23 @@ describe('readCliVersion — фактическая версия бинаря, �
         expect(spawnFn).toHaveBeenCalledWith('codex', ['--version'], expect.anything());
     });
 
+    it('обёртка получает исполняемую копию первым аргументом и версия читается через неё же', () => {
+        const spawnFn = spawnReturning({ stdout: VERSION_OUTPUT.codex });
+        expect(
+            ralph.readCliVersion(
+                '/state/cli/codex/bin/codex.js',
+                parseCodexCliVersion,
+                spawnFn,
+                '/opt/codex-launcher',
+            ),
+        ).toEqual({ version: '0.163.0' });
+        expect(spawnFn).toHaveBeenCalledWith(
+            '/opt/codex-launcher',
+            ['/state/cli/codex/bin/codex.js', '--version'],
+            expect.anything(),
+        );
+    });
+
     it('бинаря нет — unknown с причиной', () => {
         const error = Object.assign(new Error('spawnSync claude ENOENT'), { code: 'ENOENT' });
         const v = ralph.readCliVersion(
@@ -258,6 +275,43 @@ describe('readCliVersion — фактическая версия бинаря, �
         expect(ralph.sessionCliVersion('openai', readFn, noteFn)).toEqual({ version: '0.163.0' });
         expect(readFn).toHaveBeenCalledWith('codex', parseCodexCliVersion);
         expect(noteFn).toHaveBeenCalledWith('codex', { version: '0.163.0' });
+    });
+
+    it.each([
+        [{ version: '0.164.0' }, /codex[\s\S]*0\.163\.0[\s\S]*0\.164\.0/],
+        [
+            { version: 'unknown', unknownReason: 'код 127' },
+            /codex[\s\S]*не прочиталась[\s\S]*код 127/,
+        ],
+    ])('расхождение или нечтение — стоп с причиной, а не ⚠ и не запись смены', (actual, reason) => {
+        const noteFn = vi.fn();
+        const pushes: string[] = [];
+        expect(() =>
+            ralph.sessionCliVersion(
+                'openai',
+                () => actual,
+                noteFn,
+                undefined,
+                () => {},
+                {
+                    persistFn: () => {
+                        if (actual.version === 'unknown') throw new Error('ENOSPC');
+                    },
+                    pushEventFn: (message: string) => {
+                        pushes.push(message);
+                        return false;
+                    },
+                    exitFn: (): never => {
+                        throw new Error('exit 1');
+                    },
+                },
+            ),
+        ).toThrow('exit 1');
+        expect(noteFn).not.toHaveBeenCalled();
+        expect(pushes).toHaveLength(1);
+        expect(pushes[0]).toMatch(/cli-version/);
+        expect(pushes[0]).toMatch(reason as RegExp);
+        expect(pushes[0]).not.toContain('⚠');
     });
 
     it('рантайм без записи в реестре профилей — unknown, бинарь не трогается', () => {

@@ -176,6 +176,32 @@ describe('allOpenIssues / hasAnyIssues / milestoneLabels', () => {
     });
 });
 
+describe('findOpenIssue — восстановление публикации по точному заголовку', () => {
+    it('возвращает ровно одну карточку, null при отсутствии и отклоняет неоднозначность', () => {
+        const forgeJsonFn = vi.fn((_cmd: string) => [
+            issue(3, { title: 'точный' }),
+            issue(5, { title: 'другой' }),
+        ]);
+        const commands = make();
+        expect(commands.findOpenIssue('точный', { forgeJsonFn } as never)?.number).toBe(3);
+        expect(commands.findOpenIssue('отсутствует', { forgeJsonFn } as never)).toBeNull();
+        expect(forgeJsonFn.mock.calls[0][0]).toContain('--state open');
+        expect(forgeJsonFn.mock.calls[0][0]).not.toContain('--milestone');
+
+        const duplicates = () => [issue(3, { title: 'точный' }), issue(5, { title: 'точный' })];
+        expect(() =>
+            commands.findOpenIssue('точный', { forgeJsonFn: duplicates } as never),
+        ).toThrow(/Несколько открытых/);
+    });
+
+    it('сбой чтения пробрасывается, а не превращается в отсутствие карточки', () => {
+        const forgeJsonFn = () => {
+            throw new Error('forge unavailable');
+        };
+        expect(() => make().findOpenIssue('точный', { forgeJsonFn })).toThrow(/forge unavailable/);
+    });
+});
+
 describe('issueDetails — тело карточки для кодер-сессии (#50)', () => {
     it('читает заголовок и тело по номеру', () => {
         const forgeJsonFn = vi.fn((_cmd: string) => ({ title: 'Заголовок', body: 'Тело' }));

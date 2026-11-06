@@ -102,12 +102,25 @@ describe('классы следов — от противного', () => {
         expect(found).toHaveLength(1);
         expect(found[0].line).toBe(3);
     });
+
+    it('объяснение называет класс, замену и словарную причину с номером строки', () => {
+        const findings = [
+            ...traceFindings('cd /root/app'),
+            ...traceFindings('acme', { deny: /acme/ }),
+        ];
+        const text = explain('example.ts', findings);
+        expect(text).toContain('example.ts:1 — абсолютный путь домашнего каталога');
+        expect(text).toContain('/path/to/app');
+        expect(text).toContain('example.ts:1 — имя из RALPH_TRACE_DENY');
+        expect(text).toContain('cd /root/app');
+    });
 });
 
 describe('словарь имён — снаружи, а не в дереве (#117)', () => {
     it('пустой RALPH_TRACE_DENY → словаря нет, структурные классы работают дальше', () => {
         expect(denyNamePattern({} as NodeJS.ProcessEnv)).toBeNull();
         expect(denyNamePattern({ RALPH_TRACE_DENY: '  ' } as NodeJS.ProcessEnv)).toBeNull();
+        expect(denyNamePattern({ RALPH_TRACE_DENY: ' , ' } as NodeJS.ProcessEnv)).toBeNull();
     });
 
     it('имя из словаря краснит строку, которую структурные классы пропускают', () => {

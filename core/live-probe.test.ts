@@ -302,6 +302,17 @@ describe('runLiveProbe: запуск стенда', () => {
         expect(calls[0].env.ANTHROPIC_BASE_URL).toBeUndefined();
     });
 
+    it('Codex, Kimi Code и OpenCode идут на фиктивном провайдере без конфига и ключа', () => {
+        for (const cli of ['codex', 'kimi', 'opencode']) {
+            const { calls, spawnFn } = fakeSpawn(`RESULT ${cli} unknown-tool PASS — ok\n`);
+            const r = runLiveProbe(base({ cli, config: null, env: { PATH: '/usr/bin' }, spawnFn }));
+            expect(r.verdict).toBe('PASS');
+            expect(calls[0].env.STAND_FAKE_PROVIDER).toBe('1');
+            expect(calls[0].env.STAND_ISOLATE_ARGS).toBe('--pass-env IS_SANDBOX');
+            expect(calls[0].env.RALPH_PROBE_KEY).toBeUndefined();
+        }
+    });
+
     it('маршрут для CLI без строки маршрута — отказ, а не провайдер по умолчанию', () => {
         const { calls, spawnFn } = fakeSpawn('');
         const r = runLiveProbe(
@@ -496,6 +507,22 @@ describe('liveProbeForIntent', () => {
         );
         expect(r.verdict).toBe('INCONCLUSIVE');
         expect(r.comment).not.toContain(KEY);
+    });
+
+    it('fake-provider без конфига тоже получает стартовую строку со сроком', () => {
+        const logs: string[] = [];
+        liveProbeForIntent(
+            { cli: 'codex', case: 'unknown-tool' },
+            {
+                rawConfig: null,
+                ...ROOTS,
+                logFn: (l) => logs.push(l),
+                runFn: () => ({ verdict: 'PASS', reason: 'ok', tail: '' }),
+            },
+        );
+        expect(logs).toEqual([
+            '🔄 Живая проба codex unknown-tool запущена — срок 15 мин, раннер ждёт стенд.',
+        ]);
     });
 
     it('строка старта со сроком до стенда, полный хвост — в лог без ключа', () => {

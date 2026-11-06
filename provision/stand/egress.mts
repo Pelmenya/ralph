@@ -12,8 +12,11 @@
  * котором крутится прод; ошибка в нём роняет соседей, а не пробу. Namespace без интерфейсов
  * закрыт по построению, и открыт в нём только этот прокси.
  *
- * Проксируется только `CONNECT` (TLS до провайдера идёт насквозь): незашифрованный HTTP
- * провайдеру модели не нужен, а разбирать его значило бы держать второй протокол. Отказ —
+ * Для живого провайдера проксируется только `CONNECT` (TLS идёт насквозь). Отчёт #263 использует
+ * отдельный `startTcpForward`: фиктивный HTTP-провайдер слушает loopback хоста, и заранее
+ * названный TCP-адрес — единственный доступный изнутри. Обычный HTTP остаётся неразобранным.
+ * Для живого CONNECT незашифрованный HTTP провайдеру модели не нужен, а разбирать его значило
+ * бы держать второй протокол. Отказ —
  * `403` с адресом и строка в журнале прокси: попытка выйти за пределы — свидетельство, а не
  * только ошибка в выводе CLI.
  *
@@ -257,6 +260,25 @@ export function startEgressProxy(
         };
         client.on('data', onData);
         client.on('error', () => {});
+    });
+    server.listen(socketPath);
+    return server;
+}
+
+/**
+ * Канал отчёта к фиктивному HTTP-провайдеру хоста. В отличие от CONNECT к живому провайдеру,
+ * здесь разрешён один заранее названный loopback и байты не разбираются: HTTP остаётся HTTP.
+ */
+export function startTcpForward(
+    socketPath: string,
+    target: { host: string; port: number },
+): Server {
+    const server = createServer((client) => {
+        const upstream = createConnection(target.port, target.host);
+        client.pipe(upstream);
+        upstream.pipe(client);
+        client.on('error', () => upstream.destroy());
+        upstream.on('error', () => client.destroy());
     });
     server.listen(socketPath);
     return server;

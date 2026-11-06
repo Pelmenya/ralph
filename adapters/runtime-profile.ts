@@ -31,8 +31,8 @@ export type RuntimeProfile = { harness: string; provider: string; model: string 
 type RuntimeIdentity = {
     harness: string;
     provider: string;
-    // Бинарь, у которого спрашивается версия. Он же ключ сравнения «версия сменилась»:
-    // у claude и kimi бинарь один, и обновление видно обоим.
+    // Имя системного бинаря — только подпись и ключ профиля. Сессия и чтение версии идут
+    // через закреплённую копию (#261); у claude и kimi копия одна, как прежде был один бинарь.
     bin: string;
     parseVersion: (output: string) => CliVersion;
     // Провайдер берётся из модели `provider/model` (OpenCode, #121): харнесс один, а

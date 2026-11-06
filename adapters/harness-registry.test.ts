@@ -9,7 +9,7 @@ import {
     HARNESSES_DIR,
     HARNESS_REGISTRY,
     discoverHarnessPackages,
-    cliVersionDrift,
+    cliVersionProblem,
     harnessPackageProblems,
     loopDeniedTools,
     protectedSurfacesOf,
@@ -26,6 +26,7 @@ const goodPackage = (harness: string, over: Record<string, unknown> = {}) => ({
     harnessPackage: {
         interfaceVersion: HARNESS_INTERFACE_VERSION,
         harness,
+        distribution: { registry: 'npm', package: '@example/cli', bin: 'bin/cli.exe' },
         guardRegistration: () => ({ hooks: [], problems: [] }),
         probes: [
             {
@@ -191,21 +192,26 @@ describe('реестр: отказы с причиной', () => {
     });
 });
 
-describe('cliVersionDrift — версия CLI против описания', () => {
+describe('cliVersionProblem — исполняемая версия против описания', () => {
     const registry = {
         packages: new Map([['h', { descriptor: { cliVersion: '1.0.0' } }]]),
         problems: new Map(),
     } as never;
 
-    it('совпала, не прочиталась, пакета нет — расхождения нет', () => {
-        expect(cliVersionDrift(registry, 'h', '1.0.0', 'unknown')).toBeNull();
-        expect(cliVersionDrift(registry, 'h', 'unknown', 'unknown')).toBeNull();
-        expect(cliVersionDrift(registry, 'x', '2.0.0', 'unknown')).toBeNull();
+    it('совпала — проблемы нет; пакет без описания — отказ', () => {
+        expect(cliVersionProblem(registry, 'h', '1.0.0', 'unknown')).toBeNull();
+        expect(cliVersionProblem(registry, 'x', '2.0.0', 'unknown')).toMatch(/«x»/);
     });
 
-    it('другая версия — причина с обеими версиями и следствием', () => {
-        expect(cliVersionDrift(registry, 'h', '1.1.0', 'unknown')).toMatch(
-            /снято с CLI 1\.0\.0, исполняется 1\.1\.0.*unknown-field/,
+    it('другая версия — причина с харнессом и обеими версиями', () => {
+        expect(cliVersionProblem(registry, 'h', '1.1.0', 'unknown')).toMatch(
+            /h[\s\S]*1\.0\.0[\s\S]*1\.1\.0/,
+        );
+    });
+
+    it('версия не прочиталась — отдельный отказ с исходной причиной', () => {
+        expect(cliVersionProblem(registry, 'h', 'unknown', 'unknown', 'код 127')).toMatch(
+            /h[\s\S]*не прочиталась[\s\S]*код 127/,
         );
     });
 });
@@ -215,8 +221,50 @@ describe('форма кода пакета', () => {
         expect(harnessPackageProblems(goodPackage('a').harnessPackage, 'a')).toEqual([]);
     });
 
-    it('версия сверяется раньше формы: чужая версия — одна причина', () => {
-        expect(harnessPackageProblems({ interfaceVersion: 0 }, 'a')).toHaveLength(1);
+    it.each([
+        [
+            'claude-code',
+            '@anthropic-ai/claude-code',
+            'node_modules/@anthropic-ai/claude-code/bin/claude.exe',
+        ],
+        ['codex', '@openai/codex', 'node_modules/@openai/codex/bin/codex.js'],
+        [
+            'kimi-code',
+            '@moonshot-ai/kimi-code',
+            'node_modules/@moonshot-ai/kimi-code/dist/main.mjs',
+        ],
+        ['opencode', 'opencode-ai', 'node_modules/opencode-ai/bin/opencode.exe'],
+    ])('поставка %s объявлена самим пакетом', (name, packageName, bin) => {
+        expect(HARNESS_REGISTRY.packages.get(name)?.pkg.distribution).toEqual({
+            registry: 'npm',
+            package: packageName,
+            bin,
+        });
+    });
+
+    it.each([
+        ['нет distribution', undefined, /distribution не объект/],
+        ['незнакомый registry', { registry: 'pnpm', package: 'p', bin: 'b' }, /registry/],
+        [
+            'незнакомый ключ',
+            { registry: 'npm', package: 'p', bin: 'b', version: '1.0.0' },
+            /незнакомый ключ version/,
+        ],
+        ['пустое имя пакета', { registry: 'npm', package: '', bin: 'b' }, /package/],
+        ['абсолютный bin', { registry: 'npm', package: 'p', bin: '/b' }, /bin/],
+        ['bin уходит наружу', { registry: 'npm', package: 'p', bin: '../b' }, /bin/],
+    ])('%s — пакет отвергнут', (_what, distribution, reason) => {
+        expect(
+            harnessPackageProblems(goodPackage('a', { distribution }).harnessPackage, 'a').join(
+                '\n',
+            ),
+        ).toMatch(reason);
+    });
+
+    it('пакет прежнего интерфейса отвергнут по версии до проверки distribution', () => {
+        expect(harnessPackageProblems({ interfaceVersion: 1 }, 'a')).toEqual([
+            `package.ts: несовместимая версия интерфейса 1 (реестр знает ${HARNESS_INTERFACE_VERSION})`,
+        ]);
     });
 
     it('нет функций, состава пробы и флагов — каждая причина названа', () => {

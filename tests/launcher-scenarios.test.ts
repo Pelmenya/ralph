@@ -8,7 +8,7 @@
 //
 // Мир собирается тем же приёмом, что песочница живого цикла (`live-sandbox.ts`): источник —
 // копия продукта отдельным репозиторием (история канона в песочницу не едет), потребитель с
-// голым origin, форж и кодер — шимами в PATH, окружение дочерних процессов — с нуля, без
+// голым origin, форж, кодер и реестр npm — шимами в PATH, окружение дочерних процессов — с нуля, без
 // предохранителя побочек: запись на диск здесь и есть предмет проверки.
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import fs from 'node:fs';
@@ -16,7 +16,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { LAUNCHER_CONTRACT_VERSION } from '../core/compat.ts';
+import { buildManifest, formatManifest, INSTALL_MANIFEST } from '../core/core-install.ts';
+import { HARNESS_REGISTRY } from '../adapters/harness-registry.ts';
+import { RUNTIME_IDENTITIES } from '../adapters/runtime-profile.ts';
 import { sandboxLauncher } from './live-sandbox.ts';
+import { registryNpmShim } from './npm-shim.ts';
 
 // Срок — как у соседних живых наборов: настоящие git, launcher и раннер. Сценарий stop
 // с секундной сессией внутри под нагрузкой гейта шёл дольше дефолтных 5 с. Срок хука —
@@ -72,9 +76,15 @@ esac
 `;
 }
 
+const CLAUDE_PACKAGE = HARNESS_REGISTRY.packages.get(RUNTIME_IDENTITIES.claude.harness);
+if (!CLAUDE_PACKAGE) throw new Error('пакет Claude Code для launcher-песочницы не принят');
+const CLAUDE_VERSION = CLAUDE_PACKAGE.descriptor.cliVersion;
+const CLAUDE_BIN = CLAUDE_PACKAGE.pkg.distribution.bin;
+
 function coderShim(root: string, body: string): string {
     return `#!/bin/sh
 if [ "$1" = "--version" ]; then echo "0.0.0 (sandbox)"; exit 0; fi
+if [ "$2" = "--version" ]; then echo "${CLAUDE_VERSION} (Claude Code)"; exit 0; fi
 cat > "${root}/coder-prompt.txt"
 ${body}
 echo "кодер-сессия песочницы отработала"
@@ -95,6 +105,8 @@ function config(w: TWorld, maxIterations: number, productRoot?: string | null): 
             fallbackModel: 'none',
             permissionMode: 'bypassPermissions',
             installCmd: 'true',
+            // Сессия и `--version` идут через shim по контракту #261: копия — его первый argv.
+            cliLauncher: { 'claude-code': path.join(w.root, 'bin', 'claude') },
             adapters: { deployCheck: 'none' },
             gate: { checks: [['test', 'true']], prodChecks: [], prodDropChecks: [] },
             blockedHealAttempts: 1,
@@ -203,6 +215,12 @@ function buildWorld(
     fs.writeFileSync(path.join(root, 'bin', 'claude'), coderShim(root, opts.coderScript ?? ''), {
         mode: 0o755,
     });
+    fs.writeFileSync(path.join(root, 'bin', 'npm'), registryNpmShim(), { mode: 0o755 });
+    const copy = path.join(w.runtimeDir, 'cli', 'claude-code', CLAUDE_VERSION);
+    const copiedBin = path.join(copy, CLAUDE_BIN);
+    fs.mkdirSync(path.dirname(copiedBin), { recursive: true });
+    fs.writeFileSync(copiedBin, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(copy, INSTALL_MANIFEST), formatManifest(buildManifest(copy)));
 
     git(w, root, 'init', '--quiet', '--bare', path.join(root, 'origin.git'));
     git(w, w.consumer, 'init', '--quiet', '-b', 'main');

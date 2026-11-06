@@ -1454,11 +1454,13 @@ describe('resolveProfile: секции kimiNativeRuntime и opencodeRuntime — 
             raw({
                 kimiNativeRuntime: { status: 'experimental', model: 'k/m', home: '/path/to/home' },
                 opencodeRuntime: { status: 'experimental', model: 'prov/m' },
+                cliLauncher: { 'kimi-code': '/opt/kimi-launcher' },
             }),
             'dev',
             boom,
         );
         expect(cfg.kimiNativeRuntime.home).toBe('/path/to/home');
+        expect(cfg.cliLauncher).toEqual({ 'kimi-code': '/opt/kimi-launcher' });
     });
 
     it.each([
@@ -1471,6 +1473,8 @@ describe('resolveProfile: секции kimiNativeRuntime и opencodeRuntime — 
         [{ kimiNativeRuntime: [] }, /kimiNativeRuntime = \[\] — ожидался объект/],
         [{ opencodeRuntime: { model: 42 } }, /opencodeRuntime\.model = 42/],
         [{ opencodeRuntime: { providers: 'x' } }, /opencodeRuntime\.providers — незнакомый ключ/],
+        [{ cliLauncher: { codex: 'relative/launcher' } }, /cliLauncher\.codex/],
+        [{ cliLauncher: { unknown: '/opt/launcher' } }, /cliLauncher\.unknown/],
     ])('НЕГАТИВНЫЙ: %j — стоп, а не умолчание', (section, why) => {
         expect(() => resolveProfile(raw(section), 'dev', boom)).toThrow(why);
     });

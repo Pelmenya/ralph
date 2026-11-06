@@ -16,7 +16,7 @@
  */
 import type { GuardHook, HarnessProbe } from './harness-guard.ts';
 
-export const HARNESS_INTERFACE_VERSION = 1;
+export const HARNESS_INTERFACE_VERSION = 2;
 
 /**
  * Хук барьера так, как его позовёт CLI: matcher в семантике этого CLI, команда, таймаут и
@@ -55,9 +55,18 @@ export type GuardPlugin = {
     };
 };
 
+export type HarnessDistribution = {
+    registry: 'npm';
+    package: string;
+    /** Исполняемый файл внутри каталога установки пакета. */
+    bin: string;
+};
+
 export type HarnessPackage = {
     interfaceVersion: number;
     harness: string;
+    /** Поставка собственной копии CLI; версия живёт только в descriptor.cliVersion. */
+    distribution: HarnessDistribution;
     /**
      * Регистрация барьера так, как она уйдёт в CLI, прочитанная обратно. Источника два, и
      * пакет берёт свой: `settings` — настройки сессии, которые собирает раннер (их читает
